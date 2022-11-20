@@ -39,7 +39,7 @@ def set_48h_charging_schedule(caller=None, price_cap=0.22):
     logging.info(f"EnergyBroker: set up charging schedule request received by {caller}")
 
     if dotenv_config('MAX_TIBBER_BUY_PRICE'):
-        price_cap = dotenv_config('MAX_TIBBER_BUY_PRICE')
+        price_cap = int(dotenv_config('MAX_TIBBER_BUY_PRICE'))
 
     clear_victron_schedules()
     new_schedule = lowest_48h_prices(price_cap=price_cap)
