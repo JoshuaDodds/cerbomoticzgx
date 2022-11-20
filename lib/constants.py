@@ -1,0 +1,159 @@
+import logging
+from dotenv import dotenv_values
+
+logging.basicConfig(
+    format='%(asctime)s cerbomoticzGx: %(message)s',
+    level=logging.INFO,
+    datefmt='%Y-%m-%d %H:%M:%S')
+
+
+def dotenv_config(env_variable):
+    return dotenv_values('.env')[env_variable]
+
+
+"""
+Basig Configuration
+"""
+cerboGxEndpoint = dotenv_config('CERBOGX_IP')
+systemId0 = dotenv_config('VRM_PORTAL_ID')
+dzEndpoint = dotenv_config('DZ_URL_PREFIX')
+PushOverConfig = {"id": dotenv_config('PO_USER_ID'), "key": dotenv_config('PO_API_KEY')}
+
+"""
+Topics we will monitor for PV system updates to domotics system
+"""
+Topics = dict({
+    "system0":
+        {
+            # PV / ESS Metrics
+            "batt_soc": f"N/{systemId0}/battery/277/Soc",
+            "batt_current": f"N/{systemId0}/battery/277/Dc/0/Current",
+            "batt_voltage": f"N/{systemId0}/battery/277/Dc/0/Voltage",
+            "batt_power": f"N/{systemId0}/battery/277/Dc/0/Power",
+            # "batt_discharged_energy": f"N/{systemId0}/battery/277/History/DischargedEnergy",
+            # "batt_charged_energy": f"N/{systemId0}/battery/277/History/ChargedEnergy",
+            "modules_online": f"N/{systemId0}/battery/512/System/NrOfModulesOnline",
+            "pv_power": f"N/{systemId0}/system/0/Dc/Pv/Power",
+            "pv_current": f"N/{systemId0}/system/0/Dc/Pv/Current",
+            "system_state": f"N/{systemId0}/system/0/SystemState/State",
+
+            # AC Out Metrics
+            "ac_out_power": f"N/{systemId0}/vebus/276/Ac/Out/P",
+
+            # AC In Metrics
+            "ac_in_power": f"N/{systemId0}/vebus/276/Ac/ActiveIn/P",
+
+            # Control
+            "ac_power_setpoint": f"N/{systemId0}/settings/0/Settings/CGwacs/AcPowerSetPoint",
+            "max_charge_voltage": f"N/{systemId0}/settings/0/Settings/SystemSetup/MaxChargeVoltage",
+            "minimum_ess_soc": f"N/{systemId0}/settings/0/Settings/CGwacs/BatteryLife/MinimumSocLimit",
+            "grid_charging_enabled": f"Tesla/settings/grid_charging_enabled",
+            "trigger_ess_charge_scheduling": f"EnergyBroker/RunTrigger",
+
+            # Tibber
+            "tibber_total": f"N/{systemId0}/Tibber/home/energy/day/euro_day_total",
+
+            # Charge Circuit for Tesla
+            "tesla_power": f"N/{systemId0}/acload/40/Ac/Power",
+            "tesla_l1_current": f"N/{systemId0}/acload/40/Ac/L1/Current",
+            "tesla_l2_current": f"N/{systemId0}/acload/40/Ac/L2/Current",
+            "tesla_l3_current": f"N/{systemId0}/acload/40/Ac/L3/Current",
+        }
+})
+
+"""
+Topics we are able to write to
+"""
+TopicsWritable = dict({
+    "system0":
+        {
+            # Control
+            "ac_power_setpoint": f"W/{systemId0}/settings/0/Settings/CGwacs/AcPowerSetPoint",
+            "max_charge_voltage": f"W/{systemId0}/settings/0/Settings/SystemSetup/MaxChargeVoltage",
+            "minimum_ess_soc": f"W/{systemId0}/settings/0/Settings/CGwacs/BatteryLife/MinimumSocLimit"
+        }
+})
+
+"""
+DomoticZ Device ID's to update
+"""
+DzDevices = dict({
+    "system0":
+        {
+            "batt_soc": "587",
+            "batt_current": "593",
+            "batt_voltage": "586",
+            "pv_power": "592",
+            "pv_current": "591",
+            "system_state": "622",
+            "tibber_total": "626",
+            "tesla_power": "627",
+            "batt_power": "628",
+        },
+    "vehicle0":
+        {
+            "vehicle_status": "624",
+        }
+})
+
+"""
+DomoticZ Rest API updating endpoints
+"""
+DzEndpoints = dict({
+    "system0": {
+        str(f"{Topics['system0']['batt_soc']}"):      f"{dzEndpoint}{DzDevices['system0']['batt_soc']}&nvalue=0&svalue=",
+        str(f"{Topics['system0']['batt_current']}"):  f"{dzEndpoint}{DzDevices['system0']['batt_current']}&nvalue=0&svalue=",
+        str(f"{Topics['system0']['batt_voltage']}"):  f"{dzEndpoint}{DzDevices['system0']['batt_voltage']}&nvalue=0&svalue=",
+        str(f"{Topics['system0']['pv_power']}"):      f"{dzEndpoint}{DzDevices['system0']['pv_power']}&nvalue=0&svalue=",
+        str(f"{Topics['system0']['pv_current']}"):    f"{dzEndpoint}{DzDevices['system0']['pv_current']}&nvalue=0&svalue=",
+        str(f"{Topics['system0']['system_state']}"):  f"{dzEndpoint}{DzDevices['system0']['system_state']}&nvalue=0&svalue=",
+        str(f"{Topics['system0']['tibber_total']}"):  f"{dzEndpoint}{DzDevices['system0']['tibber_total']}&svalue=",
+        str(f"{Topics['system0']['tesla_power']}"): f"{dzEndpoint}{DzDevices['system0']['tesla_power']}&nvalue=0&svalue=",
+        str(f"{Topics['system0']['batt_power']}"):      f"{dzEndpoint}{DzDevices['system0']['batt_power']}&nvalue=0&svalue=",
+    },
+    "vehicle0": {
+        # Endpoints fed by ev_charge_controller.py
+        str(f"vehicle_status"):  f"{dzEndpoint}{DzDevices['vehicle0']['vehicle_status']}&nvalue=0&svalue=",
+    }
+})
+
+"""
+Integer to human readable system state mappings
+"""
+SystemState = dict({
+    0: "Off",
+    1: "Low Accu Power",
+    2: "VE.Bus Fault",
+    3: "Bulk Charging",
+    4: "Absorption Charging",
+    5: "Float Charging",
+    6: "Storage Mode",
+    7: "Equalisation Charging",
+    8: "Pass-through Mode",
+    9: "Inverting",
+    10: "Assisting",
+    252: "External Control",
+    256: "Discharging",
+    257: "Sustain",
+    259: "Scheduled Charging",
+})
+
+"""
+python time weekday to victron weekday numbering conversion table
+"""
+PythonToVictronWeekdayNumberConversion = dict({
+    0: 1,
+    1: 2,
+    2: 3,
+    3: 4,
+    4: 5,
+    5: 6,
+    6: 0,
+})
+
+def retrieve_mqtt_subcribed_topics(sysid=None):
+    if not sysid:
+        sysid = "system0"
+
+    for value in Topics[sysid].keys():
+        yield Topics[sysid][value]

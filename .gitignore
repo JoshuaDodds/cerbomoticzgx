@@ -90,3 +90,5 @@ ENV/
 
 cache.json
 homeconnect_oauth_token.json
+tibber.db
+prices.png
