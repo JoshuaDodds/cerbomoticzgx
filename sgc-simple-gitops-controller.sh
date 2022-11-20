@@ -48,7 +48,7 @@ while true; do
     echo "$SVC_NAME: Killing any running python3 processes...Sleeping for $INTERVAL"
     pkill -f python3
     echo "$SVC_NAME: Updating cerbomoticzGx service..."
-    rsync -qav --exclude 'log.txt' --exclude '__pycache__' /app/gitops-managed-repos/cerbomoticzGx/ /app/cerbomoticzGx/
+    rsync -qav --exclude 'log.txt' --exclude '__pycache__' /app/gitops-managed-repos/cerbomoticzgx/ /app/
 
   # currently, caught but unhandled exceptions (will not cause the script to exit)
   elif [ "$REMOTE" = "$BASE" ]; then
