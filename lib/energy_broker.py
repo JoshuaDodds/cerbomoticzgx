@@ -5,8 +5,8 @@ import schedule as scheduler
 
 import paho.mqtt.publish as publish
 
-from .constants import logging, cerboGxEndpoint, systemId0, PythonToVictronWeekdayNumberConversion, PushOverConfig
-from .tibber_api import lowest_48h_prices, dip_peak_data
+from .constants import logging, cerboGxEndpoint, systemId0, PythonToVictronWeekdayNumberConversion, PushOverConfig, dotenv_config
+from .tibber_api import lowest_48h_prices
 
 def main():
     logging.info("EnergyBroker: Initializing...")
@@ -38,6 +38,9 @@ def publish_mqtt_trigger():
 def set_48h_charging_schedule(caller=None, price_cap=0.22):
     logging.info(f"EnergyBroker: set up charging schedule request received by {caller}")
 
+    if dotenv_config('MAX_TIBBER_BUY_PRICE'):
+        price_cap = dotenv_config('MAX_TIBBER_BUY_PRICE')
+
     clear_victron_schedules()
     new_schedule = lowest_48h_prices(price_cap=price_cap)
 
@@ -50,36 +53,6 @@ def set_48h_charging_schedule(caller=None, price_cap=0.22):
             schedule_victron_ess_charging(int(hour), schedule=schedule, day=day)
             push_notification(hour, day, price)
             schedule += 1
-
-
-def old_set_48h_charging_schedule(caller=None, price_cap=0.25):
-    logging.info(f"EnergyBroker: set up charging schedule request received by {caller}")
-    logging.info(f"EnergyBroker: Upcoming slots under {price_cap} cents (if any) are...")
-
-    clear_victron_schedules()
-    today_cheap_hours = None
-    tomorrow_cheap_hours = None
-
-    try:
-        today_cheap_hours = dip_peak_data(__name__, level="", day=0, price_cap=price_cap)[0:2]
-        tomorrow_cheap_hours = dip_peak_data(__name__, level="", day=1, price_cap=price_cap)[0:2]
-    except Exception as e:
-        # this is broad and permissive by design - tomorrow_cheap_hours will be emptry until prices are
-        # published each day at 13:00, so we expect something to fail here until new rates are published..
-        logging.debug(e)
-        pass
-
-    if today_cheap_hours and len(today_cheap_hours) > 0:
-        i = 0
-        for hour in today_cheap_hours:
-            schedule_victron_ess_charging(int(hour), schedule=i, day=0)
-            i += 1
-
-    if tomorrow_cheap_hours and len(tomorrow_cheap_hours) > 0:
-        i = 2
-        for hour in tomorrow_cheap_hours:
-            schedule_victron_ess_charging(int(hour), schedule=i, day=1)
-            i += 1
 
 def schedule_victron_ess_charging(hour, schedule=0, duration=3600, day=0):
     """
