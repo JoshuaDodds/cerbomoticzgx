@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # sync any required secrets from secrets mount
-cp -a /secrets/.env* /app || exit 1
+cp -a /secrets/.env* /secrets/* /app || exit 1
 
 ### Start the "services"
 # fork cerbomoticzGx service and restart on exit
