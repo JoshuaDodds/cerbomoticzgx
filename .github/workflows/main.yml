@@ -57,3 +57,16 @@ jobs:
             ghcr.io/${{ steps.calver.outputs.repo }}:latest
           cache-from: type=registry,ref=ghcr.io/${{ steps.calver.outputs.repo }}:buildcache
           cache-to: type=registry,ref=ghcr.io/${{ steps.calver.outputs.repo }}:buildcache,mode=max
+
+      - name: Generate release tag
+        uses: amitsingh-007/next-release-tag@v1.0.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create Release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ env.release_tag }}
+          release_name: Release ${{ env.release_tag }}
