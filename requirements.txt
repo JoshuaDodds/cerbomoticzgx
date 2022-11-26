@@ -4,7 +4,7 @@ pytz~=2022.2.1
 TeslaPy~=2.6.0
 oauthlib~=3.2.0
 python-dotenv~=0.21.0
-tibber.py~=0.1.0
+tibber.py~=0.1.1
 python-dateutil~=2.8.2
 graphql_subscription_manager==0.7.1
 pandas==1.5.1

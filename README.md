@@ -34,14 +34,19 @@ Note: The name of this project is a nod to both Victron Energy & the Domoticz pr
 ```pip install -r requirements.txt```
 
 ### Configuration
-- Read the ```.env``` file carefully and adjust as needed.  
+- Read the ```.env``` file carefully and adjust as needed.
 - Carefully read through lib/contstants.py and adjust to fit your situation
 
 ### Running from CLI
 ```python3 main.py```
 
 ### Docker Container
-WIP
+If you will be building and running this from a container you will want to fork this repo and make sure you set up your configuration 
+to match your wishes and your own system.
+
+Check the entrypoint.sh  for the container. You will need to adjust how you handle secrets & configuration injection for the container.
+
+Finally, use the build.sh script as a template for building an arm64 image and pushing it to a container repository.
 
 ---------------
 (This package is in its infancy - contributions and collaborations are welcome.)

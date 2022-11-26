@@ -13,8 +13,8 @@ docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
 echo "$CR_PAT" | docker login ghcr.io -u USERNAME --password-stdin
 
 # build and tag local amd64 version
-#docker rmi ghcr.io/joshuadodds/cerbomoticzgx:latest-amd64
-#docker buildx build --platform linux/amd64 -t ghcr.io/joshuadodds/cerbomoticzgx:"$VERSION"-amd64 -t ghcr.io/joshuadodds/cerbomoticzgx:latest-amd64 -f cerbomoticzGx.Dockerfile .
+# docker rmi ghcr.io/joshuadodds/cerbomoticzgx:latest-amd64
+# docker buildx build --platform linux/amd64 -t ghcr.io/joshuadodds/cerbomoticzgx:"$VERSION"-amd64 -t ghcr.io/joshuadodds/cerbomoticzgx:latest-amd64 -f cerbomoticzGx.Dockerfile .
 
 # build, tag, and push to CR
 docker rmi ghcr.io/joshuadodds/cerbomoticzgx:latest
