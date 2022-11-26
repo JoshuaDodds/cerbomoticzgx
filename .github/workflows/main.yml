@@ -56,5 +56,5 @@ jobs:
           tags: |
             ghcr.io/${{ steps.calver.outputs.repo }}:${{ steps.calver.outputs.tag }}
             ghcr.io/${{ steps.calver.outputs.repo }}:latest
-          cache-from: type=registry,ref=ghcr.io/${{ steps.calver.outputs.repo }}:buildcache
-          cache-to: type=registry,ref=ghcr.io/${{ steps.calver.outputs.repo }}:buildcache,mode=max
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
