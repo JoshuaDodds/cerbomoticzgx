@@ -49,12 +49,11 @@ jobs:
       - name: Build Multi and push to CR
         uses: docker/build-push-action@v3
         with:
-          context: .
           file: cerbomoticzGx.Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
             ghcr.io/${{ steps.calver.outputs.repo }}:${{ steps.calver.outputs.tag }}
             ghcr.io/${{ steps.calver.outputs.repo }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=registry,ref=ghcr.io/${{ steps.calver.outputs.repo }}:buildcache
+          cache-to: type=registry,ref=ghcr.io/${{ steps.calver.outputs.repo }}:buildcache,mode=max
