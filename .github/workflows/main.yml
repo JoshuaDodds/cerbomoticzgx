@@ -24,7 +24,7 @@ jobs:
       - name: Create CalVer tag
         id: calver
         run: |
-          echo "tag=$(date +%Y.%m.%d.%H)" >> $GITHUB_OUTPUT
+          echo "tag=$(TZ='Europe/Amsterdam' date +%Y.%m.%d.%H)" >> $GITHUB_OUTPUT
           echo "repo=$(echo ${{ github.repository }} | tr [:upper:] [:lower:])" >> $GITHUB_OUTPUT
 
       - name: Debug Info
