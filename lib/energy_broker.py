@@ -21,7 +21,7 @@ def scheduler_loop():
     def is_alive(): logging.info(f"EnergyBroker: heartbeat...thumpThump!")
 
     # scheduler.every().day.at("09:30").do(publish_mqtt_trigger)
-    scheduler.every().day.at("13:05").do(publish_mqtt_trigger)
+    scheduler.every().day.at("13:10").do(publish_mqtt_trigger)
     scheduler.every(5).minutes.do(is_alive)
 
     for job in scheduler.get_jobs():
