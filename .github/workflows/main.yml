@@ -24,8 +24,8 @@ jobs:
       - name: Create CalVer tag
         id: calver
         run: |
-          echo "::set-output name=tag::$(date +%Y.%m.%d.%S)"
-          echo "::set-output name=repo::$(echo ${{ github.repository }} | tr [:upper:] [:lower:])"
+          echo "tag=$(date +%Y.%m.%d.%H)" >> $GITHUB_OUTPUT
+          echo "repo=$(echo ${{ github.repository }} | tr [:upper:] [:lower:])" >> $GITHUB_OUTPUT
 
       - name: Debug Info
         run: |
@@ -55,3 +55,4 @@ jobs:
           push: true
           tags: |
             ghcr.io/${{ steps.calver.outputs.repo }}:${{ steps.calver.outputs.tag }}
+            ghcr.io/${{ steps.calver.outputs.repo }}:latest
