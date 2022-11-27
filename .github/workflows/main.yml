@@ -1,4 +1,4 @@
-name: CI Workflow
+name: Build & Release
 
 on:
   push:
@@ -16,22 +16,16 @@ jobs:
       contents: write
       packages: write
     steps:
-      - name: Checkout repository
+      - name: Repository Checkout
         uses: actions/checkout@v3
         with:
           fetch-depth: '0'
 
-      - name: Create CalVer tag
+      - name: Generate container version tag
         id: calver
         run: |
           echo "tag=$(TZ='Europe/Amsterdam' date +%Y.%m.%d.%H)" >> $GITHUB_OUTPUT
           echo "repo=$(echo ${{ github.repository }} | tr [:upper:] [:lower:])" >> $GITHUB_OUTPUT
-
-      - name: Debug Info
-        run: |
-          whoami
-          id
-          echo "Next version will be: ${{ steps.calver.outputs.tag }}"          
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v2
@@ -46,7 +40,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build Multi and push to CR
+      - name: Multiplatform docker build and push
         uses: docker/build-push-action@v3
         with:
           file: cerbomoticzGx.Dockerfile
