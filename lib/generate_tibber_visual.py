@@ -30,7 +30,7 @@ async def main():
     gv = GenerateViz(db)
 
     print(f"Tibber Graph Generator: Generating visualization...")
-    gv.create_visualization(filepath="prices.png", comparison_kwh=13, decimals=1)
+    gv.create_visualization(filepath="prices.png", comparison_kwh=13, decimals=2)
 
     db.close()
 

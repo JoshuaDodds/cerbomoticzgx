@@ -1,6 +1,6 @@
 import tibber
-
 import time
+
 from paho.mqtt import publish
 from datetime import datetime, timezone
 from dateutil import parser, tz
@@ -8,6 +8,8 @@ from dateutil import parser, tz
 from .constants import logging, cerboGxEndpoint, dotenv_config, systemId0
 from .domoticz_updater import domoticz_update
 
+
+logging.getLogger("gql.transport.websockets").setLevel(logging.WARNING)
 
 tzinfos = {"UTC": tz.gettz(dotenv_config('TIMEZONE'))}
 account = tibber.Account(dotenv_config('TIBBER_ACCESS_TOKEN'))
@@ -48,7 +50,7 @@ def live_measurements(home=_home or None):
 
     # Start the live feed. This runs forever.
     logging.info(f"Tibber: Live measurements starting...")
-    home.start_livefeed()
+    home.start_live_feed()
 
 def dip_peak_data(caller=None, level="CHEAP", day=0, price_cap=0.22):
     """

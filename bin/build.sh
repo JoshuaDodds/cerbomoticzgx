@@ -16,9 +16,14 @@ echo "$CR_PAT" | docker login ghcr.io -u USERNAME --password-stdin
 # docker rmi ghcr.io/joshuadodds/cerbomoticzgx:latest-amd64
 # docker buildx build --platform linux/amd64 -t ghcr.io/joshuadodds/cerbomoticzgx:"$VERSION"-amd64 -t ghcr.io/joshuadodds/cerbomoticzgx:latest-amd64 -f cerbomoticzGx.Dockerfile .
 
-# build, tag, and push to CR
+# rm older image
 docker rmi ghcr.io/joshuadodds/cerbomoticzgx:latest
-docker buildx build --platform linux/arm64 -t ghcr.io/joshuadodds/cerbomoticzgx:"$VERSION" -t ghcr.io/joshuadodds/cerbomoticzgx:latest -f cerbomoticzGx.Dockerfile --push .
+
+# build, tag, and push to CR
+docker buildx build --platform linux/arm64 --cache-from ghcr.io/joshuadodds/cerbomoticzgx:buildcache \
+  --cache-to ghcr.io/joshuadodds/cerbomoticzgx:buildcache \
+  -t ghcr.io/joshuadodds/cerbomoticzgx:"$VERSION" -t ghcr.io/joshuadodds/cerbomoticzgx:latest \
+  -f cerbomoticzGx.Dockerfile --push .
 
 # cleanup older local untagged images
 docker image prune -f
