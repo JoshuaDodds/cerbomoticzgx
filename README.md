@@ -20,7 +20,7 @@ a Domoticz server via its REST API for monitoring and historic tracking
 - Grid Assisted vehicle charging mode for when you need to just charge at full rate regardless of cost
 - Energy Broker module which attempts to buy energy at the lowest possible rate in a 48 hour period and store this in your home battery
 - Tibber graphing module to generate visuals of the upcoming electricity prices (Thanks to [Tibberios](https://github.com/Lef-F/tibberios))
-- Tibber API integration to constantly monitor current energy rates, daily consumption and production, forecasted pricing, etc
+- Tibber API integration to constantly monitor current energy rates, daily consumption and production, forecasted pricing, etc (Thanks to [Tibber.py](https://github.com/BeatsuDev/tibber.py))
 - deep integration with Victron system for monitoring and control via the cerbo Gx MQTT broker
 - Creates, exports, and updates a number of custom metrics to the victron MQTT broker for consumption by the [venus-nextgen Energy Dashboard](https://github.com/JoshuaDodds/venus-nextgen)
 
@@ -49,6 +49,6 @@ Check the entrypoint.sh  for the container. You will need to adjust how you hand
 Finally, use the build.sh script as a template for building an arm64 image and pushing it to a container repository.
 
 ---------------
-(This package is in its infancy - contributions and collaborations are welcome.)
+(This package is in its infancy, but contributions and collaborations are welcome.)
 
 Copyright 2022 Joshua Dodds
