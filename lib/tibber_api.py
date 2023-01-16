@@ -190,7 +190,7 @@ def today_price_points(home, rank=1):
 
         return _hour, _delta, _level, _cost
 
-def lowest_48h_prices(price_cap=0.22):
+def lowest_48h_prices(price_cap=0.22, max_items=4):
     """
     Returns a list of the lowest 4 price data sets in the coming 48 hours
 
@@ -221,7 +221,7 @@ def lowest_48h_prices(price_cap=0.22):
 
         index += 1
 
-    return relevant_data[0:4]
+    return relevant_data[0:max_items]
 
 def current_price_level(home):
     return home.current_subscription.price_info.current.level
