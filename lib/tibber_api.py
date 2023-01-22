@@ -50,7 +50,7 @@ def live_measurements(home=_home or None):
 
     # Start the live feed. This runs forever.
     logging.info(f"Tibber: Live measurements starting...")
-    home.start_live_feed(user_agent="cerbomoticzgx/0.0.1")
+    home.start_live_feed(user_agent="cerbomoticzgx/0.0.1", retries=1800, retry_interval=30)
 
 def dip_peak_data(caller=None, level="CHEAP", day=0, price_cap=0.22):
     """
