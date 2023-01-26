@@ -28,7 +28,8 @@ Topics = dict({
             # PV / ESS Metrics
             "batt_soc": f"N/{systemId0}/battery/277/Soc",
             "batt_current": f"N/{systemId0}/battery/277/Dc/0/Current",
-            "batt_voltage": f"N/{systemId0}/battery/277/Dc/0/Voltage",
+            # "batt_voltage": f"N/{systemId0}/battery/277/Dc/0/Voltage", # Use Shunt Voltage
+            "batt_voltage": f"N/{systemId0}/battery/512/Dc/0/Voltage",   # Use LFP Voltage
             "batt_power": f"N/{systemId0}/battery/277/Dc/0/Power",
             # "batt_discharged_energy": f"N/{systemId0}/battery/277/History/DischargedEnergy",
             # "batt_charged_energy": f"N/{systemId0}/battery/277/History/ChargedEnergy",
@@ -59,6 +60,18 @@ Topics = dict({
             "tesla_l2_current": f"N/{systemId0}/acload/40/Ac/L2/Current",
             "tesla_l3_current": f"N/{systemId0}/acload/40/Ac/L3/Current",
         }
+})
+
+
+mqtt_msg_value_conversion = dict({
+    "system_state": lambda value: SystemState[value],
+    "batt_current": lambda value: round(value, 2),
+    "pv_power": lambda value: f"{round(value)};1",
+    "pv_current": lambda value: round(value),
+    "batt_soc": lambda value: round(value, 2),
+    "batt_voltage": lambda value: round(value, 2),
+    "tesla_power": lambda value: f"{round(value)};1",
+    "batt_power": lambda value: f"{round(value)};1",
 })
 
 """

@@ -1,11 +1,16 @@
 import urllib3
 
-from .constants import DzEndpoints, logging, systemId0
+from .helpers import topic_friendly_name
+from .constants import DzEndpoints, logging, systemId0, mqtt_msg_value_conversion
 
 http = urllib3.PoolManager(num_pools=10, maxsize=25)
 
 
 def domoticz_update(topic, value, logmsg):
+    # apply value conversions for domoticz if needed
+    if mqtt_msg_value_conversion.get(topic_friendly_name(topic)):
+        value = mqtt_msg_value_conversion.get(topic_friendly_name(topic))(value=value)
+
     if systemId0 in topic:
         try:
             _response = http.request('GET', f"{DzEndpoints['system0'][topic]}{value}")
