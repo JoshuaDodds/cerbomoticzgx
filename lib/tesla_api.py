@@ -91,10 +91,10 @@ class TeslaApi:
                 self.update_mqtt_and_domoticz()
                 return True
         except teslapy.VehicleError:
-            logging.info(error_msg)
+            logging.info(f"tesla_api: VehicleError: {error_msg}")
             return False
         except teslapy.HTTPError:
-            logging.info(error_msg)
+            logging.info(f"tesla_api: HTTPError: {error_msg}")
             return False
 
     def send_command(self, cmd, error_msg):
@@ -115,7 +115,7 @@ class TeslaApi:
                 return True
 
         except teslapy.VehicleError:
-            logging.info(error_msg)
+            logging.info(f"tesla_api: VehicleError: {error_msg}")
             return False
 
     @staticmethod
@@ -131,10 +131,10 @@ class TeslaApi:
                     return True
 
         except teslapy.VehicleError as e:
-            logging.info(e)
+            logging.info(f"tesla_api: VehicleError: {e}")
             return False
         except teslapy.HTTPError as e:
-            logging.info(e)
+            logging.info(f"tesla_api: HTTPError: {e}")
             return False
 
     # Commands
@@ -172,7 +172,7 @@ class TeslaApi:
                     return vehicles[0]
 
         except Exception as e:
-            logging.info(e)
+            logging.info(f"tesla_api: get_vehicle_data() rrror: {e}")
             return e
 
     def minutes_to_full_charge(self):
