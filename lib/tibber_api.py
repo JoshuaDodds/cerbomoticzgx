@@ -18,7 +18,7 @@ _home = account.homes[0]
 
 def live_measurements(home=_home or None):
     @home.event("live_measurement")
-    def log_accumulated(data):
+    async def log_accumulated(data):
         ts = datetime.now().replace(microsecond=0)
         logging.debug(f"Tibber: Imported: {data.accumulated_consumption or 0.000} kWh / {data.accumulated_cost or 0.00} {data.currency} :: "
                       f"Exported: {data.accumulated_production or 0.000} kWh / {data.accumulated_reward or 0.00} {data.currency} :: "
