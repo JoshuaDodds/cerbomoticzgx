@@ -28,7 +28,7 @@ git config --global user.name "SGC Bot"
 echo -e "$SVC_NAME: Entering work loop...";
 
 while true; do
-  echo -e "$SVC_NAME: Updating remote git repo & reconciling with cluster state";
+  echo -e "$SVC_NAME: Updating remote git repo & comparing with current state...";
   git remote update >> /dev/null
 
   UPSTREAM=${1:-'@{u}'}
