@@ -1,12 +1,12 @@
 import time
-import requests
 import threading
 import schedule as scheduler
 
 import paho.mqtt.publish as publish
 
-from .constants import logging, cerboGxEndpoint, systemId0, PythonToVictronWeekdayNumberConversion, PushOverConfig, dotenv_config
+from .constants import logging, cerboGxEndpoint, systemId0, PythonToVictronWeekdayNumberConversion, dotenv_config
 from .tibber_api import lowest_48h_prices
+from lib.notifications import pushover_notification
 
 def main():
     logging.info("EnergyBroker: Initializing...")
@@ -91,11 +91,9 @@ def clear_victron_schedules():
                        hostname=cerboGxEndpoint)
 
 def push_notification(hour, day, price):
-    _id = PushOverConfig.get("id")
-    _key = PushOverConfig.get("key")
-    msg = f"Energy Broker Alert: ESS Charge scheduled for {hour}:00 {'Today' if day == 0 else 'Tomorrow'} @ {price}"
-    payload = {"message": msg, "user": _id, "token": _key}
-    _req = requests.post('https://api.pushover.net/1/messages.json', data=payload, headers={'User-Agent': 'CerbomoticzGx'})
+    topic = f"Energy Broker Alert"
+    msg = f"ESS Charge scheduled for {hour}:00 {'Today' if day == 0 else 'Tomorrow'} @ {price}"
+    pushover_notification(topic, msg)
 
 class Utils:
     @staticmethod

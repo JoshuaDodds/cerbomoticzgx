@@ -11,4 +11,5 @@ __all__ = [
     'generate_tibber_visual',
     'event_handler',
     'helpers',
+    'notifications'
 ]
