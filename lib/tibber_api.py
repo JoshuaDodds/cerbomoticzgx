@@ -1,12 +1,16 @@
 import tibber
 import time
+import json
 
+import paho.mqtt.subscribe as subscribe
 from paho.mqtt import publish
-from datetime import datetime, timezone
+
+from datetime import datetime, timezone, timedelta
 from dateutil import parser, tz
 
-from .constants import logging, cerboGxEndpoint, dotenv_config, systemId0
-from .domoticz_updater import domoticz_update
+from lib.constants import logging, cerboGxEndpoint, dotenv_config, systemId0
+from lib.domoticz_updater import domoticz_update
+from lib.notifications import pushover_notification
 
 
 logging.getLogger("gql.transport").setLevel(logging.ERROR)
@@ -19,38 +23,52 @@ _home = account.homes[0]
 def live_measurements(home=_home or None):
     @home.event("live_measurement")
     async def log_accumulated(data):
-        ts = datetime.now().replace(microsecond=0)
-        logging.debug(f"Tibber: Imported: {data.accumulated_consumption or 0.000} kWh / {data.accumulated_cost or 0.00} {data.currency} :: "
-                      f"Exported: {data.accumulated_production or 0.000} kWh / {data.accumulated_reward or 0.00} {data.currency} :: "
-                      f"Pwr Factor: {data.power_factor or 0.000} :: Avg Pwr: {data.average_power} Watts")
+        try:
+            ts = datetime.now().replace(microsecond=0)
+            logging.debug(f"Tibber: Imported: {data.accumulated_consumption or 0.000} kWh / {data.accumulated_cost or 0.00} {data.currency} :: "
+                          f"Exported: {data.accumulated_production or 0.000} kWh / {data.accumulated_reward or 0.00} {data.currency} :: "
+                          f"Pwr Factor: {data.power_factor or 0.000} :: Avg Pwr: {data.average_power} Watts")
 
-        # update mqtt topics
-        publish.single("Tibber/home/energy/day/imported", payload=f"{{\"value\": \"{data.accumulated_consumption}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/energy/day/cost", payload=f"{{\"value\": \"{data.accumulated_cost or 0.00}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/energy/day/exported", payload=f"{{\"value\": \"{data.accumulated_production}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/energy/day/reward", payload=f"{{\"value\": \"{data.accumulated_reward or 0.00}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/energy/day/import_peak", payload=f"{{\"value\": \"{data.max_power}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/energy/day/export_peak", payload=f"{{\"value\": \"{data.max_power_production}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/energy/day/average_power", payload=f"{{\"value\": \"{data.average_power}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/energy/day/last_update", payload=f"{{\"value\": \"{ts}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+            # update mqtt topics
+            publish.single("Tibber/home/energy/day/imported", payload=f"{{\"value\": \"{data.accumulated_consumption}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+            publish.single("Tibber/home/energy/day/cost", payload=f"{{\"value\": \"{data.accumulated_cost or 0.00}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+            publish.single("Tibber/home/energy/day/exported", payload=f"{{\"value\": \"{data.accumulated_production}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+            publish.single("Tibber/home/energy/day/reward", payload=f"{{\"value\": \"{data.accumulated_reward or 0.00}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+            publish.single("Tibber/home/energy/day/import_peak", payload=f"{{\"value\": \"{data.max_power}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+            publish.single("Tibber/home/energy/day/export_peak", payload=f"{{\"value\": \"{data.max_power_production}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+            publish.single("Tibber/home/energy/day/average_power", payload=f"{{\"value\": \"{data.average_power}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+            publish.single("Tibber/home/energy/day/last_update", payload=f"{{\"value\": \"{ts}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
 
-        # Update domoticz
-        day_total = None
-        if data.accumulated_cost and data.accumulated_reward:
-            day_total = round(data.accumulated_reward - data.accumulated_cost, 2)
-        if day_total:
-            if day_total > 0.00:
-                counter_for_dz = str(day_total).replace('.', '')
+            # Update domoticz
+            day_total = None
+            if data.accumulated_cost and data.accumulated_reward:
+                day_total = round(data.accumulated_reward - data.accumulated_cost, 2)
+            if day_total:
+                if day_total > 0.00:
+                    counter_for_dz = str(day_total).replace('.', '')
+                else:
+                    counter_for_dz = str(0.00)
             else:
                 counter_for_dz = str(0.00)
-        else:
-            counter_for_dz = str(0.00)
 
-        domoticz_update(f"N/{systemId0}/Tibber/home/energy/day/euro_day_total", counter_for_dz, f"Tibber Total: {day_total}")
+            domoticz_update(f"N/{systemId0}/Tibber/home/energy/day/euro_day_total", counter_for_dz, f"Tibber Total: {day_total}")
+
+        except Exception as e:
+            logging.info(f"Tibber: Error encountered during live measurement data callback [log_accumulated()]: {e}")
+
+    def last_data_is_stale(data): # noqa
+        msg = subscribe.simple("Tibber/home/energy/day/last_update", qos=0, msg_count=1, hostname=cerboGxEndpoint, port=1883)
+        payload = json.loads(msg.payload.decode("utf-8"))['value']
+        last_update = datetime.strptime(payload, "%Y-%m-%d %H:%M:%S")
+        if datetime.now() - last_update > timedelta(minutes=5):
+            pushover_notification(f"Tibber Live Alert", "No data received in more than 5 minutes.")
+            return True
+        else:
+            return False
 
     # Start the live feed. This runs forever.
     logging.info(f"Tibber: Live measurements starting...")
-    home.start_live_feed(user_agent="cerbomoticzgx/0.0.1", retries=1800, retry_interval=30)
+    home.start_live_feed(user_agent="cerbomoticzgx/0.0.1", retries=1800, retry_interval=30, exit_condition=last_data_is_stale)
 
 def dip_peak_data(caller=None, level="CHEAP", day=0, price_cap=0.22):
     """
