@@ -63,7 +63,7 @@ class TeslaApi:
             self.update_mqtt_and_domoticz()
 
         else:
-            logging.info(f"TeslaApi: Last vehicle status update was at: {self.last_update_ts_hr}. Skipping mothership API request.")
+            logging.info(f"TeslaApi: Last vehicle status update was at: {self.last_update_ts_hr}. Skipping new request to mothership (Tesla API)")
 
     def update_mqtt_and_domoticz(self):
         publish.single("Tesla/vehicle0/vehicle_name", payload=f"{{\"value\": \"{self.vehicle_name}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
