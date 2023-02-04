@@ -352,7 +352,7 @@ class EvCharger:
         return f"EvCharger (vehicle): Charging: {tesla.is_charging}, Plugged: {tesla.is_plugged}, " \
                f"Car SOC: {tesla.vehicle_soc}%, Car SOC Setpoint: {tesla.vehicle_soc_setpoint}%, ESS SOC: {self.ess_soc}%, " \
                f"Surplus: {self.surplus_watts}W / {self.surplus_amps}A" \
-               f" ETA: {round((tesla.time_until_full / 60), 2)} Hour(s)"
+               f" ETA: {tesla.time_until_full}"
 
     def general_status_msg(self):
         return f"EvCharger (general): PV Surplus: {self.surplus_amps}A / {self.surplus_watts}W" \

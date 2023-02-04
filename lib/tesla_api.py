@@ -27,7 +27,7 @@ class TeslaApi:
         self.is_plugged = False
         self.is_home = False
         self.is_full = False
-        self.time_until_full = 0
+        self.time_until_full = "N/A"
         self.charging_status = "Unknown"
         self.plugged_status = "Unknown"
         self.last_update_ts = 0
@@ -109,7 +109,7 @@ class TeslaApi:
                     self.update_vehicle_status(force=True)
                 if 'STOP_CHARGE' in cmd:
                     self.is_charging = False
-                    self.time_until_full = 0
+                    self.time_until_full = "N/A"
                     self.charging_status = "Idle"
                     self.update_vehicle_status(force=True)
                 return True
