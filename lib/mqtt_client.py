@@ -28,16 +28,18 @@ def on_connect(_client, _userdata, _flags, _rc):
 def on_message(_client, _userdata, msg):
     if msg and msg.payload:
         try:
+            # grab topic and payload from message
             topic = msg.topic
             value = json.loads(msg.payload.decode("utf-8"))['value']
+            # format a  logging message
             logmsg = f"{' '.join(topic.rsplit('/', 3)[1:3])}: {value}"
 
             if topic and value:
-                # capture events which should update Domoticz
+                # capture and dispatch events which should update Domoticz
                 if topic in DzEndpoints['system0']:
                     domoticz_update(topic, value, logmsg)
 
-                # dispatch event to the event handler
+                # capture and dispatch all events to the event handler
                 Event(topic, value, logmsg, EvChargeControl).dispatch()
 
         except Exception as E:
