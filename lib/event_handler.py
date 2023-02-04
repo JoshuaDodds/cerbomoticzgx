@@ -33,6 +33,10 @@ class Event:
     def system_state(self):
         pass
 
+    def inverter_mode(self):
+        """ Triggered when inverter mode setting is changed: on, off, charger only"""
+        pass
+
     def batt_voltage(self):
         _value = round(self.value, 2)
         self.EvCharger.set_ess_volts(_value)
