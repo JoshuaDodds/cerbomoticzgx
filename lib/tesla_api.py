@@ -180,10 +180,10 @@ class TeslaApi:
 
         if type(minutes_until_full) is int:
             if minutes_until_full > 60:
-                fractional_hour = minutes_until_full / 60
+                fractional_hour = round(minutes_until_full / 60, 2)
                 label = "hrs"
             else:
-                fractional_hour = minutes_until_full
+                fractional_hour = math.floor(minutes_until_full)
                 label = "mins"
 
             self.time_until_full = f"{fractional_hour:.2f} {label}" if fractional_hour != 1 else f"{fractional_hour:.0f} {label[:-1]}"
