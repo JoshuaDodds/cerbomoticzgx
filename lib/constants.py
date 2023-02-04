@@ -26,17 +26,17 @@ Topics = dict({
     "system0":
         {
             # PV / ESS Metrics
-            "batt_soc": f"N/{systemId0}/battery/277/Soc",
+            "batt_soc":     f"N/{systemId0}/battery/277/Soc",
             "batt_current": f"N/{systemId0}/battery/277/Dc/0/Current",
-            # "batt_voltage": f"N/{systemId0}/battery/277/Dc/0/Voltage", # Use Shunt Voltage
+            # "batt_voltage":   f"N/{systemId0}/battery/277/Dc/0/Voltage", # Use Shunt Voltage
             "batt_voltage": f"N/{systemId0}/battery/512/Dc/0/Voltage",   # Use LFP Voltage
-            "batt_power": f"N/{systemId0}/battery/277/Dc/0/Power",
+            "batt_power":   f"N/{systemId0}/battery/277/Dc/0/Power",
             # "batt_discharged_energy": f"N/{systemId0}/battery/277/History/DischargedEnergy",
-            # "batt_charged_energy": f"N/{systemId0}/battery/277/History/ChargedEnergy",
-            "modules_online": f"N/{systemId0}/battery/512/System/NrOfModulesOnline",
-            "pv_power": f"N/{systemId0}/system/0/Dc/Pv/Power",
-            "pv_current": f"N/{systemId0}/system/0/Dc/Pv/Current",
-            "system_state": f"N/{systemId0}/system/0/SystemState/State",
+            # "batt_charged_energy":    f"N/{systemId0}/battery/277/History/ChargedEnergy",
+            "modules_online":   f"N/{systemId0}/battery/512/System/NrOfModulesOnline",
+            "pv_power":         f"N/{systemId0}/system/0/Dc/Pv/Power",
+            "pv_current":       f"N/{systemId0}/system/0/Dc/Pv/Current",
+            "system_state":     f"N/{systemId0}/system/0/SystemState/State",
 
             # AC Out Metrics
             "ac_out_power": f"N/{systemId0}/vebus/276/Ac/Out/P",
@@ -45,33 +45,22 @@ Topics = dict({
             "ac_in_power": f"N/{systemId0}/vebus/276/Ac/ActiveIn/P",
 
             # Control
-            "ac_power_setpoint": f"N/{systemId0}/settings/0/Settings/CGwacs/AcPowerSetPoint",
-            "max_charge_voltage": f"N/{systemId0}/settings/0/Settings/SystemSetup/MaxChargeVoltage",
-            "minimum_ess_soc": f"N/{systemId0}/settings/0/Settings/CGwacs/BatteryLife/MinimumSocLimit",
-            "grid_charging_enabled": f"Tesla/settings/grid_charging_enabled",
-            "trigger_ess_charge_scheduling": f"EnergyBroker/RunTrigger",
+            "ac_power_setpoint":                f"N/{systemId0}/settings/0/Settings/CGwacs/AcPowerSetPoint",
+            "max_charge_voltage":               f"N/{systemId0}/settings/0/Settings/SystemSetup/MaxChargeVoltage",
+            "minimum_ess_soc":                  f"N/{systemId0}/settings/0/Settings/CGwacs/BatteryLife/MinimumSocLimit",
+            "inverter_mode":                    f"N/{systemId0}/vebus/276/Mode",
+            "grid_charging_enabled":            f"Tesla/settings/grid_charging_enabled",
+            "trigger_ess_charge_scheduling":    f"EnergyBroker/RunTrigger",
 
             # Tibber
-            "tibber_total": f"N/{systemId0}/Tibber/home/energy/day/euro_day_total",
+            "tibber_total":     f"N/{systemId0}/Tibber/home/energy/day/euro_day_total",
 
             # Charge Circuit for Tesla
-            "tesla_power": f"N/{systemId0}/acload/40/Ac/Power",
+            "tesla_power":      f"N/{systemId0}/acload/40/Ac/Power",
             "tesla_l1_current": f"N/{systemId0}/acload/40/Ac/L1/Current",
             "tesla_l2_current": f"N/{systemId0}/acload/40/Ac/L2/Current",
             "tesla_l3_current": f"N/{systemId0}/acload/40/Ac/L3/Current",
         }
-})
-
-
-mqtt_msg_value_conversion = dict({
-    "system_state": lambda value: SystemState[value],
-    "batt_current": lambda value: round(value, 2),
-    "pv_power": lambda value: f"{round(value)};1",
-    "pv_current": lambda value: round(value),
-    "batt_soc": lambda value: round(value, 2),
-    "batt_voltage": lambda value: round(value, 2),
-    "tesla_power": lambda value: f"{round(value)};1",
-    "batt_power": lambda value: f"{round(value)};1",
 })
 
 """
@@ -81,10 +70,22 @@ TopicsWritable = dict({
     "system0":
         {
             # Control
-            "ac_power_setpoint": f"W/{systemId0}/settings/0/Settings/CGwacs/AcPowerSetPoint",
-            "max_charge_voltage": f"W/{systemId0}/settings/0/Settings/SystemSetup/MaxChargeVoltage",
-            "minimum_ess_soc": f"W/{systemId0}/settings/0/Settings/CGwacs/BatteryLife/MinimumSocLimit"
+            "ac_power_setpoint":    f"W/{systemId0}/settings/0/Settings/CGwacs/AcPowerSetPoint",
+            "max_charge_voltage":   f"W/{systemId0}/settings/0/Settings/SystemSetup/MaxChargeVoltage",
+            "minimum_ess_soc":      f"W/{systemId0}/settings/0/Settings/CGwacs/BatteryLife/MinimumSocLimit",
+            "inverter_mode":        f"N/{systemId0}/vebus/276/Mode",
         }
+})
+
+mqtt_msg_value_conversion = dict({
+    "system_state": lambda value: SystemState[value],
+    "batt_current": lambda value: round(value, 2),
+    "pv_power":     lambda value: f"{round(value)};1",
+    "pv_current":   lambda value: round(value),
+    "batt_soc":     lambda value: round(value, 2),
+    "batt_voltage": lambda value: round(value, 2),
+    "tesla_power":  lambda value: f"{round(value)};1",
+    "batt_power":   lambda value: f"{round(value)};1",
 })
 
 """
@@ -114,14 +115,14 @@ DomoticZ Rest API updating endpoints
 """
 DzEndpoints = dict({
     "system0": {
-        str(f"{Topics['system0']['batt_soc']}"):      f"{dzEndpoint}{DzDevices['system0']['batt_soc']}&nvalue=0&svalue=",
-        str(f"{Topics['system0']['batt_current']}"):  f"{dzEndpoint}{DzDevices['system0']['batt_current']}&nvalue=0&svalue=",
-        str(f"{Topics['system0']['batt_voltage']}"):  f"{dzEndpoint}{DzDevices['system0']['batt_voltage']}&nvalue=0&svalue=",
-        str(f"{Topics['system0']['pv_power']}"):      f"{dzEndpoint}{DzDevices['system0']['pv_power']}&nvalue=0&svalue=",
-        str(f"{Topics['system0']['pv_current']}"):    f"{dzEndpoint}{DzDevices['system0']['pv_current']}&nvalue=0&svalue=",
-        str(f"{Topics['system0']['system_state']}"):  f"{dzEndpoint}{DzDevices['system0']['system_state']}&nvalue=0&svalue=",
-        str(f"{Topics['system0']['tibber_total']}"):  f"{dzEndpoint}{DzDevices['system0']['tibber_total']}&svalue=",
-        str(f"{Topics['system0']['tesla_power']}"): f"{dzEndpoint}{DzDevices['system0']['tesla_power']}&nvalue=0&svalue=",
+        str(f"{Topics['system0']['batt_soc']}"):        f"{dzEndpoint}{DzDevices['system0']['batt_soc']}&nvalue=0&svalue=",
+        str(f"{Topics['system0']['batt_current']}"):    f"{dzEndpoint}{DzDevices['system0']['batt_current']}&nvalue=0&svalue=",
+        str(f"{Topics['system0']['batt_voltage']}"):    f"{dzEndpoint}{DzDevices['system0']['batt_voltage']}&nvalue=0&svalue=",
+        str(f"{Topics['system0']['pv_power']}"):        f"{dzEndpoint}{DzDevices['system0']['pv_power']}&nvalue=0&svalue=",
+        str(f"{Topics['system0']['pv_current']}"):      f"{dzEndpoint}{DzDevices['system0']['pv_current']}&nvalue=0&svalue=",
+        str(f"{Topics['system0']['system_state']}"):    f"{dzEndpoint}{DzDevices['system0']['system_state']}&nvalue=0&svalue=",
+        str(f"{Topics['system0']['tibber_total']}"):    f"{dzEndpoint}{DzDevices['system0']['tibber_total']}&svalue=",
+        str(f"{Topics['system0']['tesla_power']}"):     f"{dzEndpoint}{DzDevices['system0']['tesla_power']}&nvalue=0&svalue=",
         str(f"{Topics['system0']['batt_power']}"):      f"{dzEndpoint}{DzDevices['system0']['batt_power']}&nvalue=0&svalue=",
     },
     "vehicle0": {
