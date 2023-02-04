@@ -186,7 +186,7 @@ class TeslaApi:
                 fractional_hour = math.floor(minutes_until_full)
                 label = "mins"
 
-            self.time_until_full = f"{fractional_hour:.2f} {label}" if fractional_hour != 1 else f"{fractional_hour:.0f} {label[:-1]}"
+            self.time_until_full = f"{fractional_hour} {label}" if fractional_hour != 1 else f"{fractional_hour} {label[:-1]}"
 
         else:
             self.time_until_full = minutes_until_full
