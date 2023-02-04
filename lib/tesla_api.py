@@ -175,8 +175,22 @@ class TeslaApi:
             logging.info(f"tesla_api: get_vehicle_data() rrror: {e}")
             return e
 
-    def minutes_to_full_charge(self):
-        self.time_until_full = self.get_vehicle_data()['charge_state']['minutes_to_full_charge'] if self.is_charging else 0
+    def minutes_to_full_charge(self) -> str:
+        minutes_until_full = self.get_vehicle_data()['charge_state']['minutes_to_full_charge'] if self.is_charging else "N/A"
+
+        if type(minutes_until_full) is int:
+            if minutes_until_full > 60:
+                fractional_hour = minutes_until_full / 60
+                label = "hours"
+            else:
+                fractional_hour = minutes_until_full
+                label = "minutes"
+
+            self.time_until_full = f"{fractional_hour:.2f} {label}" if fractional_hour != 1 else f"{fractional_hour:.0f} {label[:-1]}"
+
+        else:
+            self.time_until_full = minutes_until_full
+
         self.update_mqtt_and_domoticz()
         return self.time_until_full
 
