@@ -270,7 +270,7 @@ class EvCharger:
         if not charging_amp_totals:
             charging_amp_totals = (self.l1_charging_amps + self.l2_charging_amps + self.l3_charging_amps) / 3
 
-        self.charging_amps = charging_amp_totals
+        self.charging_amps = round(charging_amp_totals, 2)
 
         publish.single("Tesla/vehicle0/charging_amps", payload=f"{{\"value\": \"{self.charging_amps}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
 
