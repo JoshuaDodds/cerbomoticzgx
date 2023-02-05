@@ -2,13 +2,10 @@ name: Review PR with OpenAI GPT model
 
 on:
   pull_request:
-    types: [ opened, synchronize ]
+    types: [ opened, edited ]
 
 jobs:
-  pr_commented:
-    if: |
-      github.event.issue.pull_request &&
-      startsWith(github.event.comment.body, 'openai')
+  auto_review:
     name: Review PR
     runs-on: ubuntu-latest
     steps:
@@ -32,3 +29,4 @@ jobs:
           echo "GITHUB_TOKEN=${{ github.token }}" >> $GITHUB_ENV
           echo "GITHUB_ACTOR=${{ github.actor }}" >> $GITHUB_ENV
           python review.py
+`
