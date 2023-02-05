@@ -35,19 +35,19 @@ def regulate_battery_max_voltage(ess_soc):
     current_max_charge_voltage = float(json.loads(max_charge_voltage_msg.payload.decode("utf-8"))['value'])
 
     try:
-        if int(ess_soc) == int(dotenv_config('MINIMUM_ESS_SOC')) and current_max_charge_voltage != float_voltage:
+        if int(ess_soc) == float(dotenv_config('MINIMUM_ESS_SOC')) and current_max_charge_voltage != float_voltage:
             publish.single(TopicsWritable["system0"]["max_charge_voltage"], payload=f"{{\"value\": {float_voltage}}}", qos=0, retain=False, hostname=cerboGxEndpoint, port=1883)
             logging.info(f"Victron Integration: Adjusting max charge voltage to {float_voltage}V due to battery SOC at {ess_soc}%")
 
             publish.single("Tesla/vehicle0/solar/ess_max_charge_voltage", payload=f"{{\"value\": \"{float_voltage}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
 
-        elif int(ess_soc) < int(dotenv_config('MINIMUM_ESS_SOC')) and current_max_charge_voltage != max_voltage:
+        elif int(ess_soc) < float(dotenv_config('MINIMUM_ESS_SOC')) and current_max_charge_voltage != max_voltage:
             publish.single(TopicsWritable["system0"]["max_charge_voltage"], payload=f"{{\"value\": {max_voltage}}}", qos=0, retain=False, hostname=cerboGxEndpoint, port=1883)
             logging.info(f"Victron Integration: Adjusting max charge voltage to {max_voltage}V due to battery SOC {ess_soc}% of {dotenv_config('MINIMUM_ESS_SOC')}%")
 
             publish.single("Tesla/vehicle0/solar/ess_max_charge_voltage", payload=f"{{\"value\": \"{max_voltage}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
 
-        elif int(ess_soc) >= int(dotenv_config('MAXIMUM_ESS_SOC')):
+        elif int(ess_soc) >= float(dotenv_config('MAXIMUM_ESS_SOC')):
             publish.single(TopicsWritable["system0"]["max_charge_voltage"], payload=f"{{\"value\": \"{battery_full_voltage}\"}}", qos=0, retain=False, hostname=cerboGxEndpoint, port=1883)
             logging.info(f"Victron Integration: Adjusting max charge voltage to {battery_full_voltage} due to battery SOC reaching {dotenv_config('MAXIMUM_ESS_SOC')}% or higher")
 
