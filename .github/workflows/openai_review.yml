@@ -1,11 +1,14 @@
 name: Review PR with OpenAI GPT model
 
 on:
-  pull_request:
-    types: [ opened, edited, synchronize, ready_for_review, review_requested ]
+  issue_comment:
+    types: [ created ]
 
 jobs:
-  auto_review:
+  pr_commented:
+    if: |
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, 'openai')
     name: Review PR
     runs-on: ubuntu-latest
     steps:
