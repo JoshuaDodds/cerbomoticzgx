@@ -2,6 +2,7 @@ import teslapy
 import math
 import time
 
+import lib.helpers
 from .constants import logging, dotenv_config, cerboGxEndpoint
 import paho.mqtt.publish as publish
 from .domoticz_updater import domoticz_update
@@ -177,20 +178,7 @@ class TeslaApi:
 
     def minutes_to_full_charge(self) -> str:
         minutes_until_full = self.get_vehicle_data()['charge_state']['minutes_to_full_charge'] if self.is_charging else "N/A"
-
-        if type(minutes_until_full) is int:
-            if minutes_until_full > 60:
-                fractional_hour = round(minutes_until_full / 60, 2)
-                label = "hrs"
-            else:
-                fractional_hour = math.floor(minutes_until_full)
-                label = "mins"
-
-            self.time_until_full = f"{fractional_hour} {label}" if fractional_hour != 1 else f"{fractional_hour} {label[:-1]}"
-
-        else:
-            self.time_until_full = minutes_until_full
-
+        self.time_until_full = lib.helpers.convert_to_fractional_hour(minutes_until_full)
         self.update_mqtt_and_domoticz()
         return self.time_until_full
 
