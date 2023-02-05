@@ -1,5 +1,9 @@
+import json
+import paho.mqtt.subscribe as subscribe
+
 from lib.helpers.base7_math import *
-from lib.constants import Topics
+from lib.constants import Topics, cerboGxEndpoint, systemId0
+
 
 def get_topic_key(topic, system_id="system0"):
     """
@@ -30,3 +34,8 @@ def convert_to_fractional_hour(minutes: int) -> str:
         return f"{hours} hr {minutes} min" if minutes != 0 else f"{hours} hr"
     else:
         return f"{minutes} min"
+
+
+def get_current_value_from_mqtt(topic: str) -> any:
+    t = subscribe.simple(Topics['system0'][topic], qos=0, msg_count=1, hostname=cerboGxEndpoint, port=1883)
+    return json.loads(t.payload.decode("utf-8"))['value']
