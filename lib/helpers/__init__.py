@@ -21,6 +21,9 @@ def convert_to_fractional_hour(minutes: int) -> str:
     Returns:
     str: The converted number of minutes in the format 'x hr y min' or 'x min', depending on the value.
     """
+    if type(minutes) is not int:    # we are not charging and minutes == "N/A"
+        return minutes
+
     if minutes > 60:
         hours = int(minutes / 60)
         minutes = int(minutes % 60)
