@@ -111,7 +111,7 @@ def publish_pricing_data(caller):
         logging.info(f"Tibber: (called from {caller}): retrieved and published Tibber pricing data to mqtt bus.")
 
     except Exception as e:
-        logging.error(f"Tibber: (publish_pricing_Data) (Error): {e}")
+        logging.error(f"Tibber: (publish_pricing_data) (Error): {e}")
 
 def mqtt_publish_current_price(home):
     value = home.current_subscription.price_info.current.total

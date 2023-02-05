@@ -36,7 +36,7 @@ def sync_tasks_start():
         for module, service in ACTIVE_MODULES[0]['sync'].items():
             if service:
                 logging.info(f"Starting {module}")
-                eval(module)()
+                exec(f"{module}()")
 
     except Exception as E:
         logging.error(f"sync_tasks_start (error): {E}")
@@ -56,12 +56,6 @@ def main():
             mqtt_thread.start()
 
         if ACTIVE_MODULES[0]['async']['tibber_api']:
-            # try:
-            #     live_measurements()
-            # except Exception as E:
-            #     logging.error(f"Tibber: live measurements stopped with reason: {E}. Restarting...")
-            #     time.sleep(5.0)
-            #     live_measurements()
             try:
                 asyncio.run(live_measurements())
             except Exception as E:
