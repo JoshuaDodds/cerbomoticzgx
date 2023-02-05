@@ -24,8 +24,7 @@ jobs:
       - name: Review PR and make comment
         run: |
           source .env/bin/activate
-          PRE_LINK="https://github.com/${{ github.repository }}/pull/${{ github.event.issue.number }}"
-          LINK="$(echo $PRE_LINK | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+          echo "LINK=https://github.com/joshuadodds/pull/${{ github.event.issue.number }}" >> $GITHUB_ENV
           echo "OPENAI_API_KEY=${{ secrets.OPENAI }}" >> $GITHUB_ENV
           echo "GITHUB_TOKEN=${{ github.token }}" >> $GITHUB_ENV
           echo "GITHUB_ACTOR=${{ github.actor }}" >> $GITHUB_ENV
