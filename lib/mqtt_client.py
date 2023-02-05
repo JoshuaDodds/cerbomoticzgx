@@ -3,10 +3,10 @@ import json
 
 import paho.mqtt.client as mqtt
 
-from .event_handler import Event
-from .cerbo_keep_alive import keep_cerbo_alive
-from .constants import retrieve_mqtt_subcribed_topics, logging, cerboGxEndpoint, DzEndpoints
-from .domoticz_updater import domoticz_update
+from lib.event_handler import Event
+from lib.cerbo_keep_alive import keep_cerbo_alive
+from lib.constants import retrieve_mqtt_subcribed_topics, logging, cerboGxEndpoint, DzEndpoints
+from lib.domoticz_updater import domoticz_update
 
 global EvChargeControl
 

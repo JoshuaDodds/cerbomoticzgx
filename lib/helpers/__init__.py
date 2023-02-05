@@ -1,24 +1,26 @@
-from .base7_math import *
-from ..constants import Topics
+from lib.helpers.base7_math import *
+from lib.constants import Topics
 
-def topic_friendly_name(topic, system_id="system0"):
+def get_topic_key(topic, system_id="system0"):
     """
-    Convert a MQQT subscribed literal topic to its equivalent friendly string label
+    Retrieves the key name for a MQQT literal topic from the Topics dict() if one exists
     """
-    subscribed_topics = Topics[system_id]
+    try:
+        subscribed_topics = Topics[system_id]
+    except KeyError:
+        return None
+
     return next((k for k in subscribed_topics if subscribed_topics.get(k) == topic), None)
 
-def convert_to_fractional_hour(minutes) -> str:
-    """
-    Converts a given number of minutes to fractional hours or minutes, in the format "x hr y min"
 
+def convert_to_fractional_hour(minutes: int) -> str:
+    """
     Parameters:
-    minutes (int): The number of minutes to convert.
+    minutes (int):
 
     Returns:
     str: The converted number of minutes in the format 'x hr y min' or 'x min', depending on the value.
     """
-
     if minutes > 60:
         hours = int(minutes / 60)
         minutes = int(minutes % 60)

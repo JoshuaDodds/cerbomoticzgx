@@ -1,4 +1,4 @@
-from .helpers import topic_friendly_name
+from .helpers import get_topic_key
 from .constants import dotenv_config, logging
 from .victron_integration import regulate_battery_max_voltage
 from .tibber_api import publish_pricing_data
@@ -9,19 +9,19 @@ class Event:
     def __init__(self, mqtt_topic, value, logging_msg=None, ev_charger=None):
         self.EvCharger = ev_charger
         # map mqqt topic to a shorter friendly  name which will match the class method name as well
-        self.topic_friendly_name = topic_friendly_name(topic=mqtt_topic)
+        self.topic_key = get_topic_key(topic=mqtt_topic)
         self.mqtt_topic = mqtt_topic
         self.value = value
         self.logging_msg = logging_msg
 
-        # logging.info(f"{self.topic_friendly_name} = {self.value}")
+        # logging.info(f"{self.topic_key} = {self.value}")
 
     def dispatch(self):
         try:
-            if self.topic_friendly_name:
-                # call the method which matches self.topic_friendly_name
-                getattr(self, self.topic_friendly_name, self._invalid_method)()
-                # logging.info(f"{self.topic_friendly_name} method")
+            if self.topic_key:
+                # call the method which matches self.topic_key
+                getattr(self, self.topic_key, self._invalid_method)()
+                # logging.info(f"{self.topic_key} method")
             else:
                 self._invalid_method()
         except TypeError as e:

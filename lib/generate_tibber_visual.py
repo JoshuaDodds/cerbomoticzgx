@@ -1,8 +1,8 @@
 import boto3
 
-from .tibberios.core import Database, TibberConnector
-from .tibberios.visualization import GenerateViz
-from .constants import dotenv_config
+from lib.tibberios.core import Database, TibberConnector
+from lib.tibberios.visualization import GenerateViz
+from lib.constants import dotenv_config
 
 
 async def main():

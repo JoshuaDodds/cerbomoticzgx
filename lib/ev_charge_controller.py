@@ -6,10 +6,10 @@ import math
 import threading
 import paho.mqtt.publish as publish
 
-from .constants import logging, cerboGxEndpoint, dotenv_config
-from .tesla_api import TeslaApi
-from .victron_integration import is_grid_import_enabled
-from .energy_broker import Utils as EnergyBrokerUtils
+from lib.constants import logging, cerboGxEndpoint, dotenv_config
+from lib.tesla_api import TeslaApi
+from lib.victron_integration import is_grid_import_enabled
+from lib.energy_broker import Utils as EnergyBrokerUtils
 
 tesla = TeslaApi()
 
@@ -95,26 +95,22 @@ class EvCharger:
 
     def should_manage_or_initiate_charging(self):
         if (tesla.is_charging
-            and tesla.is_home
-            and not tesla.is_supercharging
-            and not self.grid_charging_enabled):
+                and tesla.is_home
+                and not tesla.is_supercharging
+                and not self.grid_charging_enabled):
             return True
 
-        elif (not self.is_the_sun_shining()           # sun is not out ?
-              or int(self.ess_soc) < 95               # battery not full ?
-              or int(self.surplus_amps) < 2           # can not charge efficiently?
-              or self.grid_charging_enabled):         # Grid charging is active
-            return False
-
-        elif (tesla.is_home                           # vehicle is home ?
-              and tesla.is_plugged                    # and plugged in ?
-              and not tesla.is_supercharging          # we are not at a supercharger ?
-              and not tesla.is_full                   # battery SOC is not reached?
-              and not self.grid_charging_enabled):
+        if (self.is_the_sun_shining()
+                and int(self.ess_soc) >= 95
+                and int(self.surplus_amps) >= 2
+                and not self.grid_charging_enabled
+                and tesla.is_home
+                and tesla.is_plugged
+                and not tesla.is_supercharging
+                and not tesla.is_full):
             return True
 
-        else:
-            return False
+        return False
 
     def initiate_charging(self):
         # Inititial start charge logic

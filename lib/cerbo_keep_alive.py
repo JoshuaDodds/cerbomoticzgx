@@ -1,7 +1,7 @@
 import threading
 
 import paho.mqtt.publish as publish
-from .constants import logging, systemId0, cerboGxEndpoint
+from lib.constants import logging, systemId0, cerboGxEndpoint
 
 
 def keep_cerbo_alive():

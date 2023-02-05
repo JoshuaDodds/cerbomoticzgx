@@ -4,8 +4,8 @@ import schedule as scheduler
 
 import paho.mqtt.publish as publish
 
-from .constants import logging, cerboGxEndpoint, systemId0, PythonToVictronWeekdayNumberConversion, dotenv_config
-from .tibber_api import lowest_48h_prices
+from lib.constants import logging, cerboGxEndpoint, systemId0, PythonToVictronWeekdayNumberConversion, dotenv_config
+from lib.tibber_api import lowest_48h_prices
 from lib.notifications import pushover_notification
 
 def main():
