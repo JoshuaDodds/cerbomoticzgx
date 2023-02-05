@@ -29,4 +29,3 @@ jobs:
           echo "GITHUB_TOKEN=${{ github.token }}" >> $GITHUB_ENV
           echo "GITHUB_ACTOR=${{ github.actor }}" >> $GITHUB_ENV
           python review.py
-`
