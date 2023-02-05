@@ -2,7 +2,7 @@ name: Review PR with OpenAI GPT model
 
 on:
   pull_request:
-    types: [ opened, edited ]
+    types: [ opened, edited, synchronize, ready_for_review, review_requested ]
 
 jobs:
   auto_review:
