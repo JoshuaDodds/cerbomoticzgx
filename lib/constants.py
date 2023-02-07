@@ -25,7 +25,7 @@ Topics we will monitor for PV system updates to domotics system
 Topics = dict({
     "system0":
         {
-            # PV / ESS Metrics
+            # ESS Metrics
             "batt_soc":     f"N/{systemId0}/battery/277/Soc",
             "batt_current": f"N/{systemId0}/battery/277/Dc/0/Current",
             # "batt_voltage":   f"N/{systemId0}/battery/277/Dc/0/Voltage", # Use Shunt Voltage
@@ -34,9 +34,13 @@ Topics = dict({
             # "batt_discharged_energy": f"N/{systemId0}/battery/277/History/DischargedEnergy",
             # "batt_charged_energy":    f"N/{systemId0}/battery/277/History/ChargedEnergy",
             "modules_online":   f"N/{systemId0}/battery/512/System/NrOfModulesOnline",
+
+            # PV
             "pv_power":         f"N/{systemId0}/system/0/Dc/Pv/Power",
             "pv_current":       f"N/{systemId0}/system/0/Dc/Pv/Current",
             "system_state":     f"N/{systemId0}/system/0/SystemState/State",
+            "c2_daily_yield":   f"N/{systemId0}/solarcharger/279/History/Daily/0/Yield",
+            "c1_daily_yield":   f"N/{systemId0}/solarcharger/281/History/Daily/0/Yield",
 
             # AC Out Metrics
             "ac_out_power": f"N/{systemId0}/vebus/276/Ac/Out/P",
