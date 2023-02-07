@@ -2,7 +2,7 @@ import json
 import paho.mqtt.subscribe as subscribe
 
 from lib.helpers.base7_math import *
-from lib.constants import Topics, cerboGxEndpoint, systemId0
+from lib.constants import Topics, cerboGxEndpoint
 
 
 def get_topic_key(topic, system_id="system0"):
