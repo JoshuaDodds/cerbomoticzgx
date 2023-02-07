@@ -40,8 +40,13 @@ jobs:
   hello_world_job:
     permissions: write-all
     runs-on: ubuntu-latest
-    name: Test if the action works
+    name: OpenAI Code Review
     steps:
+      - name: repo name to lowercase
+        id: lowercase
+        run: |
+          echo "repo=$(echo ${{ github.repository }} | tr [:upper:] [:lower:])" >> $GITHUB_OUTPUT
+
       - uses: actions/checkout@v3
         with:
           ref: ${{ github.event.pull_request.head.sha }}
@@ -60,6 +65,6 @@ jobs:
           GIT_COMMIT_HASH: ${{ github.event.pull_request.head.sha }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BODY: ${{ github.event.pull_request.body }}
-          REPOSITORY_NAME: ${{ github.repository }}
+          REPOSITORY_NAME: ${{ steps.lowercase.outputs.repo }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           DIFF: ${{ env.DIFF }}
