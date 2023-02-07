@@ -70,6 +70,12 @@ class Event:
         _value = round(self.value)
         self.EvCharger.set_pv_amps(_value)
 
+    def c1_daily_yield(self):
+        pass
+
+    def c2_daily_yield(self):
+        pass
+
     def tesla_power(self):
         _value = round(self.value)
         self.EvCharger.set_charging_watts(_value)
