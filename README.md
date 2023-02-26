@@ -48,11 +48,14 @@ Note: The name of this project is a nod to both Victron Energy & the Domoticz pr
 ### Installation
 ```pip install -r requirements.txt```
 
-### Configuration
+### Configuration / Setup
 - Read the ```.env``` file carefully and adjust as needed.
 - Carefully read through lib/contstants.py and adjust to fit your situation
 - IMPORTANT: disable the simple-gitops-controller in `entrypoint.sh` or make sure it points at your own repository. Comment out the last line
 `/app/sgc-simple-gitops-controller.sh | ts %Y-%m-%d" "%H:%M:%S` to disable it. 
+- Also in `entrypoint.sh` disable the graph generator and secrets copying since these are specific to my own setup. 
+
+TODO: disable specific services that are specific for me
 
 ### Running from CLI
 ```python3 main.py```
