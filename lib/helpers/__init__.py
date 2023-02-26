@@ -1,11 +1,29 @@
 import json
 import paho.mqtt.subscribe as subscribe
+import paho.mqtt.publish as publish
+from datetime import datetime
 
 from lib.helpers.base7_math import *
 from lib.constants import Topics, cerboGxEndpoint
 
 
-def get_topic_key(topic, system_id="system0"):
+def publish_message(topic, message) -> None:
+    """
+    publishes a single message to a given topic on the MQtt broker
+    """
+    publish.single(topic=topic, payload=f"{{\"value\": \"{message}\"}}", qos=0, retain=False, hostname=cerboGxEndpoint,
+                   port=1883)
+
+
+def get_current_value_from_mqtt(topic: str) -> any:
+    """
+    Retrieves a single message froma given topic on the MQTT broker
+    """
+    t = subscribe.simple(Topics['system0'][topic], qos=0, msg_count=1, hostname=cerboGxEndpoint, port=1883)
+    return json.loads(t.payload.decode("utf-8"))['value']
+
+
+def get_topic_key(topic, system_id="system0") -> str:
     """
     Retrieves the key name for a MQQT literal topic from the Topics dict() if one exists
     """
@@ -36,6 +54,18 @@ def convert_to_fractional_hour(minutes: int) -> str:
         return f"{minutes} min"
 
 
-def get_current_value_from_mqtt(topic: str) -> any:
-    t = subscribe.simple(Topics['system0'][topic], qos=0, msg_count=1, hostname=cerboGxEndpoint, port=1883)
-    return json.loads(t.payload.decode("utf-8"))['value']
+def get_seasonal_max_items() -> int:
+    """
+    Returns: (int): max number of 1 hour charge slots needed to top up the battery from the grid
+    based on the current month.
+    """
+    if datetime.now().month in [10, 11, 12, 1]:
+        return 4
+    if datetime.now().month in [8, 9, 2]:
+        return 2
+
+    return 0
+
+
+# Function Aliases
+retrieve_message = get_current_value_from_mqtt
