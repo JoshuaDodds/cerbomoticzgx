@@ -51,11 +51,12 @@ Note: The name of this project is a nod to both Victron Energy & the Domoticz pr
 ### Configuration / Setup
 - Read the ```.env``` file carefully and adjust as needed.
 - Carefully read through lib/contstants.py and adjust to fit your situation
-- IMPORTANT: disable the simple-gitops-controller in `entrypoint.sh` or make sure it points at your own repository. Comment out the last line
-`/app/sgc-simple-gitops-controller.sh | ts %Y-%m-%d" "%H:%M:%S` to disable it. 
-- Also in `entrypoint.sh` disable the graph generator and secrets copying since these are specific to my own setup. 
+- IMPORTANT:  See notes below if you plan to run this from a container image.  My image won't work for you as is. Read the notes below 
+for the things you will need to adjust in your own fork of this repo.  
+ 
+**TODO: handle this issue automatically in a universal container build** 
 
-TODO: disable specific services that are specific for me
+
 
 ### Running from CLI
 ```python3 main.py```
@@ -64,7 +65,7 @@ TODO: disable specific services that are specific for me
 If you will be building and running this from a container you will want to fork this repo and make sure you set up your configuration 
 to match your wishes and your own system.
 
-Check the entrypoint.sh  for the container. You will need to adjust how you handle secrets & configuration injection for the container.
+Check the entrypoint.sh  for the container. You will need to adjust how you handle secrets & gitops configuration injection for the container.
 
 Finally, use the build.sh script as a template for building an arm64 image and pushing it to a container repository.
 
