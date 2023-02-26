@@ -5,6 +5,7 @@ Do you have one or more of the following devices in your home?
 
 - [x] Solar panels (the more the better)
 - [x] A Tesla vehicle (optional)
+- [x] A Tibber energy contract with a Pulse device (optional)
 - [x] Victron Energy Equipment (Cerbo GX compatible Inverters/Chargers, MPPT charge controllers, etc.)
 - [x] Home Energy Storage System with canbus or serial control and working well with your Victron system
 - [x] an ABB B21/23/24 Kilowatt meter (optional)
