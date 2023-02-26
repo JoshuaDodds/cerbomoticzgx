@@ -47,7 +47,7 @@ class EvCharger:
         self.load_reservation_reduction_factor = float(dotenv_config("LOAD_REDUCTION_FACTOR"))
         self.minimum_ess_soc = int(dotenv_config("MINIMUM_ESS_SOC"))  # see example .env.example file
 
-        # tesla.update_vehicle_status()
+        tesla.update_vehicle_status(force=True)
 
         logging.info("EvCharger (__init__): Init complete.")
 
