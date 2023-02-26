@@ -1,6 +1,6 @@
 import os
 import signal
-from lib.helpers import get_topic_key, publish_message
+from lib.helpers import get_topic_key
 from lib.constants import dotenv_config, logging
 from lib.victron_integration import regulate_battery_max_voltage
 from lib.tibber_api import publish_pricing_data
@@ -36,7 +36,6 @@ class Event:
         _value = self.value
         _pid = os.getpid()
         logging.info(f"lib.event_handler: received shutdown message from broker. Sending SIGKILL to PID {_pid}...")
-        publish_message(self.mqtt_topic, "False") # clear published shutdown directive
         os.kill(_pid, signal.SIGKILL)
 
     def system_state(self):

@@ -9,6 +9,7 @@ from lib.ev_charge_controller import EvCharger
 from lib.energy_broker import main as energybroker
 from lib.victron_integration import restore_default_battery_max_voltage
 from lib.tibber_api import live_measurements
+from lib.helpers import publish_message
 
 
 ACTIVE_MODULES = json.loads(dotenv_config('ACTIVE_MODULES'))
@@ -45,6 +46,8 @@ def sync_tasks_start():
 
 def main():
     try:
+        # clear any previously published shutdown directives
+        publish_message(self.mqtt_topic, "False")
         # start sync tasks
         sync_tasks_start()
 
