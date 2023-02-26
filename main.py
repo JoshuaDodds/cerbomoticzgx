@@ -34,6 +34,9 @@ def shutdown():
 
     mqtt_stop()
 
+    # publish message to broker that we are shutting down
+    publish_message("Cerbomoticzgx/system/shutdown", "True")
+
 def sync_tasks_start():
     try:
         for module, service in ACTIVE_MODULES[0]['sync'].items():
@@ -47,7 +50,8 @@ def sync_tasks_start():
 def main():
     try:
         # clear any previously published shutdown directives
-        publish_message(self.mqtt_topic, "False")
+        publish_message("Cerbomoticzgx/system/shutdown", "False")
+
         # start sync tasks
         sync_tasks_start()
 
