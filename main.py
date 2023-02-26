@@ -24,6 +24,8 @@ def mqtt_client(loop):
     asyncio.run(mqtt_start(EvChargeControl))
 
 def shutdown():
+    logging.info("main(): Cleaning up and exiting...")
+
     if dotenv_config('VICTRON_OPTIMIZED_CHARGING') == '1':
         restore_default_battery_max_voltage()
 
@@ -64,7 +66,6 @@ def main():
                 asyncio.run(live_measurements())
 
     except (KeyboardInterrupt, SystemExit):
-        logging.info("main(): Cleaning up and exiting...")
         shutdown()
 
 
