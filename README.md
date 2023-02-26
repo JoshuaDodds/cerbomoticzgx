@@ -1,6 +1,20 @@
 CerbomoticzGx
 ========================
+## Introduction 
+Do you have one or more of the following devices in your home?
 
+- [x] Solar panels (the more the better)
+- [x] A Tesla vehicle (optional)
+- [x] Victron Energy Equipment (Cerbo GX compatible Inverters/Chargers, MPPT charge controllers, etc.)
+- [x] Home Energy Storage System with canbus or serial control and working well with your Victron system
+- [x] an ABB B21/23/24 Kilowatt meter (optional)
+- [x] a Domoticz based Home Automation system (optional)
+
+If so, this project might be something you will find interesting. Have a look at what this project offers by 
+reading more below.  Also, many of the cool features the modules in this project offer are visualized and controllable 
+via a by a frontend React based Dashboard which you can find over here: [venus-nextgen Energy Dashboard](https://github.com/JoshuaDodds/venus-nextgen)
+
+## Features
 This project is a series of modules which aim to integrate, automate and control the following systems and components.
 
 - Victron Energy Equipment (Cerbo GX controlled Inverters, Solar MPPT charge controllers, etc.)
