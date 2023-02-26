@@ -7,11 +7,11 @@ from lib.helpers.base7_math import *
 from lib.constants import Topics, cerboGxEndpoint
 
 
-def publish_message(topic, message) -> None:
+def publish_message(topic, message, retain=False) -> None:
     """
     publishes a single message to a given topic on the MQtt broker
     """
-    publish.single(topic=topic, payload=f"{{\"value\": \"{message}\"}}", qos=0, retain=False, hostname=cerboGxEndpoint,
+    publish.single(topic=topic, payload=f"{{\"value\": \"{message}\"}}", qos=0, retain=retain, hostname=cerboGxEndpoint,
                    port=1883)
 
 
