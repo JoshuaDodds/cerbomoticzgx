@@ -34,9 +34,12 @@ class Event:
 
     def system_shutdown(self):
         _value = self.value
-        _pid = os.getpid()
-        logging.info(f"lib.event_handler: received shutdown message from broker. Sending SIGKILL to PID {_pid}...")
-        os.kill(_pid, signal.SIGKILL)
+        if "True" in _value:
+            _pid = os.getpid()
+            logging.info(f"lib.event_handler: received shutdown message from broker. Sending SIGKILL to PID {_pid}...")
+            os.kill(_pid, signal.SIGKILL)
+        else:
+            logging.info(f"lib.event_handler: received invalid message \"{_value}\" from broker on shutdown topic. Ignoring.")
 
     def system_state(self):
         pass
