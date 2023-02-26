@@ -55,6 +55,7 @@ Topics = dict({
             "inverter_mode":                    f"N/{systemId0}/vebus/276/Mode",
             "grid_charging_enabled":            f"Tesla/settings/grid_charging_enabled",
             "trigger_ess_charge_scheduling":    f"EnergyBroker/RunTrigger",
+            "system_shutdown":                  f"Cerbomoticzgx/system/shutdown",
 
             # Tibber
             "tibber_total":     f"N/{systemId0}/Tibber/home/energy/day/euro_day_total",
@@ -78,6 +79,7 @@ TopicsWritable = dict({
             "max_charge_voltage":   f"W/{systemId0}/settings/0/Settings/SystemSetup/MaxChargeVoltage",
             "minimum_ess_soc":      f"W/{systemId0}/settings/0/Settings/CGwacs/BatteryLife/MinimumSocLimit",
             "inverter_mode":        f"N/{systemId0}/vebus/276/Mode",
+            "system_shutdown":      f"Cerbomoticzgx/system/shutdown",
         }
 })
 
