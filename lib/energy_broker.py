@@ -5,6 +5,7 @@ import schedule as scheduler
 import paho.mqtt.publish as publish
 
 from lib.constants import logging, cerboGxEndpoint, systemId0, PythonToVictronWeekdayNumberConversion, dotenv_config
+from lib.helpers import get_seasonal_max_items
 from lib.tibber_api import lowest_48h_prices
 from lib.notifications import pushover_notification
 
@@ -42,7 +43,8 @@ def set_48h_charging_schedule(caller=None, price_cap=0.22):
         price_cap = float(dotenv_config('MAX_TIBBER_BUY_PRICE'))
 
     clear_victron_schedules()
-    new_schedule = lowest_48h_prices(price_cap=price_cap)
+    max_items = get_seasonal_max_items()
+    new_schedule = lowest_48h_prices(price_cap=price_cap, max_items=max_items)
 
     if len(new_schedule) > 0:
         schedule = 0
