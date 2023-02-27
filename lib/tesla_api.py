@@ -10,7 +10,7 @@ from lib.constants import logging, dotenv_config, cerboGxEndpoint
 from lib.domoticz_updater import domoticz_update
 
 retry = teslapy.Retry(total=2, status_forcelist=(500, 502, 503, 504))
-timeout = 8
+timeout = 15
 email = dotenv_config("TESLA_EMAIL")
 
 logging.getLogger('teslapy').setLevel(logging.WARNING)
