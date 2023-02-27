@@ -1,3 +1,4 @@
+import requests.exceptions
 import teslapy
 import math
 import time
@@ -9,6 +10,7 @@ from lib.constants import logging, dotenv_config, cerboGxEndpoint
 from lib.domoticz_updater import domoticz_update
 
 retry = teslapy.Retry(total=2, status_forcelist=(500, 502, 503, 504))
+timeout = 8
 email = dotenv_config("TESLA_EMAIL")
 
 logging.getLogger('teslapy').setLevel(logging.WARNING)
@@ -61,7 +63,7 @@ class TeslaApi:
             self.minutes_to_full_charge()
             self.is_max_soc_reached()
             self.last_update_ts = self.get_vehicle_data().timestamp
-            self.last_update_ts_hr = time.strftime('%H:%M:%S', time.localtime(self.last_update_ts))
+            self.last_update_ts_hr = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self.last_update_ts))
 
             self.update_mqtt_and_domoticz()
 
@@ -78,6 +80,7 @@ class TeslaApi:
         publish.single("Tesla/vehicle0/is_supercharging", payload=f"{{\"value\": \"{self.is_supercharging}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
         publish.single("Tesla/vehicle0/time_until_full", payload=f"{{\"value\": \"{self.time_until_full}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
         publish.single("Tesla/vehicle0/is_charging", payload=f"{{\"value\": \"{self.is_charging}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+        publish.single("Tesla/vehicle0/last_update_at", payload=f"{{\"value\": \"{self.last_update_ts_hr}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
 
         # send selected metrics to domoticz for tracking and display
         _msg = f"{self.charging_status} @ {self.charging_amp_limit}A, {self.vehicle_soc}% of {self.vehicle_soc_setpoint}%, {self.plugged_status}"
@@ -87,7 +90,7 @@ class TeslaApi:
     def set_charge(self, amps, error_msg):
         self.wake_vehicle()
         try:
-            with teslapy.Tesla(email, retry=retry) as tesla:
+            with teslapy.Tesla(email, retry=retry, timeout=timeout) as tesla:
                 vehicles = tesla.vehicle_list()
                 vehicles[0].command('CHARGING_AMPS', charging_amps=amps)
                 self.charging_amp_limit = amps
@@ -103,7 +106,7 @@ class TeslaApi:
     def send_command(self, cmd, error_msg):
         self.wake_vehicle()
         try:
-            with teslapy.Tesla(email, retry=retry) as tesla:
+            with teslapy.Tesla(email, retry=retry, timeout=timeout) as tesla:
                 vehicles = tesla.vehicle_list()
                 vehicles[0].command(cmd)
                 if 'START_CHARGE' in cmd:
@@ -124,7 +127,7 @@ class TeslaApi:
     @staticmethod
     def wake_vehicle():
         try:
-            with teslapy.Tesla(email, retry=retry) as tesla:
+            with teslapy.Tesla(email, retry=retry, timeout=timeout) as tesla:
                 vehicles = tesla.vehicle_list()
                 if vehicles[0].available():
                     # vehicle is already awake
@@ -162,7 +165,7 @@ class TeslaApi:
     # Metrics / Data
     def get_vehicle_data(self):
         try:
-            with teslapy.Tesla(email, retry=retry) as tesla:
+            with teslapy.Tesla(email, retry=retry, timeout=timeout) as tesla:
                 vehicles = tesla.vehicle_list()
                 vehicles[0].get_vehicle_summary()
                 if 'online' in vehicles[0]['state']:
@@ -223,13 +226,18 @@ class TeslaApi:
         lat = round(float(dotenv_config('HOME_ADDRESS_LAT')), 3)
         long = round(float(dotenv_config('HOME_ADDRESS_LONG')), 3)
 
-        if round(self.get_vehicle_data()['drive_state']['latitude'], 3) == lat and \
-           round(self.get_vehicle_data()['drive_state']['longitude'], 3) == long:
-            self.is_home = True
-            self.update_mqtt_and_domoticz()
-        else:
-            self.is_home = False
-            self.update_mqtt_and_domoticz()
+        try:
+            if round(self.get_vehicle_data()['drive_state']['latitude'], 3) == lat and \
+               round(self.get_vehicle_data()['drive_state']['longitude'], 3) == long:
+                self.is_home = True
+                self.update_mqtt_and_domoticz()
+            else:
+                self.is_home = False
+                self.update_mqtt_and_domoticz()
+        except requests.exceptions.InvalidSchema:
+            logging.info(f"TeslaApi: vehicle location could not be determined.")
+            self.is_home = None
+
         return self.is_home
 
     def is_vehicle_supercharging(self):
