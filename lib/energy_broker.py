@@ -9,7 +9,7 @@ from lib.helpers import get_seasonal_max_items
 from lib.tibber_api import lowest_48h_prices
 from lib.notifications import pushover_notification
 
-MAX_TIBBER_BUY_PRICE = float(dotenv_config('MAX_TIBBER_BUY_PRICE'))
+MAX_TIBBER_BUY_PRICE = float(dotenv_config('MAX_TIBBER_BUY_PRICE')) or None
 
 
 def main():
