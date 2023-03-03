@@ -9,6 +9,9 @@ from lib.helpers import get_seasonal_max_items
 from lib.tibber_api import lowest_48h_prices
 from lib.notifications import pushover_notification
 
+MAX_TIBBER_BUY_PRICE = float(dotenv_config('MAX_TIBBER_BUY_PRICE'))
+
+
 def main():
     logging.info("EnergyBroker: Initializing...")
 
@@ -36,14 +39,10 @@ def publish_mqtt_trigger():
     publish.single("EnergyBroker/RunTrigger", payload=f"{{\"value\": {time.localtime().tm_hour}}}", qos=0, retain=False,
                    hostname=cerboGxEndpoint)
 
-def set_48h_charging_schedule(caller=None, price_cap=0.22):
+def set_48h_charging_schedule(caller=None, price_cap=MAX_TIBBER_BUY_PRICE, max_items=get_seasonal_max_items()):
     logging.info(f"EnergyBroker: set up charging schedule request received by {caller}")
 
-    if dotenv_config('MAX_TIBBER_BUY_PRICE'):
-        price_cap = float(dotenv_config('MAX_TIBBER_BUY_PRICE'))
-
     clear_victron_schedules()
-    max_items = get_seasonal_max_items()
     new_schedule = lowest_48h_prices(price_cap=price_cap, max_items=max_items)
 
     if len(new_schedule) > 0:
