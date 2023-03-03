@@ -60,9 +60,11 @@ def get_seasonal_max_items() -> int:
     based on the current month.
     """
     if datetime.now().month in [10, 11, 12, 1]:
-        return 4
+        return 3
     if datetime.now().month in [8, 9, 2]:
         return 2
+    if datetime.now().month in [3]:
+        return 1
 
     return 0
 
