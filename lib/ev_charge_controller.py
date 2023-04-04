@@ -101,7 +101,7 @@ class EvCharger:
             return True
 
         if (self.is_the_sun_shining()
-                and int(self.ess_soc) >= 95
+                and int(self.ess_soc) >= self.minimum_ess_soc
                 and int(self.surplus_amps) >= 2
                 and not self.grid_charging_enabled
                 and tesla.is_home
