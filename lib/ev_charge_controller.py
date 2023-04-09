@@ -119,72 +119,72 @@ class EvCharger:
 
     def initiate_charging(self):
         # Inititial start charge logic
-        if not tesla.is_charging and tesla.is_plugged:
 
-            if self.surplus_amps >= 2:
-                try:
-                    logging.info(f"EvCharger (start charge): Surplus energy detected! Requesting start charge at "
-                                 f"{self.surplus_amps} Amps")
-                    if tesla.set_tesla_charge_amps(self.surplus_amps):
-                        self.set_surplus_amps(self.surplus_amps)
-                        tesla.start_tesla_charge()
-                        return True
-
-                except Exception as E:
-                    logging.info(E)
-                    return False
-
-            if self.surplus_amps < 2:
-                try:
-                    logging.info(f"EvCharger (start charge): {self.surplus_amps} Amp(s)/{self.surplus_watts} Watt(s) "
-                                 f"insufficient surplus solar energy.")
-                    logging.debug(self.vehicle_status_msg())
+        # if not tesla.is_charging and tesla.is_plugged:  # todo: testing without this extra check
+        if self.surplus_amps >= 2:
+            try:
+                logging.info(f"EvCharger (start charge): Surplus energy detected! Requesting start charge at "
+                             f"{self.surplus_amps} Amps")
+                if tesla.set_tesla_charge_amps(self.surplus_amps):
                     self.set_surplus_amps(self.surplus_amps)
-                    self.update_charging_amp_totals(0)
-                    return False
+                    tesla.start_tesla_charge()
+                    return True
 
-                except Exception as E:
-                    logging.info(E)
-                    return False
+            except Exception as E:
+                logging.info(E)
+                return False
+
+        if self.surplus_amps < 2:
+            try:
+                logging.info(f"EvCharger (start charge): {self.surplus_amps} Amp(s)/{self.surplus_watts} Watt(s) "
+                             f"insufficient surplus solar energy.")
+                logging.debug(self.vehicle_status_msg())
+                self.set_surplus_amps(self.surplus_amps)
+                self.update_charging_amp_totals(0)
+                return False
+
+            except Exception as E:
+                logging.info(E)
+                return False
 
         logging.info(self.general_status_msg())
 
     def manage_charging(self):
         # adjusting charge rate when charge is active
-        if tesla.is_charging:
-            if self.surplus_amps < 2:
-                try:
-                    logging.info(f"EvCharger (charge mgmt): Should stop charge. Insufficient solar energy of "
-                                 f"{self.surplus_amps} Amps")
-                    self.set_surplus_amps(self.surplus_amps)
-                    tesla.stop_tesla_charge()
-                    self.update_charging_amp_totals(0)
-                    return True
-                except Exception as E:
-                    logging.info(E)
-                    return False
+        # if tesla.is_charging:  # todo: testing without this extra check
+        if self.surplus_amps < 2:
+            try:
+                logging.info(f"EvCharger (charge mgmt): Should stop charge. Insufficient solar energy of "
+                             f"{self.surplus_amps} Amps")
+                self.set_surplus_amps(self.surplus_amps)
+                tesla.stop_tesla_charge()
+                self.update_charging_amp_totals(0)
+                return True
+            except Exception as E:
+                logging.info(E)
+                return False
 
-            if self.surplus_amps != round(self.charging_amps, 0) and self.surplus_amps >= 2:
-                try:
-                    logging.info(f"EvCharger (charge mgmt): current charge limit is {self.charging_amps} Amp(s). Should "
-                                 f"adjust charge rate to {self.surplus_amps} surplus Amp(s).")
-                    self.set_surplus_amps(self.surplus_amps)
-                    tesla.set_tesla_charge_amps(self.surplus_amps)
-                    self.update_charging_amp_totals(self.surplus_amps)
-                    return True
-                except Exception as E:
-                    logging.info(E)
-                    return False
+        if self.surplus_amps != round(self.charging_amps, 0) and self.surplus_amps >= 2:
+            try:
+                logging.info(f"EvCharger (charge mgmt): current charge limit is {self.charging_amps} Amp(s). Should "
+                             f"adjust charge rate to {self.surplus_amps} surplus Amp(s).")
+                self.set_surplus_amps(self.surplus_amps)
+                tesla.set_tesla_charge_amps(self.surplus_amps)
+                self.update_charging_amp_totals(self.surplus_amps)
+                return True
+            except Exception as E:
+                logging.info(E)
+                return False
 
-            if tesla.is_max_soc_reached():
-                try:
-                    logging.info(f"EvCharger (charge mgmt): Max SOC reached. Stopping charge.")
-                    tesla.stop_tesla_charge()
-                    self.update_charging_amp_totals(0)
-                    return True
-                except Exception as E:
-                    logging.info(E)
-                    return False
+        if tesla.is_max_soc_reached():
+            try:
+                logging.info(f"EvCharger (charge mgmt): Max SOC reached. Stopping charge.")
+                tesla.stop_tesla_charge()
+                self.update_charging_amp_totals(0)
+                return True
+            except Exception as E:
+                logging.info(E)
+                return False
 
         logging.info(self.general_status_msg())
 
