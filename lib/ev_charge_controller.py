@@ -94,13 +94,17 @@ class EvCharger:
             self.main_thread.start()
 
     def should_manage_or_initiate_charging(self):
-        if (tesla.is_charging
+        if (int(self.charging_watts) > 5
+                and not self.grid_charging_enabled):
+            return True
+
+        elif (tesla.is_charging
                 and tesla.is_home
                 and not tesla.is_supercharging
                 and not self.grid_charging_enabled):
             return True
 
-        if (self.is_the_sun_shining()
+        elif (self.is_the_sun_shining()
                 and int(self.ess_soc) >= self.minimum_ess_soc
                 and int(self.surplus_amps) >= 2
                 and not self.grid_charging_enabled
@@ -110,7 +114,8 @@ class EvCharger:
                 and not tesla.is_full):
             return True
 
-        return False
+        else:
+            return False
 
     def initiate_charging(self):
         # Inititial start charge logic
