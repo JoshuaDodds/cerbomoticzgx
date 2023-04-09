@@ -94,8 +94,7 @@ class EvCharger:
             self.main_thread.start()
 
     def should_manage_or_initiate_charging(self):
-        if (int(self.charging_watts) > 5
-                and not self.grid_charging_enabled):
+        if (int(self.charging_watts) > 5 and not self.grid_charging_enabled):
             return True
 
         if (tesla.is_charging
