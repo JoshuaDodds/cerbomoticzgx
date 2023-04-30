@@ -42,6 +42,9 @@ def publish_mqtt_trigger():
 def set_48h_charging_schedule(caller=None, price_cap=MAX_TIBBER_BUY_PRICE, max_items=get_seasonal_max_items()):
     logging.info(f"EnergyBroker: set up charging schedule request received by {caller}")
 
+    if max_items < 1:
+        return False
+
     clear_victron_schedules()
     new_schedule = lowest_48h_prices(price_cap=price_cap, max_items=max_items)
 
