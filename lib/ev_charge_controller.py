@@ -113,6 +113,7 @@ class EvCharger:
                 and not tesla.is_full):
             return True
 
+        logging.info("No condition to initiate or manage charging was met. This means a no-op for the EV charging module.")
         return False
 
     def initiate_charging(self):
