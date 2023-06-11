@@ -8,9 +8,11 @@ from lib.constants import logging, cerboGxEndpoint, systemId0, PythonToVictronWe
 from lib.helpers import get_seasonal_max_items
 from lib.tibber_api import lowest_48h_prices
 from lib.notifications import pushover_notification
+from lib.tibber_api import publish_pricing_data
+from lib.global_state import GlobalStateClient
 
 MAX_TIBBER_BUY_PRICE = float(dotenv_config('MAX_TIBBER_BUY_PRICE')) or None
-
+STATE = GlobalStateClient()
 
 def main():
     logging.info("EnergyBroker: Initializing...")
@@ -22,7 +24,10 @@ def main():
     logging.info("EnergyBroker: Started.")
 
 def scheduler_loop():
-    def is_alive(): logging.info(f"EnergyBroker: heartbeat...thumpThump!")
+    def is_alive():
+        logging.info(f"EnergyBroker: heartbeat...thumpThump!")
+        if dotenv_config('TIBBER_UPDATES_ENABLED') == '1' and STATE.get('batt_soc') == 100.0:
+            publish_pricing_data(__name__)
 
     # scheduler.every().day.at("09:30").do(publish_mqtt_trigger)
     scheduler.every().day.at("14:00").do(publish_mqtt_trigger)

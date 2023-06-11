@@ -7,8 +7,9 @@ from lib.helpers import get_topic_key
 from lib.constants import dotenv_config, logging, cerboGxEndpoint
 from lib.victron_integration import regulate_battery_max_voltage
 from lib.tibber_api import publish_pricing_data
-from lib.energy_broker import set_48h_charging_schedule
+from lib.energy_broker import set_48h_charging_schedule, Utils
 from lib.global_state import GlobalStateClient
+from lib.notifications import pushover_notification
 
 LOAD_RESERVATION = int(dotenv_config("LOAD_RESERVATION")) or 0
 LOAD_RESERVATION_REDUCTION_FACTOR = float(dotenv_config("LOAD_REDUCTION_FACTOR")) or 1
@@ -44,8 +45,18 @@ class Event:
     def _unhandled_method(self):
         # if a specific handle method is not specified here for a topic, it will still get written to the
         # global state db but will just be uncaught in this event handler.
-        # pass
         logging.debug(f"{__name__}: Invalid method or nothing implemented for topic: '{self.mqtt_topic}'")
+
+    def tibber_price_now(self):
+        _value = float(self.value)
+        inverter_mode = self.gs_client.get("inverter_mode")
+        # if energy is free or the provider is paying, switch to using the grid
+        if _value <= 0 and inverter_mode == 3:
+            pushover_notification("Tibber Price Alert", f"Energy cost is {round(_value, 3)} cents per kWh. Switching to grid energy.")
+            Utils.set_inverter_mode(mode=1)
+        if _value >= 0.001 and inverter_mode == 1:
+            pushover_notification("Tibber Price Alert", f"Energy cost is {round(_value, 3)} cents per kWh. Switching back to battery.")
+            Utils.set_inverter_mode(mode=3)
 
     def system_shutdown(self):
         _value = self.value
@@ -60,13 +71,6 @@ class Event:
         else:
             logging.info(f"lib.event_handler: received invalid message \"{_value}\" from broker on shutdown topic. Ignoring.")
 
-    def system_state(self):
-        pass
-
-    def inverter_mode(self):
-        """ Triggered when inverter mode setting is changed: on, off, charger only"""
-        pass
-
     def batt_voltage(self):
         _value = round(self.value, 2)
         publish.single("Tesla/vehicle0/solar/ess_volts", payload=f"{{\"value\": \"{_value}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
@@ -79,18 +83,6 @@ class Event:
             regulate_battery_max_voltage(_value)
         if dotenv_config('TIBBER_UPDATES_ENABLED') == '1':
             publish_pricing_data(__name__)
-
-    def modules_online(self):
-        pass
-
-    def minimum_ess_soc(self):
-        pass
-
-    def batt_current(self):
-        pass
-
-    def tibber_day_total(self):
-        pass
 
     def batt_power(self):
         _value = round(self.value)
@@ -105,12 +97,6 @@ class Event:
     def pv_current(self):
         _value = round(self.value)
         publish.single("Tesla/vehicle0/solar/pv_amps", payload=f"{{\"value\": \"{_value}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-
-    def c1_daily_yield(self):
-        pass
-
-    def c2_daily_yield(self):
-        pass
 
     def tesla_power(self):
         _value = round(self.value)
@@ -134,9 +120,6 @@ class Event:
         _value = self.value == "True"
         # todo: EvCharger.set_grid_charging_enabled(_value)
 
-    def ac_power_setpoint(self):
-        pass
-
     def tesla_l1_current(self):
         self.update_charging_amp_totals()
 
@@ -145,9 +128,11 @@ class Event:
 
     def tesla_l3_current(self):
         self.update_charging_amp_totals()
+
     #
     # calculation and helper methods
     #
+
     @staticmethod
     def amps_to_watts(amps):
         return amps * 230 * 3
