@@ -36,7 +36,7 @@ def scheduler_loop():
         time.sleep(1)
 
 def publish_mqtt_trigger():
-    publish.single("EnergyBroker/RunTrigger", payload=f"{{\"value\": {time.localtime().tm_hour}}}", qos=0, retain=False,
+    publish.single("Cerbomoticzgx/EnergyBroker/RunTrigger", payload=f"{{\"value\": {time.localtime().tm_hour}}}", qos=0, retain=False,
                    hostname=cerboGxEndpoint)
 
 def set_48h_charging_schedule(caller=None, price_cap=MAX_TIBBER_BUY_PRICE, max_items=get_seasonal_max_items()):

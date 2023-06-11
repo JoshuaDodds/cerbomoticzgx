@@ -3,6 +3,7 @@ import teslapy
 import math
 import time
 import paho.mqtt.publish as publish
+import threading
 
 import lib.helpers
 
@@ -37,7 +38,8 @@ class TeslaApi:
         self.last_update_ts = 0
         self.last_update_ts_hr = 0
 
-        # self.update_vehicle_status()
+        self.update_init = threading.Thread(target=self.update_vehicle_status, daemon=True)
+        self.update_init.start()
 
     def __del__(self):
         self.cleanup()
@@ -45,7 +47,7 @@ class TeslaApi:
 
     def update_vehicle_status(self, force=False):
         if (not self.last_update_ts
-            or time.localtime() >= time.localtime(self.last_update_ts + (60 * 15))
+            or time.localtime() >= time.localtime(self.last_update_ts + (60 * 5))
             or self.is_charging
             or self.is_plugged
             or force):
@@ -178,7 +180,7 @@ class TeslaApi:
                     return vehicles[0]
 
         except Exception as e:
-            logging.info(f"tesla_api: get_vehicle_data() rrror: {e}")
+            logging.info(f"tesla_api: get_vehicle_data() error: {e}")
             return e
 
     def minutes_to_full_charge(self) -> str:

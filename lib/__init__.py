@@ -13,4 +13,5 @@ __all__ = [
     'helpers',
     'notifications',
     'solar_forecasting',
+    'global_state',
 ]

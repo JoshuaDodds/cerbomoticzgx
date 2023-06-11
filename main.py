@@ -10,27 +10,25 @@ from lib.energy_broker import main as energybroker
 from lib.victron_integration import restore_default_battery_max_voltage
 from lib.tibber_api import live_measurements
 from lib.helpers import publish_message
+from lib.global_state import GlobalStateDatabase
 
 
 ACTIVE_MODULES = json.loads(dotenv_config('ACTIVE_MODULES'))
-EvChargeControl = EvCharger()
+GlobalState = GlobalStateDatabase()
 
-
-def ev_charge_controller(): EvChargeControl.main()
+def ev_charge_controller(): EvCharger().main()
 
 def energy_broker(): energybroker()
 
 def mqtt_client(loop):
     asyncio.set_event_loop(loop)
-    asyncio.run(mqtt_start(EvChargeControl))
+    asyncio.run(mqtt_start())
 
 def shutdown():
     logging.info("main(): Cleaning up and exiting...")
 
     if dotenv_config('VICTRON_OPTIMIZED_CHARGING') == '1':
         restore_default_battery_max_voltage()
-
-    EvChargeControl.__del__()
 
     mqtt_stop()
 
@@ -57,7 +55,7 @@ def main():
 
         # start async tasks
         if ACTIVE_MODULES[0]['async']['mqtt_client'] and not ACTIVE_MODULES[0]['async']['tibber_api']:
-            asyncio.run(mqtt_start(EvChargeControl))
+            asyncio.run(mqtt_start())
 
         elif ACTIVE_MODULES[0]['async']['mqtt_client'] and ACTIVE_MODULES[0]['async']['tibber_api']:
             mqtt_loop = asyncio.new_event_loop()

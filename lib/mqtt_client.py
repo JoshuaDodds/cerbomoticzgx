@@ -8,8 +8,6 @@ from lib.cerbo_keep_alive import keep_cerbo_alive
 from lib.constants import retrieve_mqtt_subcribed_topics, logging, cerboGxEndpoint, DzEndpoints
 from lib.domoticz_updater import domoticz_update
 
-global EvChargeControl
-
 client = mqtt.Client()
 http = urllib3.PoolManager()
 
@@ -40,16 +38,13 @@ def on_message(_client, _userdata, msg):
                     domoticz_update(topic, value, logmsg)
 
                 # capture and dispatch all events to the event handler
-                Event(topic, value, logmsg, EvChargeControl).dispatch()
+                Event(topic, value, logmsg).dispatch()
 
         except Exception as E:
             logging.info(E)
 
 
-def mqtt_start(evcharge_control):
-    global EvChargeControl
-    EvChargeControl = evcharge_control
-
+def mqtt_start():
     try:
         logging.info(f"Starting mqtt_client")
         client.on_connect = on_connect
