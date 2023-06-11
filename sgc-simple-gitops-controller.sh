@@ -38,6 +38,7 @@ while true; do
 
   if [ "$LOCAL" = "$REMOTE" ]; then
     # echo "$SVC_NAME: Up-to-date - No remote changes."
+    true
 
   elif [ "$LOCAL" = "$BASE" ]; then
     echo "$SVC_NAME: Remote has changes - Storing changed files..."
