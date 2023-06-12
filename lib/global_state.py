@@ -42,10 +42,17 @@ class GlobalStateClient:
 
         if result:
             result_value = result[0]
-            if '.' in result_value:
-                return float(result_value)
-            else:
-                return int(result_value)
+            try:
+                if '.' in result_value:
+                    return float(result_value)
+                elif "True" in str(result_value):
+                    return bool(True)
+                elif "False" in str(result_value):
+                    return bool(False)
+                else:
+                    return int(result_value)
+            except Exception as e:
+                return str(result_value)
         else:
             return 0
 

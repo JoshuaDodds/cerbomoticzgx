@@ -10,10 +10,14 @@ from lib.tibber_api import publish_pricing_data
 from lib.energy_broker import set_48h_charging_schedule, Utils
 from lib.global_state import GlobalStateClient
 from lib.notifications import pushover_notification
+from lib.tesla_api import TeslaApi
+
+tesla = TeslaApi()
 
 LOAD_RESERVATION = int(dotenv_config("LOAD_RESERVATION")) or 0
 LOAD_RESERVATION_REDUCTION_FACTOR = float(dotenv_config("LOAD_REDUCTION_FACTOR")) or 1
 MINIMUM_ESS_SOC = int(dotenv_config("MINIMUM_ESS_SOC")) or 100
+
 
 class Event:
 
@@ -49,12 +53,18 @@ class Event:
 
     def tibber_price_now(self):
         _value = float(self.value)
-        inverter_mode = self.gs_client.get("inverter_mode")
-        # if energy is free or the provider is paying, switch to using the grid
-        if _value <= 0 and inverter_mode == 3:
+        inverter_mode = int(self.gs_client.get("inverter_mode"))
+        vehicle_is_charging = bool(self.gs_client.get("tesla_is_charging"))
+        vehicle_is_plugged = bool(self.gs_client.get("tesla_plug_status"))
+
+        # if energy is free or the provider is paying, switch to using the grid and start vehicle charging
+        if _value <= 0.0001 and inverter_mode == 3:
             pushover_notification("Tibber Price Alert", f"Energy cost is {round(_value, 3)} cents per kWh. Switching to grid energy.")
             Utils.set_inverter_mode(mode=1)
-        if _value >= 0.001 and inverter_mode == 1:
+
+        # revese the above action
+        if _value >= 0.0001 and inverter_mode == 1:
+            print(inverter_mode)
             pushover_notification("Tibber Price Alert", f"Energy cost is {round(_value, 3)} cents per kWh. Switching back to battery.")
             Utils.set_inverter_mode(mode=3)
 

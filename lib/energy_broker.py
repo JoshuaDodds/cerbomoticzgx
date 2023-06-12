@@ -116,4 +116,4 @@ class Utils:
 
         if mode and mode == 1 or mode == 3:
             publish.single(topic, payload=f"{{\"value\": {mode}}}", qos=0, retain=False, hostname=cerboGxEndpoint)
-            logging.info(f"{__name__}: Requested Multiplus-II's mode switch to {mode_name.get(mode)}")
+            logging.info(f"EnergyBroker.Utils.set_inverter_mode: {__name__} has set Multiplus-II's mode to {mode_name.get(mode)}")
