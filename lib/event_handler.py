@@ -7,10 +7,14 @@ from lib.helpers import get_topic_key
 from lib.constants import dotenv_config, logging, cerboGxEndpoint
 from lib.victron_integration import regulate_battery_max_voltage
 from lib.tibber_api import publish_pricing_data
-from lib.energy_broker import set_48h_charging_schedule, Utils
 from lib.global_state import GlobalStateClient
-from lib.notifications import pushover_notification
 from lib.tesla_api import TeslaApi
+from lib.energy_broker import (
+    manage_sale_of_stored_energy_to_the_grid,
+    set_48h_charging_schedule,
+    manage_grid_usage_based_on_current_price
+)
+
 
 tesla = TeslaApi()
 
@@ -33,12 +37,11 @@ class Event:
 
     def dispatch(self):
         try:
-            # Update Global State db even if the method is not handled explicitly within the scope of
-            # this event handler.
-            self.gs_client.set(self.topic_key, self.value)
-
             if self.topic_key:
-                # call the method which matches self.topic_key
+                # Update the Global State db even if we do not have an explicit method defined for this topi_key
+                self.gs_client.set(self.topic_key, self.value)
+
+                # if a method is defined, call it. Otherwise, call _unhandled_method()
                 getattr(self, self.topic_key, self._unhandled_method)()
                 logging.debug(f"{self.topic_key} method")
             else:
@@ -53,20 +56,7 @@ class Event:
 
     def tibber_price_now(self):
         _value = float(self.value)
-        inverter_mode = int(self.gs_client.get("inverter_mode"))
-        vehicle_is_charging = bool(self.gs_client.get("tesla_is_charging"))
-        vehicle_is_plugged = bool(self.gs_client.get("tesla_plug_status"))
-
-        # if energy is free or the provider is paying, switch to using the grid and start vehicle charging
-        if _value <= 0.0001 and inverter_mode == 3:
-            pushover_notification("Tibber Price Alert", f"Energy cost is {round(_value, 3)} cents per kWh. Switching to grid energy.")
-            Utils.set_inverter_mode(mode=1)
-
-        # revese the above action
-        if _value >= 0.0001 and inverter_mode == 1:
-            print(inverter_mode)
-            pushover_notification("Tibber Price Alert", f"Energy cost is {round(_value, 3)} cents per kWh. Switching back to battery.")
-            Utils.set_inverter_mode(mode=3)
+        manage_grid_usage_based_on_current_price(_value)
 
     def system_shutdown(self):
         _value = self.value
@@ -93,6 +83,7 @@ class Event:
             regulate_battery_max_voltage(_value)
         if dotenv_config('TIBBER_UPDATES_ENABLED') == '1':
             publish_pricing_data(__name__)
+            manage_sale_of_stored_energy_to_the_grid(_value)
 
     def batt_power(self):
         _value = round(self.value)

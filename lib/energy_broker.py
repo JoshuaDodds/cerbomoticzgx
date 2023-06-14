@@ -10,9 +10,12 @@ from lib.tibber_api import lowest_48h_prices
 from lib.notifications import pushover_notification
 from lib.tibber_api import publish_pricing_data
 from lib.global_state import GlobalStateClient
+from lib.victron_integration import ac_power_setpoint
+
 
 MAX_TIBBER_BUY_PRICE = float(dotenv_config('MAX_TIBBER_BUY_PRICE')) or None
 STATE = GlobalStateClient()
+
 
 def main():
     logging.info("EnergyBroker: Initializing...")
@@ -26,6 +29,10 @@ def main():
 def scheduler_loop():
     def is_alive():
         logging.info(f"EnergyBroker: heartbeat...thumpThump!")
+
+        # updating the hourly price is normally triggered on batter_soc changes.  Since this will not happen when
+        # battery is full and idle, we check for that condition here and still update the hourly price at 5 minute
+        # intervals.
         if dotenv_config('TIBBER_UPDATES_ENABLED') == '1' and STATE.get('batt_soc') == 100.0:
             publish_pricing_data(__name__)
 
@@ -39,6 +46,43 @@ def scheduler_loop():
     while True:
         scheduler.run_pending()
         time.sleep(1)
+
+def manage_sale_of_stored_energy_to_the_grid(batt_soc: float) -> None:
+    tibber_price_now = STATE.get('tibber_price_now')
+    tibber_24h_high = STATE.get('tibber_cost_highest_today')
+    ac_setpoint = STATE.get('ac_power_setpoint')
+
+    if batt_soc > 80.0 and tibber_price_now >= tibber_24h_high and tibber_price_now != 0:
+        if ac_setpoint != -10000.0:
+            ac_power_setpoint(watts="-10000.0")
+            logging.info(f"Beginning to sell energy at a cost of {round(tibber_price_now, 3)}")
+            pushover_notification("Energy Sale Alert",
+                                  f"Beginning to sell energy at a cost of {round(tibber_price_now, 3)}")
+    else:
+        if ac_setpoint < 0.0:
+            ac_power_setpoint(watts="0.0")
+            logging.info(f"Stopped energy export at {batt_soc} and a current price of {round(tibber_price_now, 3)}")
+            pushover_notification("Energy Sale Alert",
+                                  f"Stopped energy export at {batt_soc} and a current price of {round(tibber_price_now, 3)}")
+
+
+def manage_grid_usage_based_on_current_price(price: float) -> None:
+    inverter_mode = int(STATE.get("inverter_mode"))
+
+    # if energy is free or the provider is paying, switch to using the grid and start vehicle charging
+    if price <= 0.0001 and inverter_mode == 3:
+        pushover_notification("Tibber Price Alert",
+                              f"Energy cost is {round(price, 3)} cents per kWh. Switching to grid energy.")
+        Utils.set_inverter_mode(mode=1)
+        return
+
+    # revese the above action when energy is no longer free
+    if price >= 0.0001 and inverter_mode == 1:
+        print(inverter_mode)
+        pushover_notification("Tibber Price Alert",
+                              f"Energy cost is {round(price, 3)} cents per kWh. Switching back to battery.")
+        Utils.set_inverter_mode(mode=3)
+        return
 
 def publish_mqtt_trigger():
     publish.single("Cerbomoticzgx/EnergyBroker/RunTrigger", payload=f"{{\"value\": {time.localtime().tm_hour}}}", qos=0, retain=False,

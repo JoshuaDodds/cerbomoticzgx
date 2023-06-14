@@ -2,9 +2,12 @@ import json
 import paho.mqtt.publish as publish
 import paho.mqtt.subscribe as subscribe
 
+from lib.global_state import GlobalStateClient
+
 from lib.constants import logging, cerboGxEndpoint, Topics, TopicsWritable, dotenv_config
 
 
+STATE = GlobalStateClient()
 float_voltage = float(dotenv_config('BATTERY_FLOAT_VOLTAGE'))
 max_voltage = float(dotenv_config('BATTERY_ABSORPTION_VOLTAGE'))
 battery_full_voltage = float(dotenv_config('BATTERY_FULL_VOLTAGE'))
@@ -12,7 +15,8 @@ battery_full_voltage = float(dotenv_config('BATTERY_FULL_VOLTAGE'))
 def ac_power_setpoint(watts=None):
     if watts:
         _msg = f"{{\"value\": {watts}}}"
-        logging.info(f"Victron Integration: Setting AC Power Set Point to: {watts} watts")
+        logging.debug(f"Victron Integration: Setting AC Power Set Point to: {watts} watts")
+        STATE.set(key='ac_power_setpoint', value="0.0")
         publish.single(TopicsWritable['system0']['ac_power_setpoint'], payload=_msg, qos=0, retain=False, hostname=cerboGxEndpoint, port=1883)
 
 def minimum_ess_soc(percent: int = 10):

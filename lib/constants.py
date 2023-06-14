@@ -58,10 +58,12 @@ Topics = dict({
             "system_shutdown":                  f"Cerbomoticzgx/system/shutdown",
 
             # Tibber
-            "tibber_total":         f"N/{systemId0}/Tibber/home/energy/day/euro_day_total",  # workaround to update dz
-            "tibber_day_total":     f"Tibber/home/energy/day/reward",
-            "tibber_last_update":   f"Tibber/home/energy/day/last_update",
-            "tibber_price_now":     f"Tibber/home/price_info/now/total",
+            "tibber_total":                 f"N/{systemId0}/Tibber/home/energy/day/euro_day_total",  # workaround to update dz
+            "tibber_day_total":             f"Tibber/home/energy/day/reward",
+            "tibber_last_update":           f"Tibber/home/energy/day/last_update",
+            "tibber_price_now":             f"Tibber/home/price_info/now/total",
+            "tibber_cost_highest_today":    f"Tibber/home/price_info/today/highest/0/cost",
+            "tibber_cost_lowest_today":     f"Tibber/home/price_info/today/lowest/0/cost",
 
             # Tesla specific metrics
             "tesla_power":          f"N/{systemId0}/acload/40/Ac/Power",
