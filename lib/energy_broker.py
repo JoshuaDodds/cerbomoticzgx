@@ -52,7 +52,7 @@ def manage_sale_of_stored_energy_to_the_grid(batt_soc: float) -> None:
     tibber_24h_high = STATE.get('tibber_cost_highest_today')
     ac_setpoint = STATE.get('ac_power_setpoint')
 
-    if batt_soc > 80.0 and tibber_price_now >= tibber_24h_high and tibber_price_now != 0:
+    if batt_soc > 70.0 and tibber_price_now >= tibber_24h_high and tibber_price_now != 0:
         if ac_setpoint != -10000.0:
             ac_power_setpoint(watts="-10000.0")
             logging.info(f"Beginning to sell energy at a cost of {round(tibber_price_now, 3)}")
