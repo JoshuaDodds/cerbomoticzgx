@@ -227,9 +227,9 @@ class EvCharger:
         publish.single("Tesla/vehicle0/solar/surplus_amps", payload=f"{{\"value\": \"{surplus_amps}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
 
         if surplus_amps > 0:
-            publish.single("Tesla/vehicle0/solar/insufficient_surplus", payload=f"{{\"value\": \"false\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+            publish.single("Tesla/vehicle0/solar/insufficient_surplus", payload=f"{{\"value\": \"False\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
         else:
-            publish.single("Tesla/vehicle0/solar/insufficient_surplus", payload=f"{{\"value\": \"true\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+            publish.single("Tesla/vehicle0/solar/insufficient_surplus", payload=f"{{\"value\": \"True\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
 
     def set_surplus_watts(self, surplus_watts):
         self.global_state.set("surplus_watts", round(surplus_watts, 2))

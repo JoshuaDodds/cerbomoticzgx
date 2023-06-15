@@ -14,6 +14,7 @@ from lib.global_state import GlobalStateDatabase
 
 
 ACTIVE_MODULES = json.loads(dotenv_config('ACTIVE_MODULES'))
+ESS_NET_METERING = bool(dotenv_config('TIBBER_UPDATES_ENABLED')) or False
 GlobalState = GlobalStateDatabase()
 
 def ev_charge_controller(): EvCharger().main()
@@ -49,6 +50,7 @@ def main():
     try:
         # clear any previously published shutdown directives
         publish_message("Cerbomoticzgx/system/shutdown", message="False", retain=True)
+        publish_message(f"Cerbomoticzgx/system/EssNetMeteringEnabled", message=f"{ESS_NET_METERING}", retain=True)
 
         # start sync tasks
         sync_tasks_start()

@@ -1,22 +1,18 @@
 import os
 import math
 import signal
-import paho.mqtt.publish as publish
 
-from lib.helpers import get_topic_key
-from lib.constants import dotenv_config, logging, cerboGxEndpoint
+from lib.helpers import get_topic_key, publish_message
+from lib.constants import dotenv_config, logging
 from lib.victron_integration import regulate_battery_max_voltage
 from lib.tibber_api import publish_pricing_data
 from lib.global_state import GlobalStateClient
-from lib.tesla_api import TeslaApi
 from lib.energy_broker import (
     manage_sale_of_stored_energy_to_the_grid,
     set_48h_charging_schedule,
     manage_grid_usage_based_on_current_price
 )
 
-
-tesla = TeslaApi()
 
 LOAD_RESERVATION = int(dotenv_config("LOAD_RESERVATION")) or 0
 LOAD_RESERVATION_REDUCTION_FACTOR = float(dotenv_config("LOAD_REDUCTION_FACTOR")) or 1
@@ -73,11 +69,11 @@ class Event:
 
     def batt_voltage(self):
         _value = round(self.value, 2)
-        publish.single("Tesla/vehicle0/solar/ess_volts", payload=f"{{\"value\": \"{_value}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+        publish_message("Tesla/vehicle0/solar/ess_volts", message=f"{_value}", retain=True)
 
     def batt_soc(self):
         _value = round(self.value, 2)
-        publish.single("Tesla/vehicle0/solar/ess_soc", payload=f"{{\"value\": \"{_value}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+        publish_message("Tesla/vehicle0/solar/ess_soc", message=f"{_value}", retain=True)
 
         if dotenv_config('VICTRON_OPTIMIZED_CHARGING') == '1':
             regulate_battery_max_voltage(_value)
@@ -87,23 +83,23 @@ class Event:
 
     def batt_power(self):
         _value = round(self.value)
-        publish.single("Tesla/vehicle0/solar/ess_watts", payload=f"{{\"value\": \"{_value}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+        publish_message("Tesla/vehicle0/solar/ess_watts", message=f"{_value}", retain=True)
         self.calculate_surplus_watts()
 
     def pv_power(self):
         _value = round(self.value)
-        publish.single("Tesla/vehicle0/solar/pv_watts", payload=f"{{\"value\": \"{_value}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+        publish_message("Tesla/vehicle0/solar/pv_watts", message=f"{_value}", retain=True)
         self.calculate_surplus_watts()
 
     def pv_current(self):
         _value = round(self.value)
-        publish.single("Tesla/vehicle0/solar/pv_amps", payload=f"{{\"value\": \"{_value}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+        publish_message("Tesla/vehicle0/solar/pv_amps", message=f"{_value}", retain=True)
 
     def tesla_power(self):
         _value = round(self.value)
         self.adjust_ac_out_power()
-        publish.single("Tesla/vehicle0/charging_watts", payload=f"{{\"value\": \"{_value}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tesla/vehicle0/Ac/tesla_load", payload=f"{{\"value\": \"{_value}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+        publish_message("Tesla/vehicle0/charging_watts", message=f"{_value}", retain=True)
+        publish_message("Tesla/vehicle0/Ac/tesla_load", message=f"{_value}", retain=True)
 
     def ac_out_power(self):
         self.adjust_ac_out_power()
@@ -111,11 +107,11 @@ class Event:
     def ac_in_power(self):
         _value = round(self.value)
         self.adjust_ac_out_power()
-        publish.single("Tesla/vehicle0/Ac/ac_in", payload=f"{{\"value\": \"{_value}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+        publish_message("Tesla/vehicle0/Ac/ac_in", message=f"{_value}", retain=True)
 
     def max_charge_voltage(self):
         _value = float(self.value)
-        publish.single("Tesla/vehicle0/solar/ess_max_charge_voltage", payload=f"{{\"value\": \"{_value}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+        publish_message("Tesla/vehicle0/solar/ess_max_charge_voltage", message=f"{_value}", retain=True)
 
     def grid_charging_enabled(self):
         _value = self.value == "True"
@@ -189,27 +185,27 @@ class Event:
         charging_amps = round(charging_amp_totals, 2)
 
         self.gs_client.set("tesla_charging_amps_total", charging_amps)
-        publish.single("Tesla/vehicle0/charging_amps", payload=f"{{\"value\": \"{charging_amps}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+        publish_message("Tesla/vehicle0/charging_amps", message=f"{charging_amps}", retain=True)
 
     def set_surplus_amps(self, surplus_amps):
         self.gs_client.set("surplus_amps", surplus_amps)
-        publish.single("Tesla/vehicle0/solar/surplus_amps", payload=f"{{\"value\": \"{surplus_amps}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+        publish_message("Tesla/vehicle0/solar/surplus_amps", message=f"{surplus_amps}", retain=True)
 
         if surplus_amps > 0:
-            publish.single("Tesla/vehicle0/solar/insufficient_surplus", payload=f"{{\"value\": \"false\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+            publish_message("Tesla/vehicle0/solar/insufficient_surplus", message="False", retain=True)
         else:
-            publish.single("Tesla/vehicle0/solar/insufficient_surplus", payload=f"{{\"value\": \"true\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+            publish_message("Tesla/vehicle0/solar/insufficient_surplus", message="True", retain=True)
 
     def set_surplus_watts(self, surplus_watts):
         surplus_watts = round(surplus_watts, 2)
         self.gs_client.set("surplus_watts", surplus_watts)
-        publish.single("Tesla/vehicle0/solar/surplus_watts", payload=f"{{\"value\": \"{surplus_watts}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tesla/vehicle0/solar/load_reservation", payload=f"{{\"value\": \"{LOAD_RESERVATION}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+        publish_message("Tesla/vehicle0/solar/surplus_watts", message=f"{surplus_watts}", retain=True)
+        publish_message("Tesla/vehicle0/solar/load_reservation", message=f"{LOAD_RESERVATION}", retain=True)
 
     def adjust_ac_out_power(self):
         adjusted_ac_out_power = round(self.gs_client.get("ac_out_power") - self.gs_client.get("tesla_power"), 2)
         self.gs_client.set("ac_out_adjusted_power", adjusted_ac_out_power)
-        publish.single("Tesla/vehicle0/Ac/ac_loads", payload=f"{{\"value\": \"{adjusted_ac_out_power}\"}}", qos=0, retain=False, hostname=cerboGxEndpoint, port=1883)
+        publish_message("Tesla/vehicle0/Ac/ac_loads", message=f"{adjusted_ac_out_power}", retain=False)
 
     @staticmethod
     def trigger_ess_charge_scheduling():
