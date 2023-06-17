@@ -41,6 +41,8 @@ class TeslaApi:
         self.update_init = threading.Thread(target=self.update_vehicle_status, daemon=True)
         self.update_init.start()
 
+        logging.info(f"TeslaApi: Init complete.")
+
     def __del__(self):
         self.cleanup()
         logging.info(f"TeslaApi (__del__): Exiting...")
@@ -49,10 +51,11 @@ class TeslaApi:
         if (not self.last_update_ts
             or time.localtime() >= time.localtime(self.last_update_ts + (60 * 5))
             or self.is_charging
-            or self.is_plugged
+            # or self.is_plugged
             or force):
 
-            logging.info(f"TeslaApi: retrieving latest vehicle state... Last update was at: {self.last_update_ts_hr}")
+            logging.info(f"TeslaApi(update_vehicle_statue): (called from: {__name__}): retrieving latest vehicle state... Last update was at: {self.last_update_ts_hr}")
+
             self.get_vehicle_name()
             self.battery_soc()
             self.battery_soc_setpoint()

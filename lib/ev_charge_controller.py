@@ -10,7 +10,6 @@ from lib.victron_integration import is_grid_import_enabled
 from lib.energy_broker import Utils as EnergyBrokerUtils
 from lib.global_state import GlobalStateClient
 
-tesla = TeslaApi()
 
 PROPERTY_MAPPING = {
     "charging_watts": "tesla_power",
@@ -68,21 +67,23 @@ class EvCharger:
         self.load_reservation_reduction_factor = float(dotenv_config("LOAD_REDUCTION_FACTOR"))
         self.minimum_ess_soc = int(dotenv_config("MINIMUM_ESS_SOC"))  # see example .env.example file
 
+        self.tesla = TeslaApi()
+
         logging.info("EvCharger (__init__): Init complete.")
 
     def __del__(self):
         self.cleanup()
-        tesla.__del__()
+        self.tesla.__del__()
         logging.info("EvCharger (__del__): Exiting...")
 
     def main(self):
         try:
             if self.should_manage_or_initiate_charging():
                 self.dynamic_load_reservation_adjustment()
-                tesla.update_vehicle_status(force=False)
-                if not tesla.is_vehicle_charging():
+                self.tesla.update_vehicle_status(force=False)
+                if not self.tesla.is_vehicle_charging():
                     self.initiate_charging()
-                elif tesla.is_vehicle_charging():
+                elif self.tesla.is_vehicle_charging():
                     self.manage_charging()
 
                 logging.info(self.vehicle_status_msg())
@@ -90,10 +91,10 @@ class EvCharger:
 
             else:
                 if self.grid_charging_enabled:
-                    tesla.update_vehicle_status(force=False)
+                    self.tesla.update_vehicle_status(force=False)
                     logging.info(self.vehicle_status_msg())
                 else:
-                    tesla.update_mqtt_and_domoticz()
+                    self.tesla.update_mqtt_and_domoticz()
                     logging.debug(self.general_status_msg())
                 self.main_thread = threading.Timer(20.0, self.main)
 
@@ -113,9 +114,9 @@ class EvCharger:
         if int(self.charging_watts) > 5 and not self.grid_charging_enabled:
             return True
 
-        if ((tesla.is_charging
-                and tesla.is_home
-                and not tesla.is_supercharging)
+        if ((self.tesla.is_charging
+                and self.tesla.is_home
+                and not self.tesla.is_supercharging)
                 and not self.grid_charging_enabled):
             return True
 
@@ -123,10 +124,10 @@ class EvCharger:
                 and int(self.ess_soc) >= self.minimum_ess_soc
                 and int(self.surplus_amps) >= 2
                 and not self.grid_charging_enabled
-                and tesla.is_home
-                and tesla.is_plugged
-                and not tesla.is_supercharging
-                and not tesla.is_full):
+                and self.tesla.is_home
+                and self.tesla.is_plugged
+                and not self.tesla.is_supercharging
+                and not self.tesla.is_full):
             return True
 
         logging.debug("No condition to initiate or manage charging was met. This means a no-op for the EV charging module.")
@@ -140,9 +141,9 @@ class EvCharger:
             try:
                 logging.info(f"EvCharger (start charge): Surplus energy detected! Requesting start charge at "
                              f"{self.surplus_amps} Amps")
-                if tesla.set_tesla_charge_amps(self.surplus_amps):
+                if self.tesla.set_tesla_charge_amps(self.surplus_amps):
                     self.set_surplus_amps(self.surplus_amps)
-                    tesla.start_tesla_charge()
+                    self.tesla.start_tesla_charge()
                     return True
 
             except Exception as E:
@@ -166,13 +167,12 @@ class EvCharger:
 
     def manage_charging(self):
         # adjusting charge rate when charge is active
-        # if tesla.is_charging:  # todo: testing without this extra check
         if self.surplus_amps < 2:
             try:
                 logging.info(f"EvCharger (charge mgmt): Should stop charge. Insufficient solar energy of "
                              f"{self.surplus_amps} Amps")
                 self.set_surplus_amps(self.surplus_amps)
-                tesla.stop_tesla_charge()
+                self.tesla.stop_tesla_charge()
                 self.update_charging_amp_totals(0)
                 return True
             except Exception as E:
@@ -184,17 +184,17 @@ class EvCharger:
                 logging.info(f"EvCharger (charge mgmt): current charge limit is {self.charging_amps} Amp(s). Should "
                              f"adjust charge rate to {self.surplus_amps} surplus Amp(s).")
                 self.set_surplus_amps(self.surplus_amps)
-                tesla.set_tesla_charge_amps(self.surplus_amps)
+                self.tesla.set_tesla_charge_amps(self.surplus_amps)
                 self.update_charging_amp_totals(self.surplus_amps)
                 return True
             except Exception as E:
                 logging.info(E)
                 return False
 
-        if tesla.is_max_soc_reached():
+        if self.tesla.is_max_soc_reached():
             try:
                 logging.info(f"EvCharger (charge mgmt): Max SOC reached. Stopping charge.")
-                tesla.stop_tesla_charge()
+                self.tesla.stop_tesla_charge()
                 self.update_charging_amp_totals(0)
                 return True
             except Exception as E:
@@ -247,19 +247,14 @@ class EvCharger:
         self.grid_charging_enabled = status
         if status is True:
             logging.info(f"EvCharger: Charging Vehicle from Grid power is -- ENABLED --")
-            # ac_power_setpoint('13000.0')
             EnergyBrokerUtils.set_inverter_mode(mode=1)
-            if not tesla.is_vehicle_charging():
-                tesla.start_tesla_charge()
-            # tesla.set_tesla_charge_amps(18) and tesla.set_tesla_charge_amps(18)
+            if not self.tesla.is_vehicle_charging():
+                self.tesla.start_tesla_charge()
         else:
             logging.info(f"EvCharger: Charging Vehicle from Grid power is -- DISABLED --")
-            if tesla.is_vehicle_charging():
-                tesla.stop_tesla_charge()
-            # ac_power_setpoint('0.0')
+            if self.tesla.is_vehicle_charging():
+                self.tesla.stop_tesla_charge()
             EnergyBrokerUtils.set_inverter_mode(mode=3)
-
-            # publish.single(Topics["system0"]["grid_charging_enabled"], payload=f"{{\"value\": \"{status}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
 
     @staticmethod
     def is_the_sun_shining():
@@ -267,10 +262,10 @@ class EvCharger:
             else True
 
     def vehicle_status_msg(self):
-        return f"EvCharger (vehicle): Charging: {tesla.is_charging}, Plugged: {tesla.is_plugged}, " \
-               f"Car SOC: {tesla.vehicle_soc}%, Car SOC Setpoint: {tesla.vehicle_soc_setpoint}%, ESS SOC: {round(self.ess_soc, 2)}%, " \
+        return f"EvCharger (vehicle): Charging: {self.tesla.is_charging}, Plugged: {self.tesla.is_plugged}, " \
+               f"Car SOC: {self.tesla.vehicle_soc}%, Car SOC Setpoint: {self.tesla.vehicle_soc_setpoint}%, ESS SOC: {round(self.ess_soc, 2)}%, " \
                f"Surplus: {self.surplus_watts}W / {self.surplus_amps}A" \
-               f" ETA: {tesla.time_until_full}"
+               f" ETA: {self.tesla.time_until_full}"
 
     def general_status_msg(self):
         return f"EvCharger (general): PV Surplus: {self.surplus_amps}A / {self.surplus_watts}W" \

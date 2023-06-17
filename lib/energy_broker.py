@@ -52,19 +52,22 @@ def manage_sale_of_stored_energy_to_the_grid(batt_soc: float) -> None:
     tibber_24h_high = STATE.get('tibber_cost_highest_today')
     ac_setpoint = STATE.get('ac_power_setpoint')
     ess_net_metering = STATE.get('ess_net_metering_enabled')
+    ess_net_metering_overridden = STATE.get('ess_net_metering_overridden') or False
 
-    if batt_soc > 70.0 and tibber_price_now >= tibber_24h_high and tibber_price_now != 0 and ess_net_metering:
-        if ac_setpoint != -10000.0:
-            ac_power_setpoint(watts="-10000.0")
-            logging.info(f"Beginning to sell energy at {batt_soc}% SOC and a price of {round(tibber_price_now, 3)}")
-            pushover_notification("Energy Sale Alert",
-                                  f"Beginning to sell energy at a cost of {round(tibber_price_now, 3)}")
-    else:
-        if ac_setpoint < 0.0:
-            ac_power_setpoint(watts="0.0")
-            logging.info(f"Stopped energy export at {batt_soc}% SOC and a current price of {round(tibber_price_now, 3)}")
-            pushover_notification("Energy Sale Alert",
-                                  f"Stopped energy export at {batt_soc} and a current price of {round(tibber_price_now, 3)}")
+    if not ess_net_metering_overridden:
+
+        if batt_soc > 60.0 and tibber_price_now >= tibber_24h_high and tibber_price_now != 0 and ess_net_metering:
+            if ac_setpoint != -10000.0:
+                ac_power_setpoint(watts="-10000.0", override_ess_net_mettering=False)
+                logging.info(f"Beginning to sell energy at {batt_soc}% SOC and a price of {round(tibber_price_now, 3)}")
+                pushover_notification("Energy Sale Alert",
+                                      f"Beginning to sell energy at a cost of {round(tibber_price_now, 3)}")
+        else:
+            if ac_setpoint < 0.0:
+                ac_power_setpoint(watts="0.0", override_ess_net_mettering=False)
+                logging.info(f"Stopped energy export at {batt_soc}% SOC and a current price of {round(tibber_price_now, 3)}")
+                pushover_notification("Energy Sale Alert",
+                                      f"Stopped energy export at {batt_soc} and a current price of {round(tibber_price_now, 3)}")
 
 
 def manage_grid_usage_based_on_current_price(price: float) -> None:

@@ -1,5 +1,8 @@
 import sqlite3
-from lib.constants import logging
+
+from lib.helpers import publish_message
+from lib.constants import logging, cerboGxEndpoint
+
 
 class GlobalStateDatabase:
     def __init__(self):
@@ -11,9 +14,6 @@ class GlobalStateDatabase:
         logging.info("GlobalStateDatabase:  database initialized.")
 
     def __del__(self):
-        self.stop()
-
-    def stop(self):
         if self.connection:
             self.cursor.close()
             self.connection.close()
@@ -58,4 +58,6 @@ class GlobalStateClient:
 
     def set(self, key, value):
         self.cursor.execute("INSERT OR REPLACE INTO data VALUES (?, ?)", (key, value))
+        publish_message(f"Cerbomoticzgx/GlobalState/{key}", message=value, retain=True)
+
         self.connection.commit()

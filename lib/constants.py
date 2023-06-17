@@ -57,6 +57,7 @@ Topics = dict({
             "trigger_ess_charge_scheduling":    f"Cerbomoticzgx/EnergyBroker/RunTrigger",
             "system_shutdown":                  f"Cerbomoticzgx/system/shutdown",
             "ess_net_metering_enabled":         f"Cerbomoticzgx/system/EssNetMeteringEnabled",
+            "ess_net_metering_overridden":      f"Cerbomoticzgx/system/EssNetMeteringOverridden",
 
             # Tibber
             "tibber_total":                 f"N/{systemId0}/Tibber/home/energy/day/euro_day_total",  # workaround to update dz
