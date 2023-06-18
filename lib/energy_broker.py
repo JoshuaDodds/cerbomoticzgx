@@ -5,7 +5,7 @@ import schedule as scheduler
 import paho.mqtt.publish as publish
 
 from lib.constants import logging, cerboGxEndpoint, systemId0, PythonToVictronWeekdayNumberConversion, dotenv_config
-from lib.helpers import get_seasonal_max_items
+from lib.helpers import get_seasonally_adjusted_max_charge_slots
 from lib.tibber_api import lowest_48h_prices
 from lib.notifications import pushover_notification
 from lib.tibber_api import publish_pricing_data
@@ -94,7 +94,10 @@ def publish_mqtt_trigger():
     publish.single("Cerbomoticzgx/EnergyBroker/RunTrigger", payload=f"{{\"value\": {time.localtime().tm_hour}}}", qos=0, retain=False,
                    hostname=cerboGxEndpoint)
 
-def set_48h_charging_schedule(caller=None, price_cap=MAX_TIBBER_BUY_PRICE, max_items=get_seasonal_max_items()):
+def set_48h_charging_schedule(caller=None, price_cap=MAX_TIBBER_BUY_PRICE):
+    batt_soc = STATE.get('batt_soc')
+    max_items = get_seasonally_adjusted_max_charge_slots(batt_soc)
+
     logging.info(f"EnergyBroker: set up daily charging schedule request received by {caller}")
 
     if max_items < 1:

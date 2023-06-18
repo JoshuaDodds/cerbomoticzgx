@@ -1,4 +1,5 @@
 import json
+from math import floor
 import paho.mqtt.subscribe as subscribe
 import paho.mqtt.publish as publish
 from datetime import datetime
@@ -54,17 +55,27 @@ def convert_to_fractional_hour(minutes: int) -> str:
         return f"{minutes} min"
 
 
-def get_seasonal_max_items() -> int:
+def calculate_max_charge_slots_needed(batt_soc: float) -> int:
+    """
+    This assumes for the installed system that it can charge 25% of ESS storage capacity in an hour based on
+    the installed systems specifications.  With that in mind, this function take the current cbattery SOC
+    and determines how many hours are needed to fill it to 100% based each hour representing a 25% increase in
+    battery SOC.
+    """
+    return round((100 - (round(floor(batt_soc / 25) * 25))) / 25)
+
+
+def get_seasonally_adjusted_max_charge_slots(batt_soc: float) -> int:
     """
     Returns: (int): max number of 1 hour charge slots needed to top up the battery from the grid
     based on the current month.
     """
     if datetime.now().month in [10, 11, 12, 1]:
-        return 3
+        return calculate_max_charge_slots_needed(batt_soc)
     if datetime.now().month in [8, 9, 2]:
-        return 2
+        return calculate_max_charge_slots_needed(batt_soc)
     if datetime.now().month in [3]:
-        return 1
+        return calculate_max_charge_slots_needed(batt_soc)
 
     return 0
 

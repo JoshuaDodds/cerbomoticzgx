@@ -1,7 +1,7 @@
 import sqlite3
 
 from lib.helpers import publish_message
-from lib.constants import logging, cerboGxEndpoint
+from lib.constants import logging
 
 
 class GlobalStateDatabase:
