@@ -27,18 +27,11 @@ def main():
     logging.info("EnergyBroker: Started.")
 
 def scheduler_loop():
-    def is_alive():
-        logging.info(f"EnergyBroker: heartbeat...thumpThump!")
-
-        # updating the hourly price is normally triggered on batter_soc changes.  Since this will not happen when
-        # battery is full and idle, we check for that condition here and still update the hourly price at 5 minute
-        # intervals.
-        if dotenv_config('TIBBER_UPDATES_ENABLED') == '1' and STATE.get('batt_soc') == 100.0:
-            publish_pricing_data(__name__)
-
-    # scheduler.every().day.at("09:30").do(publish_mqtt_trigger)
-    scheduler.every().day.at("14:00").do(publish_mqtt_trigger)
-    scheduler.every(5).minutes.do(is_alive)
+    # Scheduled Tasks
+    scheduler.every().hour.at(":00").do(manage_sale_of_stored_energy_to_the_grid)
+    scheduler.every().hour.at(":00").do(retrieve_latest_tibber_pricing)
+    scheduler.every().hour.at(":30").do(retrieve_latest_tibber_pricing)
+    scheduler.every().day.at("13:20").do(publish_mqtt_trigger)  # trigger the charging schedule setup
 
     for job in scheduler.get_jobs():
         logging.info(f"EnergyBroker: job: {job}")
@@ -47,7 +40,15 @@ def scheduler_loop():
         scheduler.run_pending()
         time.sleep(1)
 
-def manage_sale_of_stored_energy_to_the_grid(batt_soc: float) -> None:
+def retrieve_latest_tibber_pricing():
+    if dotenv_config('TIBBER_UPDATES_ENABLED') != '1':
+        return None
+    else:
+        publish_pricing_data(__name__)
+        logging.info(f"EnergyBroker: Running task: retrieve_latest_tibber_pricing()")
+
+def manage_sale_of_stored_energy_to_the_grid() -> None:
+    batt_soc = STATE.get('batt_soc')
     tibber_price_now = STATE.get('tibber_price_now')
     tibber_24h_high = STATE.get('tibber_cost_highest_today')
     ac_setpoint = STATE.get('ac_power_setpoint')
@@ -69,9 +70,9 @@ def manage_sale_of_stored_energy_to_the_grid(batt_soc: float) -> None:
                 pushover_notification("Energy Sale Alert",
                                       f"Stopped energy export at {batt_soc} and a current price of {round(tibber_price_now, 3)}")
 
-
-def manage_grid_usage_based_on_current_price(price: float) -> None:
+def manage_grid_usage_based_on_current_price(price: float = None) -> None:
     inverter_mode = int(STATE.get("inverter_mode"))
+    price = price if price is not None else STATE.get('tibber_price_now')
 
     # if energy is free or the provider is paying, switch to using the grid and start vehicle charging
     if price <= 0.0001 and inverter_mode == 3:
@@ -89,11 +90,12 @@ def manage_grid_usage_based_on_current_price(price: float) -> None:
         return
 
 def publish_mqtt_trigger():
+    """ Triggers the event_handler to call set_48h_charging_scheudle() function"""
     publish.single("Cerbomoticzgx/EnergyBroker/RunTrigger", payload=f"{{\"value\": {time.localtime().tm_hour}}}", qos=0, retain=False,
                    hostname=cerboGxEndpoint)
 
 def set_48h_charging_schedule(caller=None, price_cap=MAX_TIBBER_BUY_PRICE, max_items=get_seasonal_max_items()):
-    logging.info(f"EnergyBroker: set up charging schedule request received by {caller}")
+    logging.info(f"EnergyBroker: set up daily charging schedule request received by {caller}")
 
     if max_items < 1:
         return False

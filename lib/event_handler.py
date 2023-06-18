@@ -5,7 +5,6 @@ import signal
 from lib.helpers import get_topic_key, publish_message
 from lib.constants import dotenv_config, logging
 from lib.victron_integration import regulate_battery_max_voltage
-from lib.tibber_api import publish_pricing_data
 from lib.global_state import GlobalStateClient
 from lib.energy_broker import (
     manage_sale_of_stored_energy_to_the_grid,
@@ -78,8 +77,7 @@ class Event:
         if dotenv_config('VICTRON_OPTIMIZED_CHARGING') == '1':
             regulate_battery_max_voltage(_value)
         if dotenv_config('TIBBER_UPDATES_ENABLED') == '1':
-            publish_pricing_data(__name__)
-            manage_sale_of_stored_energy_to_the_grid(_value)
+            manage_sale_of_stored_energy_to_the_grid()
 
     def batt_power(self):
         _value = round(self.value)

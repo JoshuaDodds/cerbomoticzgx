@@ -49,7 +49,7 @@ class TeslaApi:
 
     def update_vehicle_status(self, force=False):
         if (not self.last_update_ts
-            or time.localtime() >= time.localtime(self.last_update_ts + (60 * 5))
+            or time.localtime() >= time.localtime(self.last_update_ts + (60 * 10))
             or self.is_charging
             # or self.is_plugged
             or force):

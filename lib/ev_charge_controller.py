@@ -61,7 +61,7 @@ class EvCharger:
         for property_name, key in PROPERTY_MAPPING.items():
             create_property(property_name, key)
 
-        self.grid_charging_enabled = is_grid_import_enabled()
+        self.grid_charging_enabled = threading.Thread(target=is_grid_import_enabled, daemon=True).start()
         self.load_reservation = int(dotenv_config("LOAD_RESERVATION"))  # see example .env.example file
         self.load_reservation_is_reduced = False
         self.load_reservation_reduction_factor = float(dotenv_config("LOAD_REDUCTION_FACTOR"))
