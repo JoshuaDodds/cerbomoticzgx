@@ -49,6 +49,12 @@ class Event:
         # global state db but will just be uncaught in this event handler.
         logging.debug(f"{__name__}: Invalid method or nothing implemented for topic: '{self.mqtt_topic}'")
 
+    def ess_net_metering_enabled(self):
+        if not bool(self.value):
+            logging.info(f"Enabling ESS Net Metering.")
+        else:
+            logging.info(f"Disabling ESS Net Metering.")
+
     def tibber_price_now(self):
         _value = float(self.value)
         manage_grid_usage_based_on_current_price(_value)
