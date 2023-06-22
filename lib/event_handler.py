@@ -52,7 +52,7 @@ class Event:
     def ess_net_metering_enabled(self):
         if self.gs_client.get('ess_net_metering_enabled') is None:
             pass
-        if not self.gs_client.get('ess_net_metering_enabled'):
+        if self.gs_client.get('ess_net_metering_enabled'):
             logging.info(f"Enabling ESS Net Metering.")
         else:
             logging.info(f"Disabling ESS Net Metering.")
