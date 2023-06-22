@@ -50,7 +50,9 @@ class Event:
         logging.debug(f"{__name__}: Invalid method or nothing implemented for topic: '{self.mqtt_topic}'")
 
     def ess_net_metering_enabled(self):
-        if not bool(self.value):
+        if self.gs_client.get('ess_net_metering_enabled') is None:
+            pass
+        if not self.gs_client.get('ess_net_metering_enabled'):
             logging.info(f"Enabling ESS Net Metering.")
         else:
             logging.info(f"Disabling ESS Net Metering.")
