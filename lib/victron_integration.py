@@ -62,7 +62,7 @@ def regulate_battery_max_voltage(ess_soc):
             publish.single("Tesla/vehicle0/solar/ess_max_charge_voltage", payload=f"{{\"value\": \"{battery_full_voltage}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
 
         else:
-            logging.info(f"Victron Integration: No Action. Battery max charge voltage is appropriately set at {current_max_charge_voltage}V with ESS SOC at {ess_soc}%")
+            logging.debug(f"Victron Integration: No Action. Battery max charge voltage is appropriately set at {current_max_charge_voltage}V with ESS SOC at {ess_soc}%")
             publish.single("Tesla/vehicle0/solar/ess_max_charge_voltage", payload=f"{{\"value\": \"{current_max_charge_voltage}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
 
         return True
