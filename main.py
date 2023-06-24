@@ -14,7 +14,6 @@ from lib.global_state import GlobalStateDatabase
 from lib.energy_broker import (
     manage_sale_of_stored_energy_to_the_grid,
     manage_grid_usage_based_on_current_price,
-    retrieve_latest_tibber_pricing,
 )
 
 
@@ -63,7 +62,8 @@ def post_startup():
     # managed state.
     manage_sale_of_stored_energy_to_the_grid()
     manage_grid_usage_based_on_current_price()
-    retrieve_latest_tibber_pricing()
+
+    logging.info(f"main(): post_startup() functions executed.")
 
 
 def main():
@@ -81,6 +81,7 @@ def main():
             mqtt_loop = asyncio.new_event_loop()
             mqtt_thread = threading.Thread(target=mqtt_client, args=(mqtt_loop,))
             mqtt_thread.start()
+            post_startup()
 
         if ACTIVE_MODULES[0]['async']['tibber_api']:
             try:
@@ -89,8 +90,6 @@ def main():
                 logging.error(f"Tibber: live measurements stopped with reason: {E}. Restarting...")
                 time.sleep(5.0)
                 asyncio.run(live_measurements())
-
-        post_startup()
 
     except (KeyboardInterrupt, SystemExit):
         shutdown()
