@@ -70,11 +70,9 @@ def get_seasonally_adjusted_max_charge_slots(batt_soc: float) -> int:
     Returns: (int): max number of 1 hour charge slots needed to top up the battery from the grid
     based on the current month.
     """
-    if datetime.now().month in [10, 11, 12, 1]:
-        return calculate_max_charge_slots_needed(batt_soc)
-    if datetime.now().month in [8, 9, 2]:
-        return calculate_max_charge_slots_needed(batt_soc)
-    if datetime.now().month in [3]:
+    current_month = datetime.now().month
+
+    if current_month in [10, 11, 12, 1, 8, 9, 2, 3]:
         return calculate_max_charge_slots_needed(batt_soc)
 
     return 0

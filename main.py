@@ -11,7 +11,11 @@ from lib.victron_integration import restore_default_battery_max_voltage
 from lib.tibber_api import live_measurements, publish_pricing_data
 from lib.helpers import publish_message
 from lib.global_state import GlobalStateDatabase
-from lib.energy_broker import manage_sale_of_stored_energy_to_the_grid, manage_grid_usage_based_on_current_price
+from lib.energy_broker import (
+    manage_sale_of_stored_energy_to_the_grid,
+    manage_grid_usage_based_on_current_price,
+    retrieve_latest_tibber_pricing,
+)
 
 
 ACTIVE_MODULES = json.loads(dotenv_config('ACTIVE_MODULES'))
@@ -59,6 +63,8 @@ def post_startup():
     # managed state.
     manage_sale_of_stored_energy_to_the_grid()
     manage_grid_usage_based_on_current_price()
+    retrieve_latest_tibber_pricing()
+
 
 def main():
     try:
