@@ -91,6 +91,8 @@ def main():
                 time.sleep(5.0)
                 asyncio.run(live_measurements())
 
+        post_startup()
+
     except (KeyboardInterrupt, SystemExit):
         shutdown()
 
