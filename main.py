@@ -9,8 +9,8 @@ from lib.ev_charge_controller import EvCharger
 from lib.energy_broker import main as energybroker
 from lib.victron_integration import restore_default_battery_max_voltage
 from lib.tibber_api import live_measurements, publish_pricing_data
-from lib.helpers import publish_message
-from lib.global_state import GlobalStateDatabase
+from lib.helpers import publish_message, retrieve_message
+from lib.global_state import GlobalStateDatabase, GlobalStateClient
 from lib.energy_broker import (
     manage_sale_of_stored_energy_to_the_grid,
     manage_grid_usage_based_on_current_price,
@@ -19,7 +19,9 @@ from lib.energy_broker import (
 
 ACTIVE_MODULES = json.loads(dotenv_config('ACTIVE_MODULES'))
 ESS_NET_METERING = bool(dotenv_config('TIBBER_UPDATES_ENABLED')) or False
-GlobalState = GlobalStateDatabase()
+GlobalStateDB = GlobalStateDatabase()
+STATE = GlobalStateClient()
+
 
 def ev_charge_controller(): EvCharger().main()
 
@@ -53,11 +55,17 @@ def shutdown():
 def init():
     # clear any previously published shutdown directives
     publish_message("Cerbomoticzgx/system/shutdown", message="False", retain=True)
-    publish_message(f"Cerbomoticzgx/system/EssNetMeteringEnabled", message=f"{ESS_NET_METERING}", retain=True)
 
 def post_startup():
+    # Reapply previously set Dynamic ESS preferences set in the previous run
+    DYNAMIC_ESS_BATT_MIN_SOC = retrieve_message('ess_net_metering_batt_min_soc') or dotenv_config('DYNAMIC_ESS_BATT_MIN_SOC')
+    DYNAMIC_ESS_NET_METERING_ENABLED = retrieve_message('ess_net_metering_enabled') or bool(dotenv_config('DYNAMIC_ESS_NET_METERING_ENABLED'))
+    publish_message(topic='Cerbomoticzgx/system/EssNetMeteringBattMinSoc', message=str(DYNAMIC_ESS_BATT_MIN_SOC), retain=True)
+    publish_message(topic='Cerbomoticzgx/system/EssNetMeteringEnabled', message=str(DYNAMIC_ESS_NET_METERING_ENABLED), retain=True)
+
     # update tibber pricing info
     publish_pricing_data(__name__)
+
     # Make sure we apply energy broker logic post startup to recover if the service restarts while in a
     # managed state.
     manage_sale_of_stored_energy_to_the_grid()

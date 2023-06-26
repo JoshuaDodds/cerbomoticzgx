@@ -12,7 +12,6 @@ from lib.tibber_api import publish_pricing_data
 from lib.global_state import GlobalStateClient
 from lib.victron_integration import ac_power_setpoint
 
-
 MAX_TIBBER_BUY_PRICE = float(dotenv_config('MAX_TIBBER_BUY_PRICE')) or None
 STATE = GlobalStateClient()
 
@@ -48,16 +47,17 @@ def retrieve_latest_tibber_pricing():
         logging.info(f"EnergyBroker: Running task: retrieve_latest_tibber_pricing()")
 
 def manage_sale_of_stored_energy_to_the_grid() -> None:
-    batt_soc = STATE.get('batt_soc')
+    batt_soc = float(STATE.get('batt_soc'))
     tibber_price_now = STATE.get('tibber_price_now')
     tibber_24h_high = STATE.get('tibber_cost_highest_today')
     ac_setpoint = STATE.get('ac_power_setpoint')
     ess_net_metering = STATE.get('ess_net_metering_enabled')
     ess_net_metering_overridden = STATE.get('ess_net_metering_overridden') or False
+    ess_net_metering_batt_min_soc = float(STATE.get('ess_net_metering_batt_min_soc'))
 
     if not ess_net_metering_overridden:
 
-        if batt_soc > 60.0 and tibber_price_now >= tibber_24h_high and tibber_price_now != 0 and ess_net_metering:
+        if batt_soc > ess_net_metering_batt_min_soc and tibber_price_now >= tibber_24h_high and tibber_price_now != 0 and ess_net_metering:
             if ac_setpoint != -10000.0:
                 ac_power_setpoint(watts="-10000.0", override_ess_net_mettering=False)
                 logging.info(f"Beginning to sell energy at {batt_soc}% SOC and a price of {round(tibber_price_now, 3)}")
