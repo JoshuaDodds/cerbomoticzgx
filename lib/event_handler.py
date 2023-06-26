@@ -53,9 +53,9 @@ class Event:
         if self.gs_client.get('ess_net_metering_enabled') is None:
             pass
         if self.gs_client.get('ess_net_metering_enabled'):
-            logging.info(f"ESS Net Metering is DISABLED.")
-        else:
             logging.info(f"ESS Net Metering is ENABLED.")
+        else:
+            logging.info(f"ESS Net Metering is DISABLED.")
 
     def tibber_price_now(self):
         _value = float(self.value)
