@@ -79,6 +79,8 @@ def get_seasonally_adjusted_max_charge_slots(batt_soc: float) -> int:
 
 
 def reduce_decimal(value):
+    value = str(value)
+
     if '.' in value:
         try:
             float_value = float(value)
