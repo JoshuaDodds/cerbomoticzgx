@@ -28,8 +28,8 @@ Topics = dict({
             # ESS Metrics
             "batt_soc":     f"N/{systemId0}/battery/277/Soc",
             "batt_current": f"N/{systemId0}/battery/277/Dc/0/Current",
-            # "batt_voltage":   f"N/{systemId0}/battery/277/Dc/0/Voltage", # Use Shunt Voltage
-            "batt_voltage": f"N/{systemId0}/battery/512/Dc/0/Voltage",   # Use LFP Voltage
+            "batt_voltage":   f"N/{systemId0}/battery/277/Dc/0/Voltage",  # Use Shunt Voltage
+            # "batt_voltage": f"N/{systemId0}/battery/512/Dc/0/Voltage",   # Use LFP Voltage
             "batt_power":   f"N/{systemId0}/battery/277/Dc/0/Power",
             # "batt_discharged_energy": f"N/{systemId0}/battery/277/History/DischargedEnergy",
             # "batt_charged_energy":    f"N/{systemId0}/battery/277/History/ChargedEnergy",
