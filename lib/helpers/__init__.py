@@ -78,5 +78,17 @@ def get_seasonally_adjusted_max_charge_slots(batt_soc: float) -> int:
     return 0
 
 
+def reduce_decimal(value):
+    if '.' in value:
+        try:
+            float_value = float(value)
+            rounded_value = round(float_value, 4)
+            return str(rounded_value)
+        except ValueError:
+            return value
+    else:
+        return value
+
+
 # Function Aliases
 retrieve_message = get_current_value_from_mqtt

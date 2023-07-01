@@ -1,6 +1,6 @@
 import sqlite3
 
-from lib.helpers import publish_message
+from lib.helpers import publish_message, reduce_decimal
 from lib.constants import logging
 
 
@@ -51,13 +51,14 @@ class GlobalStateClient:
                     return bool(False)
                 else:
                     return int(result_value)
-            except Exception as e:
+            except Exception as e: # noqa
                 return str(result_value)
         else:
             return 0
 
     def set(self, key, value):
-        self.cursor.execute("INSERT OR REPLACE INTO data VALUES (?, ?)", (key, value))
-        publish_message(f"Cerbomoticzgx/GlobalState/{key}", message=value, retain=True)
+        _value = reduce_decimal(value)
+        self.cursor.execute("INSERT OR REPLACE INTO data VALUES (?, ?)", (key, _value))
+        publish_message(f"Cerbomoticzgx/GlobalState/{key}", message=_value, retain=True)
 
         self.connection.commit()
