@@ -61,7 +61,7 @@ class EvCharger:
         for property_name, key in PROPERTY_MAPPING.items():
             create_property(property_name, key)
 
-        self.grid_charging_enabled = threading.Thread(target=is_grid_import_enabled, daemon=True).start()
+        self.grid_charging_enabled = self.global_state.get('grid_charging_enabled')
         self.load_reservation = int(dotenv_config("LOAD_RESERVATION"))  # see example .env.example file
         self.load_reservation_is_reduced = False
         self.load_reservation_reduction_factor = float(dotenv_config("LOAD_REDUCTION_FACTOR"))
@@ -90,7 +90,7 @@ class EvCharger:
                 self.main_thread = threading.Timer(3.0, self.main)
 
             else:
-                if self.grid_charging_enabled:
+                if self.global_state.get('grid_charging_enabled'):
                     self.tesla.update_vehicle_status(force=False)
                     logging.info(self.vehicle_status_msg())
                 else:
@@ -111,19 +111,29 @@ class EvCharger:
             self.main_thread.start()
 
     def should_manage_or_initiate_charging(self):
-        if int(self.charging_watts) > 5 and not self.grid_charging_enabled:
+        if self.global_state.get('tesla_charge_requested') and self.global_state.get('grid_charging_enabled'):
+            if not self.tesla.is_charging:
+                if self.tesla.is_home and self.tesla.is_plugged:
+                    logging.info(f"EvChargeControl: Charge request received. Sending charge start TeslaApi command.")
+                    self.tesla.start_tesla_charge()
+
+        if not self.global_state.get('tesla_charge_requested') and self.tesla.is_charging and self.tesla.is_home:
+            logging.info(f"EvChargeControl: Stop Charge request received. Sending charge stop TeslaApi command.")
+            self.tesla.stop_tesla_charge()
+
+        if int(self.charging_watts) > 5 and not self.global_state.get('grid_charging_enabled'):
             return True
 
         if ((self.tesla.is_charging
                 and self.tesla.is_home
                 and not self.tesla.is_supercharging)
-                and not self.grid_charging_enabled):
+                and not self.global_state.get('grid_charging_enabled')):
             return True
 
         if (self.is_the_sun_shining()
                 and int(self.ess_soc) >= self.minimum_ess_soc
                 and int(self.surplus_amps) >= 2
-                and not self.grid_charging_enabled
+                and not self.global_state.get('grid_charging_enabled')
                 and self.tesla.is_home
                 and self.tesla.is_plugged
                 and not self.tesla.is_supercharging
