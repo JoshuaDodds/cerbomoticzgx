@@ -71,7 +71,7 @@ def post_startup():
     manage_sale_of_stored_energy_to_the_grid()
     manage_grid_usage_based_on_current_price()
 
-    logging.info(f"main(): post_startup() functions executed.")
+    logging.info(f"post_startup() actions complete.")
 
 
 def main():
