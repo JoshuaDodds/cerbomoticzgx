@@ -49,6 +49,14 @@ class Event:
         # global state db but will just be uncaught in this event handler.
         logging.debug(f"{__name__}: Invalid method or nothing implemented for topic: '{self.mqtt_topic}'")
 
+    def ac_power_setpoint(self):
+        if float(self.value) > 0 or float(self.value) < 0:
+            logging.info(f"AC Power Setpoint changed to {self.value}")
+
+    def ess_net_metering_batt_min_soc(self):
+        if self.gs_client.get('ess_net_metering_batt_min_soc'):
+            logging.info(f"ESS Net Metering Min Batt SOC set to {self.value}")
+
     def ess_net_metering_enabled(self):
         if self.gs_client.get('ess_net_metering_enabled') is None:
             pass
@@ -58,8 +66,9 @@ class Event:
             logging.info(f"ESS Net Metering is DISABLED.")
 
     def tibber_price_now(self):
-        _value = float(self.value)
-        manage_grid_usage_based_on_current_price(_value)
+        if self.value:
+            _value = float(self.value)
+            manage_grid_usage_based_on_current_price(_value)
 
     def system_shutdown(self):
         _value = self.value
@@ -121,7 +130,7 @@ class Event:
 
     def grid_charging_enabled(self):
         _value = self.value == "True"
-        # todo: EvCharger.set_grid_charging_enabled(_value)
+        publish_message("Tesla/settings/grid_charging_enabled", message=f"{_value}", retain=True)
 
     def tesla_l1_current(self):
         self.update_charging_amp_totals()
