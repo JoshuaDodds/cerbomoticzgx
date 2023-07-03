@@ -55,20 +55,30 @@ def manage_sale_of_stored_energy_to_the_grid() -> None:
     ess_net_metering_overridden = STATE.get('ess_net_metering_overridden') or False
     ess_net_metering_batt_min_soc = float(STATE.get('ess_net_metering_batt_min_soc'))
 
-    if not ess_net_metering_overridden:
+    if ess_net_metering_overridden:
+        if batt_soc <= ess_net_metering_batt_min_soc:
+            if ac_setpoint < 0.0:
+                ac_power_setpoint(watts="0.0", override_ess_net_mettering=False)
+                logging.info(f"AC Power Setpoint changed to 0.0")
+                logging.info(f"Stopped energy export at {batt_soc}% SOC because of DynEss min batt SoC configuration setting.")
 
+    if not ess_net_metering_overridden:
         if batt_soc > ess_net_metering_batt_min_soc and tibber_price_now >= tibber_24h_high and tibber_price_now != 0 and ess_net_metering:
             if ac_setpoint != -10000.0:
                 ac_power_setpoint(watts="-10000.0", override_ess_net_mettering=False)
+
                 logging.info(f"Beginning to sell energy at {batt_soc}% SOC and a price of {round(tibber_price_now, 3)}")
                 pushover_notification("Energy Sale Alert",
                                       f"Beginning to sell energy at a cost of {round(tibber_price_now, 3)}")
         else:
             if ac_setpoint < 0.0:
                 ac_power_setpoint(watts="0.0", override_ess_net_mettering=False)
+
+                logging.info(f"AC Power Setpoint changed to 0.0")
                 logging.info(f"Stopped energy export at {batt_soc}% SOC and a current price of {round(tibber_price_now, 3)}")
                 pushover_notification("Energy Sale Alert",
                                       f"Stopped energy export at {batt_soc} and a current price of {round(tibber_price_now, 3)}")
+
 
 def manage_grid_usage_based_on_current_price(price: float = None) -> None:
     inverter_mode = int(STATE.get("inverter_mode"))
@@ -76,17 +86,27 @@ def manage_grid_usage_based_on_current_price(price: float = None) -> None:
 
     # if energy is free or the provider is paying, switch to using the grid and start vehicle charging
     if price <= 0.0001 and inverter_mode == 3:
+        logging.info(f"Energy cost is {round(price, 3)} cents per kWh. Switching to grid energy.")
+
+        Utils.set_inverter_mode(mode=1)
+        STATE.set('grid_charging_enabled', 'True')
+        STATE.set('tesla_charge_requested', 'True')
+
         pushover_notification("Tibber Price Alert",
                               f"Energy cost is {round(price, 3)} cents per kWh. Switching to grid energy.")
-        Utils.set_inverter_mode(mode=1)
         return
 
     # revese the above action when energy is no longer free
     if price >= 0.0001 and inverter_mode == 1:
-        print(inverter_mode)
+        logging.info(f"Energy cost is {round(price, 3)} cents per kWh. Switching back to battery.")
+
+        Utils.set_inverter_mode(mode=3)
+        STATE.set('grid_charging_enabled', 'False')
+        STATE.set('tesla_charge_requested', 'False')
+
         pushover_notification("Tibber Price Alert",
                               f"Energy cost is {round(price, 3)} cents per kWh. Switching back to battery.")
-        Utils.set_inverter_mode(mode=3)
+
         return
 
 def publish_mqtt_trigger():
