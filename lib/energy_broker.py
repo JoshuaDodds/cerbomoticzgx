@@ -84,6 +84,11 @@ def manage_grid_usage_based_on_current_price(price: float = None) -> None:
     inverter_mode = int(STATE.get("inverter_mode"))
     ess_net_metering_overridden = STATE.get('ess_net_metering_overridden') or False
     price = price if price is not None else STATE.get('tibber_price_now')
+    vehicle_plugged = True if STATE.get('tesla_plug_status') == "Plugged" else False
+    vehicle_home = STATE.get('tesla_is_home')
+    vehicle_soc = STATE.get('tesla_battery_soc')
+    vehicle_soc_setpoint = STATE.get('tesla_battery_soc_setpoint')
+    vehicle_is_charging = STATE.get('tesla_is_charging')
 
     if not ess_net_metering_overridden:
         # if energy is free or the provider is paying, switch to using the grid and start vehicle charging
@@ -92,7 +97,8 @@ def manage_grid_usage_based_on_current_price(price: float = None) -> None:
 
             Utils.set_inverter_mode(mode=1)
             STATE.set('grid_charging_enabled', 'True')
-            STATE.set('tesla_charge_requested', 'True')
+            if vehicle_plugged and vehicle_home and (vehicle_soc < vehicle_soc_setpoint) and not vehicle_is_charging:
+                STATE.set('tesla_charge_requested', 'True')
 
             pushover_notification("Tibber Price Alert",
                                   f"Energy cost is {round(price, 3)} cents per kWh. Switching to grid energy.")
