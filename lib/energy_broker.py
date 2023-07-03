@@ -82,32 +82,34 @@ def manage_sale_of_stored_energy_to_the_grid() -> None:
 
 def manage_grid_usage_based_on_current_price(price: float = None) -> None:
     inverter_mode = int(STATE.get("inverter_mode"))
+    ess_net_metering_overridden = STATE.get('ess_net_metering_overridden') or False
     price = price if price is not None else STATE.get('tibber_price_now')
 
-    # if energy is free or the provider is paying, switch to using the grid and start vehicle charging
-    if price <= 0.0001 and inverter_mode == 3:
-        logging.info(f"Energy cost is {round(price, 3)} cents per kWh. Switching to grid energy.")
+    if not ess_net_metering_overridden:
+        # if energy is free or the provider is paying, switch to using the grid and start vehicle charging
+        if price <= 0.0001 and inverter_mode == 3:
+            logging.info(f"Energy cost is {round(price, 3)} cents per kWh. Switching to grid energy.")
 
-        Utils.set_inverter_mode(mode=1)
-        STATE.set('grid_charging_enabled', 'True')
-        STATE.set('tesla_charge_requested', 'True')
+            Utils.set_inverter_mode(mode=1)
+            STATE.set('grid_charging_enabled', 'True')
+            STATE.set('tesla_charge_requested', 'True')
 
-        pushover_notification("Tibber Price Alert",
-                              f"Energy cost is {round(price, 3)} cents per kWh. Switching to grid energy.")
-        return
+            pushover_notification("Tibber Price Alert",
+                                  f"Energy cost is {round(price, 3)} cents per kWh. Switching to grid energy.")
+            return
 
-    # revese the above action when energy is no longer free
-    if price >= 0.0001 and inverter_mode == 1:
-        logging.info(f"Energy cost is {round(price, 3)} cents per kWh. Switching back to battery.")
+        # reverse the above action when energy is no longer free
+        if price >= 0.0001 and inverter_mode == 1:
+            logging.info(f"Energy cost is {round(price, 3)} cents per kWh. Switching back to battery.")
 
-        Utils.set_inverter_mode(mode=3)
-        STATE.set('grid_charging_enabled', 'False')
-        STATE.set('tesla_charge_requested', 'False')
+            Utils.set_inverter_mode(mode=3)
+            STATE.set('grid_charging_enabled', 'False')
+            STATE.set('tesla_charge_requested', 'False')
 
-        pushover_notification("Tibber Price Alert",
-                              f"Energy cost is {round(price, 3)} cents per kWh. Switching back to battery.")
+            pushover_notification("Tibber Price Alert",
+                                  f"Energy cost is {round(price, 3)} cents per kWh. Switching back to battery.")
 
-        return
+            return
 
 def publish_mqtt_trigger():
     """ Triggers the event_handler to call set_48h_charging_scheudle() function"""
