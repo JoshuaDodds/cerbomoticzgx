@@ -66,7 +66,11 @@ Topics = dict({
             "tibber_last_update":           f"Tibber/home/energy/day/last_update",
             "tibber_price_now":             f"Tibber/home/price_info/now/total",
             "tibber_cost_highest_today":    f"Tibber/home/price_info/today/highest/0/cost",
+            "tibber_cost_highest2_today":   f"Tibber/home/price_info/today/highest/1/cost",
+            "tibber_cost_highest3_today":   f"Tibber/home/price_info/today/highest/2/cost",
             "tibber_cost_lowest_today":     f"Tibber/home/price_info/today/lowest/0/cost",
+            "tibber_cost_lowest2_today":    f"Tibber/home/price_info/today/lowest/1/cost",
+            "tibber_cost_lowest3_today":    f"Tibber/home/price_info/today/lowest/2/cost",
 
             # Tesla specific metrics
             "tesla_power":                  f"N/{systemId0}/acload/40/Ac/Power",

@@ -1,5 +1,5 @@
 import json
-from math import floor
+from math import floor, ceil
 import paho.mqtt.subscribe as subscribe
 import paho.mqtt.publish as publish
 from datetime import datetime
@@ -63,6 +63,15 @@ def calculate_max_charge_slots_needed(batt_soc: float) -> int:
     battery SOC.
     """
     return round((100 - (round(floor(batt_soc / 25) * 25))) / 25)
+
+
+def calculate_max_discharge_slots_needed(capacity_for_sale: float) -> int:
+    """
+    This function calculates the number of maximum discharge slots needed (hours) to discharge the available batt
+    capacity we have available for sale (derived from the limit we set on ess net metering)
+    It assumes that each slot represents a 25% decrease in battery SOC.
+    """
+    return ceil(capacity_for_sale / 25)
 
 
 def get_seasonally_adjusted_max_charge_slots(batt_soc: float) -> int:

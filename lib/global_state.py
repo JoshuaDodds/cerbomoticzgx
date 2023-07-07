@@ -29,7 +29,7 @@ class GlobalStateClient:
         if self.connection:
             self.cursor.close()
             self.connection.close()
-            # logging.info("GlobalStateClient: Connection to Global state database closed.")
+            logging.debug("GlobalStateClient: Connection to Global state database closed.")
 
     def all(self):
         self.cursor.execute("SELECT key,value FROM data")

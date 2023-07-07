@@ -5,12 +5,13 @@ import schedule as scheduler
 import paho.mqtt.publish as publish
 
 from lib.constants import logging, cerboGxEndpoint, systemId0, PythonToVictronWeekdayNumberConversion, dotenv_config
-from lib.helpers import get_seasonally_adjusted_max_charge_slots
+from lib.helpers import get_seasonally_adjusted_max_charge_slots, calculate_max_discharge_slots_needed
 from lib.tibber_api import lowest_48h_prices
 from lib.notifications import pushover_notification
 from lib.tibber_api import publish_pricing_data
 from lib.global_state import GlobalStateClient
 from lib.victron_integration import ac_power_setpoint
+
 
 MAX_TIBBER_BUY_PRICE = float(dotenv_config('MAX_TIBBER_BUY_PRICE')) or None
 STATE = GlobalStateClient()
@@ -46,6 +47,30 @@ def retrieve_latest_tibber_pricing():
         publish_pricing_data(__name__)
         logging.info(f"EnergyBroker: Running task: retrieve_latest_tibber_pricing()")
 
+
+def get_todays_n_highest_prices(batt_soc: float, ess_net_metering_batt_min_soc: float = 0.0) -> list:
+    if batt_soc > ess_net_metering_batt_min_soc:
+        n = calculate_max_discharge_slots_needed(batt_soc - ess_net_metering_batt_min_soc)
+        prices = [
+            STATE.get('tibber_cost_highest_today'),
+            STATE.get('tibber_cost_highest2_today'),
+            STATE.get('tibber_cost_highest3_today'),
+        ]
+
+        sorted_items = sorted(prices, reverse=True)
+        return sorted_items[:n] if len(sorted_items[:n]) != 0 else None
+    else:
+        return None
+
+
+def should_start_selling(price_now: float, batt_soc: float, ess_net_metering_batt_min_soc: float):
+    prices = get_todays_n_highest_prices(batt_soc=batt_soc, ess_net_metering_batt_min_soc=ess_net_metering_batt_min_soc)
+    if not prices:
+        return False
+    else:
+        return any(price_now >= price for price in prices)
+
+
 def manage_sale_of_stored_energy_to_the_grid() -> None:
     batt_soc = float(STATE.get('batt_soc'))
     tibber_price_now = STATE.get('tibber_price_now')
@@ -63,7 +88,11 @@ def manage_sale_of_stored_energy_to_the_grid() -> None:
                 logging.info(f"Stopped energy export at {batt_soc}% SOC because of DynEss min batt SoC configuration setting.")
 
     if not ess_net_metering_overridden:
-        if batt_soc > ess_net_metering_batt_min_soc and tibber_price_now >= tibber_24h_high and tibber_price_now != 0 and ess_net_metering:
+        if batt_soc > ess_net_metering_batt_min_soc \
+                and should_start_selling(tibber_price_now, batt_soc, ess_net_metering_batt_min_soc) \
+                and tibber_price_now != 0 \
+                and ess_net_metering:
+
             if ac_setpoint != -10000.0:
                 ac_power_setpoint(watts="-10000.0", override_ess_net_mettering=False)
 
