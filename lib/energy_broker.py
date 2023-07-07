@@ -74,7 +74,6 @@ def should_start_selling(price_now: float, batt_soc: float, ess_net_metering_bat
 def manage_sale_of_stored_energy_to_the_grid() -> None:
     batt_soc = float(STATE.get('batt_soc'))
     tibber_price_now = STATE.get('tibber_price_now')
-    tibber_24h_high = STATE.get('tibber_cost_highest_today')
     ac_setpoint = STATE.get('ac_power_setpoint')
     ess_net_metering = STATE.get('ess_net_metering_enabled')
     ess_net_metering_overridden = STATE.get('ess_net_metering_overridden') or False
