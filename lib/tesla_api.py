@@ -7,9 +7,11 @@ import threading
 
 import lib.helpers
 
-from main import STATE
+from lib.global_state import GlobalStateClient
 from lib.constants import logging, dotenv_config, cerboGxEndpoint
 from lib.domoticz_updater import domoticz_update
+
+STATE = GlobalStateClient()
 
 retry = teslapy.Retry(total=2, status_forcelist=(500, 502, 503, 504))
 timeout = 5
