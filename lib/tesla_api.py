@@ -7,6 +7,7 @@ import threading
 
 import lib.helpers
 
+from main import STATE
 from lib.constants import logging, dotenv_config, cerboGxEndpoint
 from lib.domoticz_updater import domoticz_update
 
@@ -150,11 +151,11 @@ class TeslaApi:
 
     # Commands
     def stop_tesla_charge(self):
-        self.global_state.set('tesla_charge_requested', "False")
+        STATE.set('tesla_charge_requested', "False")
         return self.send_command('STOP_CHARGE', "Error stopping Tesla charge")
 
     def start_tesla_charge(self):
-        self.global_state.set('tesla_charge_requested', "True")
+        STATE.set('tesla_charge_requested', "True")
         return self.send_command('START_CHARGE', "Error starting Tesla charge")
 
     def set_tesla_charge_amps(self, amps):

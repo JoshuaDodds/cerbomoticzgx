@@ -60,8 +60,7 @@ def post_startup():
     # set higher than 0 zero cost at startup until actual pricing is retreived
     STATE.set('tibber_price_now', '1')
 
-
-    # Reapply previously set Dynamic ESS preferences set in the previous run
+    # Re-apply previously set Dynamic ESS preferences set in the previous run
     AC_POWER_SETPOINT = retrieve_message('ac_power_setpoint') or '0.0'
     DYNAMIC_ESS_BATT_MIN_SOC = retrieve_message('ess_net_metering_batt_min_soc') or dotenv_config('DYNAMIC_ESS_BATT_MIN_SOC')
     DYNAMIC_ESS_NET_METERING_ENABLED = retrieve_message('ess_net_metering_enabled') or bool(dotenv_config('DYNAMIC_ESS_NET_METERING_ENABLED'))
