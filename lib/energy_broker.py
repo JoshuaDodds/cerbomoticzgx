@@ -5,7 +5,7 @@ import schedule as scheduler
 import paho.mqtt.publish as publish
 
 from lib.constants import logging, cerboGxEndpoint, systemId0, PythonToVictronWeekdayNumberConversion, dotenv_config
-from lib.helpers import get_seasonally_adjusted_max_charge_slots, calculate_max_discharge_slots_needed
+from lib.helpers import get_seasonally_adjusted_max_charge_slots, calculate_max_discharge_slots_needed, publish_message
 from lib.tibber_api import lowest_48h_prices
 from lib.notifications import pushover_notification
 from lib.tibber_api import publish_pricing_data
@@ -48,6 +48,19 @@ def retrieve_latest_tibber_pricing():
         logging.info(f"EnergyBroker: Running task: retrieve_latest_tibber_pricing()")
 
 
+def publish_export_schedule(price_list: list) -> None:
+    if len(price_list) == 0:
+        message = "There is no sale of surplus energy scheduled today."
+    elif len(price_list) == 1:
+        item = "{:.4f}".format(price_list[0])
+        message = f"Sale of energy will happen today at the price: {item}."
+    else:
+        items = " and ".join("{:.4f}".format(item) for item in price_list)
+        message = f"Sale of energy will happen today when prices are: {items}."
+
+    publish_message("Tibber/home/price_info/today/tibber_export_schedule_status", message=message, retain=True)
+
+
 def get_todays_n_highest_prices(batt_soc: float, ess_net_metering_batt_min_soc: float = 0.0) -> list:
     if batt_soc > ess_net_metering_batt_min_soc:
         n = calculate_max_discharge_slots_needed(batt_soc - ess_net_metering_batt_min_soc)
@@ -58,7 +71,11 @@ def get_todays_n_highest_prices(batt_soc: float, ess_net_metering_batt_min_soc: 
         ]
 
         sorted_items = sorted(prices, reverse=True)
-        return sorted_items[:n] if len(sorted_items[:n]) != 0 else None
+        price_list = sorted_items[:n] if len(sorted_items[:n]) != 0 else None
+        if price_list:
+            publish_export_schedule(price_list)
+
+        return price_list
     else:
         return None
 
@@ -72,12 +89,12 @@ def should_start_selling(price_now: float, batt_soc: float, ess_net_metering_bat
 
 
 def manage_sale_of_stored_energy_to_the_grid() -> None:
-    batt_soc = float(STATE.get('batt_soc'))
+    batt_soc = STATE.get('batt_soc')
     tibber_price_now = STATE.get('tibber_price_now')
     ac_setpoint = STATE.get('ac_power_setpoint')
     ess_net_metering = STATE.get('ess_net_metering_enabled')
     ess_net_metering_overridden = STATE.get('ess_net_metering_overridden') or False
-    ess_net_metering_batt_min_soc = float(STATE.get('ess_net_metering_batt_min_soc'))
+    ess_net_metering_batt_min_soc = STATE.get('ess_net_metering_batt_min_soc')
 
     if ess_net_metering_overridden:
         if batt_soc <= ess_net_metering_batt_min_soc:

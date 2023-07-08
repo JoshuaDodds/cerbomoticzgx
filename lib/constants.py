@@ -61,16 +61,20 @@ Topics = dict({
             "ess_net_metering_batt_min_soc":    f"Cerbomoticzgx/system/EssNetMeteringBattMinSoc",
 
             # Tibber
-            "tibber_total":                 f"N/{systemId0}/Tibber/home/energy/day/euro_day_total",  # workaround to update dz
-            "tibber_day_total":             f"Tibber/home/energy/day/reward",
-            "tibber_last_update":           f"Tibber/home/energy/day/last_update",
-            "tibber_price_now":             f"Tibber/home/price_info/now/total",
-            "tibber_cost_highest_today":    f"Tibber/home/price_info/today/highest/0/cost",
-            "tibber_cost_highest2_today":   f"Tibber/home/price_info/today/highest/1/cost",
-            "tibber_cost_highest3_today":   f"Tibber/home/price_info/today/highest/2/cost",
-            "tibber_cost_lowest_today":     f"Tibber/home/price_info/today/lowest/0/cost",
-            "tibber_cost_lowest2_today":    f"Tibber/home/price_info/today/lowest/1/cost",
-            "tibber_cost_lowest3_today":    f"Tibber/home/price_info/today/lowest/2/cost",
+            "tibber_total":                     f"N/{systemId0}/Tibber/home/energy/day/euro_day_total",  # workaround to update dz
+            "tibber_day_total":                 f"Tibber/home/energy/day/reward",
+            "tibber_last_update":               f"Tibber/home/energy/day/last_update",
+            "tibber_price_now":                 f"Tibber/home/price_info/now/total",
+            "tibber_cost_highest_today":        f"Tibber/home/price_info/today/highest/0/cost",
+            "tibber_cost_highest_today_hr":     f"Tibber/home/price_info/today/highest/0/hour",
+            "tibber_cost_highest2_today":       f"Tibber/home/price_info/today/highest/1/cost",
+            "tibber_cost_highest2_today_hr":    f"Tibber/home/price_info/today/highest/1/hour",
+            "tibber_cost_highest3_today":       f"Tibber/home/price_info/today/highest/2/cost",
+            "tibber_cost_highest3_today_hr":    f"Tibber/home/price_info/today/highest/2/hour",
+            "tibber_cost_lowest_today":         f"Tibber/home/price_info/today/lowest/0/cost",
+            "tibber_cost_lowest2_today":        f"Tibber/home/price_info/today/lowest/1/cost",
+            "tibber_cost_lowest3_today":        f"Tibber/home/price_info/today/lowest/2/cost",
+            "tibber_export_schedule_status":    f"Tibber/home/price_info/today/tibber_export_schedule_status",
 
             # Tesla specific metrics
             "tesla_power":                  f"N/{systemId0}/acload/40/Ac/Power",
