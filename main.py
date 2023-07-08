@@ -59,11 +59,24 @@ def init():
 def post_startup():
     # set higher than 0 zero cost at startup until actual pricing is retreived
     STATE.set('tibber_price_now', '1')
+    STATE.set('ac_power_setpoint', '0.0')
+
     # Reapply previously set Dynamic ESS preferences set in the previous run
     DYNAMIC_ESS_BATT_MIN_SOC = retrieve_message('ess_net_metering_batt_min_soc') or dotenv_config('DYNAMIC_ESS_BATT_MIN_SOC')
     DYNAMIC_ESS_NET_METERING_ENABLED = retrieve_message('ess_net_metering_enabled') or bool(dotenv_config('DYNAMIC_ESS_NET_METERING_ENABLED'))
+    GRID_CHARGING_ENABLED = retrieve_message('grid_charging_enabled') or False
+
+    publish_message(topic='Tesla/settings/grid_charging_enabled', message=str(GRID_CHARGING_ENABLED), retain=True)
+    STATE.set('grid_charging_enabled', str(GRID_CHARGING_ENABLED))
+
     publish_message(topic='Cerbomoticzgx/system/EssNetMeteringBattMinSoc', message=str(DYNAMIC_ESS_BATT_MIN_SOC), retain=True)
+    STATE.set('ess_net_metering_batt_min_soc', str(DYNAMIC_ESS_BATT_MIN_SOC))
+
     publish_message(topic='Cerbomoticzgx/system/EssNetMeteringEnabled', message=str(DYNAMIC_ESS_NET_METERING_ENABLED), retain=True)
+    STATE.set('ess_net_metering_enabled', str(DYNAMIC_ESS_NET_METERING_ENABLED))
+
+    publish_message(topic='Cerbomoticzgx/system/EssNetMeteringOverridden', message="False", retain=True)
+    STATE.set('ess_net_metering_overridden', 'False')
 
     # update tibber pricing info
     publish_pricing_data(__name__)

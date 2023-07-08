@@ -20,8 +20,12 @@ def get_current_value_from_mqtt(topic: str) -> any:
     """
     Retrieves a single message froma given topic on the MQTT broker
     """
-    t = subscribe.simple(Topics['system0'][topic], qos=0, msg_count=1, hostname=cerboGxEndpoint, port=1883)
-    return json.loads(t.payload.decode("utf-8"))['value']
+    try:
+        t = subscribe.simple(Topics['system0'][topic], qos=0, msg_count=1, hostname=cerboGxEndpoint, port=1883)
+        return json.loads(t.payload.decode("utf-8"))['value']
+
+    except KeyError as e: # noqa
+        return None
 
 
 def get_topic_key(topic, system_id="system0") -> str:
