@@ -149,9 +149,13 @@ class TeslaApi:
             return False
 
     # Commands
-    def stop_tesla_charge(self): return self.send_command('STOP_CHARGE', "Error stopping Tesla charge")
+    def stop_tesla_charge(self):
+        self.global_state.set('tesla_charge_requested', "False")
+        return self.send_command('STOP_CHARGE', "Error stopping Tesla charge")
 
-    def start_tesla_charge(self): return self.send_command('START_CHARGE', "Error starting Tesla charge")
+    def start_tesla_charge(self):
+        self.global_state.set('tesla_charge_requested', "True")
+        return self.send_command('START_CHARGE', "Error starting Tesla charge")
 
     def set_tesla_charge_amps(self, amps):
         amps = 0 if amps < 0 else amps
