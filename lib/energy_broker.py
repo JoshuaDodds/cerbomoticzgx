@@ -100,6 +100,8 @@ def manage_sale_of_stored_energy_to_the_grid() -> None:
     ess_net_metering_overridden = STATE.get('ess_net_metering_overridden') or False
     ess_net_metering_batt_min_soc = STATE.get('ess_net_metering_batt_min_soc')
 
+    get_todays_n_highest_prices(batt_soc, ess_net_metering_batt_min_soc)
+
     if ess_net_metering_overridden:
         if batt_soc <= ess_net_metering_batt_min_soc:
             if ac_setpoint < 0.0:
