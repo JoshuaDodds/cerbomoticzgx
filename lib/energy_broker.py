@@ -74,12 +74,13 @@ def get_todays_n_highest_prices(batt_soc: float, ess_net_metering_batt_min_soc: 
         price_list = sorted_items[:n] if len(sorted_items[:n]) != 0 else None
         if price_list:
             publish_export_schedule(price_list)
-        else:
-            message = "There is no sale of surplus energy scheduled yet for today."
-            publish_message("Tibber/home/price_info/today/tibber_export_schedule_status", message=message, retain=True)
 
         return price_list
+
     else:
+        message = "There is no sale of surplus energy scheduled yet for today."
+        publish_message("Tibber/home/price_info/today/tibber_export_schedule_status", message=message, retain=True)
+
         return None
 
 
