@@ -178,15 +178,15 @@ def mqtt_publish_lowest_price_points(home):
     # tomorrow
     if tomorrow_price_points(home, rank=1) and tomorrow_price_points(home, rank=2):
         logging.debug(f"Tibber: publishing tomorrow's lowest price points to Mqtt broker...")
-        publish.single("Tibber/home/price_info/tomorrow/lowest/0/hour", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=0)[0]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/price_info/tomorrow/lowest/0/delta", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=0)[1]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/price_info/tomorrow/lowest/0/level", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=0)[2]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/price_info/tomorrow/lowest/0/cost", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=0)[3]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+        publish.single("Tibber/home/price_info/tomorrow/lowest/0/hour", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=1)[0]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+        publish.single("Tibber/home/price_info/tomorrow/lowest/0/delta", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=1)[1]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+        publish.single("Tibber/home/price_info/tomorrow/lowest/0/level", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=1)[2]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+        publish.single("Tibber/home/price_info/tomorrow/lowest/0/cost", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=1)[3]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
 
-        publish.single("Tibber/home/price_info/tomorrow/lowest/1/hour", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=1)[0]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/price_info/tomorrow/lowest/1/delta", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=1)[1]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/price_info/tomorrow/lowest/1/level", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=1)[2]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/price_info/tomorrow/lowest/1/cost", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=1)[3]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+        publish.single("Tibber/home/price_info/tomorrow/lowest/1/hour", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=2)[0]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+        publish.single("Tibber/home/price_info/tomorrow/lowest/1/delta", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=2)[1]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+        publish.single("Tibber/home/price_info/tomorrow/lowest/1/level", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=2)[2]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+        publish.single("Tibber/home/price_info/tomorrow/lowest/1/cost", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=2)[3]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
 
 def tomorrow_price_points(home, rank=1):
     _tomorrow = home.current_subscription.price_info.tomorrow
