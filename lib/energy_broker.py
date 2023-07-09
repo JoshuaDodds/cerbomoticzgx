@@ -50,13 +50,13 @@ def retrieve_latest_tibber_pricing():
 
 def publish_export_schedule(price_list: list) -> None:
     if len(price_list) == 0:
-        message = "There is no sale of surplus energy scheduled today."
+        message = "Will not export today."
     elif len(price_list) == 1:
         item = "{:.4f}".format(price_list[0])
-        message = f"Sale of energy will happen today at the price: {item}."
+        message = f"Export at: {item}."
     else:
         items = " and ".join("{:.4f}".format(item) for item in price_list)
-        message = f"Sale of energy will happen today when prices are: {items}."
+        message = f"Export at: {items}."
 
     publish_message("Tibber/home/price_info/today/tibber_export_schedule_status", message=message, retain=True)
 
