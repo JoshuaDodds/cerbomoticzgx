@@ -6,7 +6,7 @@ import asyncio
 from lib.constants import logging, dotenv_config
 from lib.mqtt_client import mqtt_start, mqtt_stop
 from lib.ev_charge_controller import EvCharger
-from lib.energy_broker import main as energybroker
+from lib.energy_broker import main as energybroker, get_todays_n_highest_prices
 from lib.victron_integration import restore_default_battery_max_voltage
 from lib.tibber_api import live_measurements, publish_pricing_data
 from lib.helpers import publish_message, retrieve_message
@@ -56,40 +56,6 @@ def init():
     # clear any previously published shutdown directives
     publish_message("Cerbomoticzgx/system/shutdown", message="False", retain=True)
 
-def post_startup():
-    # set higher than 0 zero cost at startup until actual pricing is retreived
-    STATE.set('tibber_price_now', '1')
-
-    # Re-apply previously set Dynamic ESS preferences set in the previous run
-    AC_POWER_SETPOINT = retrieve_message('ac_power_setpoint') or '0.0'
-    DYNAMIC_ESS_BATT_MIN_SOC = retrieve_message('ess_net_metering_batt_min_soc') or dotenv_config('DYNAMIC_ESS_BATT_MIN_SOC')
-    DYNAMIC_ESS_NET_METERING_ENABLED = retrieve_message('ess_net_metering_enabled') or bool(dotenv_config('DYNAMIC_ESS_NET_METERING_ENABLED'))
-    GRID_CHARGING_ENABLED = retrieve_message('grid_charging_enabled') or False
-
-    STATE.set('ac_power_setpoint', AC_POWER_SETPOINT)
-
-    publish_message(topic='Tesla/settings/grid_charging_enabled', message=str(GRID_CHARGING_ENABLED), retain=True)
-    STATE.set('grid_charging_enabled', str(GRID_CHARGING_ENABLED))
-
-    publish_message(topic='Cerbomoticzgx/system/EssNetMeteringBattMinSoc', message=str(DYNAMIC_ESS_BATT_MIN_SOC), retain=True)
-    STATE.set('ess_net_metering_batt_min_soc', str(DYNAMIC_ESS_BATT_MIN_SOC))
-
-    publish_message(topic='Cerbomoticzgx/system/EssNetMeteringEnabled', message=str(DYNAMIC_ESS_NET_METERING_ENABLED), retain=True)
-    STATE.set('ess_net_metering_enabled', str(DYNAMIC_ESS_NET_METERING_ENABLED))
-
-    publish_message(topic='Cerbomoticzgx/system/EssNetMeteringOverridden', message="False", retain=True)
-    STATE.set('ess_net_metering_overridden', 'False')
-
-    # update tibber pricing info
-    publish_pricing_data(__name__)
-
-    # Make sure we apply energy broker logic post startup to recover if the service restarts while in a
-    # managed state.
-    manage_sale_of_stored_energy_to_the_grid()
-    manage_grid_usage_based_on_current_price()
-
-    logging.info(f"post_startup() actions complete.")
-
 
 def main():
     try:
@@ -120,6 +86,44 @@ def main():
 
     except (KeyboardInterrupt, SystemExit):
         shutdown()
+
+
+def post_startup():
+    # set higher than 0 zero cost at startup until actual pricing is retreived
+    STATE.set('tibber_price_now', '1')
+
+    # Re-apply previously set Dynamic ESS preferences set in the previous run
+    AC_POWER_SETPOINT = retrieve_message('ac_power_setpoint') or '0.0'
+    DYNAMIC_ESS_BATT_MIN_SOC = retrieve_message('ess_net_metering_batt_min_soc') or dotenv_config('DYNAMIC_ESS_BATT_MIN_SOC')
+    DYNAMIC_ESS_NET_METERING_ENABLED = retrieve_message('ess_net_metering_enabled') or bool(dotenv_config('DYNAMIC_ESS_NET_METERING_ENABLED'))
+    GRID_CHARGING_ENABLED = retrieve_message('grid_charging_enabled') or False
+
+    STATE.set('ac_power_setpoint', AC_POWER_SETPOINT)
+
+    publish_message(topic='Tesla/settings/grid_charging_enabled', message=str(GRID_CHARGING_ENABLED), retain=True)
+    STATE.set('grid_charging_enabled', str(GRID_CHARGING_ENABLED))
+
+    publish_message(topic='Cerbomoticzgx/system/EssNetMeteringBattMinSoc', message=str(DYNAMIC_ESS_BATT_MIN_SOC), retain=True)
+    STATE.set('ess_net_metering_batt_min_soc', str(DYNAMIC_ESS_BATT_MIN_SOC))
+
+    publish_message(topic='Cerbomoticzgx/system/EssNetMeteringEnabled', message=str(DYNAMIC_ESS_NET_METERING_ENABLED), retain=True)
+    STATE.set('ess_net_metering_enabled', str(DYNAMIC_ESS_NET_METERING_ENABLED))
+
+    publish_message(topic='Cerbomoticzgx/system/EssNetMeteringOverridden', message="False", retain=True)
+    STATE.set('ess_net_metering_overridden', 'False')
+
+    # clear the energy sale scheduling status message
+    get_todays_n_highest_prices(0, 100)
+
+    # update tibber pricing info
+    publish_pricing_data(__name__)
+
+    # Make sure we apply energy broker logic post startup to recover if the service restarts while in a
+    # managed state.
+    manage_sale_of_stored_energy_to_the_grid()
+    manage_grid_usage_based_on_current_price()
+
+    logging.info(f"post_startup() actions complete.")
 
 
 if __name__ == "__main__":
