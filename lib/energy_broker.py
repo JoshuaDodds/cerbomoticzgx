@@ -56,7 +56,7 @@ def publish_export_schedule(price_list: list) -> None:
         message = f"Export at: {item}."
     else:
         items = " and ".join("{:.4f}".format(item) for item in price_list)
-        message = f"Export at: {items}."
+        message = f"Export at: {items}"
 
     publish_message("Tibber/home/price_info/today/tibber_export_schedule_status", message=message, retain=True)
 
