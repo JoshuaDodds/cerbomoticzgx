@@ -56,6 +56,7 @@ class Event:
     def ess_net_metering_batt_min_soc(self):
         if self.gs_client.get('ess_net_metering_batt_min_soc'):
             logging.info(f"ESS Net Metering Min Batt SOC set to {self.value}")
+            manage_sale_of_stored_energy_to_the_grid()
 
     def ess_net_metering_enabled(self):
         if self.gs_client.get('ess_net_metering_enabled') is None:
