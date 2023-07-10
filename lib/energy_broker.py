@@ -49,16 +49,20 @@ def retrieve_latest_tibber_pricing():
 
 
 def publish_export_schedule(price_list: list) -> None:
-    if len(price_list) == 0:
-        message = "Will not export today."
-    elif len(price_list) == 1:
-        item = "{:.4f}".format(price_list[0])
-        message = f"Export at: {item}."
-    else:
-        items = " and ".join("{:.4f}".format(item) for item in price_list)
-        message = f"Export at: {items}"
+    if price_list:
+        if len(price_list) == 0:
+            message = "No export today."
+        elif len(price_list) == 1:
+            item = "{:.4f}".format(price_list[0])
+            message = f"Export at: {item}"
+        else:
+            items = " and ".join("{:.4f}".format(item) for item in price_list)
+            message = f"Export at: {items}"
 
-    publish_message("Tibber/home/price_info/today/tibber_export_schedule_status", message=message, retain=True)
+        publish_message("Tibber/home/price_info/today/tibber_export_schedule_status", message=message, retain=True)
+
+    else:
+        publish_message("Tibber/home/price_info/today/tibber_export_schedule_status", message="No export today.", retain=True)
 
 
 def get_todays_n_highest_prices(batt_soc: float, ess_net_metering_batt_min_soc: float = 0.0) -> list:
