@@ -63,12 +63,9 @@ class Event:
             pass
         if self.gs_client.get('ess_net_metering_enabled'):
             logging.info(f"ESS Net Metering is ENABLED.")
-            manage_sale_of_stored_energy_to_the_grid()
-            manage_grid_usage_based_on_current_price()
         else:
             logging.info(f"ESS Net Metering is DISABLED.")
             manage_sale_of_stored_energy_to_the_grid()
-            manage_grid_usage_based_on_current_price()
 
     def tibber_price_now(self):
         if self.value:
