@@ -90,7 +90,7 @@ def main():
 
 def post_startup():
     # set higher than 0 zero cost at startup until actual pricing is retreived
-    STATE.set('tibber_price_now', '0.010')
+    STATE.set('tibber_price_now', 0)
 
     # Re-apply previously set Dynamic ESS preferences set in the previous run
     AC_POWER_SETPOINT = retrieve_message('ac_power_setpoint') or '0.0'

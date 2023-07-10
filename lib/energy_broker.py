@@ -98,7 +98,7 @@ def should_start_selling(price_now: float, batt_soc: float, ess_net_metering_bat
 
 def manage_sale_of_stored_energy_to_the_grid() -> None:
     batt_soc = STATE.get('batt_soc')
-    tibber_price_now = STATE.get('tibber_price_now')
+    tibber_price_now = STATE.get('tibber_price_now') or 0
     ac_setpoint = STATE.get('ac_power_setpoint')
     ess_net_metering = STATE.get('ess_net_metering_enabled')
     ess_net_metering_overridden = STATE.get('ess_net_metering_overridden') or False
@@ -116,7 +116,7 @@ def manage_sale_of_stored_energy_to_the_grid() -> None:
     if not ess_net_metering_overridden:
         if batt_soc > ess_net_metering_batt_min_soc \
                 and should_start_selling(tibber_price_now, batt_soc, ess_net_metering_batt_min_soc) \
-                and tibber_price_now != 0 \
+                and tibber_price_now > 0 \
                 and ess_net_metering:
 
             if ac_setpoint != -8000.0:
