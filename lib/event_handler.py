@@ -65,7 +65,6 @@ class Event:
             logging.info(f"ESS Net Metering is ENABLED.")
         else:
             logging.info(f"ESS Net Metering is DISABLED.")
-            manage_sale_of_stored_energy_to_the_grid()
 
     def tibber_price_now(self):
         if self.value:
