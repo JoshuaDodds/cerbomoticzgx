@@ -6,8 +6,6 @@ import paho.mqtt.publish as publish
 
 from lib.constants import logging, cerboGxEndpoint, dotenv_config
 from lib.tesla_api import TeslaApi
-from lib.victron_integration import is_grid_import_enabled
-from lib.energy_broker import Utils as EnergyBrokerUtils
 from lib.global_state import GlobalStateClient
 
 
@@ -260,19 +258,6 @@ class EvCharger:
 
         self.global_state.set("tesla_charging_amps_total", round(charging_amp_totals, 2))
         publish.single("Tesla/vehicle0/charging_amps", payload=f"{{\"value\": \"{self.charging_amps}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-
-    def set_grid_charging_enabled(self, status: bool = False):
-        self.grid_charging_enabled = status
-        if status is True:
-            logging.info(f"EvCharger: Charging Vehicle from Grid power is -- ENABLED --")
-            EnergyBrokerUtils.set_inverter_mode(mode=1)
-            if not self.tesla.is_vehicle_charging():
-                self.tesla.start_tesla_charge()
-        else:
-            logging.info(f"EvCharger: Charging Vehicle from Grid power is -- DISABLED --")
-            if self.tesla.is_vehicle_charging():
-                self.tesla.stop_tesla_charge()
-            EnergyBrokerUtils.set_inverter_mode(mode=3)
 
     @staticmethod
     def is_the_sun_shining():

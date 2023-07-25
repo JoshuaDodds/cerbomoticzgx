@@ -70,16 +70,3 @@ def regulate_battery_max_voltage(ess_soc):
     except Exception as E:
         logging.info(f"Victron Integration (error): {E}")
         return False
-
-def is_grid_import_enabled():
-    setpoint_msg = subscribe.simple(Topics['system0']['ac_power_setpoint'], qos=0, msg_count=1, hostname=cerboGxEndpoint, port=1883)
-    mode_msg = subscribe.simple(Topics['system0']['inverter_mode'], qos=0, msg_count=1, hostname=cerboGxEndpoint, port=1883)
-    ac_in_setpoint = json.loads(setpoint_msg.payload.decode("utf-8"))['value']
-    inverter_mode = json.loads(mode_msg.payload.decode("utf-8"))['value']
-
-    if ac_in_setpoint > 0.0 or inverter_mode == 1:
-        publish.single(Topics["system0"]["grid_charging_enabled"], payload=f"{{\"value\": \"True\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        return True
-    else:
-        publish.single(Topics["system0"]["grid_charging_enabled"], payload=f"{{\"value\": \"False\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        return False
