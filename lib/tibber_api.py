@@ -54,7 +54,7 @@ def live_measurements(home=_home or None):
             domoticz_update(f"N/{systemId0}/Tibber/home/energy/day/euro_day_total", counter_for_dz, f"Tibber Total: {day_total}")
 
         except Exception as e:
-            logging.info(f"Tibber: Error encountered during live measurement data callback [log_accumulated()]: {e}")
+            logging.info(f"tibber_api: Error encountered during live measurement data callback method log_accumulated(). Error: {e}")
 
     def last_data_is_stale(data): # noqa
         msg = subscribe.simple("Tibber/home/energy/day/last_update", qos=0, msg_count=1, hostname=cerboGxEndpoint, port=1883)

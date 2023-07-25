@@ -11,6 +11,7 @@ from lib.notifications import pushover_notification
 from lib.tibber_api import publish_pricing_data
 from lib.global_state import GlobalStateClient
 from lib.victron_integration import ac_power_setpoint
+from lib.solar_forecasting import get_victron_solar_forecast
 
 
 MAX_TIBBER_BUY_PRICE = float(dotenv_config('MAX_TIBBER_BUY_PRICE')) or None
@@ -28,6 +29,7 @@ def main():
 
 def scheduler_loop():
     # Scheduled Tasks
+    scheduler.every(5).minutes.do(get_victron_solar_forecast)
     scheduler.every().hour.at(":00").do(manage_sale_of_stored_energy_to_the_grid)
     scheduler.every().hour.at(":00").do(retrieve_latest_tibber_pricing)
     scheduler.every().hour.at(":30").do(retrieve_latest_tibber_pricing)
@@ -45,7 +47,7 @@ def retrieve_latest_tibber_pricing():
         return None
     else:
         publish_pricing_data(__name__)
-        logging.info(f"EnergyBroker: Running task: retrieve_latest_tibber_pricing()")
+        logging.debug(f"EnergyBroker: Running task: retrieve_latest_tibber_pricing()")
 
 
 def publish_export_schedule(price_list: list) -> None:
@@ -67,6 +69,7 @@ def publish_export_schedule(price_list: list) -> None:
 
 def get_todays_n_highest_prices(batt_soc: float, ess_net_metering_batt_min_soc: float = 0.0) -> list:
     ess_net_metering_enabled = STATE.get('ess_net_metering_enabled') or None
+
     if batt_soc > ess_net_metering_batt_min_soc and ess_net_metering_enabled:
         n = calculate_max_discharge_slots_needed(batt_soc - ess_net_metering_batt_min_soc)
         prices = [

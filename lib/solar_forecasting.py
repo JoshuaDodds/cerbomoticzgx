@@ -1,95 +1,94 @@
 import time
+import pytz
 import requests
-import datetime
+from datetime import datetime
+from urllib.parse import urlencode
 
-from lib.helpers import get_current_value_from_mqtt
 from lib.constants import logging, dotenv_config
+from lib.global_state import GlobalStateClient
+from lib.helpers import get_current_value_from_mqtt
 
-API_KEY = dotenv_config('OPENWEATHER_API_KEY')
-lat, lon = 52.09, 5.12
+STATE = GlobalStateClient()
+timezone = pytz.timezone(dotenv_config('TIMEZONE'))
+idSite = dotenv_config('VRM_SITE_ID')
+login_url = dotenv_config('VRM_LOGIN_URL')
+login_data = {"username": dotenv_config('VRM_USER'), "password": dotenv_config('VRM_PASS')}
+api_url = dotenv_config('VRM_API_URL')
 
+def get_victron_solar_forecast():
+    now_tz = datetime.now(timezone)
+    start_of_today, end_of_today = (int(now_tz.replace(hour=h, minute=0, second=0, microsecond=0).timestamp()) for h in [5, 22])
+    now = int(now_tz.timestamp()) - 60
 
-def live_forecast_expected_solar_generation(system_capacity=11.7, efficiency=0.14):
-    weather_url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={API_KEY}"
-    weather_data = requests.get(weather_url).json()
+    # Log in and get the token
+    try:
+        response = requests.post(login_url, json=login_data, timeout=5)
+        token = response.json().get("token")
+    except requests.ConnectTimeout or requests.ConnectionError as e:  # noqa
+        logging.info("Connectivity issue to VRM Login endpoint...")
+        return
 
-    clouds = weather_data["clouds"]["all"]
-    temperature = weather_data["main"]["temp"]
-    humidity = weather_data["main"]["humidity"]
-    pressure = weather_data["main"]["pressure"]
+    if not token:
+        logging.info("Failed to get the token for VRM Portal API access (solar_forecasting). Check login credentials in .env config file.")
+        return None
 
-    # Calculate the expected solar radiation (in W/m^2)
-    # Improved formula based on enhanced version of Angstrom formula which is widely used to estimate solar radiation.
-    # Credits & Reference: S.A.A. Jairaj and R. Suresh (2010), "Enhancement of Angstrom formula for the estimation
-    #   of global solar radiation".
-    solar_radiation = (0.000001 * (temperature ** 4)) - (0.01 * (temperature ** 2)) + 0.4643 * temperature + 107.6 - (
-                0.0013 * (pressure ** (1 / 5))) + (0.6334 * humidity) + (0.2326 * (clouds / 100))
-    # Estimate the expected solar generation
-    expected_generation = round(system_capacity * efficiency * solar_radiation / 1000, 2)
-    return expected_generation
+    headers = {
+        'Content-Type': 'application/json',
+        'x-authorization': f'Bearer {token}'
+    }
 
+    params = {
+        'type': "forecast",
+        "start": now,
+        "end": end_of_today,
+        "interval": "days",
+        # "attributeCodes[]": 1221,  # see: https://www.victronenergy.com/live/venus-os:large#using_data_from_vrm
+    }
 
-def daily_forecast_expected_solar_generation(system_capacity=11.7, efficiency=0.14):
-    # Get 24-hour forecast data
-    today_midnight = int(datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-    forecast_url = f"https://api.openweathermap.org/data/2.5/forecast?lat={lat}&lon={lon}&appid={API_KEY}&cnt=24&dt={today_midnight}"
-    # forecast_url = f"https://api.openweathermap.org/data/2.5/forecast?lat={lat}&lon={lon}&appid={API_KEY}&cnt=12"
-    forecast_data = requests.get(forecast_url).json()
+    url = f"{api_url}/installations/{idSite}/stats?{urlencode(params)}"
+    logging.debug(f"Calling VRM API with URL: {url}")
 
-    total_clouds = 0
-    total_temperature = 0
-    total_humidity = 0
-    total_pressure = 0
+    try:
+        response = requests.get(url, headers=headers, timeout=5)
+    except requests.ConnectTimeout or requests.ConnectionError as e:  # noqa
+        logging.info("Connectivity issue to VRM API...")
 
-    # Get average cloud cover percentage, temperature, humidity, and pressure over 24 hours
-    for hour in forecast_data["list"]:
-        total_clouds += hour["clouds"]["all"]
-        total_temperature += hour["main"]["temp"]
-        total_humidity += hour["main"]["humidity"]
-        total_pressure += hour["main"]["pressure"]
+    if response.status_code != 200:
+        logging.info(f"Failed to retrieve data. Status code: {response.status_code}")
+        return None
 
-    num_hours = len(forecast_data["list"])
-    clouds = total_clouds / num_hours
-    temperature = total_temperature / num_hours
-    humidity = total_humidity / num_hours
-    pressure = total_pressure / num_hours
+    data = response.json().get("records", [])
 
-    # Calculate the expected solar radiation (in W/m^2)
-    # Improved formula based on enhanced version of Angstrom formula which is widely used to estimate solar radiation.
-    # Credits & Reference: S.A.A. Jairaj and R. Suresh (2010), "Enhancement of Angstrom formula for the estimation
-    #   of global solar radiation".
-    solar_radiation = (0.000001 * (temperature ** 4)) - (0.01 * (temperature ** 2)) + 0.4643 * temperature + 107.6 - (
-                0.0013 * (pressure ** (1 / 5))) + (0.6334 * humidity) + (0.2326 * (clouds / 100))
+    solar_production = actual_solar_generation() * 1000
+    solar_production_left = round(data['solar_yield_forecast'][0][1], 2)
+    solar_forecast_kwh = round(solar_production_left + solar_production, 2)
 
-    # Estimate the expected solar generation
-    expected_generation = round(system_capacity * efficiency * solar_radiation / 1000, 2)
+    logging.debug(f"Solar_forecasting: retrieved and published daily pv forecast. Actual:{actual_solar_generation()} kWh Forecasted:{solar_forecast_kwh} kWh ToGo: {solar_production_left}")
 
-    return expected_generation
+    STATE.set('pv_projected_today', solar_forecast_kwh)
+    return solar_forecast_kwh
 
 def actual_solar_generation():
-    # actual generated so far today
+    # c1 = STATE.get('c1_daily_yield')
+    # c2 = STATE.get('c2_daily_yield')
+
     c1 = get_current_value_from_mqtt('c1_daily_yield')
     c2 = get_current_value_from_mqtt('c2_daily_yield')
+
     actual_generation = round(c1 + c2, 2)
 
     return actual_generation
-
-def update_domoticz(actual, live):
-    if actual and live:
-        dz_url = f"http://dz-insecure.hs.mfis.net:80/json.htm?type=command&param=udevice&idx=634&nvalue=0&svalue={round(actual * 1000)};0;{round(live * 1000)};0;0;0"
-        _dz_response = requests.get(dz_url)
 
 
 if __name__ == "__main__":
     while True:
         try:
-            actual_generated = actual_solar_generation()
-            live_forecast = live_forecast_expected_solar_generation(system_capacity=11.7, efficiency=0.1998)
-            daily_forecast = daily_forecast_expected_solar_generation(system_capacity=11.7, efficiency=0.1998)
-
-            logging.info(f"Actual:{actual_generated} kWh Live Forecast:{live_forecast} kWh Daily Forecast: {daily_forecast} kWh")
-            # update_domoticz(actual_generated, live_forecast)
-            time.sleep(60 * 15)
+            get_victron_solar_forecast()
+            time.sleep(60 * 2)
 
         except Exception as e:
             logging.info(f"Error: {e}")
+
+        except KeyboardInterrupt:
+            print(f"\n")
+            exit(0)

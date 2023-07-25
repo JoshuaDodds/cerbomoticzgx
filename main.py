@@ -9,8 +9,9 @@ from lib.ev_charge_controller import EvCharger
 from lib.energy_broker import main as energybroker, get_todays_n_highest_prices
 from lib.victron_integration import restore_default_battery_max_voltage
 from lib.tibber_api import live_measurements, publish_pricing_data
-from lib.helpers import publish_message, retrieve_message
+from lib.helpers import publish_message
 from lib.global_state import GlobalStateDatabase, GlobalStateClient
+from lib.solar_forecasting import get_victron_solar_forecast
 from lib.energy_broker import (
     manage_sale_of_stored_energy_to_the_grid,
     manage_grid_usage_based_on_current_price,
@@ -67,6 +68,7 @@ def main():
         # start async tasks
         if ACTIVE_MODULES[0]['async']['mqtt_client'] and not ACTIVE_MODULES[0]['async']['tibber_api']:
             asyncio.run(mqtt_start())
+            post_startup()
 
         elif ACTIVE_MODULES[0]['async']['mqtt_client'] and ACTIVE_MODULES[0]['async']['tibber_api']:
             mqtt_loop = asyncio.new_event_loop()
@@ -76,38 +78,40 @@ def main():
 
         if ACTIVE_MODULES[0]['async']['tibber_api']:
             try:
-                asyncio.run(live_measurements())
+                asyncio.run(live_measurements())  # This blocks & acts as the parent pid of the cerbomoticGx service
+
             except Exception as E:
                 logging.error(f"Tibber: live measurements stopped with reason: {E}. Restarting...")
                 time.sleep(5.0)
-                asyncio.run(live_measurements())
-
-        post_startup()
+                asyncio.run(live_measurements())  # This would also block if reached and would be our service's parent pid
 
     except (KeyboardInterrupt, SystemExit):
         shutdown()
 
 
 def post_startup():
+    time.sleep(2)
+    logging.info(f"post_startup() actions executing...")
+
     # set higher than 0 zero cost at startup until actual pricing is retreived
-    STATE.set('tibber_price_now', 0)
+    STATE.set('tibber_price_now', 0.10)
 
     # Re-apply previously set Dynamic ESS preferences set in the previous run
-    AC_POWER_SETPOINT = retrieve_message('ac_power_setpoint') or '0.0'
-    DYNAMIC_ESS_BATT_MIN_SOC = retrieve_message('ess_net_metering_batt_min_soc') or dotenv_config('DYNAMIC_ESS_BATT_MIN_SOC')
-    DYNAMIC_ESS_NET_METERING_ENABLED = retrieve_message('ess_net_metering_enabled') or bool(dotenv_config('DYNAMIC_ESS_NET_METERING_ENABLED'))
-    GRID_CHARGING_ENABLED = retrieve_message('grid_charging_enabled') or False
+    AC_POWER_SETPOINT = '0.0'
+    DYNAMIC_ESS_BATT_MIN_SOC = dotenv_config('DYNAMIC_ESS_BATT_MIN_SOC')
+    DYNAMIC_ESS_NET_METERING_ENABLED = dotenv_config('DYNAMIC_ESS_NET_METERING_ENABLED')
+    GRID_CHARGING_ENABLED = False
 
     STATE.set('ac_power_setpoint', AC_POWER_SETPOINT)
 
-    publish_message(topic='Tesla/settings/grid_charging_enabled', message=str(GRID_CHARGING_ENABLED), retain=True)
+    # publish_message(topic='Cerbomoticzgx/GlobalState/grid_charging_enabled', message=str(GRID_CHARGING_ENABLED), retain=True)
     STATE.set('grid_charging_enabled', str(GRID_CHARGING_ENABLED))
 
     publish_message(topic='Cerbomoticzgx/system/EssNetMeteringBattMinSoc', message=str(DYNAMIC_ESS_BATT_MIN_SOC), retain=True)
     STATE.set('ess_net_metering_batt_min_soc', str(DYNAMIC_ESS_BATT_MIN_SOC))
 
-    publish_message(topic='Cerbomoticzgx/system/EssNetMeteringEnabled', message=str(DYNAMIC_ESS_NET_METERING_ENABLED), retain=True)
-    STATE.set('ess_net_metering_enabled', str(DYNAMIC_ESS_NET_METERING_ENABLED))
+    publish_message(topic='Cerbomoticzgx/system/EssNetMeteringEnabled', message=DYNAMIC_ESS_NET_METERING_ENABLED, retain=True)
+    STATE.set('ess_net_metering_enabled', DYNAMIC_ESS_NET_METERING_ENABLED)
 
     publish_message(topic='Cerbomoticzgx/system/EssNetMeteringOverridden', message="False", retain=True)
     STATE.set('ess_net_metering_overridden', 'False')
@@ -122,6 +126,7 @@ def post_startup():
     # managed state.
     manage_sale_of_stored_energy_to_the_grid()
     manage_grid_usage_based_on_current_price()
+    get_victron_solar_forecast()
 
     logging.info(f"post_startup() actions complete.")
 
