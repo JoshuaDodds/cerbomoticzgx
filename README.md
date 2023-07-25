@@ -38,6 +38,8 @@ a Domoticz server via its REST API for monitoring and historic tracking
 - Tibber API integration to constantly monitor current energy rates, daily consumption and production, forecasted pricing, etc (Thanks to [Tibber.py](https://github.com/BeatsuDev/tibber.py))
 - deep integration with Victron system for monitoring and control via the cerbo Gx MQTT broker
 - Creates, exports, and updates a number of custom metrics to the victron MQTT broker for consumption by the [venus-nextgen Energy Dashboard](https://github.com/JoshuaDodds/venus-nextgen)
+- dynamic ESS algorithms for automated buy and sell of energy
+- solar forecasting data specific to your installation using ML models and AI for quite accurate current day production forecasts (courtesy of new VRM API features developed by Victron Energy). Note: A Victron VRM portal account is needed for this feature. 
 
 Configuration for your CerboGX IP Address, VRM instance ID, and Domoticz IP/Port are configured in 
 the ```.env``` configuration file. 
