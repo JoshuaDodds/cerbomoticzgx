@@ -4,7 +4,7 @@ cp -a /secrets/.env* /secrets/* /app || exit 1
 
 ### Start the "services"
 # fork cerbomoticzGx service and restart on exit
-while true; do cd /app || false && python3 main.py; sleep 10s; echo "cerbomoticzgx: service exit. restarting..."; done &
+while true; do cd /app || false && python3 main.py; sleep 10s; echo "cerbomoticzgx: service exit. restarting..." && rm -rf /dev/shm/cerbo_state.db; done &
 
 # fork an hourly run of the tibber graphing service
 while true; do cd /app || false && python3 -m lib.generate_tibber_visual | ts %Y-%m-%d" "%H:%M:%S; sleep 1h; done &
