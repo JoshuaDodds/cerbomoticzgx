@@ -1,3 +1,22 @@
+"""
+This Python module is used to retrieve solar forecasting data from Victron's VRM Portal API.
+
+It contains two main functions:
+    1.  get_victron_solar_forecast: This function fetches solar forecasting data from the VRM Portal API. It authenticates with the API, sends a GET
+        request to retrieve the data, processes the response, and updates the global state with the forecasted solar production for the current day.
+        The calculated value is determined by querying the VRM API for forecasted solar production from now until sundown and adding that to any
+        solar production that has already been produced today.  Currently sunup and sundown is hardcoded with "Magic Numbers" which set these two
+        value to 5AM dand 10PM respectively.
+
+    2.  actual_solar_generation: This function retrieves the current solar power generation values for today from the Cerbo MQTT data bus and returns
+        the combined sum from both solar charge controllers.
+
+When run as a script, this module continuously calls the get_victron_solar_forecast function every two minutes, effectively updating the solar forecasting
+data on a regular basis. The energy_broker module imports this module and instantiates a scheduler which runs the get_victron_solar_forecast function every
+5 minutes.
+
+This module relies on environment variables defined in the .env file
+"""
 import time
 import pytz
 import requests
@@ -6,25 +25,25 @@ from urllib.parse import urlencode
 
 from lib.constants import logging, dotenv_config
 from lib.global_state import GlobalStateClient
-from lib.helpers import get_current_value_from_mqtt
 
 STATE = GlobalStateClient()
-timezone = pytz.timezone(dotenv_config('TIMEZONE'))
-idSite = dotenv_config('VRM_SITE_ID')
-login_url = dotenv_config('VRM_LOGIN_URL')
-login_data = {"username": dotenv_config('VRM_USER'), "password": dotenv_config('VRM_PASS')}
-api_url = dotenv_config('VRM_API_URL')
+TIMEZONE = pytz.timezone(dotenv_config('TIMEZONE'))
+IDSITE = dotenv_config('VRM_SITE_ID')
+LOGIN_URL = dotenv_config('VRM_LOGIN_URL')
+LOGIN_DATA = {"username": dotenv_config('VRM_USER'), "password": dotenv_config('VRM_PASS')}
+API_URL = dotenv_config('VRM_API_URL')
+
 
 def get_victron_solar_forecast():
-    now_tz = datetime.now(timezone)
-    start_of_today, end_of_today = (int(now_tz.replace(hour=h, minute=0, second=0, microsecond=0).timestamp()) for h in [5, 22])
+    now_tz = datetime.now(TIMEZONE)
+    start_of_today, end_of_today = (int(now_tz.replace(hour=h, minute=0, second=0, microsecond=0).timestamp()) for h in
+                                    [5, 22])
     now = int(now_tz.timestamp()) - 60
 
-    # Log in and get the token
     try:
-        response = requests.post(login_url, json=login_data, timeout=5)
+        response = requests.post(LOGIN_URL, json=LOGIN_DATA, timeout=5)
         token = response.json().get("token")
-    except requests.ConnectTimeout or requests.ConnectionError as LoginError:  # noqa
+    except (requests.ConnectTimeout, requests.ConnectionError) as LoginError:
         logging.info(f"Connectivity issue to VRM Login endpoint: {LoginError}")
         return
 
@@ -42,10 +61,9 @@ def get_victron_solar_forecast():
         "start": now,
         "end": end_of_today,
         "interval": "days",
-        # "attributeCodes[]": 1221,  # see: https://www.victronenergy.com/live/venus-os:large#using_data_from_vrm
     }
 
-    url = f"{api_url}/installations/{idSite}/stats?{urlencode(params)}"
+    url = f"{API_URL}/installations/{IDSITE}/stats?{urlencode(params)}"
     logging.debug(f"Calling VRM API with URL: {url}")
 
     try:
@@ -78,27 +96,29 @@ def get_victron_solar_forecast():
 
     return solar_forecast_kwh
 
-def actual_solar_generation():
-    # c1 = STATE.get('c1_daily_yield')
-    # c2 = STATE.get('c2_daily_yield')
 
-    c1 = get_current_value_from_mqtt('c1_daily_yield')
-    c2 = get_current_value_from_mqtt('c2_daily_yield')
+def actual_solar_generation():
+    c1 = STATE.get('c1_daily_yield')
+    c2 = STATE.get('c2_daily_yield')
 
     actual_generation = round(c1 + c2, 2)
 
     return actual_generation
 
 
-if __name__ == "__main__":
+def main():
     while True:
         try:
             get_victron_solar_forecast()
             time.sleep(60 * 2)
 
-        except Exception as error:
-            logging.info(f"Error: {error}")
+        except Exception as UnexpectedError:
+            logging.info(f"Error: {UnexpectedError}")
 
         except KeyboardInterrupt:
-            print(f"\n")
+            print("\n")
             exit(0)
+
+
+if __name__ == "__main__":
+    main()
