@@ -24,8 +24,8 @@ def get_victron_solar_forecast():
     try:
         response = requests.post(login_url, json=login_data, timeout=5)
         token = response.json().get("token")
-    except requests.ConnectTimeout or requests.ConnectionError as e:  # noqa
-        logging.info("Connectivity issue to VRM Login endpoint...")
+    except requests.ConnectTimeout or requests.ConnectionError as LoginError:  # noqa
+        logging.info(f"Connectivity issue to VRM Login endpoint: {LoginError}")
         return
 
     if not token:
@@ -50,22 +50,32 @@ def get_victron_solar_forecast():
 
     try:
         response = requests.get(url, headers=headers, timeout=5)
-    except requests.ConnectTimeout or requests.ConnectionError as e:  # noqa
-        logging.info("Connectivity issue to VRM API...")
+    except requests.ConnectTimeout or requests.ConnectionError as ApiError:
+        # log error and let scheduler try again in 5 minutes
+        logging.info(f"Connectivity issue to VRM API: {ApiError}")
+        return None
 
     if response.status_code != 200:
+        # log error and let scheduler try again in 5 minutes
         logging.info(f"Failed to retrieve data. Status code: {response.status_code}")
         return None
 
     data = response.json().get("records", [])
 
+    try:
+        solar_production_left = round(float(data['solar_yield_forecast'][0][1]), 2)
+    except (ValueError, TypeError, IndexError, KeyError):
+        # catch and log unexpected or missing data and let scheduler try again in 5 minutes
+        logging.info(f"Unexpected data received from VRM Api. Received: \"{data['solar_yield_forecast'][0][1]}\" instead of float type value.")
+        return None
+
     solar_production = actual_solar_generation() * 1000
-    solar_production_left = round(data['solar_yield_forecast'][0][1], 2)
     solar_forecast_kwh = round(solar_production_left + solar_production, 2)
 
     logging.debug(f"Solar_forecasting: retrieved and published daily pv forecast. Actual:{actual_solar_generation()} kWh Forecasted:{solar_forecast_kwh} kWh ToGo: {solar_production_left}")
 
     STATE.set('pv_projected_today', solar_forecast_kwh)
+
     return solar_forecast_kwh
 
 def actual_solar_generation():
@@ -86,8 +96,8 @@ if __name__ == "__main__":
             get_victron_solar_forecast()
             time.sleep(60 * 2)
 
-        except Exception as e:
-            logging.info(f"Error: {e}")
+        except Exception as error:
+            logging.info(f"Error: {error}")
 
         except KeyboardInterrupt:
             print(f"\n")
