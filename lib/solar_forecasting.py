@@ -5,7 +5,7 @@ It contains two main functions:
     1.  get_victron_solar_forecast: This function fetches solar forecasting data from the VRM Portal API. It authenticates with the API, sends a GET
         request to retrieve the data, processes the response, and updates the global state with the forecasted solar production for the current day.
         The calculated value is determined by querying the VRM API for forecasted solar production from now until sundown and adding that to any
-        solar production that has already been produced today.  Currently sunup and sundown is hardcoded with "Magic Numbers" which set these two
+        solar production that has already been produced today.  Currently, sunup and sundown is hardcoded with "Magic Numbers" which set these two
         value to 5AM dand 10PM respectively.
 
     2.  actual_solar_generation: This function retrieves the current solar power generation values for today from the Cerbo MQTT data bus and returns
