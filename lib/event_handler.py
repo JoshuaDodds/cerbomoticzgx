@@ -131,8 +131,8 @@ class Event:
 
     def grid_charging_enabled(self):
         _value = self.value == "True"
-        state = "Enabled" if _value else "Disabled"
-        logging.info(f"Grid assisted charging toggled to {state}")
+        grid_import_state = "Enabled" if _value else "Disabled"
+        logging.info(f"Grid assisted charging toggled to {grid_import_state}")
 
     def tesla_l1_current(self):
         self.update_charging_amp_totals()

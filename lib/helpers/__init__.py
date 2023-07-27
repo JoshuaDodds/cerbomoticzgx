@@ -5,7 +5,7 @@ import paho.mqtt.publish as publish
 from datetime import datetime
 
 from lib.helpers.base7_math import *
-from lib.constants import Topics, cerboGxEndpoint
+from lib.constants import Topics, cerboGxEndpoint, logging
 
 
 def publish_message(topic, message, retain=False) -> None:
@@ -14,6 +14,10 @@ def publish_message(topic, message, retain=False) -> None:
     """
     publish.single(topic=topic, payload=f"{{\"value\": \"{message}\"}}", qos=0, retain=retain, hostname=cerboGxEndpoint,
                    port=1883)
+
+    # todo: remove below debug logging
+    if topic == "True" or topic == "False":
+        logging.info(f"{__name__} sent topic: {topic} with message payload of: {message}")
 
 
 def get_current_value_from_mqtt(topic: str) -> any:
