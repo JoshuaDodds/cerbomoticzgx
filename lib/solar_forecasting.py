@@ -74,8 +74,11 @@ def get_victron_solar_forecast():
         return None
 
     if response.status_code != 200:
-        # log error and let scheduler try again in 5 minutes
-        logging.info(f"Failed to retrieve data. Status code: {response.status_code}")
+        if 500 <= response.status_code < 600:
+            # log error and let scheduler try again in 5 minutes
+            logging.info(f"Server error when retrieving data. Status code: {response.status_code}")
+        else:
+            logging.info(f"Failed to retrieve data. Status code: {response.status_code}")
         return None
 
     data = response.json().get("records", [])
