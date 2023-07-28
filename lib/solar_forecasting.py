@@ -84,7 +84,7 @@ def get_victron_solar_forecast():
         solar_production_left = round(float(data['solar_yield_forecast'][0][1]), 2)
     except (ValueError, TypeError, IndexError, KeyError) as e:  # noqa
         # catch and log unexpected or missing data and let scheduler try again in 5 minutes
-        logging.info(f"Unexpected data received from VRM Api. Received: '{data['solar_yield_forecast'][0][1]}' instead of float type value.")
+        logging.info(f"Unexpected data received from VRM Api. Received: {data['solar_yield_forecast'][0][1]} instead of float type value.")
         pass
         return None
 
