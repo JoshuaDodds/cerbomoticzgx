@@ -49,7 +49,7 @@ def get_victron_solar_forecast():
 
     if not token:
         logging.info("Failed to get the token for VRM Portal API access (solar_forecasting). Check login credentials in .env config file.")
-        return None
+        return None  # We will try again in 5 minutes when the scheduler invokes this method in a new thread again.
 
     headers = {
         'Content-Type': 'application/json',
