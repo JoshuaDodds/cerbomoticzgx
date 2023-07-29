@@ -83,22 +83,25 @@ def get_victron_solar_forecast():
 
     data = response.json().get("records", [])
 
-    try:
-        solar_production_left = round(float(data['solar_yield_forecast'][0][1]), 2)
-    except (ValueError, TypeError, IndexError, KeyError) as e:  # noqa
-        # catch and log unexpected or missing data and let scheduler try again in 5 minutes
-        logging.info(f"Unexpected data received from VRM Api. Received: {data['solar_yield_forecast'][0][1]} instead of float type value.")
-        pass
+    if data:
+        try:
+            solar_production_left = round(float(data['solar_yield_forecast'][0][1]), 2)
+            solar_production = actual_solar_generation() * 1000
+            solar_forecast_kwh = round(solar_production_left + solar_production, 2)
+
+            logging.debug(f"Daily pv forecast: Actual:{actual_solar_generation()} kWh Forecasted:{solar_forecast_kwh} kWh ToGo: {solar_production_left}")
+
+            STATE.set('pv_projected_today', solar_forecast_kwh)
+
+            return solar_forecast_kwh
+
+        except (ValueError, TypeError, IndexError, KeyError) as e:  # noqa
+            # catch and log unexpected or missing data and let scheduler try again in 5 minutes
+            logging.info(f"Unexpected or no data received from VRM API.")
+            return None
+
+    else:
         return None
-
-    solar_production = actual_solar_generation() * 1000
-    solar_forecast_kwh = round(solar_production_left + solar_production, 2)
-
-    logging.debug(f"Solar_forecasting: retrieved and published daily pv forecast. Actual:{actual_solar_generation()} kWh Forecasted:{solar_forecast_kwh} kWh ToGo: {solar_production_left}")
-
-    STATE.set('pv_projected_today', solar_forecast_kwh)
-
-    return solar_forecast_kwh
 
 
 def actual_solar_generation():

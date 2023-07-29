@@ -32,6 +32,19 @@ def get_current_value_from_mqtt(topic: str) -> any:
         return None
 
 
+def get_raw_message_from_mqtt(topic: str) -> any:
+    """
+    Retrieves a single message froma given topic on the MQTT broker
+    """
+    try:
+        t = subscribe.simple(topic, qos=0, msg_count=1, hostname=cerboGxEndpoint, port=1883)
+        # return json.loads(t.payload.decode("utf-8"))['value']
+        return t
+
+    except KeyError as e: # noqa
+        return None
+
+
 def get_topic_key(topic, system_id="system0") -> str:
     """
     Retrieves the key name for a MQQT literal topic from the Topics dict() if one exists
@@ -111,3 +124,4 @@ def reduce_decimal(value):
 
 # Function Aliases
 retrieve_message = get_current_value_from_mqtt
+retrieve_raw_message = get_raw_message_from_mqtt

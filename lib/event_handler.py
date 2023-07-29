@@ -33,7 +33,7 @@ class Event:
     def dispatch(self):
         try:
             if self.topic_key:
-                # Update the Global State db even if we do not have an explicit method defined for this topi_key
+                # Update the Global State db even if we do not have an explicit method defined for this topic_key
                 self.gs_client.set(self.topic_key, self.value)
 
                 # if a method is defined, call it. Otherwise, call _unhandled_method()
