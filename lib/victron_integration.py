@@ -55,7 +55,7 @@ def regulate_battery_max_voltage(ess_soc):
 
             publish.single("Tesla/vehicle0/solar/ess_max_charge_voltage", payload=f"{{\"value\": \"{max_voltage}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
 
-        elif int(ess_soc) >= float(dotenv_config('MAXIMUM_ESS_SOC')):
+        elif int(ess_soc) >= float(dotenv_config('MAXIMUM_ESS_SOC')) and current_max_charge_voltage != float(dotenv_config('BATTERY_FULL_VOLTAGE')):
             publish.single(TopicsWritable["system0"]["max_charge_voltage"], payload=f"{{\"value\": \"{battery_full_voltage}\"}}", qos=0, retain=False, hostname=cerboGxEndpoint, port=1883)
             logging.info(f"Victron Integration: Adjusting max charge voltage to {battery_full_voltage} due to battery SOC reaching {dotenv_config('MAXIMUM_ESS_SOC')}% or higher")
 
