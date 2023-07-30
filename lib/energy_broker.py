@@ -123,8 +123,8 @@ def manage_sale_of_stored_energy_to_the_grid() -> None:
                 and tibber_price_now > 0 \
                 and ess_net_metering:
 
-            if ac_setpoint != -8000.0:
-                ac_power_setpoint(watts="-8000.0", override_ess_net_mettering=False)
+            if ac_setpoint != -10000.0:
+                ac_power_setpoint(watts="-10000.0", override_ess_net_mettering=False)
 
                 logging.info(f"Beginning to sell energy at {batt_soc}% SOC and a price of {round(tibber_price_now, 3)}")
                 pushover_notification("Energy Sale Alert",
