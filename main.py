@@ -74,10 +74,10 @@ def main():
             mqtt_loop = asyncio.new_event_loop()
             mqtt_thread = threading.Thread(target=mqtt_client, args=(mqtt_loop,))
             mqtt_thread.start()
-            post_startup()
 
         if ACTIVE_MODULES[0]['async']['tibber_api']:
             try:
+                post_startup()
                 asyncio.run(live_measurements())  # This blocks & acts as the parent pid of the cerbomoticGx service
 
             except Exception as E:
