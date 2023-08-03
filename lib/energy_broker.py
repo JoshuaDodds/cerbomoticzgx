@@ -33,7 +33,11 @@ def scheduler_loop():
     scheduler.every().hour.at(":00").do(manage_sale_of_stored_energy_to_the_grid)
     scheduler.every().hour.at(":00").do(retrieve_latest_tibber_pricing)
     scheduler.every().hour.at(":30").do(retrieve_latest_tibber_pricing)
-    scheduler.every().day.at("13:20").do(publish_mqtt_trigger)  # trigger the charging schedule setup
+    # Grid Charging Schedule Tasks
+    scheduler.every().day.at("13:20").do(publish_mqtt_trigger)  # when new prices are published
+    scheduler.every().day.at("01:00").do(set_48h_charging_schedule("scheduled_task()"))  # when we have a new pv forecast
+    scheduler.every().day.at("04:00").do(set_48h_charging_schedule("scheduled_task()"))  # when the forecast might be more accurate
+    scheduler.every().day.at("08:00").do(set_48h_charging_schedule("scheduled_task()", silent=False))  # One last update with a push notification of the final schedule
 
     for job in scheduler.get_jobs():
         logging.info(f"EnergyBroker: job: {job}")
@@ -181,7 +185,7 @@ def publish_mqtt_trigger():
     publish.single("Cerbomoticzgx/EnergyBroker/RunTrigger", payload=f"{{\"value\": {time.localtime().tm_hour}}}", qos=0, retain=False,
                    hostname=cerboGxEndpoint)
 
-def set_48h_charging_schedule(caller=None, price_cap=MAX_TIBBER_BUY_PRICE):
+def set_48h_charging_schedule(caller=None, price_cap=MAX_TIBBER_BUY_PRICE, silent=True):
     batt_soc = STATE.get('batt_soc')
     max_items = get_seasonally_adjusted_max_charge_slots(batt_soc)
 
@@ -200,7 +204,8 @@ def set_48h_charging_schedule(caller=None, price_cap=MAX_TIBBER_BUY_PRICE):
             day = item[0]
             price = item[3]
             schedule_victron_ess_charging(int(hour), schedule=schedule, day=day)
-            push_notification(hour, day, price)
+            if not silent:
+                push_notification(hour, day, price)
             schedule += 1
 
 def schedule_victron_ess_charging(hour, schedule=0, duration=3600, day=0):
