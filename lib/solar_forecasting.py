@@ -92,6 +92,7 @@ def get_victron_solar_forecast():
             logging.debug(f"Daily pv forecast: Actual:{actual_solar_generation()} kWh Forecasted:{solar_forecast_kwh} kWh ToGo: {solar_production_left}")
 
             STATE.set('pv_projected_today', solar_forecast_kwh)
+            STATE.set('pv_projected_remaining', solar_production_left)
 
             return solar_forecast_kwh
 
