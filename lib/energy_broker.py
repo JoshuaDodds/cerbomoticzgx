@@ -35,9 +35,9 @@ def scheduler_loop():
     scheduler.every().hour.at(":30").do(retrieve_latest_tibber_pricing)
     # Grid Charging Schedule Tasks
     scheduler.every().day.at("13:20").do(publish_mqtt_trigger)  # when new prices are published
-    scheduler.every().day.at("01:00").do(set_48h_charging_schedule, caller="scheduled_task()")  # when we have a new pv forecast
-    scheduler.every().day.at("04:00").do(set_48h_charging_schedule, caller="scheduled_task()")  # when the forecast might be more accurate
-    scheduler.every().day.at("08:00").do(set_48h_charging_schedule, caller="scheduled_task()", silent=False)  # One last update with a push notification of the final schedule
+    scheduler.every().day.at("01:00").do(set_48h_charging_schedule, caller="scheduler_loop()")  # when we have a new pv forecast
+    scheduler.every().day.at("04:00").do(set_48h_charging_schedule, caller="scheduler_loop()")  # when the forecast might be more accurate
+    scheduler.every().day.at("08:00").do(set_48h_charging_schedule, caller="scheduler_loop()", silent=False)  # One last update with a push notification of the final schedule
 
     for job in scheduler.get_jobs():
         logging.info(f"EnergyBroker: job: {job}")
@@ -190,7 +190,7 @@ def set_48h_charging_schedule(caller=None, price_cap=MAX_TIBBER_BUY_PRICE, silen
     pv_forecast = STATE.get('pv_projected_today') or 0.0
     max_items = get_seasonally_adjusted_max_charge_slots(batt_soc, pv_forecast)
 
-    logging.info(f"EnergyBroker: set up daily charging schedule request received by {caller}")
+    logging.info(f"EnergyBroker: set up daily charging schedule request received by {caller} using batt_soc={batt_soc} and pv_forecast={pv_forecast}")
 
     if max_items < 1:
         return False
