@@ -3,7 +3,6 @@ import time
 from datetime import datetime
 from math import floor, ceil
 
-import paho.mqtt.subscribe as subscribe
 import paho.mqtt.publish as publish
 import paho.mqtt.client as mqtt
 
@@ -26,9 +25,10 @@ def publish_message(topic, message, retain=False) -> None:
 def on_message(client, userdata, message):  # noqa
     userdata.append(json.loads(message.payload.decode("utf-8"))['value'])
 
-def get_current_value_from_mqtt(topic: str, timeout=1.0) -> any:
+def get_current_value_from_mqtt(topic: str, timeout: float = 1.0, raw: bool = False) -> any:
     """
-    Retrieves a single message from a given topic on the MQTT broker
+    Retrieves a single message from a given topic on the MQTT broker.
+    If raw is True, it retrieves the raw message.
     """
     try:
         # Create a new MQTT client
@@ -36,7 +36,10 @@ def get_current_value_from_mqtt(topic: str, timeout=1.0) -> any:
 
         # Set up the on_message callback
         messages = []
-        client.on_message = lambda client, userdata, message: on_message(client, messages, message)  # noqa
+        if raw:
+            client.on_message = lambda client, userdata, message: userdata.append(message)  # noqa
+        else:
+            client.on_message = lambda client, userdata, message: on_message(client, messages, message)  # noqa
 
         # Connect to the MQTT broker and subscribe to the topic
         client.connect(cerboGxEndpoint, port=1883)
@@ -56,31 +59,6 @@ def get_current_value_from_mqtt(topic: str, timeout=1.0) -> any:
 
         # Return the first message received, or None if no message was received
         return messages[0] if messages else None
-
-    except KeyError as e: # noqa
-        return None
-
-
-def old_get_current_value_from_mqtt(topic: str) -> any:
-    """
-    Retrieves a single message froma given topic on the MQTT broker
-    """
-    try:
-        t = subscribe.simple(Topics['system0'][topic], qos=0, msg_count=1, hostname=cerboGxEndpoint, port=1883)
-        return json.loads(t.payload.decode("utf-8"))['value']
-
-    except KeyError as e: # noqa
-        return None
-
-
-def get_raw_message_from_mqtt(topic: str) -> any:
-    """
-    Retrieves a single message froma given topic on the MQTT broker
-    """
-    try:
-        t = subscribe.simple(topic, qos=0, msg_count=1, hostname=cerboGxEndpoint, port=1883)
-        # return json.loads(t.payload.decode("utf-8"))['value']
-        return t
 
     except KeyError as e: # noqa
         return None
@@ -171,4 +149,3 @@ def reduce_decimal(value):
 
 # Function Aliases
 retrieve_message = get_current_value_from_mqtt
-retrieve_raw_message = get_raw_message_from_mqtt
