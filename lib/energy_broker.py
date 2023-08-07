@@ -14,7 +14,9 @@ from lib.victron_integration import ac_power_setpoint
 from lib.solar_forecasting import get_victron_solar_forecast
 
 
-MAX_TIBBER_BUY_PRICE = float(dotenv_config('MAX_TIBBER_BUY_PRICE')) or None
+MAX_TIBBER_BUY_PRICE = float(dotenv_config('MAX_TIBBER_BUY_PRICE')) or 0.20
+SWITCH_TO_GRID_PRICE_THRESHOLD = float(dotenv_config('SWITCH_TO_GRID_PRICE_THRESHOLD')) or 0.0001
+
 STATE = GlobalStateClient()
 
 
@@ -34,10 +36,9 @@ def scheduler_loop():
     scheduler.every().hour.at(":00").do(retrieve_latest_tibber_pricing)
     scheduler.every().hour.at(":30").do(retrieve_latest_tibber_pricing)
     # Grid Charging Schedule Tasks
-    scheduler.every().day.at("13:20").do(publish_mqtt_trigger)                                  # when new prices are published
-    scheduler.every().day.at("01:00").do(set_48h_charging_schedule, caller="scheduler_loop()")  # when we have a new pv forecast
-    scheduler.every().day.at("04:00").do(set_48h_charging_schedule, caller="scheduler_loop()")  # when the forecast might be more accurate
-    scheduler.every().day.at("08:00").do(set_48h_charging_schedule, caller="scheduler_loop()", silent=False)  # One last update with a push notification of the final schedule
+    scheduler.every().day.at("13:20").do(publish_mqtt_trigger)                                  # when next day prices are published each day
+    scheduler.every().hour.at(":00").do(set_48h_charging_schedule, caller="scheduler_loop()")   # refine the schedule hourly as solar forecast data is refined and changes
+    scheduler.every().day.at("08:00").do(set_48h_charging_schedule, caller="scheduler_loop()", silent=False)  # Morning update with a push notification of the final schedule
 
     for job in scheduler.get_jobs():
         logging.info(f"EnergyBroker: job: {job}")
@@ -155,7 +156,7 @@ def manage_grid_usage_based_on_current_price(price: float = None) -> None:
 
     if not ess_net_metering_overridden:
         # if energy is free or the provider is paying, switch to using the grid and start vehicle charging
-        if price <= 0.0001 and inverter_mode == 3:
+        if price <= SWITCH_TO_GRID_PRICE_THRESHOLD and inverter_mode == 3:
             logging.info(f"Energy cost is {round(price, 3)} cents per kWh. Switching to grid energy.")
 
             Utils.set_inverter_mode(mode=1)
@@ -168,7 +169,7 @@ def manage_grid_usage_based_on_current_price(price: float = None) -> None:
             return
 
         # reverse the above action when energy is no longer free
-        if price >= 0.0001 and inverter_mode == 1:
+        if price >= SWITCH_TO_GRID_PRICE_THRESHOLD and inverter_mode == 1:
             logging.info(f"Energy cost is {round(price, 3)} cents per kWh. Switching back to battery.")
 
             Utils.set_inverter_mode(mode=3)
@@ -187,7 +188,7 @@ def publish_mqtt_trigger():
 
 def set_48h_charging_schedule(caller=None, price_cap=MAX_TIBBER_BUY_PRICE, silent=True):
     batt_soc = STATE.get('batt_soc')
-    pv_forecast = STATE.get('pv_projected_today') or 0.0
+    pv_forecast = STATE.get('pv_projected_remaining') or 0.0
     max_items = get_seasonally_adjusted_max_charge_slots(batt_soc, pv_forecast)
 
     logging.info(f"EnergyBroker: set up daily charging schedule request received by {caller} using batt_soc={batt_soc} and pv_forecast={pv_forecast}")

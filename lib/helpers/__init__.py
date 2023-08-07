@@ -95,21 +95,21 @@ def calculate_max_discharge_slots_needed(capacity_for_sale: float) -> int:
     return ceil(capacity_for_sale / 25)
 
 
-def get_seasonally_adjusted_max_charge_slots(batt_soc: float, pv_forecasted: float = 0.0) -> int:
+def get_seasonally_adjusted_max_charge_slots(batt_soc: float, pv_production_remaining: float = 0.0) -> int:
     """
     Returns: (int): max number of 1 hour charge slots needed to top up the battery from the grid
     based on the current month. If optional pv_forecasted amount (in kWh) is passed, it adds this
-    to the batt_soc with a reduction of the amount of expected self consumption.
+    to the batt_soc.
     """
-    if pv_forecasted:
+
+    if pv_production_remaining:
         # convert ov_forecasted from kWh  to a percentage assuming battery capacity of 40kWh
-        day_consumption = 8.0  # The kWh normally consumed by AC Loads during the day
-        pv_forecasted = round(((pv_forecasted - day_consumption) / 40) * 100, 2)
+        pv_production_remaining = round((pv_production_remaining / 40) * 100, 2)
 
     current_month = datetime.now().month
 
     if current_month in [10, 11, 12, 1, 8, 9, 2, 3]:
-        return max(0, calculate_max_charge_slots_needed(batt_soc + pv_forecasted))
+        return max(0, calculate_max_charge_slots_needed(batt_soc + pv_production_remaining))
 
     return 0
 
