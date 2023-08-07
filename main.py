@@ -105,10 +105,10 @@ def post_startup():
     TESLA_CHARGE_REQUESTED = retrieve_message('tesla_charge_requested') or False
 
     STATE.set('ac_power_setpoint', AC_POWER_SETPOINT)
-    STATE.set('tesla_charge_requested', TESLA_CHARGE_REQUESTED)
-
-    # publish_message(topic='Cerbomoticzgx/GlobalState/grid_charging_enabled', message=str(GRID_CHARGING_ENABLED), retain=True)
     STATE.set('grid_charging_enabled', str(GRID_CHARGING_ENABLED))
+
+    publish_message(topic='Tesla/vehicle0/control/charge_requested', message=TESLA_CHARGE_REQUESTED, retain=True)
+    STATE.set('tesla_charge_requested', TESLA_CHARGE_REQUESTED)
 
     publish_message(topic='Cerbomoticzgx/system/EssNetMeteringBattMinSoc', message=str(DYNAMIC_ESS_BATT_MIN_SOC), retain=True)
     STATE.set('ess_net_metering_batt_min_soc', str(DYNAMIC_ESS_BATT_MIN_SOC))
