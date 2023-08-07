@@ -97,10 +97,11 @@ def post_startup():
     STATE.set('tibber_price_now', 0.10)
 
     # Re-apply previously set Dynamic ESS preferences set in the previous run
-    AC_POWER_SETPOINT = '0.0'
-    DYNAMIC_ESS_BATT_MIN_SOC = dotenv_config('DYNAMIC_ESS_BATT_MIN_SOC')
-    DYNAMIC_ESS_NET_METERING_ENABLED = dotenv_config('DYNAMIC_ESS_NET_METERING_ENABLED')
+    AC_POWER_SETPOINT = retrieve_message('ac_power_setpoint') or '0.0'
+    DYNAMIC_ESS_BATT_MIN_SOC = retrieve_message('ess_net_metering_batt_min_soc') or dotenv_config('DYNAMIC_ESS_BATT_MIN_SOC')
+    DYNAMIC_ESS_NET_METERING_ENABLED = retrieve_message('ess_net_metering_enabled') or dotenv_config('DYNAMIC_ESS_NET_METERING_ENABLED')
     GRID_CHARGING_ENABLED = retrieve_message('grid_charging_enabled') or False
+    ESS_NET_METERING_OVERRIDDEN = retrieve_message('ess_net_metering_overridden') or False
 
     STATE.set('ac_power_setpoint', AC_POWER_SETPOINT)
 
@@ -113,8 +114,8 @@ def post_startup():
     publish_message(topic='Cerbomoticzgx/system/EssNetMeteringEnabled', message=DYNAMIC_ESS_NET_METERING_ENABLED, retain=True)
     STATE.set('ess_net_metering_enabled', DYNAMIC_ESS_NET_METERING_ENABLED)
 
-    publish_message(topic='Cerbomoticzgx/system/EssNetMeteringOverridden', message="False", retain=True)
-    STATE.set('ess_net_metering_overridden', 'False')
+    publish_message(topic='Cerbomoticzgx/system/EssNetMeteringOverridden', message=ESS_NET_METERING_OVERRIDDEN, retain=True)
+    STATE.set('ess_net_metering_overridden', ESS_NET_METERING_OVERRIDDEN)
 
     # clear the energy sale scheduling status message
     get_todays_n_highest_prices(0, 100)
