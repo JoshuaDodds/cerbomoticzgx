@@ -9,7 +9,7 @@ from lib.ev_charge_controller import EvCharger
 from lib.energy_broker import main as energybroker, get_todays_n_highest_prices
 from lib.victron_integration import restore_default_battery_max_voltage
 from lib.tibber_api import live_measurements, publish_pricing_data
-from lib.helpers import publish_message
+from lib.helpers import publish_message, retrieve_message
 from lib.global_state import GlobalStateDatabase, GlobalStateClient
 from lib.solar_forecasting import get_victron_solar_forecast
 from lib.energy_broker import (
@@ -100,7 +100,7 @@ def post_startup():
     AC_POWER_SETPOINT = '0.0'
     DYNAMIC_ESS_BATT_MIN_SOC = dotenv_config('DYNAMIC_ESS_BATT_MIN_SOC')
     DYNAMIC_ESS_NET_METERING_ENABLED = dotenv_config('DYNAMIC_ESS_NET_METERING_ENABLED')
-    GRID_CHARGING_ENABLED = False
+    GRID_CHARGING_ENABLED = retrieve_message('grid_charging_enabled') or False
 
     STATE.set('ac_power_setpoint', AC_POWER_SETPOINT)
 

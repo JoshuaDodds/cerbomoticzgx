@@ -1,8 +1,11 @@
 import json
+import time
+from datetime import datetime
 from math import floor, ceil
+
 import paho.mqtt.subscribe as subscribe
 import paho.mqtt.publish as publish
-from datetime import datetime
+import paho.mqtt.client as mqtt
 
 from lib.helpers.base7_math import *
 from lib.constants import Topics, cerboGxEndpoint, logging
@@ -20,7 +23,45 @@ def publish_message(topic, message, retain=False) -> None:
         logging.info(f"{__name__} sent topic: {topic} with message payload of: {message}")
 
 
-def get_current_value_from_mqtt(topic: str) -> any:
+def on_message(client, userdata, message):  # noqa
+    userdata.append(json.loads(message.payload.decode("utf-8"))['value'])
+
+def get_current_value_from_mqtt(topic: str, timeout=1.0) -> any:
+    """
+    Retrieves a single message from a given topic on the MQTT broker
+    """
+    try:
+        # Create a new MQTT client
+        client = mqtt.Client()
+
+        # Set up the on_message callback
+        messages = []
+        client.on_message = lambda client, userdata, message: on_message(client, messages, message)  # noqa
+
+        # Connect to the MQTT broker and subscribe to the topic
+        client.connect(cerboGxEndpoint, port=1883)
+        client.subscribe(Topics['system0'][topic], qos=0)
+
+        # Start the client loop in a non-blocking way
+        client.loop_start()
+
+        # Wait for up to `timeout` seconds for a message to arrive
+        start_time = time.time()
+        while time.time() - start_time < timeout and not messages:
+            time.sleep(0.1)  # Don't busy-wait; sleep for a short time
+
+        # Stop the client loop and disconnect from the broker
+        client.loop_stop()
+        client.disconnect()
+
+        # Return the first message received, or None if no message was received
+        return messages[0] if messages else None
+
+    except KeyError as e: # noqa
+        return None
+
+
+def old_get_current_value_from_mqtt(topic: str) -> any:
     """
     Retrieves a single message froma given topic on the MQTT broker
     """
