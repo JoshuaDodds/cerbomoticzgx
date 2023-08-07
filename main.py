@@ -102,8 +102,10 @@ def post_startup():
     DYNAMIC_ESS_NET_METERING_ENABLED = retrieve_message('ess_net_metering_enabled') or dotenv_config('DYNAMIC_ESS_NET_METERING_ENABLED')
     GRID_CHARGING_ENABLED = retrieve_message('grid_charging_enabled') or False
     ESS_NET_METERING_OVERRIDDEN = retrieve_message('ess_net_metering_overridden') or False
+    TESLA_CHARGE_REQUESTED = retrieve_message('tesla_charge_requested') or False
 
     STATE.set('ac_power_setpoint', AC_POWER_SETPOINT)
+    STATE.set('tesla_charge_requested', TESLA_CHARGE_REQUESTED)
 
     # publish_message(topic='Cerbomoticzgx/GlobalState/grid_charging_enabled', message=str(GRID_CHARGING_ENABLED), retain=True)
     STATE.set('grid_charging_enabled', str(GRID_CHARGING_ENABLED))
