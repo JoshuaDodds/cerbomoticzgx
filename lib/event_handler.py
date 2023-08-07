@@ -9,7 +9,8 @@ from lib.global_state import GlobalStateClient
 from lib.energy_broker import (
     manage_sale_of_stored_energy_to_the_grid,
     set_48h_charging_schedule,
-    manage_grid_usage_based_on_current_price
+    manage_grid_usage_based_on_current_price,
+    Utils
 )
 
 
@@ -131,7 +132,14 @@ class Event:
 
     def grid_charging_enabled(self):
         _value = self.value == "True"
-        grid_import_state = "Enabled" if _value else "Disabled"
+
+        if _value:
+            grid_import_state = "Enabled"
+            Utils.set_inverter_mode(mode=1)
+        else:
+            grid_import_state = "Disabled"
+            Utils.set_inverter_mode(mode=3)
+
         logging.info(f"Grid assisted charging toggled to {grid_import_state}")
 
     def tesla_l1_current(self):
