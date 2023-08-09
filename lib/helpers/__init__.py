@@ -25,6 +25,7 @@ def publish_message(topic, message, retain=False) -> None:
 def on_message(client, userdata, message):  # noqa
     userdata.append(json.loads(message.payload.decode("utf-8"))['value'])
 
+
 def get_current_value_from_mqtt(topic: str, timeout: float = 1.0, raw: bool = False) -> any:
     """
     Retrieves a single message from a given topic on the MQTT broker.

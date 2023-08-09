@@ -120,8 +120,7 @@ class EvCharger:
 
         if not self.global_state.get('tesla_charge_requested') and self.tesla.is_charging and self.tesla.is_home:
             logging.info(f"EvChargeControl: Stop Charge request received. Sending charge stop TeslaApi command.")
-            self.tesla.stop_tesla_charge()
-            self.tesla.update_vehicle_status(force=True)
+            return True
 
         if (int(self.charging_watts) > 5
             and not self.global_state.get('grid_charging_enabled')
