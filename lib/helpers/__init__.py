@@ -128,7 +128,7 @@ def get_seasonally_adjusted_max_charge_slots(batt_soc: float, pv_production_rema
 
     current_month = datetime.now().month
 
-    if current_month in [10, 11, 12, 1, 8, 9, 2, 3]:
+    if current_month in [9, 10, 11, 12, 1, 2, 3]:
         return max(0, calculate_max_charge_slots_needed(batt_soc + pv_production_remaining))
 
     return 0

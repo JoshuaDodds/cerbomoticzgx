@@ -109,28 +109,20 @@ class EvCharger:
             self.main_thread.start()
 
     def should_manage_or_initiate_charging(self):
-        # todo: move this logic into another function and make sure it does not keep triggering while care is charge_requested True
+        # todo: move this logic into another function and make sure it does not keep triggering while charge_requested is True
         if self.global_state.get('tesla_charge_requested') or self.global_state.get('grid_charging_enabled'):
-            if not self.tesla.is_charging:
+            if not self.tesla.is_charging or int(self.charging_watts) < 5:
                 if self.tesla.is_home and self.tesla.is_plugged:
                     logging.info(f"EvChargeControl: Charge request received. Sending charge start TeslaApi command.")
                     self.tesla.start_tesla_charge()
                     self.tesla.update_vehicle_status(force=True)
                     return False
 
-        if not self.global_state.get('tesla_charge_requested') and self.tesla.is_charging and self.tesla.is_home:
-            return True
-
         if (int(self.charging_watts) > 5
+            and self.tesla.is_home
+            and not self.tesla.is_supercharging
             and not self.global_state.get('grid_charging_enabled')
             and not self.global_state.get('tesla_charge_requested')):
-            return True
-
-        if ((self.tesla.is_charging
-                and self.tesla.is_home
-                and not self.tesla.is_supercharging)
-                and not self.global_state.get('grid_charging_enabled')
-                and not self.global_state.get('tesla_charge_requested')):
             return True
 
         if (self.is_the_sun_shining()
