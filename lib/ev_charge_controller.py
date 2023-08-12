@@ -85,15 +85,12 @@ class EvCharger:
                     self.manage_charging()
 
                 logging.info(self.vehicle_status_msg())
-                self.main_thread = threading.Timer(3.0, self.main)
+                self.main_thread = threading.Timer(5.0, self.main)
 
             else:
-                if self.global_state.get('grid_charging_enabled'):
+                if self.global_state.get('grid_charging_enabled') or self.global_state.get('tesla_charge_requested'):
                     self.tesla.update_vehicle_status(force=False)
                     logging.info(self.vehicle_status_msg())
-                else:
-                    self.tesla.update_mqtt_and_domoticz()
-                    logging.debug(self.general_status_msg())
                 self.main_thread = threading.Timer(20.0, self.main)
 
             self.main_thread.daemon = True
