@@ -68,7 +68,7 @@ def get_victron_solar_forecast():
 
     try:
         response = requests.get(url, headers=headers, timeout=5)
-    except requests.ConnectTimeout or requests.ConnectionError as ApiError:
+    except (requests.ConnectTimeout, requests.ConnectionError, requests.exceptions.ReadTimeout) as ApiError:
         # log error and let scheduler try again in 5 minutes
         logging.info(f"Connectivity issue to VRM API: {ApiError}")
         return None
