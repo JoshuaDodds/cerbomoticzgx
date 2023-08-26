@@ -16,6 +16,7 @@ from lib.solar_forecasting import get_victron_solar_forecast
 
 MAX_TIBBER_BUY_PRICE = float(dotenv_config('MAX_TIBBER_BUY_PRICE')) or 0.20
 SWITCH_TO_GRID_PRICE_THRESHOLD = float(dotenv_config('SWITCH_TO_GRID_PRICE_THRESHOLD')) or 0.0001
+ESS_EXPORT_AC_SETPOINT = float(dotenv_config('ESS_EXPORT_AC_SETPOINT')) or -10000.0
 
 STATE = GlobalStateClient()
 
@@ -127,8 +128,8 @@ def manage_sale_of_stored_energy_to_the_grid() -> None:
                 and tibber_price_now > 0 \
                 and ess_net_metering:
 
-            if ac_setpoint != -10000.0:
-                ac_power_setpoint(watts="-10000.0", override_ess_net_mettering=False)
+            if ac_setpoint != ESS_EXPORT_AC_SETPOINT:
+                ac_power_setpoint(watts=str(ESS_EXPORT_AC_SETPOINT), override_ess_net_mettering=False)
 
                 logging.info(f"Beginning to sell energy at {batt_soc}% SOC and a price of {round(tibber_price_now, 3)}")
                 pushover_notification("Energy Sale Alert",
