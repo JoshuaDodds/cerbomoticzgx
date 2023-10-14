@@ -38,7 +38,7 @@ def scheduler_loop():
     scheduler.every().hour.at(":30").do(retrieve_latest_tibber_pricing)
     # Grid Charging Scheduled Tasks
     scheduler.every().day.at("13:20").do(publish_mqtt_trigger)                                                # when next day prices are published each day
-    scheduler.every().hour.at(":00").do(set_48h_charging_schedule, caller="scheduler_loop()", silent=False)   # refine the schedule hourly as solar forecast data is refined and/or changes
+    scheduler.every().hour.at(":00").do(set_48h_charging_schedule, caller="scheduler_loop()", silent=True)    # refine the schedule hourly as solar forecast data is refined and/or changes
 
     for job in scheduler.get_jobs():
         logging.info(f"EnergyBroker: job: {job}")
@@ -224,7 +224,7 @@ def schedule_victron_ess_charging(hour, schedule=0, duration=3600, day=0):
         raise Exception("OoBError: hour must be an integer between 0 and 23")
 
     topic_stub = f"W/{systemId0}/settings/0/Settings/CGwacs/BatteryLife/Schedule/Charge/{schedule}/"
-    soc = 95
+    soc = 85
     start = hour * 3600
 
     publish.single(f"{topic_stub}Duration", payload=f"{{\"value\": {duration}}}", qos=0, retain=False,

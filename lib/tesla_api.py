@@ -57,7 +57,7 @@ class TeslaApi:
             or self.is_plugged
             or force):
 
-            logging.info(f"TeslaApi(update_vehicle_statue): (called from: {__name__}): retrieving latest vehicle state... Last update was at: {self.last_update_ts_hr}")
+            logging.debug(f"TeslaApi(update_vehicle_statue): (called from: {__name__}): retrieving latest vehicle state... Last update was at: {self.last_update_ts_hr}")
 
             self.get_vehicle_name()
             self.battery_soc()
