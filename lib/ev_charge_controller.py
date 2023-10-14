@@ -67,6 +67,8 @@ class EvCharger:
 
         self.tesla = TeslaApi()
 
+        self.surplus_checks = 0
+
         logging.info("EvCharger (__init__): Init complete.")
 
     def __del__(self):
@@ -81,11 +83,12 @@ class EvCharger:
                 self.tesla.update_vehicle_status(force=False)
                 if not self.tesla.is_vehicle_charging():
                     self.initiate_charging()
+                    self.main_thread = threading.Timer(5.0, self.main)
                 elif self.tesla.is_vehicle_charging():
                     self.manage_charging()
+                    self.main_thread = threading.Timer(20.0, self.main)
 
                 logging.info(self.vehicle_status_msg())
-                self.main_thread = threading.Timer(5.0, self.main)
 
             else:
                 if self.global_state.get('grid_charging_enabled') or self.global_state.get('tesla_charge_requested'):
@@ -169,18 +172,23 @@ class EvCharger:
         logging.debug(self.general_status_msg())
 
     def manage_charging(self):
-        # adjusting charge rate when charge is active
-        if self.surplus_amps < 2:
+        # adjusting charge rate when charge is active with 3 checks over 60 seconds to try and filter out temporary
+        # loss of pv surplus due to passing clouds, etc
+        if self.surplus_amps < 2 and self.surplus_checks >= 3:
             try:
                 logging.info(f"EvCharger (charge mgmt): Should stop charge. Insufficient solar energy of "
                              f"{self.surplus_amps} Amps")
                 self.set_surplus_amps(self.surplus_amps)
                 self.tesla.stop_tesla_charge()
                 self.update_charging_amp_totals(0)
+                self.surplus_checks = 0  # reset the check count
                 return True
             except Exception as E:
                 logging.info(E)
                 return False
+        else:
+            logging.info(f"EvCharger (charge mgmt): Insufficient solar energy of {self.surplus_amps} Amps but will check this again in 20 seconds before taking action.")
+            self.surplus_checks += 1
 
         if self.surplus_amps != round(self.charging_amps, 0) and self.surplus_amps >= 2:
             try:
