@@ -1,4 +1,5 @@
 import datetime
+import time
 import urllib3
 import pytz
 import threading
@@ -68,6 +69,7 @@ class EvCharger:
         self.tesla = TeslaApi()
 
         self.surplus_checks = 0
+        self.surplus_check_start_time = 0
 
         logging.info("EvCharger (__init__): Init complete.")
 
@@ -174,6 +176,37 @@ class EvCharger:
     def manage_charging(self):
         # adjusting charge rate when charge is active with 3 checks over 60 seconds to try and filter out temporary
         # loss of pv surplus due to passing clouds, etc
+        current_time = time.time()
+
+        if self.surplus_amps < 2:
+            try:
+                if self.surplus_checks == 0:
+                    self.surplus_check_start_time = current_time
+                    self.surplus_checks += 1
+                    logging.info(
+                        f"EvCharger (charge mgmt): Insufficient solar energy of {self.surplus_amps} Amps. Check count is: {self.surplus_checks}")
+                # Second check, but ensuring it's within a 60-second window
+                elif self.surplus_checks == 1 and (current_time - self.surplus_check_start_time) <= 60:
+                    self.surplus_checks += 1
+                    logging.info(
+                        f"EvCharger (charge mgmt): Insufficient solar energy of {self.surplus_amps} Amps. Check count is: {self.surplus_checks}")
+                # Third check
+                elif self.surplus_checks == 2 and (current_time - self.surplus_check_start_time) <= 60:
+                    self.surplus_checks += 1
+                    logging.info(
+                        f"EvCharger (charge mgmt): Should stop charge. Insufficient solar energy of {self.surplus_amps} Amps. Check count is: {self.surplus_checks}")
+                    self.set_surplus_amps(self.surplus_amps)
+                    self.tesla.stop_tesla_charge()
+                    self.update_charging_amp_totals(0)
+                    self.surplus_checks = 0
+                # Reset if 60 seconds have passed since the first check
+                if (current_time - self.surplus_check_start_time) >= 60:
+                    self.surplus_checks = 0
+                return True
+            except Exception as E:
+                logging.error(f"Error in manage_charging: {E}", exc_info=True)
+                return False
+
         if self.surplus_amps < 2 and self.surplus_checks >= 3:
             try:
                 logging.info(f"EvCharger (charge mgmt): Should stop charge. Insufficient solar energy of "
