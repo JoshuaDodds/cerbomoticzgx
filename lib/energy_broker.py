@@ -190,7 +190,7 @@ def set_48h_charging_schedule(caller=None, price_cap=MAX_TIBBER_BUY_PRICE, silen
     pv_forecast = (STATE.get('pv_projected_remaining') / 1000) or 0.0  # convert Wh to kWh
     max_items = get_seasonally_adjusted_max_charge_slots(batt_soc, pv_forecast)
 
-    logging.info(f"EnergyBroker: set up daily charging schedule request received by {caller} using batt_soc={batt_soc} and pv_forecast={pv_forecast}")
+    logging.info(f"EnergyBroker: set up daily charging schedule request received by {caller} using batt_soc={batt_soc}% and pv_forecast={pv_forecast} kWh")
 
     if max_items < 1:
         return False
