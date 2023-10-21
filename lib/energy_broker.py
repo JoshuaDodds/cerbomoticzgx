@@ -187,10 +187,13 @@ def publish_mqtt_trigger():
 
 def set_48h_charging_schedule(caller=None, price_cap=MAX_TIBBER_BUY_PRICE, silent=True):
     batt_soc = STATE.get('batt_soc')
-    pv_forecast = round((STATE.get('pv_projected_remaining') / 1000), 2) or 0.0  # convert Wh to kWh
-    max_items = get_seasonally_adjusted_max_charge_slots(batt_soc, pv_forecast)
 
-    logging.info(f"EnergyBroker: set up daily charging schedule request received by {caller} using batt_soc={batt_soc}% and pv_forecast={pv_forecast} kWh")
+    # convert forecast from Wh to kWh and substract expected day usage
+    pv_forecast_min_consumption_forecast = round((STATE.get('pv_projected_remaining') / 1000 - 25), 2) or 0.0
+
+    max_items = get_seasonally_adjusted_max_charge_slots(batt_soc, pv_forecast_min_consumption_forecast)
+
+    logging.info(f"EnergyBroker: set up daily charging schedule request received by {caller} using batt_soc={batt_soc}% and expected solar surplus of {pv_forecast_min_consumption_forecast} kWh")
 
     if max_items < 1:
         return False
