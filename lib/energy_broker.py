@@ -38,7 +38,8 @@ def scheduler_loop():
     scheduler.every().hour.at(":30").do(retrieve_latest_tibber_pricing)
     # Grid Charging Scheduled Tasks
     scheduler.every().day.at("13:20").do(publish_mqtt_trigger)                                                # when next day prices are published each day
-    scheduler.every().hour.at(":00").do(set_48h_charging_schedule, caller="scheduler_loop()", silent=True)    # refine the schedule hourly as solar forecast data is refined and/or changes
+    scheduler.every().day.at("13:45").do(set_48h_charging_schedule, caller="scheduler_loop()", silent=True)
+    scheduler.every().day.at("01:45").do(set_48h_charging_schedule, caller="scheduler_loop()", silent=True)
 
     for job in scheduler.get_jobs():
         logging.info(f"EnergyBroker: job: {job}")
@@ -189,7 +190,8 @@ def set_48h_charging_schedule(caller=None, price_cap=MAX_TIBBER_BUY_PRICE, silen
     batt_soc = STATE.get('batt_soc')
 
     # convert forecast from Wh to kWh and substract expected day usage
-    pv_forecast_min_consumption_forecast = round((STATE.get('pv_projected_remaining') / 1000 - 25), 2) or 0.0
+    pv_precalc = round((STATE.get('pv_projected_remaining') / 1000 - 21), 2) or 0.0
+    pv_forecast_min_consumption_forecast = pv_precalc if pv_precalc > 0 else 0.0
 
     max_items = get_seasonally_adjusted_max_charge_slots(batt_soc, pv_forecast_min_consumption_forecast)
 
