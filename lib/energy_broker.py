@@ -39,7 +39,7 @@ def scheduler_loop():
     # Grid Charging Scheduled Tasks
     scheduler.every().day.at("13:20").do(publish_mqtt_trigger)                                                # when next day prices are published each day
     scheduler.every().day.at("13:45").do(set_48h_charging_schedule, caller="scheduler_loop()", silent=True)
-    scheduler.every().day.at("01:45").do(set_48h_charging_schedule, caller="scheduler_loop()", silent=True)
+    scheduler.every().day.at("08:45").do(set_48h_charging_schedule, caller="scheduler_loop()", silent=True)
 
     for job in scheduler.get_jobs():
         logging.info(f"EnergyBroker: job: {job}")
