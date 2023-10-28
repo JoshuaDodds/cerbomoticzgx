@@ -254,5 +254,32 @@ def lowest_48h_prices(price_cap=0.22, max_items=4):
 
     return relevant_data[0:max_items]
 
+def lowest_24h_prices(price_cap=0.22, max_items=4):
+    """
+    Returns a list of the lowest 4 price data sets in the coming 24 hours
+
+    :return: list: day, hour, level, price
+    """
+    _account = tibber.Account(dotenv_config('TIBBER_ACCESS_TOKEN'))
+    home = _account.homes[0]
+
+    full_list = home.current_subscription.price_info.today
+
+    _sorted_by_price = sorted(full_list, key=lambda hour: hour.total, reverse=False)
+
+    relevant_data = []
+    for item in _sorted_by_price:
+        _day = 0 if parser.parse(item.starts_at, tzinfos=tzinfos).day == parser.parse(item.starts_at, tzinfos=tzinfos).today().day else 1
+        _hour = parser.parse(item.starts_at, tzinfos=tzinfos).hour
+        _level = item.level
+        _price = item.total
+
+        if parser.parse(item.starts_at, tzinfos=tzinfos) >= datetime.now(timezone.utc):
+            if _price <= price_cap:
+                logging.debug(f"Day: {_day} Hour: {_hour} Level: {_level} Price: {_price}")
+                relevant_data.append([_day, _hour, _level, _price])
+
+    return relevant_data[0:max_items]
+
 def current_price_level(home):
     return home.current_subscription.price_info.current.level

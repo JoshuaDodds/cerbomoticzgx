@@ -6,7 +6,7 @@ import paho.mqtt.publish as publish
 
 from lib.constants import logging, cerboGxEndpoint, systemId0, PythonToVictronWeekdayNumberConversion, dotenv_config
 from lib.helpers import get_seasonally_adjusted_max_charge_slots, calculate_max_discharge_slots_needed, publish_message
-from lib.tibber_api import lowest_48h_prices
+from lib.tibber_api import lowest_48h_prices, lowest_24h_prices
 from lib.notifications import pushover_notification
 from lib.tibber_api import publish_pricing_data
 from lib.global_state import GlobalStateClient
@@ -38,8 +38,9 @@ def scheduler_loop():
     scheduler.every().hour.at(":30").do(retrieve_latest_tibber_pricing)
     # Grid Charging Scheduled Tasks
     scheduler.every().day.at("13:20").do(publish_mqtt_trigger)                                                # when next day prices are published each day
-    scheduler.every().day.at("13:45").do(set_48h_charging_schedule, caller="scheduler_loop()", silent=True)
-    scheduler.every().day.at("08:45").do(set_48h_charging_schedule, caller="scheduler_loop()", silent=True)
+    scheduler.every().day.at("13:45").do(set_charging_schedule, caller="scheduler_loop()", silent=True)
+    scheduler.every().day.at("08:45").do(set_charging_schedule, caller="scheduler_loop()", silent=True)
+    scheduler.every().day.at("00:15").do(set_charging_schedule, caller="scheduler_loop()", silent=True)
 
     for job in scheduler.get_jobs():
         logging.info(f"EnergyBroker: job: {job}")
@@ -185,6 +186,45 @@ def publish_mqtt_trigger():
     """ Triggers the event_handler to call set_48h_charging_scheudle() function"""
     publish.single("Cerbomoticzgx/EnergyBroker/RunTrigger", payload=f"{{\"value\": {time.localtime().tm_hour}}}", qos=0, retain=False,
                    hostname=cerboGxEndpoint)
+
+
+def set_charging_schedule(caller=None, silent=True):
+    batt_soc = STATE.get('batt_soc')
+
+    if 70 <= batt_soc <= 100:
+        set_48h_charging_schedule(caller=caller, silent=silent)
+    else:
+        set_24h_charging_schedule(caller=caller, silent=silent)
+
+
+def set_24h_charging_schedule(caller=None, price_cap=MAX_TIBBER_BUY_PRICE, silent=True):
+    batt_soc = STATE.get('batt_soc')
+
+    # convert forecast from Wh to kWh and substract expected day usage
+    pv_precalc = round((STATE.get('pv_projected_remaining') / 1000 - 21), 2) or 0.0
+    pv_forecast_min_consumption_forecast = pv_precalc if pv_precalc > 0 else 0.0
+
+    max_items = get_seasonally_adjusted_max_charge_slots(batt_soc, pv_forecast_min_consumption_forecast)
+
+    logging.info(f"EnergyBroker: set up daily charging schedule request received by {caller} using batt_soc={batt_soc}% and expected solar surplus of {pv_forecast_min_consumption_forecast} kWh")
+
+    if max_items < 1:
+        return False
+
+    clear_victron_schedules()
+    new_schedule = lowest_24h_prices(price_cap=price_cap, max_items=max_items)
+
+    if len(new_schedule) > 0:
+        schedule = 0
+        for item in new_schedule:
+            hour = int(item[1])
+            day = item[0]
+            price = item[3]
+            schedule_victron_ess_charging(int(hour), schedule=schedule, day=day)
+            if not silent:
+                push_notification(hour, day, price)
+            schedule += 1
+
 
 def set_48h_charging_schedule(caller=None, price_cap=MAX_TIBBER_BUY_PRICE, silent=True):
     batt_soc = STATE.get('batt_soc')
