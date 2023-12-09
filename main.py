@@ -6,7 +6,7 @@ import asyncio
 from lib.constants import logging, dotenv_config
 from lib.mqtt_client import mqtt_start, mqtt_stop
 from lib.ev_charge_controller import EvCharger
-from lib.energy_broker import main as energybroker, get_todays_n_highest_prices
+from lib.energy_broker import main as energybroker, get_todays_n_highest_prices, set_charging_schedule
 from lib.victron_integration import restore_default_battery_max_voltage
 from lib.tibber_api import live_measurements, publish_pricing_data
 from lib.helpers import publish_message, retrieve_message
@@ -130,6 +130,9 @@ def post_startup():
     manage_sale_of_stored_energy_to_the_grid()
     manage_grid_usage_based_on_current_price()
     get_victron_solar_forecast()
+
+    # re-run the charging scheduler based on current info and pricing
+    set_charging_schedule("main.post_startup()")
 
     logging.info(f"post_startup() actions complete.")
 
