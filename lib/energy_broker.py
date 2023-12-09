@@ -191,10 +191,12 @@ def publish_mqtt_trigger():
 def set_charging_schedule(caller=None, silent=True):
     batt_soc = STATE.get('batt_soc')
 
-    if 90 <= batt_soc <= 100:  # batt soc is 75 or more
-        set_48h_charging_schedule(caller=caller, silent=silent)
-    else:
-        set_24h_charging_schedule(caller=caller, silent=silent)
+    set_48h_charging_schedule(caller=caller, silent=silent)
+
+    # if 75 <= batt_soc <= 100:  # batt soc is 75 or more
+    #     set_48h_charging_schedule(caller=caller, silent=silent)
+    # else:
+    #     set_24h_charging_schedule(caller=caller, silent=silent)
 
 
 def set_24h_charging_schedule(caller=None, price_cap=MAX_TIBBER_BUY_PRICE, silent=True):

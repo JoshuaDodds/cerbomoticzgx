@@ -97,6 +97,7 @@ def post_startup():
     STATE.set('tibber_price_now', 0.10)
 
     # Re-apply previously set Dynamic ESS preferences set in the previous run
+    logging.info(f"post_startup(): Re-storing previous state if available...")
     AC_POWER_SETPOINT = retrieve_message('ac_power_setpoint') or '0.0'
     DYNAMIC_ESS_BATT_MIN_SOC = retrieve_message('ess_net_metering_batt_min_soc') or dotenv_config('DYNAMIC_ESS_BATT_MIN_SOC')
     DYNAMIC_ESS_NET_METERING_ENABLED = retrieve_message('ess_net_metering_enabled') or dotenv_config('DYNAMIC_ESS_NET_METERING_ENABLED')
@@ -120,18 +121,22 @@ def post_startup():
     STATE.set('ess_net_metering_overridden', ESS_NET_METERING_OVERRIDDEN)
 
     # clear the energy sale scheduling status message
+    logging.info(f"post_startup(): Retrieving latest pricing data...")
     get_todays_n_highest_prices(0, 100)
 
     # update tibber pricing info
+    logging.info(f"post_startup(): Publishing latest pricing data to data bus...")
     publish_pricing_data(__name__)
 
     # Make sure we apply energy broker logic post startup to recover if the service restarts while in a
     # managed state.
+    logging.info(f"post_startup(): Re-applying Energy Broker state and logic if needed...")
     manage_sale_of_stored_energy_to_the_grid()
     manage_grid_usage_based_on_current_price()
     get_victron_solar_forecast()
 
     # re-run the charging scheduler based on current info and pricing
+    logging.info(f"post_startup(): Updating the charging schedule based on currently available data...")
     set_charging_schedule("main.post_startup()")
 
     logging.info(f"post_startup() actions complete.")
