@@ -37,10 +37,10 @@ def scheduler_loop():
     scheduler.every().hour.at(":00").do(retrieve_latest_tibber_pricing)
     scheduler.every().hour.at(":30").do(retrieve_latest_tibber_pricing)
     # Grid Charging Scheduled Tasks
-    scheduler.every().day.at("13:20").do(publish_mqtt_trigger)                                                # when next day prices are published each day
-    scheduler.every().day.at("13:45").do(set_charging_schedule, caller="scheduler_loop()", silent=True)
-    scheduler.every().day.at("08:45").do(set_charging_schedule, caller="scheduler_loop()", silent=True)
-    scheduler.every().day.at("00:15").do(set_charging_schedule, caller="scheduler_loop()", silent=True)
+    scheduler.every().day.at("13:10").do(publish_mqtt_trigger)                                                # when next day prices are published each day
+    scheduler.every().day.at("13:30").do(set_charging_schedule, caller="scheduler_loop()", silent=True)
+    scheduler.every().day.at("09:30").do(set_charging_schedule, caller="scheduler_loop()", silent=True)
+    scheduler.every().day.at("00:10").do(set_charging_schedule, caller="scheduler_loop()", silent=True)
 
     for job in scheduler.get_jobs():
         logging.info(f"EnergyBroker: job: {job}")
@@ -191,7 +191,7 @@ def publish_mqtt_trigger():
 def set_charging_schedule(caller=None, silent=True):
     batt_soc = STATE.get('batt_soc')
 
-    if 70 <= batt_soc <= 100:
+    if 90 <= batt_soc <= 100:  # batt soc is 75 or more
         set_48h_charging_schedule(caller=caller, silent=silent)
     else:
         set_24h_charging_schedule(caller=caller, silent=silent)
