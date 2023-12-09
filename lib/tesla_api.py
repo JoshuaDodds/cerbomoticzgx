@@ -239,15 +239,23 @@ class TeslaApi:
         long = round(float(dotenv_config('HOME_ADDRESS_LONG')), 3)
 
         try:
-            if round(self.get_vehicle_data()['drive_state']['latitude'], 3) == lat and \
-               round(self.get_vehicle_data()['drive_state']['longitude'], 3) == long:
-                self.is_home = True
-                self.update_mqtt_and_domoticz()
+            vehicle_data = self.get_vehicle_data()['drive_state']
+            if 'latitude' in vehicle_data and 'longitude' in vehicle_data:
+                if round(vehicle_data['latitude'], 3) == lat and round(vehicle_data['longitude'], 3) == long:
+                    self.is_home = True
+                else:
+                    self.is_home = False
             else:
-                self.is_home = False
-                self.update_mqtt_and_domoticz()
+                logging.info("TeslaApi: latitude or longitude data is missing.")
+                self.is_home = None
+
+            self.update_mqtt_and_domoticz()
+
         except requests.exceptions.InvalidSchema:
-            logging.info(f"TeslaApi: vehicle location could not be determined.")
+            logging.info("TeslaApi: vehicle location could not be determined.")
+            self.is_home = None
+        except KeyError:
+            logging.info("TeslaApi: KeyError in accessing vehicle data.")
             self.is_home = None
 
         return self.is_home
