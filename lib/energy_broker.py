@@ -31,6 +31,12 @@ def main():
     logging.info("EnergyBroker: Started.")
 
 def scheduler_loop():
+    """
+    Schedules and runs tasks using the scheduler
+
+    Returns:
+    None
+    """
     # Scheduled Tasks
     scheduler.every(5).minutes.do(get_victron_solar_forecast)
     scheduler.every().hour.at(":00").do(manage_sale_of_stored_energy_to_the_grid)
@@ -189,7 +195,7 @@ def publish_mqtt_trigger():
 
 
 def set_charging_schedule(caller=None, silent=True):
-    batt_soc = STATE.get('batt_soc')
+    batt_soc = STATE.get('batt_soc') # noqa
 
     set_48h_charging_schedule(caller=caller, silent=silent)
 

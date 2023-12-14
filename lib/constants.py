@@ -194,6 +194,22 @@ PythonToVictronWeekdayNumberConversion = dict({
 })
 
 def retrieve_mqtt_subcribed_topics(sysid=None):
+    """
+    Retrieve the MQTT subscribed topics for a given system ID.
+
+    Parameters:
+        sysid (str): The system ID for which to retrieve subscribed topics. If None, the default value is "system0".
+
+    Yields:
+        str: The MQTT subscribed topics for the given system ID.
+
+    Example:
+        >>> topics = retrieve_mqtt_subcribed_topics(sysid="system1")
+        >>> for topic in topics:
+        ...     print(topic)
+        "topic1"
+        "topic2"
+    """
     if not sysid:
         sysid = "system0"
 
