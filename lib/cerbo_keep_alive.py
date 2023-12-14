@@ -5,6 +5,11 @@ from lib.constants import logging, systemId0, cerboGxEndpoint
 
 
 def keep_cerbo_alive():
+    """
+    Method to keep CerboGX alive by publishing a keep-alive message to the Mosquitto broker.
+
+    :return: None
+    """
     try:
         t = threading.Timer(30.0, keep_cerbo_alive)
         t.daemon = True
