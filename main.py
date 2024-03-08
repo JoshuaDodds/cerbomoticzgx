@@ -106,6 +106,7 @@ def post_startup():
     TESLA_CHARGE_REQUESTED = retrieve_message('tesla_charge_requested') or False
 
     STATE.set('ac_power_setpoint', AC_POWER_SETPOINT)
+    publish_message(topic='Tesla/settings/grid_charging_enabled', message=GRID_CHARGING_ENABLED, retain=True)
     STATE.set('grid_charging_enabled', str(GRID_CHARGING_ENABLED))
 
     publish_message(topic='Tesla/vehicle0/control/charge_requested', message=TESLA_CHARGE_REQUESTED, retain=True)
