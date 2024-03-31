@@ -13,7 +13,7 @@ http = urllib3.PoolManager()
 
 
 def on_connect(_client, _userdata, _flags, _rc):
-    logging.info(f"MQTT Client Re-Connect...")
+    logging.debug(f"MQTT Client Re-Connect...")
 
     for topic in retrieve_mqtt_subcribed_topics():
         if client.subscribe(topic):
