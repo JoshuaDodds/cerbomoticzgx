@@ -13,11 +13,11 @@ http = urllib3.PoolManager()
 
 
 def on_connect(_client, _userdata, _flags, _rc):
-    logging.debug(f"MQTT Client Re-Connect...")
+    logging.info(f"MQTT Client Re-Connect...")
 
     for topic in retrieve_mqtt_subcribed_topics():
         if client.subscribe(topic):
-            logging.debug(f"MQTT Client Subscribed to: {topic}")
+            logging.info(f"MQTT Client Subscribed to: {topic}")
 
     if keep_cerbo_alive():
         logging.info(f"MQTT Client Keep Alive thread started.")
@@ -25,9 +25,9 @@ def on_connect(_client, _userdata, _flags, _rc):
 
 def on_disconnect(_client, _userdata, _rc):
     if _rc == 0:
-        logging.debug("MQTT Client disconnected gracefully.")
+        logging.info("MQTT Client disconnected gracefully.")
     else:
-        logging.debug(f"MQTT Client disconnected unexpectedly. Return code: {_rc}, Reason: {mqtt.connack_string(_rc)}")
+        logging.info(f"MQTT Client disconnected unexpectedly. Return code: {_rc}, Reason: {mqtt.connack_string(_rc)}")
 
 
 def on_message(_client, _userdata, msg):

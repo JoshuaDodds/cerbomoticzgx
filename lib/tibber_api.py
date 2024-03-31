@@ -2,13 +2,13 @@ import tibber
 import time
 import json
 
-import paho.mqtt.subscribe as subscribe
 from paho.mqtt import publish
 
 from datetime import datetime, timezone, timedelta
 from dateutil import parser, tz
 
 from lib.constants import logging, cerboGxEndpoint, dotenv_config, systemId0
+from lib.helpers import get_current_value_from_mqtt
 from lib.domoticz_updater import domoticz_update
 from lib.notifications import pushover_notification
 
@@ -57,14 +57,18 @@ def live_measurements(home=_home or None):
             logging.info(f"tibber_api: Error encountered during live measurement data callback method log_accumulated(). Error: {e}")
 
     def last_data_is_stale(data): # noqa
-        msg = subscribe.simple("Tibber/home/energy/day/last_update", qos=0, msg_count=1, hostname=cerboGxEndpoint, port=1883)
-        payload = json.loads(msg.payload.decode("utf-8"))['value']
-        last_update = datetime.strptime(payload, "%Y-%m-%d %H:%M:%S")
-        if datetime.now() - last_update > timedelta(minutes=5):
-            pushover_notification(f"Tibber Live Alert", "No data received in more than 5 minutes.")
-            return True
-        else:
-            return False
+        msg = get_current_value_from_mqtt("Tibber/home/energy/day/last_update")
+
+        if msg is not None:
+            payload = json.loads(msg.payload.decode("utf-8"))['value']
+            last_update = datetime.strptime(payload, "%Y-%m-%d %H:%M:%S")
+            if datetime.now() - last_update > timedelta(minutes=5):
+                pushover_notification(f"Tibber Live Alert", "No data received in more than 5 minutes.")
+                return True
+            else:
+                return False
+
+        return False
 
     # Start the live feed. This runs forever.
     logging.info(f"Tibber: Live measurements starting...")
