@@ -18,6 +18,7 @@ from lib.energy_broker import (
     set_charging_schedule,
     manage_sale_of_stored_energy_to_the_grid,
     manage_grid_usage_based_on_current_price,
+    retrieve_latest_tibber_pricing,
 )
 
 
@@ -41,9 +42,6 @@ def sync_tasks_start():
             if service:
                 logging.info(f"Starting {module}")
                 exec(f"{module}()")
-
-        # Start the general scheduled tasks
-        TaskScheduler()
 
     except Exception as E:
         logging.error(f"sync_tasks_start (error): {E}")
@@ -131,9 +129,11 @@ def post_startup():
     logging.info(f"post_startup(): Retrieving latest pricing data...")
     get_todays_n_highest_prices(0, 100)
 
-    # update tibber pricing info
-    logging.info(f"post_startup(): Publishing latest pricing data to data bus...")
+    # update tibber pricing info and solar forecast
+    logging.info(f"post_startup(): Publishing latest pricing and solar forecast data to data bus...")
     publish_pricing_data(__name__)
+    get_victron_solar_forecast()
+    retrieve_latest_tibber_pricing()
 
     # Make sure we apply energy broker logic post startup to recover if the service restarts while in a
     # managed state.
@@ -141,11 +141,13 @@ def post_startup():
         logging.info(f"post_startup(): Re-applying Energy Broker state and logic if set...")
         manage_sale_of_stored_energy_to_the_grid()
         manage_grid_usage_based_on_current_price()
-        get_victron_solar_forecast()
 
         # re-run the charging scheduler based on current info and pricing
         logging.info(f"post_startup(): Updating the charging schedule based on currently available data...")
         set_charging_schedule("main.post_startup()")
+
+    # Start the general scheduled tasks
+    TaskScheduler()
 
     logging.info(f"post_startup() actions complete.")
 
