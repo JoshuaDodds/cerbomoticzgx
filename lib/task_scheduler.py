@@ -23,8 +23,7 @@ def TaskScheduler():
 def scheduler_loop():
     # Scheduled Tasks
     scheduler.every(5).minutes.do(get_victron_solar_forecast)
-    scheduler.every().hour.at(":00").do(retrieve_latest_tibber_pricing)
-    scheduler.every().hour.at(":30").do(retrieve_latest_tibber_pricing)
+    scheduler.every(5).minutes.do(retrieve_latest_tibber_pricing)
 
     for job in scheduler.get_jobs():
         logging.info(f"TaskScheduler: job: {job}")
