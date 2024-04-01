@@ -6,13 +6,16 @@ import asyncio
 from lib.constants import logging, dotenv_config
 from lib.mqtt_client import mqtt_start, mqtt_stop
 from lib.ev_charge_controller import EvCharger
-from lib.energy_broker import main as energybroker, get_todays_n_highest_prices, set_charging_schedule
+from lib.task_scheduler import TaskScheduler
 from lib.victron_integration import restore_default_battery_max_voltage
 from lib.tibber_api import live_measurements, publish_pricing_data
 from lib.helpers import publish_message, retrieve_message
 from lib.global_state import GlobalStateDatabase, GlobalStateClient
 from lib.solar_forecasting import get_victron_solar_forecast
 from lib.energy_broker import (
+    main as energybroker,
+    get_todays_n_highest_prices,
+    set_charging_schedule,
     manage_sale_of_stored_energy_to_the_grid,
     manage_grid_usage_based_on_current_price,
 )
@@ -38,6 +41,9 @@ def sync_tasks_start():
             if service:
                 logging.info(f"Starting {module}")
                 exec(f"{module}()")
+
+        # Start the general scheduled tasks
+        TaskScheduler()
 
     except Exception as E:
         logging.error(f"sync_tasks_start (error): {E}")

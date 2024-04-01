@@ -31,11 +31,9 @@ def main():
     logging.info("EnergyBroker: Started.")
 
 def scheduler_loop():
-    # Scheduled Tasks
-    scheduler.every(5).minutes.do(get_victron_solar_forecast)
+    # ESS Scheduled Tasks
     scheduler.every().hour.at(":00").do(manage_sale_of_stored_energy_to_the_grid)
-    scheduler.every().hour.at(":00").do(retrieve_latest_tibber_pricing)
-    scheduler.every().hour.at(":30").do(retrieve_latest_tibber_pricing)
+
     # Grid Charging Scheduled Tasks
     scheduler.every().day.at("13:10").do(publish_mqtt_trigger)                                                # when next day prices are published each day
     scheduler.every().day.at("13:30").do(set_charging_schedule, caller="scheduler_loop()", silent=True)
