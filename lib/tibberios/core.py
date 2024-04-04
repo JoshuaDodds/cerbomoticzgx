@@ -1,3 +1,4 @@
+import logging
 from dataclasses import dataclass
 from collections import Counter
 
@@ -118,7 +119,7 @@ class TibberConnector:
 
             await home.update_price_info()
             self.current_prices = home.price_total
-        print(
+        logging.debug(
             f"Tibber Graph Generator: Got {len(self.history)} past records and {len(self.current_prices)} records of current prices with resolution: {resolution}"
         )
         self.price_data = PriceData(

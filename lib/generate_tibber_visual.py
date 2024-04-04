@@ -2,7 +2,7 @@ import boto3
 
 from lib.tibberios.core import Database, TibberConnector
 from lib.tibberios.visualization import GenerateViz
-from lib.constants import dotenv_config
+from lib.constants import dotenv_config, logging
 
 
 async def main():
@@ -29,7 +29,7 @@ async def main():
 
     gv = GenerateViz(db)
 
-    print(f"Tibber Graph Generator: Generating visualization...")
+    logging.info(f"Tibber Graph Generator: Generating visualization...")
     gv.create_visualization(filepath="prices.png", comparison_kwh=13, decimals=2)
 
     db.close()
@@ -38,13 +38,13 @@ async def main():
     s3 = boto3.client('s3', aws_access_key_id=dotenv_config("AWS_ACCESS_KEY"),
                       aws_secret_access_key=dotenv_config("AWS_SECRET_KEY"))
 
-    print(f"Tibber Graph Generator: Uploading to s3 bucket and setting ACL...")
+    logging.debug(f"Tibber Graph Generator: Uploading to s3 bucket and setting ACL...")
 
     with open("prices.png", "rb") as file:
         s3.upload_fileobj(file, "tibber-graphs", "prices.png",
                           ExtraArgs={'ContentType': "image/png", 'ACL': 'public-read'})
 
-    print(f"Tibber Graph Generator:  Finished. Sleeping 1h...")
+    logging.debug(f"Tibber Graph Generator:  Finished. Sleeping 1h...")
 
 def run():
     from asyncio import run as async_run

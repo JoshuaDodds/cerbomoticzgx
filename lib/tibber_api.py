@@ -97,7 +97,7 @@ def publish_pricing_data(caller):
         # c.close()
         # del home, _account
 
-        logging.info(f"Tibber: (called from {caller}): retrieved and published Tibber pricing data to mqtt bus.")
+        logging.debug(f"Tibber: (called from {caller}): retrieved and published Tibber pricing data to mqtt bus.")
 
     except Exception as e:
         logging.error(f"Tibber: (publish_pricing_data) (Error): {e}")
