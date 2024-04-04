@@ -1,68 +1,75 @@
 import json
 import time
+import paho.mqtt.client as mqtt
+
 from datetime import datetime
 from math import floor, ceil
 
-import paho.mqtt.publish as publish
-import paho.mqtt.client as mqtt
-
 from lib.helpers.base7_math import *
-from lib.constants import Topics, cerboGxEndpoint, logging
+from lib.constants import Topics, logging, cerboGxEndpoint
 
 
-def publish_message(topic, message, retain=False) -> None:
+def publish_message(topic, message=None, qos=0, retain=False, payload=None) -> None:
     """
     publishes a single message to a given topic on the MQtt broker
     """
-    publish.single(topic=topic, payload=f"{{\"value\": \"{message}\"}}", qos=0, retain=retain, hostname=cerboGxEndpoint,
-                   port=1883)
+    try:
+        from lib.clients.mqtt_client_factory import VictronClient
+        client = VictronClient().get_client()
 
-    # todo: remove below debug logging
-    if topic == "True" or topic == "False":
-        logging.info(f"{__name__} sent topic: {topic} with message payload of: {message}")
+        if payload is None:
+            client.publish(topic=topic, payload=f"{{\"value\": \"{message}\"}}", qos=qos, retain=retain)
+        else:
+            client.publish(topic=topic, payload=payload, qos=qos, retain=retain)
 
-
-def on_message(client, userdata, message):  # noqa
-    userdata.append(json.loads(message.payload.decode("utf-8"))['value'])
+    except Exception as e:
+        logging.info(f"{e}", exc_info=True)
 
 
 def get_current_value_from_mqtt(topic: str, timeout: float = 1.0, raw: bool = False) -> any:
     """
-    Retrieves a single message from a given topic on the MQTT broker.
+    Retrieves a single message from a given topic on the MQTT broker using a separate connection.
     If raw is True, it retrieves the raw message.
     """
-    try:
-        # Create a new MQTT client
-        client = mqtt.Client()
+    messages = []
+    completed = False
 
-        # Set up the on_message callback
-        messages = []
+    def on_connect(client, _userdata, _flags, _rc):
+        """Subscribe to the topic upon connecting."""
+        client.subscribe(topic)
+
+    def on_message(client, _userdata, msg):
+        """Handle incoming messages."""
         if raw:
-            client.on_message = lambda client, userdata, message: userdata.append(message)  # noqa
+            messages.append(msg.payload)
         else:
-            client.on_message = lambda client, userdata, message: on_message(client, messages, message)  # noqa
+            try:
+                payload = json.loads(msg.payload.decode("utf-8"))
+                messages.append(payload.get('value'))
+            except json.JSONDecodeError:
+                pass
+        client.disconnect()  # Disconnect after receiving the first message
+        nonlocal completed
+        completed = True
 
-        # Connect to the MQTT broker and subscribe to the topic
-        client.connect(cerboGxEndpoint, port=1883)
-        client.subscribe(Topics['system0'][topic], qos=0)
+    # Initialize a new temporary MQTT client
+    temp_client = mqtt.Client()
+    temp_client.on_connect = on_connect
+    temp_client.on_message = on_message
 
-        # Start the client loop in a non-blocking way
-        client.loop_start()
+    # Connect to the broker
+    temp_client.connect(cerboGxEndpoint, 1883, 60)
+    temp_client.loop_start()
 
-        # Wait for up to `timeout` seconds for a message to arrive
-        start_time = time.time()
-        while time.time() - start_time < timeout and not messages:
-            time.sleep(0.1)  # Don't busy-wait; sleep for a short time
+    # Wait for the message to arrive or for the timeout
+    start_time = time.time()
+    while time.time() - start_time < timeout and not completed:
+        time.sleep(0.1)  # Short sleep to avoid busy waiting
 
-        # Stop the client loop and disconnect from the broker
-        client.loop_stop()
-        client.disconnect()
+    temp_client.loop_stop()
+    temp_client.disconnect()
 
-        # Return the first message received, or None if no message was received
-        return messages[0] if messages else None
-
-    except KeyError as e: # noqa
-        return None
+    return messages[0] if messages else None
 
 
 def get_topic_key(topic, system_id="system0") -> str:

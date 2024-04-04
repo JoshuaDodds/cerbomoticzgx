@@ -3,11 +3,11 @@ import time
 import urllib3
 import pytz
 import threading
-import paho.mqtt.publish as publish
 
-from lib.constants import logging, cerboGxEndpoint, dotenv_config
+from lib.constants import logging, dotenv_config
 from lib.tesla_api import TeslaApi
 from lib.global_state import GlobalStateClient
+from lib.helpers import publish_message
 
 
 PROPERTY_MAPPING = {
@@ -263,29 +263,29 @@ class EvCharger:
         else:
             logging.debug(f"EvCharger (dynamic load adjustment): No load adjustment is required. Current reservation is {self.load_reservation} Watts")
 
-        publish.single("Tesla/vehicle0/solar/load_reservation", payload=f"{{\"value\": \"{self.load_reservation}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tesla/vehicle0/solar/load_reservation_is_reduced", payload=f"{{\"value\": \"{self.load_reservation_is_reduced}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+        publish_message("Tesla/vehicle0/solar/load_reservation", payload=f"{{\"value\": \"{self.load_reservation}\"}}", qos=0, retain=True)
+        publish_message("Tesla/vehicle0/solar/load_reservation_is_reduced", payload=f"{{\"value\": \"{self.load_reservation_is_reduced}\"}}", qos=0, retain=True)
 
     def set_surplus_amps(self, surplus_amps):
         self.global_state.set("surplus_amps", surplus_amps)
-        publish.single("Tesla/vehicle0/solar/surplus_amps", payload=f"{{\"value\": \"{surplus_amps}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+        publish_message("Tesla/vehicle0/solar/surplus_amps", payload=f"{{\"value\": \"{surplus_amps}\"}}", qos=0, retain=True)
 
         if surplus_amps > 0:
-            publish.single("Tesla/vehicle0/solar/insufficient_surplus", payload=f"{{\"value\": \"False\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+            publish_message("Tesla/vehicle0/solar/insufficient_surplus", payload=f"{{\"value\": \"False\"}}", qos=0, retain=True)
         else:
-            publish.single("Tesla/vehicle0/solar/insufficient_surplus", payload=f"{{\"value\": \"True\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+            publish_message("Tesla/vehicle0/solar/insufficient_surplus", payload=f"{{\"value\": \"True\"}}", qos=0, retain=True)
 
     def set_surplus_watts(self, surplus_watts):
         self.global_state.set("surplus_watts", round(surplus_watts, 2))
-        publish.single("Tesla/vehicle0/solar/surplus_watts", payload=f"{{\"value\": \"{surplus_watts}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tesla/vehicle0/solar/load_reservation", payload=f"{{\"value\": \"{self.load_reservation}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+        publish_message("Tesla/vehicle0/solar/surplus_watts", payload=f"{{\"value\": \"{surplus_watts}\"}}", qos=0, retain=True)
+        publish_message("Tesla/vehicle0/solar/load_reservation", payload=f"{{\"value\": \"{self.load_reservation}\"}}", qos=0, retain=True)
 
     def update_charging_amp_totals(self, charging_amp_totals=None):
         if not charging_amp_totals:
             charging_amp_totals = (self.l1_charging_amps + self.l2_charging_amps + self.l3_charging_amps) / 3
 
         self.global_state.set("tesla_charging_amps_total", round(charging_amp_totals, 2))
-        publish.single("Tesla/vehicle0/charging_amps", payload=f"{{\"value\": \"{self.charging_amps}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+        publish_message("Tesla/vehicle0/charging_amps", payload=f"{{\"value\": \"{self.charging_amps}\"}}", qos=0, retain=True)
 
     @staticmethod
     def is_the_sun_shining():
@@ -306,6 +306,6 @@ class EvCharger:
     def cleanup():
         logging.info("EvCharger: Topic Housecleaning before exit...")
         # clear out topics which toggle on functionality only this module uses
-        publish.single("Tesla/vehicle0/Ac/ac_loads", payload=None, qos=0, retain=False, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tesla/vehicle0/Ac/ac_in", payload=None, qos=0, retain=False, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tesla/vehicle0/Ac/tesla_load", payload=None, qos=0, retain=False, hostname=cerboGxEndpoint, port=1883)
+        publish_message("Tesla/vehicle0/Ac/ac_loads", payload=None, qos=0, retain=False)
+        publish_message("Tesla/vehicle0/Ac/ac_in", payload=None, qos=0, retain=False)
+        publish_message("Tesla/vehicle0/Ac/tesla_load", payload=None, qos=0, retain=False)
