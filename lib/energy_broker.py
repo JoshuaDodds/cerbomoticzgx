@@ -1,18 +1,13 @@
 import time
-import threading
 import schedule as scheduler
 
-import paho.mqtt.publish as publish
-
-from lib.constants import logging, cerboGxEndpoint, systemId0, PythonToVictronWeekdayNumberConversion, dotenv_config
+from lib.constants import logging, systemId0, PythonToVictronWeekdayNumberConversion, dotenv_config
 from lib.helpers import get_seasonally_adjusted_max_charge_slots, calculate_max_discharge_slots_needed, publish_message
 from lib.tibber_api import lowest_48h_prices, lowest_24h_prices
 from lib.notifications import pushover_notification
 from lib.tibber_api import publish_pricing_data
 from lib.global_state import GlobalStateClient
 from lib.victron_integration import ac_power_setpoint
-from lib.solar_forecasting import get_victron_solar_forecast
-
 
 MAX_TIBBER_BUY_PRICE = float(dotenv_config('MAX_TIBBER_BUY_PRICE')) or 0.20
 SWITCH_TO_GRID_PRICE_THRESHOLD = float(dotenv_config('SWITCH_TO_GRID_PRICE_THRESHOLD')) or 0.0001
@@ -20,15 +15,27 @@ ESS_EXPORT_AC_SETPOINT = float(dotenv_config('ESS_EXPORT_AC_SETPOINT')) or -1000
 
 STATE = GlobalStateClient()
 
-
 def main():
     logging.info("EnergyBroker: Initializing...")
 
-    main_thread = threading.Thread(target=scheduler_loop)
-    main_thread.daemon = True
-    main_thread.start()
+    # main_thread = threading.Thread(target=scheduler_loop)
+    # main_thread.daemon = True
+    # main_thread.start()
 
-    logging.info("EnergyBroker: Started.")
+    schedule_tasks()
+    logging.info("EnergyBroker: Initialization complete.")
+
+
+def schedule_tasks():
+    # ESS Scheduled Tasks
+    scheduler.every().hour.at(":00").do(manage_sale_of_stored_energy_to_the_grid)
+
+    # Grid Charging Scheduled Tasks
+    scheduler.every().day.at("13:10").do(publish_mqtt_trigger)                                                # when next day prices are published each day
+    scheduler.every().day.at("13:30").do(set_charging_schedule, caller="TaskScheduler()", silent=True)
+    scheduler.every().day.at("09:30").do(set_charging_schedule, caller="TaskScheduler()", silent=True)
+    scheduler.every().day.at("00:10").do(set_charging_schedule, caller="TaskScheduler()", silent=True)
+
 
 def scheduler_loop():
     # ESS Scheduled Tasks
@@ -36,16 +43,17 @@ def scheduler_loop():
 
     # Grid Charging Scheduled Tasks
     scheduler.every().day.at("13:10").do(publish_mqtt_trigger)                                                # when next day prices are published each day
-    scheduler.every().day.at("13:30").do(set_charging_schedule, caller="scheduler_loop()", silent=True)
-    scheduler.every().day.at("09:30").do(set_charging_schedule, caller="scheduler_loop()", silent=True)
-    scheduler.every().day.at("00:10").do(set_charging_schedule, caller="scheduler_loop()", silent=True)
+    scheduler.every().day.at("13:30").do(set_charging_schedule, caller="EnergyBroker()", silent=True)
+    scheduler.every().day.at("09:30").do(set_charging_schedule, caller="EnergyBroker()", silent=True)
+    scheduler.every().day.at("00:10").do(set_charging_schedule, caller="EnergyBroker()", silent=True)
 
     for job in scheduler.get_jobs():
-        logging.info(f"EnergyBroker: job: {job}")
+        logging.debug(f"TaskScheduler: job: {job}")
 
     while True:
         scheduler.run_pending()
         time.sleep(1)
+
 
 def retrieve_latest_tibber_pricing():
     if dotenv_config('TIBBER_UPDATES_ENABLED') != '1':
@@ -182,19 +190,18 @@ def manage_grid_usage_based_on_current_price(price: float = None) -> None:
 
 def publish_mqtt_trigger():
     """ Triggers the event_handler to call set_48h_charging_scheudle() function"""
-    publish.single("Cerbomoticzgx/EnergyBroker/RunTrigger", payload=f"{{\"value\": {time.localtime().tm_hour}}}", qos=0, retain=False,
-                   hostname=cerboGxEndpoint)
+    publish_message("Cerbomoticzgx/EnergyBroker/RunTrigger", payload=f"{{\"value\": {time.localtime().tm_hour}}}", retain=False)
 
 
 def set_charging_schedule(caller=None, silent=True):
     batt_soc = STATE.get('batt_soc')
 
-    set_48h_charging_schedule(caller=caller, silent=silent)
+    # set_48h_charging_schedule(caller=caller, silent=silent)
 
-    # if 75 <= batt_soc <= 100:  # batt soc is 75 or more
-    #     set_48h_charging_schedule(caller=caller, silent=silent)
-    # else:
-    #     set_24h_charging_schedule(caller=caller, silent=silent)
+    if 75 <= batt_soc <= 100:  # batt soc is 75 or more
+        set_48h_charging_schedule(caller=caller, silent=silent)
+    else:
+        set_24h_charging_schedule(caller=caller, silent=silent)
 
 
 def set_24h_charging_schedule(caller=None, price_cap=MAX_TIBBER_BUY_PRICE, silent=True):
@@ -272,14 +279,10 @@ def schedule_victron_ess_charging(hour, schedule=0, duration=3600, day=0):
     soc = 95
     start = hour * 3600
 
-    publish.single(f"{topic_stub}Duration", payload=f"{{\"value\": {duration}}}", qos=0, retain=False,
-                   hostname=cerboGxEndpoint)
-    publish.single(f"{topic_stub}Soc", payload=f"{{\"value\": {soc}}}", qos=0, retain=False,
-                   hostname=cerboGxEndpoint)
-    publish.single(f"{topic_stub}Start", payload=f"{{\"value\": {start}}}", qos=0, retain=False,
-                   hostname=cerboGxEndpoint)
-    publish.single(f"{topic_stub}Day", payload=f"{{\"value\": {weekday}}}", qos=0, retain=False,
-                   hostname=cerboGxEndpoint)
+    publish_message(f"{topic_stub}Duration", payload=f"{{\"value\": {duration}}}", retain=False)
+    publish_message(f"{topic_stub}Soc", payload=f"{{\"value\": {soc}}}", retain=False)
+    publish_message(f"{topic_stub}Start", payload=f"{{\"value\": {start}}}", retain=False)
+    publish_message(f"{topic_stub}Day", payload=f"{{\"value\": {weekday}}}", retain=False)
 
     logging.info(f"EnergyBroker: Adding schedule entry for day:{weekday}, duration:{duration}, start: {start}")
 
@@ -287,8 +290,7 @@ def clear_victron_schedules():
     for i in range(0, 5):
         day = -1
         topic_stub = f"W/{systemId0}/settings/0/Settings/CGwacs/BatteryLife/Schedule/Charge/{i}/"
-        publish.single(f"{topic_stub}Day", payload=f"{{\"value\": {day}}}", qos=0, retain=False,
-                       hostname=cerboGxEndpoint)
+        publish_message(f"{topic_stub}Day", payload=f"{{\"value\": {day}}}", retain=False)
 
 def push_notification(hour, day, price):
     topic = f"Energy Broker Alert"
@@ -306,5 +308,5 @@ class Utils:
         topic = f"W/{systemId0}/vebus/276/Mode"
 
         if mode and mode == 1 or mode == 3:
-            publish.single(topic, payload=f"{{\"value\": {mode}}}", qos=0, retain=False, hostname=cerboGxEndpoint)
+            publish_message(topic, payload=f"{{\"value\": {mode}}}", retain=False)
             logging.info(f"EnergyBroker.Utils.set_inverter_mode: {__name__} has set Multiplus-II's mode to {mode_name.get(mode)}")

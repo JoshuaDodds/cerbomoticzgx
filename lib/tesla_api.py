@@ -2,14 +2,14 @@ import requests.exceptions
 import teslapy
 import math
 import time
-import paho.mqtt.publish as publish
 import threading
 
 import lib.helpers
 
 from lib.global_state import GlobalStateClient
-from lib.constants import logging, dotenv_config, cerboGxEndpoint
+from lib.constants import logging, dotenv_config
 from lib.domoticz_updater import domoticz_update
+from lib.helpers import publish_message
 
 STATE = GlobalStateClient()
 
@@ -79,16 +79,16 @@ class TeslaApi:
             logging.info(f"TeslaApi: Last vehicle status update was at: {self.last_update_ts_hr}. Skipping new request to mothership (Tesla API)")
 
     def update_mqtt_and_domoticz(self):
-        publish.single("Tesla/vehicle0/vehicle_name", payload=f"{{\"value\": \"{self.vehicle_name}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tesla/vehicle0/charging_status", payload=f"{{\"value\": \"{self.charging_status}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tesla/vehicle0/battery_soc", payload=f"{{\"value\": \"{self.vehicle_soc}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tesla/vehicle0/battery_soc_setpoint", payload=f"{{\"value\": \"{self.vehicle_soc_setpoint}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tesla/vehicle0/plugged_status", payload=f"{{\"value\": \"{self.plugged_status}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tesla/vehicle0/is_home", payload=f"{{\"value\": \"{self.is_home}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tesla/vehicle0/is_supercharging", payload=f"{{\"value\": \"{self.is_supercharging}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tesla/vehicle0/time_until_full", payload=f"{{\"value\": \"{self.time_until_full}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tesla/vehicle0/is_charging", payload=f"{{\"value\": \"{self.is_charging}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tesla/vehicle0/last_update_at", payload=f"{{\"value\": \"{self.last_update_ts_hr}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+        publish_message("Tesla/vehicle0/vehicle_name", payload=f"{{\"value\": \"{self.vehicle_name}\"}}", qos=0, retain=True)
+        publish_message("Tesla/vehicle0/charging_status", payload=f"{{\"value\": \"{self.charging_status}\"}}", qos=0, retain=True)
+        publish_message("Tesla/vehicle0/battery_soc", payload=f"{{\"value\": \"{self.vehicle_soc}\"}}", qos=0, retain=True)
+        publish_message("Tesla/vehicle0/battery_soc_setpoint", payload=f"{{\"value\": \"{self.vehicle_soc_setpoint}\"}}", qos=0, retain=True)
+        publish_message("Tesla/vehicle0/plugged_status", payload=f"{{\"value\": \"{self.plugged_status}\"}}", qos=0, retain=True)
+        publish_message("Tesla/vehicle0/is_home", payload=f"{{\"value\": \"{self.is_home}\"}}", qos=0, retain=True)
+        publish_message("Tesla/vehicle0/is_supercharging", payload=f"{{\"value\": \"{self.is_supercharging}\"}}", qos=0, retain=True)
+        publish_message("Tesla/vehicle0/time_until_full", payload=f"{{\"value\": \"{self.time_until_full}\"}}", qos=0, retain=True)
+        publish_message("Tesla/vehicle0/is_charging", payload=f"{{\"value\": \"{self.is_charging}\"}}", qos=0, retain=True)
+        publish_message("Tesla/vehicle0/last_update_at", payload=f"{{\"value\": \"{self.last_update_ts_hr}\"}}", qos=0, retain=True)
 
         # send selected metrics to domoticz for tracking and display
         _msg = f"{self.charging_status} @ {self.charging_amp_limit}A, {self.vehicle_soc}% of {self.vehicle_soc_setpoint}%, {self.plugged_status}"
@@ -261,7 +261,7 @@ class TeslaApi:
         return self.is_home
 
     def is_vehicle_supercharging(self):
-        self.is_supercharging = self.get_vehicle_data()['charge_state']['fast_charger_present']
+        self.is_supercharging = self.get_vehicle_data()['charge_state']['fast_charger_present'] or False
         self.update_mqtt_and_domoticz()
         return self.is_supercharging
 
@@ -272,12 +272,12 @@ class TeslaApi:
     @staticmethod
     def cleanup():
         logging.info(f"TeslaApi: Topic housekeeping before exit...")
-        publish.single("Tesla/vehicle0/battery_soc", payload=f"", qos=0, retain=False, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tesla/vehicle0/battery_soc_setpoint", payload=f"", qos=0, retain=False, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tesla/vehicle0/charging_amps", payload=f"", qos=0, retain=False, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tesla/vehicle0/charging_status", payload=f"", qos=0, retain=False, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tesla/vehicle0/charging_watts", payload=f"", qos=0, retain=False, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tesla/vehicle0/is_charging", payload=f"", qos=0, retain=False, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tesla/vehicle0/is_home", payload=f"", qos=0, retain=False, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tesla/vehicle0/is_supercharging", payload=f"", qos=0, retain=False, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tesla/vehicle0/plugged_status", payload=f"", qos=0, retain=False, hostname=cerboGxEndpoint, port=1883)
+        publish_message("Tesla/vehicle0/battery_soc", payload=f"", qos=0, retain=False)
+        publish_message("Tesla/vehicle0/battery_soc_setpoint", payload=f"", qos=0, retain=False)
+        publish_message("Tesla/vehicle0/charging_amps", payload=f"", qos=0, retain=False)
+        publish_message("Tesla/vehicle0/charging_status", payload=f"", qos=0, retain=False)
+        publish_message("Tesla/vehicle0/charging_watts", payload=f"", qos=0, retain=False)
+        publish_message("Tesla/vehicle0/is_charging", payload=f"", qos=0, retain=False)
+        publish_message("Tesla/vehicle0/is_home", payload=f"", qos=0, retain=False)
+        publish_message("Tesla/vehicle0/is_supercharging", payload=f"", qos=0, retain=False)
+        publish_message("Tesla/vehicle0/plugged_status", payload=f"", qos=0, retain=False)

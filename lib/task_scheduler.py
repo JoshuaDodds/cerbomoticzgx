@@ -22,11 +22,12 @@ def TaskScheduler():
 
 def scheduler_loop():
     # Scheduled Tasks
-    scheduler.every(5).minutes.do(get_victron_solar_forecast)
-    scheduler.every(5).minutes.do(retrieve_latest_tibber_pricing)
+    scheduler.every(15).minutes.do(get_victron_solar_forecast)
+    scheduler.every(10).minutes.do(retrieve_latest_tibber_pricing)
+    scheduler.every().hour.at(":01").do(retrieve_latest_tibber_pricing)
 
     for job in scheduler.get_jobs():
-        logging.info(f"TaskScheduler: job: {job}")
+        logging.debug(f"TaskScheduler: job: {job}")
 
     while True:
         scheduler.run_pending()

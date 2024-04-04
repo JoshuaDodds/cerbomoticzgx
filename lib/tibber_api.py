@@ -1,17 +1,12 @@
 import tibber
 import time
-import json
 
-from paho.mqtt import publish
-
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from dateutil import parser, tz
 
-from lib.constants import logging, cerboGxEndpoint, dotenv_config, systemId0
-from lib.helpers import get_current_value_from_mqtt
+from lib.constants import logging, dotenv_config, systemId0
 from lib.domoticz_updater import domoticz_update
-from lib.notifications import pushover_notification
-
+from lib.clients.mqtt_client_factory import VictronClient
 
 logging.getLogger("gql.transport").setLevel(logging.ERROR)
 
@@ -19,6 +14,7 @@ tzinfos = {"UTC": tz.gettz(dotenv_config('TIMEZONE'))}
 account = tibber.Account(dotenv_config('TIBBER_ACCESS_TOKEN'))
 _home = account.homes[0]
 
+client = VictronClient().get_client()
 
 def live_measurements(home=_home or None):
     @home.event("live_measurement")
@@ -30,14 +26,14 @@ def live_measurements(home=_home or None):
                           f"Pwr Factor: {data.power_factor or 0.000} :: Avg Pwr: {data.average_power} Watts")
 
             # update mqtt topics
-            publish.single("Tibber/home/energy/day/imported", payload=f"{{\"value\": \"{data.accumulated_consumption}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-            publish.single("Tibber/home/energy/day/cost", payload=f"{{\"value\": \"{data.accumulated_cost or 0.00}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-            publish.single("Tibber/home/energy/day/exported", payload=f"{{\"value\": \"{data.accumulated_production}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-            publish.single("Tibber/home/energy/day/reward", payload=f"{{\"value\": \"{data.accumulated_reward or 0.00}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-            publish.single("Tibber/home/energy/day/import_peak", payload=f"{{\"value\": \"{data.max_power}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-            publish.single("Tibber/home/energy/day/export_peak", payload=f"{{\"value\": \"{data.max_power_production}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-            publish.single("Tibber/home/energy/day/average_power", payload=f"{{\"value\": \"{data.average_power}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-            publish.single("Tibber/home/energy/day/last_update", payload=f"{{\"value\": \"{ts}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+            client.publish("Tibber/home/energy/day/imported", payload=f"{{\"value\": \"{data.accumulated_consumption}\"}}", retain=True)
+            client.publish("Tibber/home/energy/day/cost", payload=f"{{\"value\": \"{data.accumulated_cost or 0.00}\"}}", retain=True)
+            client.publish("Tibber/home/energy/day/exported", payload=f"{{\"value\": \"{data.accumulated_production}\"}}", retain=True)
+            client.publish("Tibber/home/energy/day/reward", payload=f"{{\"value\": \"{data.accumulated_reward or 0.00}\"}}", retain=True)
+            client.publish("Tibber/home/energy/day/import_peak", payload=f"{{\"value\": \"{data.max_power}\"}}", retain=True)
+            client.publish("Tibber/home/energy/day/export_peak", payload=f"{{\"value\": \"{data.max_power_production}\"}}", retain=True)
+            client.publish("Tibber/home/energy/day/average_power", payload=f"{{\"value\": \"{data.average_power}\"}}", retain=True)
+            client.publish("Tibber/home/energy/day/last_update", payload=f"{{\"value\": \"{ts}\"}}", retain=True)
 
             # Update domoticz
             day_total = None
@@ -56,26 +52,12 @@ def live_measurements(home=_home or None):
         except Exception as e:
             logging.info(f"tibber_api: Error encountered during live measurement data callback method log_accumulated(). Error: {e}")
 
-    def last_data_is_stale(data): # noqa
-        msg = get_current_value_from_mqtt("Tibber/home/energy/day/last_update")
-
-        if msg is not None:
-            payload = json.loads(msg.payload.decode("utf-8"))['value']
-            last_update = datetime.strptime(payload, "%Y-%m-%d %H:%M:%S")
-            if datetime.now() - last_update > timedelta(minutes=5):
-                pushover_notification(f"Tibber Live Alert", "No data received in more than 5 minutes.")
-                return True
-            else:
-                return False
-
-        return False
-
     # Start the live feed. This runs forever.
     logging.info(f"Tibber: Live measurements starting...")
     home.start_live_feed(user_agent=f"cerbomoticzgx/{dotenv_config('VERSION')}",
                          retries=1800,
-                         retry_interval=30,
-                         exit_condition=last_data_is_stale)
+                         retry_interval=30)
+
 
 def dip_peak_data(caller=None, level="CHEAP", day=0, price_cap=0.22):
     """
@@ -122,7 +104,7 @@ def publish_pricing_data(caller):
 
 def mqtt_publish_current_price(home):
     value = home.current_subscription.price_info.current.total
-    publish.single("Tibber/home/price_info/now/total", payload=f"{{\"value\": \"{value}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+    client.publish("Tibber/home/price_info/now/total", payload=f"{{\"value\": \"{value}\"}}", qos=0, retain=True)
 
 def current_price(home):
     price = home.current_subscription.price_info.current.total
@@ -132,65 +114,65 @@ def mqtt_publish_highest_price_points(home):
     # today
     if today_price_points(home, rank=-1) and today_price_points(home, rank=-3):
         logging.debug(f"Tibber: publishing today's highest price points to Mqtt broker...")
-        publish.single("Tibber/home/price_info/today/highest/0/hour", payload=f"{{\"value\": \"{today_price_points(home, rank=0)[0]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/price_info/today/highest/0/delta", payload=f"{{\"value\": \"{today_price_points(home, rank=0)[1]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/price_info/today/highest/0/level", payload=f"{{\"value\": \"{today_price_points(home, rank=0)[2]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/price_info/today/highest/0/cost", payload=f"{{\"value\": \"{today_price_points(home, rank=0)[3]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+        client.publish("Tibber/home/price_info/today/highest/0/hour", payload=f"{{\"value\": \"{today_price_points(home, rank=0)[0]}\"}}", qos=0, retain=True)
+        client.publish("Tibber/home/price_info/today/highest/0/delta", payload=f"{{\"value\": \"{today_price_points(home, rank=0)[1]}\"}}", qos=0, retain=True)
+        client.publish("Tibber/home/price_info/today/highest/0/level", payload=f"{{\"value\": \"{today_price_points(home, rank=0)[2]}\"}}", qos=0, retain=True)
+        client.publish("Tibber/home/price_info/today/highest/0/cost", payload=f"{{\"value\": \"{today_price_points(home, rank=0)[3]}\"}}", qos=0, retain=True)
 
-        publish.single("Tibber/home/price_info/today/highest/1/hour", payload=f"{{\"value\": \"{today_price_points(home, rank=-1)[0]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/price_info/today/highest/1/delta", payload=f"{{\"value\": \"{today_price_points(home, rank=-1)[1]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/price_info/today/highest/1/level", payload=f"{{\"value\": \"{today_price_points(home, rank=-1)[2]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/price_info/today/highest/1/cost", payload=f"{{\"value\": \"{today_price_points(home, rank=-1)[3]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+        client.publish("Tibber/home/price_info/today/highest/1/hour", payload=f"{{\"value\": \"{today_price_points(home, rank=-1)[0]}\"}}", qos=0, retain=True)
+        client.publish("Tibber/home/price_info/today/highest/1/delta", payload=f"{{\"value\": \"{today_price_points(home, rank=-1)[1]}\"}}", qos=0, retain=True)
+        client.publish("Tibber/home/price_info/today/highest/1/level", payload=f"{{\"value\": \"{today_price_points(home, rank=-1)[2]}\"}}", qos=0, retain=True)
+        client.publish("Tibber/home/price_info/today/highest/1/cost", payload=f"{{\"value\": \"{today_price_points(home, rank=-1)[3]}\"}}", qos=0, retain=True)
 
-        publish.single("Tibber/home/price_info/today/highest/2/hour", payload=f"{{\"value\": \"{today_price_points(home, rank=-2)[0]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/price_info/today/highest/2/delta", payload=f"{{\"value\": \"{today_price_points(home, rank=-2)[1]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/price_info/today/highest/2/level", payload=f"{{\"value\": \"{today_price_points(home, rank=-2)[2]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/price_info/today/highest/2/cost", payload=f"{{\"value\": \"{today_price_points(home, rank=-2)[3]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+        client.publish("Tibber/home/price_info/today/highest/2/hour", payload=f"{{\"value\": \"{today_price_points(home, rank=-2)[0]}\"}}", qos=0, retain=True)
+        client.publish("Tibber/home/price_info/today/highest/2/delta", payload=f"{{\"value\": \"{today_price_points(home, rank=-2)[1]}\"}}", qos=0, retain=True)
+        client.publish("Tibber/home/price_info/today/highest/2/level", payload=f"{{\"value\": \"{today_price_points(home, rank=-2)[2]}\"}}", qos=0, retain=True)
+        client.publish("Tibber/home/price_info/today/highest/2/cost", payload=f"{{\"value\": \"{today_price_points(home, rank=-2)[3]}\"}}", qos=0, retain=True)
 
     # tomorrow
     if tomorrow_price_points(home, rank=-1) and tomorrow_price_points(home, rank=-3):
         logging.debug(f"Tibber: publishing tomorrow's highest price points to Mqtt broker...")
-        publish.single("Tibber/home/price_info/tomorrow/highest/0/hour", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=0)[0]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/price_info/tomorrow/highest/0/delta", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=0)[1]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/price_info/tomorrow/highest/0/level", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=0)[2]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/price_info/tomorrow/highest/0/cost", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=0)[3]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+        client.publish("Tibber/home/price_info/tomorrow/highest/0/hour", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=0)[0]}\"}}", qos=0, retain=True)
+        client.publish("Tibber/home/price_info/tomorrow/highest/0/delta", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=0)[1]}\"}}", qos=0, retain=True)
+        client.publish("Tibber/home/price_info/tomorrow/highest/0/level", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=0)[2]}\"}}", qos=0, retain=True)
+        client.publish("Tibber/home/price_info/tomorrow/highest/0/cost", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=0)[3]}\"}}", qos=0, retain=True)
 
-        publish.single("Tibber/home/price_info/tomorrow/highest/1/hour", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=-1)[0]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/price_info/tomorrow/highest/1/delta", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=-1)[1]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/price_info/tomorrow/highest/1/level", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=-1)[2]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/price_info/tomorrow/highest/1/cost", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=-1)[3]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+        client.publish("Tibber/home/price_info/tomorrow/highest/1/hour", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=-1)[0]}\"}}", qos=0, retain=True)
+        client.publish("Tibber/home/price_info/tomorrow/highest/1/delta", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=-1)[1]}\"}}", qos=0, retain=True)
+        client.publish("Tibber/home/price_info/tomorrow/highest/1/level", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=-1)[2]}\"}}", qos=0, retain=True)
+        client.publish("Tibber/home/price_info/tomorrow/highest/1/cost", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=-1)[3]}\"}}", qos=0, retain=True)
 
 def mqtt_publish_lowest_price_points(home):
     # today
     if today_price_points(home, rank=1) and today_price_points(home, rank=3):
         logging.debug(f"Tibber: publishing today's lowest price points to Mqtt broker...")
-        publish.single("Tibber/home/price_info/today/lowest/0/hour", payload=f"{{\"value\": \"{today_price_points(home, rank=1)[0]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/price_info/today/lowest/0/delta", payload=f"{{\"value\": \"{today_price_points(home, rank=1)[1]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/price_info/today/lowest/0/level", payload=f"{{\"value\": \"{today_price_points(home, rank=1)[2]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/price_info/today/lowest/0/cost", payload=f"{{\"value\": \"{today_price_points(home, rank=1)[3]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+        client.publish("Tibber/home/price_info/today/lowest/0/hour", payload=f"{{\"value\": \"{today_price_points(home, rank=1)[0]}\"}}", qos=0, retain=True)
+        client.publish("Tibber/home/price_info/today/lowest/0/delta", payload=f"{{\"value\": \"{today_price_points(home, rank=1)[1]}\"}}", qos=0, retain=True)
+        client.publish("Tibber/home/price_info/today/lowest/0/level", payload=f"{{\"value\": \"{today_price_points(home, rank=1)[2]}\"}}", qos=0, retain=True)
+        client.publish("Tibber/home/price_info/today/lowest/0/cost", payload=f"{{\"value\": \"{today_price_points(home, rank=1)[3]}\"}}", qos=0, retain=True)
 
-        publish.single("Tibber/home/price_info/today/lowest/1/hour", payload=f"{{\"value\": \"{today_price_points(home, rank=2)[0]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/price_info/today/lowest/1/delta", payload=f"{{\"value\": \"{today_price_points(home, rank=2)[1]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/price_info/today/lowest/1/level", payload=f"{{\"value\": \"{today_price_points(home, rank=2)[2]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/price_info/today/lowest/1/cost", payload=f"{{\"value\": \"{today_price_points(home, rank=2)[3]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+        client.publish("Tibber/home/price_info/today/lowest/1/hour", payload=f"{{\"value\": \"{today_price_points(home, rank=2)[0]}\"}}", qos=0, retain=True)
+        client.publish("Tibber/home/price_info/today/lowest/1/delta", payload=f"{{\"value\": \"{today_price_points(home, rank=2)[1]}\"}}", qos=0, retain=True)
+        client.publish("Tibber/home/price_info/today/lowest/1/level", payload=f"{{\"value\": \"{today_price_points(home, rank=2)[2]}\"}}", qos=0, retain=True)
+        client.publish("Tibber/home/price_info/today/lowest/1/cost", payload=f"{{\"value\": \"{today_price_points(home, rank=2)[3]}\"}}", qos=0, retain=True)
 
-        publish.single("Tibber/home/price_info/today/lowest/2/hour", payload=f"{{\"value\": \"{today_price_points(home, rank=3)[0]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/price_info/today/lowest/2/delta", payload=f"{{\"value\": \"{today_price_points(home, rank=3)[1]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/price_info/today/lowest/2/level", payload=f"{{\"value\": \"{today_price_points(home, rank=3)[2]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/price_info/today/lowest/2/cost", payload=f"{{\"value\": \"{today_price_points(home, rank=3)[3]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+        client.publish("Tibber/home/price_info/today/lowest/2/hour", payload=f"{{\"value\": \"{today_price_points(home, rank=3)[0]}\"}}", qos=0, retain=True)
+        client.publish("Tibber/home/price_info/today/lowest/2/delta", payload=f"{{\"value\": \"{today_price_points(home, rank=3)[1]}\"}}", qos=0, retain=True)
+        client.publish("Tibber/home/price_info/today/lowest/2/level", payload=f"{{\"value\": \"{today_price_points(home, rank=3)[2]}\"}}", qos=0, retain=True)
+        client.publish("Tibber/home/price_info/today/lowest/2/cost", payload=f"{{\"value\": \"{today_price_points(home, rank=3)[3]}\"}}", qos=0, retain=True)
 
     # tomorrow
     if tomorrow_price_points(home, rank=1) and tomorrow_price_points(home, rank=2):
         logging.debug(f"Tibber: publishing tomorrow's lowest price points to Mqtt broker...")
-        publish.single("Tibber/home/price_info/tomorrow/lowest/0/hour", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=1)[0]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/price_info/tomorrow/lowest/0/delta", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=1)[1]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/price_info/tomorrow/lowest/0/level", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=1)[2]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/price_info/tomorrow/lowest/0/cost", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=1)[3]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+        client.publish("Tibber/home/price_info/tomorrow/lowest/0/hour", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=1)[0]}\"}}", qos=0, retain=True)
+        client.publish("Tibber/home/price_info/tomorrow/lowest/0/delta", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=1)[1]}\"}}", qos=0, retain=True)
+        client.publish("Tibber/home/price_info/tomorrow/lowest/0/level", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=1)[2]}\"}}", qos=0, retain=True)
+        client.publish("Tibber/home/price_info/tomorrow/lowest/0/cost", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=1)[3]}\"}}", qos=0, retain=True)
 
-        publish.single("Tibber/home/price_info/tomorrow/lowest/1/hour", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=2)[0]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/price_info/tomorrow/lowest/1/delta", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=2)[1]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/price_info/tomorrow/lowest/1/level", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=2)[2]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-        publish.single("Tibber/home/price_info/tomorrow/lowest/1/cost", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=2)[3]}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+        client.publish("Tibber/home/price_info/tomorrow/lowest/1/hour", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=2)[0]}\"}}", qos=0, retain=True)
+        client.publish("Tibber/home/price_info/tomorrow/lowest/1/delta", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=2)[1]}\"}}", qos=0, retain=True)
+        client.publish("Tibber/home/price_info/tomorrow/lowest/1/level", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=2)[2]}\"}}", qos=0, retain=True)
+        client.publish("Tibber/home/price_info/tomorrow/lowest/1/cost", payload=f"{{\"value\": \"{tomorrow_price_points(home, rank=2)[3]}\"}}", qos=0, retain=True)
 
 def tomorrow_price_points(home, rank=1):
     _tomorrow = home.current_subscription.price_info.tomorrow
