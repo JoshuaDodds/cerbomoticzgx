@@ -15,7 +15,6 @@ def dotenv_config(env_variable):
 Basig Configuration
 """
 cerboGxEndpoint = dotenv_config('CERBOGX_IP')
-mosquittoEndpoint = dotenv_config('MOSQUITTO_IP')
 systemId0 = dotenv_config('VRM_PORTAL_ID')
 dzEndpoint = dotenv_config('DZ_URL_PREFIX')
 PushOverConfig = {"id": dotenv_config('PO_USER_ID'), "key": dotenv_config('PO_API_KEY')}

@@ -98,7 +98,7 @@ def post_startup():
     logging.info(f"post_startup() actions executing...")
 
     # set higher than 0 zero cost at startup until actual pricing is retreived
-    STATE.set('tibber_price_now', 0.40)
+    STATE.set('tibber_price_now', 0.15)
 
     # Re-apply previously set Dynamic ESS preferences set in the previous run
     logging.info(f"post_startup(): Re-storing previous state if available...")
