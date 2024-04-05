@@ -110,7 +110,7 @@ def post_startup():
     ESS_NET_METERING_OVERRIDDEN = retrieve_message('ess_net_metering_overridden') or STATE.get("ess_net_metering_overridden") or False
     TESLA_CHARGE_REQUESTED = retrieve_message('tesla_charge_requested') or STATE.get("tesla_charge_requested") or False
 
-    # this one is victron maintained so we just update our own state with what it is currently set to
+    # this one is victron maintained, so we just update our own state with what it is currently set to
     STATE.set('ac_power_setpoint', AC_POWER_SETPOINT)
 
     publish_message(topic='Tesla/settings/grid_charging_enabled', message=GRID_CHARGING_ENABLED, retain=True)
