@@ -17,11 +17,6 @@ STATE = GlobalStateClient()
 
 def main():
     logging.info("EnergyBroker: Initializing...")
-
-    # main_thread = threading.Thread(target=scheduler_loop)
-    # main_thread.daemon = True
-    # main_thread.start()
-
     schedule_tasks()
     logging.info("EnergyBroker: Initialization complete.")
 
@@ -31,28 +26,10 @@ def schedule_tasks():
     scheduler.every().hour.at(":00").do(manage_sale_of_stored_energy_to_the_grid)
 
     # Grid Charging Scheduled Tasks
-    scheduler.every().day.at("13:10").do(publish_mqtt_trigger)                                                # when next day prices are published each day
+    scheduler.every().day.at("13:10").do(publish_mqtt_trigger)  # when next day prices are published each day
     scheduler.every().day.at("13:30").do(set_charging_schedule, caller="TaskScheduler()", silent=True)
     scheduler.every().day.at("09:30").do(set_charging_schedule, caller="TaskScheduler()", silent=True)
     scheduler.every().day.at("00:10").do(set_charging_schedule, caller="TaskScheduler()", silent=True)
-
-
-def scheduler_loop():
-    # ESS Scheduled Tasks
-    scheduler.every().hour.at(":00").do(manage_sale_of_stored_energy_to_the_grid)
-
-    # Grid Charging Scheduled Tasks
-    scheduler.every().day.at("13:10").do(publish_mqtt_trigger)                                                # when next day prices are published each day
-    scheduler.every().day.at("13:30").do(set_charging_schedule, caller="EnergyBroker()", silent=True)
-    scheduler.every().day.at("09:30").do(set_charging_schedule, caller="EnergyBroker()", silent=True)
-    scheduler.every().day.at("00:10").do(set_charging_schedule, caller="EnergyBroker()", silent=True)
-
-    for job in scheduler.get_jobs():
-        logging.debug(f"TaskScheduler: job: {job}")
-
-    while True:
-        scheduler.run_pending()
-        time.sleep(1)
 
 
 def retrieve_latest_tibber_pricing():
