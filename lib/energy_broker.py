@@ -106,6 +106,8 @@ def manage_sale_of_stored_energy_to_the_grid() -> None:
                 ac_power_setpoint(watts="0.0", override_ess_net_mettering=False)
                 logging.info(f"AC Power Setpoint changed to 0.0")
                 logging.info(f"Stopped energy export at {batt_soc}% SOC because of DynEss min batt SoC configuration setting.")
+                pushover_notification("Energy Sale Alert",
+                                      f"Stopped energy export at {batt_soc}% SOC because of DynEss min batt SoC setting.")
 
     if not ess_net_metering_overridden:
         if batt_soc > ess_net_metering_batt_min_soc \
