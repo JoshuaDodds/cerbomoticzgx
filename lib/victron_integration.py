@@ -3,7 +3,6 @@ from lib.global_state import GlobalStateClient
 from lib.helpers import publish_message
 from lib.constants import logging, Topics, TopicsWritable, dotenv_config, cerboGxEndpoint
 
-
 STATE = GlobalStateClient()
 float_voltage = float(dotenv_config('BATTERY_FLOAT_VOLTAGE'))
 max_voltage = float(dotenv_config('BATTERY_ABSORPTION_VOLTAGE'))
@@ -23,7 +22,6 @@ def ac_power_setpoint(watts=None, override_ess_net_mettering=True):
 
         STATE.set(key='ac_power_setpoint', value=f"{watts}")
         publish.single(TopicsWritable['system0']['ac_power_setpoint'], payload=_msg, qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
-
 
 def minimum_ess_soc(percent: int = 10):
     if percent:
@@ -58,6 +56,8 @@ def regulate_battery_max_voltage(ess_soc):
             publish.single(TopicsWritable["system0"]["max_charge_voltage"], payload=f"{{\"value\": \"{battery_full_voltage}\"}}", qos=0, retain=False, hostname=cerboGxEndpoint, port=1883)
             logging.info(f"Victron Integration: Adjusting max charge voltage to {battery_full_voltage} due to battery SOC reaching {dotenv_config('MAXIMUM_ESS_SOC')}% or higher")
             publish.single("Tesla/vehicle0/solar/ess_max_charge_voltage", payload=f"{{\"value\": \"{battery_full_voltage}\"}}", qos=0, retain=True, hostname=cerboGxEndpoint, port=1883)
+            # when battery is full, return Minumum batt SOC (unless grid fails) to 5%
+            minimum_ess_soc(5)
 
         else:
             logging.debug(f"Victron Integration: No Action. Battery max charge voltage is appropriately set at {current_max_charge_voltage}V with ESS SOC at {ess_soc}%")

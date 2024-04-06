@@ -289,3 +289,5 @@ class Utils:
         if mode and mode == 1 or mode == 3:
             publish_message(topic, payload=f"{{\"value\": {mode}}}", retain=False)
             logging.info(f"EnergyBroker.Utils.set_inverter_mode: {__name__} has set Multiplus-II's mode to {mode_name.get(mode)}")
+        else:
+            logging.info(f"EnergyBroker.Utils.set_inverter_mode: {__name__} Error setting mode to {mode_name.get(mode)}. This is not a valid mode.")

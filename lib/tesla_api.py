@@ -14,7 +14,7 @@ from lib.helpers import publish_message
 STATE = GlobalStateClient()
 
 retry = teslapy.Retry(total=2, status_forcelist=(500, 502, 503, 504))
-timeout = 15
+timeout = 25
 email = dotenv_config("TESLA_EMAIL")
 
 logging.getLogger('teslapy').setLevel(logging.WARNING)
@@ -47,34 +47,35 @@ class TeslaApi:
         logging.info(f"TeslaApi: Init complete.")
 
     def __del__(self):
-        self.cleanup()
+        # self.cleanup()
         logging.info(f"TeslaApi (__del__): Exiting...")
 
     def update_vehicle_status(self, force=False):
         if (not self.last_update_ts
-            or time.localtime() >= time.localtime(self.last_update_ts + (60 * 10))
-            or self.is_charging
-            or self.is_plugged
-            or force):
-
-            logging.debug(f"TeslaApi(update_vehicle_statue): (called from: {__name__}): retrieving latest vehicle state... Last update was at: {self.last_update_ts_hr}")
-
-            self.get_vehicle_name()
-            self.battery_soc()
-            self.battery_soc_setpoint()
-            self.is_vehicle_online()
-            self.is_vehicle_charging()
-            self.is_vehicle_supercharging()
-            self.is_vehicle_plugged()
-            self.is_vehicle_home()
-            self.charge_current_request()
-            self.minutes_to_full_charge()
-            self.is_max_soc_reached()
-            self.last_update_ts = self.get_vehicle_data().timestamp
-            self.last_update_ts_hr = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self.last_update_ts))
-
-            self.update_mqtt_and_domoticz()
-
+                or time.localtime() >= time.localtime(self.last_update_ts + (60 * 10))
+                or self.is_charging
+                or self.is_plugged
+                or force):
+            logging.debug(
+                f"TeslaApi(update_vehicle_statue): (called from: {__name__}): retrieving latest vehicle state... Last update was at: {self.last_update_ts_hr}")
+            vehicle_data = self.get_vehicle_data()
+            if vehicle_data:
+                self.get_vehicle_name(vehicle_data)
+                self.battery_soc(vehicle_data)
+                self.battery_soc_setpoint(vehicle_data)
+                self.is_vehicle_online(vehicle_data)
+                self.is_vehicle_charging(vehicle_data)
+                self.is_vehicle_supercharging(vehicle_data)
+                self.is_vehicle_plugged(vehicle_data)
+                self.is_vehicle_home(vehicle_data)
+                self.charge_current_request(vehicle_data)
+                self.minutes_to_full_charge(vehicle_data)
+                self.is_max_soc_reached(vehicle_data)
+                self.last_update_ts = vehicle_data.timestamp
+                self.last_update_ts_hr = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self.last_update_ts))
+                self.update_mqtt_and_domoticz()
+            else:
+                logging.info(f"TeslaApi: Connection timed out. Last update was at: {self.last_update_ts_hr}")
         else:
             logging.info(f"TeslaApi: Last vehicle status update was at: {self.last_update_ts_hr}. Skipping new request to mothership (Tesla API)")
 
@@ -179,67 +180,67 @@ class TeslaApi:
         try:
             with teslapy.Tesla(email, retry=retry, timeout=timeout) as tesla:
                 vehicles = tesla.vehicle_list()
-                vehicles[0].get_vehicle_summary()
-                if 'online' in vehicles[0]['state']:
-                    vehicles[0].get_vehicle_data()
-                    return vehicles[0]
+
+                if vehicles[0]['state'] == 'online':
+                    logging.info("tesla_api: vehicle is online. Fetching vehicle data...")
                 else:
-                    logging.info(f"tesla_api: vehicle is sleeping. waking vehicle to service request...")
+                    logging.info("tesla_api: vehicle is sleeping. Waking vehicle to service request...")
                     self.wake_vehicle()
-                    vehicles[0].get_vehicle_data()
-                    return vehicles[0]
+
+                vehicle_data = vehicles[0].get_vehicle_data()
+                return vehicle_data
 
         except Exception as e:
-            logging.info(f"tesla_api: get_vehicle_data() error: {e}")
-            return e
+            logging.error(f"tesla_api: get_vehicle_data() error: {e}")
+            return None
 
-    def minutes_to_full_charge(self) -> str:
-        minutes_until_full = self.get_vehicle_data()['charge_state']['minutes_to_full_charge'] if self.is_charging else "N/A"
+    def minutes_to_full_charge(self, vehicle_data) -> str:
+        minutes_until_full = vehicle_data['charge_state']['minutes_to_full_charge'] if self.is_charging else "N/A"
         self.time_until_full = lib.helpers.convert_to_fractional_hour(minutes_until_full)
         self.update_mqtt_and_domoticz()
         return self.time_until_full
 
-    def is_vehicle_charging(self):
-        self.is_charging = self.get_vehicle_data()['charge_state']['charging_state'] == 'Charging'
+    def is_vehicle_charging(self, vehicle_data):
+        self.is_charging = vehicle_data['charge_state']['charging_state'] == 'Charging'
         self.charging_status = "Charging" if self.is_charging else "Idle"
         self.update_mqtt_and_domoticz()
         return self.is_charging
 
-    def is_vehicle_plugged(self):
-        self.is_plugged = self.get_vehicle_data()['charge_state']['charge_port_latch'] == 'Engaged'
+    def is_vehicle_plugged(self, vehicle_data):
+        self.is_plugged = vehicle_data['charge_state']['charge_port_latch'] == 'Engaged'
         self.plugged_status = "Plugged" if self.is_plugged else "Unplugged"
         self.update_mqtt_and_domoticz()
         return self.is_plugged
 
-    def is_max_soc_reached(self):
-        self.is_full = self.get_vehicle_data()['charge_state']['battery_level'] >= self.get_vehicle_data()['charge_state']['charge_limit_soc']
+    def is_max_soc_reached(self, vehicle_data):
+        self.is_full = vehicle_data['charge_state']['battery_level'] >= vehicle_data['charge_state']['charge_limit_soc']
         self.update_mqtt_and_domoticz()
         return self.is_full
 
-    def battery_soc_setpoint(self):
-        self.vehicle_soc_setpoint = self.get_vehicle_data()['charge_state']['charge_limit_soc']
+    def battery_soc_setpoint(self, vehicle_data):
+        self.vehicle_soc_setpoint = vehicle_data['charge_state']['charge_limit_soc']
         self.update_mqtt_and_domoticz()
         return self.vehicle_soc_setpoint
 
-    def battery_soc(self):
-        self.vehicle_soc = self.get_vehicle_data()['charge_state']['battery_level']
+    def battery_soc(self, vehicle_data):
+        self.vehicle_soc = vehicle_data['charge_state']['battery_level']
         self.update_mqtt_and_domoticz()
         return self.vehicle_soc
 
-    def charge_current_request(self):
-        self. charging_amp_limit = self.get_vehicle_data()['charge_state']['charge_current_request']
+    def charge_current_request(self, vehicle_data):
+        self. charging_amp_limit = vehicle_data['charge_state']['charge_current_request']
         return self.charging_amp_limit
 
-    def get_vehicle_name(self):
-        self.vehicle_name = self.get_vehicle_data()['vehicle_state']['vehicle_name']
+    def get_vehicle_name(self, vehicle_data):
+        self.vehicle_name = vehicle_data['vehicle_state']['vehicle_name']
         return self.vehicle_name
 
-    def is_vehicle_home(self):
+    def is_vehicle_home(self, vehicle_data):
         lat = round(float(dotenv_config('HOME_ADDRESS_LAT')), 3)
         long = round(float(dotenv_config('HOME_ADDRESS_LONG')), 3)
 
         try:
-            vehicle_data = self.get_vehicle_data()['drive_state']
+            vehicle_data = vehicle_data['drive_state']
             if 'latitude' in vehicle_data and 'longitude' in vehicle_data:
                 if round(vehicle_data['latitude'], 3) == lat and round(vehicle_data['longitude'], 3) == long:
                     self.is_home = True
@@ -260,13 +261,13 @@ class TeslaApi:
 
         return self.is_home
 
-    def is_vehicle_supercharging(self):
-        self.is_supercharging = self.get_vehicle_data()['charge_state']['fast_charger_present'] or False
+    def is_vehicle_supercharging(self, vehicle_data):
+        self.is_supercharging = vehicle_data['charge_state']['fast_charger_present'] or False
         self.update_mqtt_and_domoticz()
         return self.is_supercharging
 
-    def is_vehicle_online(self):
-        self.is_online = self.get_vehicle_data().available()
+    def is_vehicle_online(self, vehicle_data):
+        self.is_online = vehicle_data.available()
         return self.is_online
 
     @staticmethod
