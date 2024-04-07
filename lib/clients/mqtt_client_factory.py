@@ -7,53 +7,21 @@ import paho.mqtt.client as mqtt
 from lib.constants import retrieve_mqtt_subcribed_topics, logging, DzEndpoints, cerboGxEndpoint, systemId0
 from lib.domoticz_updater import domoticz_update
 
-
 class VictronClient:
     """
-    The VictronClient class represents a client for connecting and interacting with an MQTT broker. Notable methods
-    are:
-
-    __new__(cls, *args, **kwargs):
-        This method implements the singleton pattern to ensure the VictronClient class only ever creates one instance.
-        It creates a new instance if a client_id is explicitly specified. If no client_id is specified and no instance
-        currently exists, the method creates a new instance and stores it in the _instance class variable.
-
-    _start_keepalive(self):
-        This method initiates a keep-alive loop by creating a new thread. Within this thread, it periodically publishes
-        messages to specific topics on the MQTT broker using the client instance. The loop continues running until the
-        method sets the _stop_event thread event.
-
-    get_client(self):
-        This method returns the MQTT client instance.
-
-    Example usages:
-
-    Ensure that a new client connection instance is returned:
-        client = VictronClient(client_id="my_client").get_client()
-
-    Use/Re-use existing client instance if one exists:
-        client = VictronClient().get_client()
+    Usage:  victron_client = VictronClient().get_client()
     """
     _instance = None
-    client_id = None
 
     def __new__(cls, *args, **kwargs):
-        if 'client_id' in kwargs and kwargs['client_id'] is not None:
-            # If client_id is explicitly specified, always create a new instance
-            return super(VictronClient, cls).__new__(cls)
-        elif not cls._instance:
-            # Apply singleton pattern when no client_id is specified
+        if not cls._instance:
             cls._instance = super(VictronClient, cls).__new__(cls)
         return cls._instance
 
-    def __init__(self, client_id=None, host=cerboGxEndpoint, keepalive=45, port=1883):
-        if client_id is None:
-            client_id = f"victron_client-{random.randint(100000, 999999)}"
-
+    def __init__(self, client_id=f"victron_client-{random.randint(100000, 999999)}", host=cerboGxEndpoint, keepalive=45, port=1883):
         # To prevent re-initialization if __init__ is called again
-        if hasattr(self, '_initialized') and self._initialized and self.client_id == client_id:
+        if hasattr(self, '_initialized') and self._initialized:
             return
-
         self._initialized = True
 
         self.client_id = client_id
