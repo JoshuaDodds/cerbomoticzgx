@@ -1,6 +1,7 @@
 import json
 import threading
 import time
+import random
 import paho.mqtt.client as mqtt
 
 from lib.constants import retrieve_mqtt_subcribed_topics, logging, DzEndpoints, cerboGxEndpoint, systemId0
@@ -17,7 +18,7 @@ class VictronClient:
             cls._instance = super(VictronClient, cls).__new__(cls)
         return cls._instance
 
-    def __init__(self, client_id="victron_client", host=cerboGxEndpoint, keepalive=45, port=1883):
+    def __init__(self, client_id=f"victron_client-{random.randint(100000, 999999)}", host=cerboGxEndpoint, keepalive=45, port=1883):
         # To prevent re-initialization if __init__ is called again
         if hasattr(self, '_initialized') and self._initialized:
             return

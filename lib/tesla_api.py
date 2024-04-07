@@ -47,7 +47,7 @@ class TeslaApi:
         logging.info(f"TeslaApi: Init complete.")
 
     def __del__(self):
-        # self.cleanup()
+        self.cleanup()
         logging.info(f"TeslaApi (__del__): Exiting...")
 
     def update_vehicle_status(self, force=False):
@@ -58,7 +58,9 @@ class TeslaApi:
                 or force):
             logging.debug(
                 f"TeslaApi(update_vehicle_statue): (called from: {__name__}): retrieving latest vehicle state... Last update was at: {self.last_update_ts_hr}")
+
             vehicle_data = self.get_vehicle_data()
+
             if vehicle_data:
                 self.get_vehicle_name(vehicle_data)
                 self.battery_soc(vehicle_data)
@@ -76,6 +78,7 @@ class TeslaApi:
                 self.update_mqtt_and_domoticz()
             else:
                 logging.info(f"TeslaApi: Connection timed out. Last update was at: {self.last_update_ts_hr}")
+
         else:
             logging.info(f"TeslaApi: Last vehicle status update was at: {self.last_update_ts_hr}. Skipping new request to mothership (Tesla API)")
 

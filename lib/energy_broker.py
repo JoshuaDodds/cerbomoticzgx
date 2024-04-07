@@ -1,7 +1,8 @@
 import time
 import schedule as scheduler
 
-from lib.constants import logging, systemId0, PythonToVictronWeekdayNumberConversion, dotenv_config
+from paho.mqtt import publish
+from lib.constants import logging, systemId0, PythonToVictronWeekdayNumberConversion, dotenv_config, cerboGxEndpoint
 from lib.helpers import get_seasonally_adjusted_max_charge_slots, calculate_max_discharge_slots_needed, publish_message
 from lib.tibber_api import lowest_48h_prices, lowest_24h_prices
 from lib.notifications import pushover_notification
@@ -258,10 +259,10 @@ def schedule_victron_ess_charging(hour, schedule=0, duration=3600, day=0):
     soc = 95
     start = hour * 3600
 
-    publish_message(f"{topic_stub}Duration", payload=f"{{\"value\": {duration}}}", retain=False)
-    publish_message(f"{topic_stub}Soc", payload=f"{{\"value\": {soc}}}", retain=False)
-    publish_message(f"{topic_stub}Start", payload=f"{{\"value\": {start}}}", retain=False)
-    publish_message(f"{topic_stub}Day", payload=f"{{\"value\": {weekday}}}", retain=False)
+    publish_message(f"{topic_stub}Duration", payload=f"{{\"value\": {duration}}}", retain=True)
+    publish_message(f"{topic_stub}Soc", payload=f"{{\"value\": {soc}}}", retain=True)
+    publish_message(f"{topic_stub}Start", payload=f"{{\"value\": {start}}}", retain=True)
+    publish_message(f"{topic_stub}Day", payload=f"{{\"value\": {weekday}}}", retain=True)
 
     logging.info(f"EnergyBroker: Adding schedule entry for day:{weekday}, duration:{duration}, start: {start}")
 
@@ -284,10 +285,10 @@ class Utils:
                      1 = charger only mode - inverter will not switch on, batteries will not be discharged
         """
         mode_name = {1: "Charging Only Mode", 3: "Normal Inverter Mode"}
-        topic = f"W/{systemId0}/vebus/276/Mode"
+        topic = f"W/{systemId0}/vebus/276/Mode"  # TODO: move to constants.py
 
         if mode and mode == 1 or mode == 3:
-            publish_message(topic, payload=f"{{\"value\": {mode}}}", retain=False)
+            publish.single(topic, payload=f"{{\"value\": {mode}}}", qos=1, retain=False, hostname=cerboGxEndpoint, port=1883)
             logging.info(f"EnergyBroker.Utils.set_inverter_mode: {__name__} has set Multiplus-II's mode to {mode_name.get(mode)}")
         else:
             logging.info(f"EnergyBroker.Utils.set_inverter_mode: {__name__} Error setting mode to {mode_name.get(mode)}. This is not a valid mode.")
