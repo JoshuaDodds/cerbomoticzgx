@@ -129,7 +129,7 @@ def manage_sale_of_stored_energy_to_the_grid() -> None:
                 logging.info(f"AC Power Setpoint changed to 0.0")
                 logging.info(f"Stopped energy export at {batt_soc}% SOC and a current price of {round(tibber_price_now, 3)}")
                 pushover_notification("Energy Sale Alert",
-                                      f"Stopped energy export at {batt_soc} and a current price of {round(tibber_price_now, 3)}")
+                                      f"Stopped energy export at {batt_soc}% and a current price of {round(tibber_price_now, 3)}")
 
 
 def manage_grid_usage_based_on_current_price(price: float = None) -> None:
