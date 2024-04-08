@@ -53,6 +53,8 @@ class Event:
     def ac_power_setpoint(self):
         if float(self.value) > 0 or float(self.value) < 0:
             logging.info(f"AC Power Setpoint changed to {self.value}")
+        else:
+            logging.info(f"AC Power Setpoint reset to {self.value}")
 
     def ess_net_metering_batt_min_soc(self):
         if self.gs_client.get('ess_net_metering_batt_min_soc'):

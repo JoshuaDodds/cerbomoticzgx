@@ -8,9 +8,9 @@ float_voltage = float(dotenv_config('BATTERY_FLOAT_VOLTAGE'))
 max_voltage = float(dotenv_config('BATTERY_ABSORPTION_VOLTAGE'))
 battery_full_voltage = float(dotenv_config('BATTERY_FULL_VOLTAGE'))
 
-def ac_power_setpoint(watts=None, override_ess_net_mettering=True):
+def ac_power_setpoint(watts: str = None, override_ess_net_mettering=True):
     # disable net metering overide whenever power setpoint returns to zero
-    if watts == 0:
+    if watts == "0.0":
         publish_message(Topics['system0']['ess_net_metering_overridden'], message="False", retain=True)
 
     if watts:
