@@ -6,7 +6,7 @@ from datetime import datetime
 from math import floor, ceil
 
 from lib.helpers.base7_math import *
-from lib.constants import Topics, logging, cerboGxEndpoint
+from lib.constants import Topics, logging, mosquittoEndpoint
 
 
 def publish_message(topic, message=None, qos=0, retain=False, payload=None) -> None:
@@ -53,12 +53,12 @@ def get_current_value_from_mqtt(topic: str, timeout: float = 1.0, raw: bool = Fa
         completed = True
 
     # Initialize a new temporary MQTT client
-    temp_client = mqtt.Client()
+    temp_client = mqtt.Client(client_id="helper-message-retrieval-client")
     temp_client.on_connect = on_connect
     temp_client.on_message = on_message
 
     # Connect to the broker
-    temp_client.connect(cerboGxEndpoint, 1883, 60)
+    temp_client.connect(mosquittoEndpoint, 1883, 60)
     temp_client.loop_start()
 
     # Wait for the message to arrive or for the timeout
