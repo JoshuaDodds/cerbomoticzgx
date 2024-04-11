@@ -73,6 +73,7 @@ class Event:
         if self.value:
             _value = float(self.value)
             manage_grid_usage_based_on_current_price(_value)
+            manage_sale_of_stored_energy_to_the_grid()
 
     def system_shutdown(self):
         _value = self.value
