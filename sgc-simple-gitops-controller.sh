@@ -26,7 +26,7 @@ git config --global user.name "SGC Bot"
 
 # Check if update from git is needed and then enter work loop
 echo -e "$SVC_NAME: Checking if container runtime needs an update..."
-if diff -rq /app/ gitops-managed-repos/cerbomoticzgx/ | grep -vE 'pycache|env|cache|token|gitops|png|db'; then
+if diff -rq /app/ /app/gitops-managed-repos/cerbomoticzgx/ | grep -vE 'pycache|env|json|token|png|db|Only'; then
   echo -e "$SVC_NAME: Updating container runtime..."
   pkill -f python3
   rsync -qav --exclude 'log.txt' --exclude '__pycache__' /app/gitops-managed-repos/cerbomoticzgx/ /app/
