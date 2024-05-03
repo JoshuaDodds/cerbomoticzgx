@@ -24,9 +24,17 @@ git config pull.rebase true
 git config --global user.email "sgc@hs.mfis.net"
 git config --global user.name "SGC Bot"
 
-# Enter work loop
-echo -e "$SVC_NAME: Entering work loop...";
+# Check if update from git is needed and then enter work loop
+echo -e "$SVC_NAME: Checking if container runtime needs an update..."
+if diff -rq /app/ gitops-managed-repos/cerbomoticzgx/ | grep -vE 'pycache|env|cache|token|gitops|png|db'; then
+  echo -e "$SVC_NAME: Updating container runtime..."
+  rsync -qav --exclude 'log.txt' --exclude '__pycache__' /app/gitops-managed-repos/cerbomoticzgx/ /app/
+else
+  echo -e "$SVC_NAME: Container runtime is up to date."
+fi
 
+# Main work loop
+echo -e "$SVC_NAME: Entering work loop...";
 while true; do
   # echo -e "$SVC_NAME: Updating remote git repo & comparing with current state...";
   git remote update >> /dev/null
