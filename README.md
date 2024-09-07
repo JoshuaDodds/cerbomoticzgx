@@ -74,4 +74,4 @@ Finally, use the build.sh script as a template for building an arm64 image and p
 ---------------
 (This package is in its infancy, but contributions and collaborations are welcome.)
 
-Copyright 2022, 2023 Joshua Dodds
+Copyright 2022, 2023, 2024 Joshua Dodds - All Rights Reserved.
