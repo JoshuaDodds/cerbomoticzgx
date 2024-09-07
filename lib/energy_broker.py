@@ -28,7 +28,7 @@ def schedule_tasks():
 
     # Grid Charging Scheduled Tasks
     scheduler.every().day.at("13:10").do(publish_mqtt_trigger)  # when next day prices are published each day
-    scheduler.every().day.at("13:30").do(set_charging_schedule, caller="TaskScheduler()", silent=True)
+    # scheduler.every().day.at("13:30").do(set_charging_schedule, caller="TaskScheduler()", silent=True)
     scheduler.every().day.at("09:30").do(set_charging_schedule, caller="TaskScheduler()", silent=True)
     scheduler.every().day.at("00:10").do(set_charging_schedule, caller="TaskScheduler()", silent=True)
 
@@ -178,7 +178,7 @@ def set_charging_schedule(caller=None, silent=True):
 
     # set_48h_charging_schedule(caller=caller, silent=silent)
 
-    if 75 <= batt_soc <= 100:  # batt soc is 75 or more
+    if 90 <= batt_soc <= 100:  # batt soc is 90% or more
         set_48h_charging_schedule(caller=caller, silent=silent)
     else:
         set_24h_charging_schedule(caller=caller, silent=silent)
