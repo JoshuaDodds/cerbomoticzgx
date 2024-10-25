@@ -83,6 +83,7 @@ class Event:
 
         if _value == "True":
             _pid = os.getpid()
+            publish_message("Cerbomoticzgx/system/shutdown", message="True", retain=True)
             logging.info(f"lib.event_handler: received shutdown message from broker. Sending SIGKILL to PID {_pid}...")
             os.kill(_pid, signal.SIGKILL)
         else:

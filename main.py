@@ -58,7 +58,7 @@ def shutdown():
     publish_message("Cerbomoticzgx/system/shutdown", message="True", retain=True)
 
 def init():
-    if retrieve_message("system_shutdown"):
+    if retrieve_message("Cerbomoticzgx/system/shutdown"):
         # let post_startup() know that this is a manually requested restart
         publish_message("Cerbomoticzgx/system/manual_restart", message="True", retain=True)
 
@@ -150,7 +150,7 @@ def post_startup():
         manage_grid_usage_based_on_current_price()
 
         # re-run the charging scheduler based on current info and pricing if this was not a manual restart request
-        system_manual_restart = retrieve_message("system/manual_restart")
+        system_manual_restart = retrieve_message("Cerbomoticzgx/system/manual_restart")
 
         if system_manual_restart is False or system_manual_restart is None:
             logging.info(f"post_startup(): Updating the charging schedule based on currently available data...")
