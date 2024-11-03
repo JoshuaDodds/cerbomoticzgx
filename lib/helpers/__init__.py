@@ -3,7 +3,7 @@ import time
 import paho.mqtt.client as mqtt
 
 from datetime import datetime
-from math import floor, ceil
+from math import ceil
 
 from lib.helpers.base7_math import *
 from lib.constants import Topics, logging, mosquittoEndpoint
@@ -103,16 +103,6 @@ def convert_to_fractional_hour(minutes: int) -> str:
         return f"{minutes} min"
 
 
-def calculate_max_charge_slots_needed(batt_soc: float) -> int:
-    """
-    This assumes for the installed system that it can charge 25% of ESS storage capacity in an hour based on
-    the installed systems specifications.  With that in mind, this function take the current cbattery SOC
-    and determines how many hours are needed to fill it to 100% based each hour representing a 25% increase in
-    battery SOC.
-    """
-    return round((100 - (round(floor(batt_soc / 25) * 25))) / 25)
-
-
 def calculate_max_discharge_slots_needed(capacity_for_sale: float) -> int:
     """
     This function calculates the number of maximum discharge slots needed (hours) to discharge the available batt
@@ -121,6 +111,21 @@ def calculate_max_discharge_slots_needed(capacity_for_sale: float) -> int:
     """
     return ceil(capacity_for_sale / 25)
 
+
+def calculate_max_charge_slots_needed(batt_soc: float, target_soc: float) -> int:
+    """
+    Returns the maximum number of 1-hour charge slots needed to top up the battery.
+    Assuming each slot provides 25% charge, calculate the number of slots based on the state of charge.
+    """
+    charge_per_slot = 25.0  # Each slot provides 25% SOC
+
+    # Calculate how many slots are needed to reach the target SOC from the current SOC
+    slots_needed = (target_soc - batt_soc) / charge_per_slot
+
+    # Use math.ceil to round up to the nearest integer
+    rounded_slots = ceil(slots_needed)
+
+    return max(0, rounded_slots)
 
 def get_seasonally_adjusted_max_charge_slots(batt_soc: float, pv_production_remaining: float = 0.0) -> int:
     """
@@ -147,13 +152,10 @@ def get_seasonally_adjusted_max_charge_slots(batt_soc: float, pv_production_rema
     combined_soc = batt_soc + pv_production_remaining
 
     # Ensure we do not exceed the max target SOC
-    if combined_soc > max_target_soc:
-        combined_soc = max_target_soc
+    combined_soc = min(combined_soc, max_target_soc)
 
-    if current_month in winter_months:
-        return max(0, calculate_max_charge_slots_needed(combined_soc))
-
-    return 0
+    # Calculate the required charge slots based on the target SOC
+    return calculate_max_charge_slots_needed(combined_soc, max_target_soc)
 
 
 def reduce_decimal(value):
