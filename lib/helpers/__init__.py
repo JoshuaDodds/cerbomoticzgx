@@ -129,14 +129,29 @@ def get_seasonally_adjusted_max_charge_slots(batt_soc: float, pv_production_rema
     to the batt_soc.
     """
 
+    winter_months = [9, 10, 11, 12, 1, 2, 3]
+
     if pv_production_remaining:
-        # convert ov_forecasted from kWh  to a percentage assuming battery capacity of 40kWh
+        # convert pv_forecasted from kWh to a percentage assuming battery capacity of 40kWh
         pv_production_remaining = round((pv_production_remaining / 40) * 100, 2)
 
     current_month = datetime.now().month
 
-    if current_month in [9, 10, 11, 12, 1, 2, 3]:
-        return max(0, calculate_max_charge_slots_needed(batt_soc + pv_production_remaining))
+    # Set the maximum target state of charge to 75% if in the specified months
+    if current_month in winter_months:
+        max_target_soc = 75.0
+    else:
+        max_target_soc = 100.0
+
+    # Calculate the combined state of charge including PV production
+    combined_soc = batt_soc + pv_production_remaining
+
+    # Ensure we do not exceed the max target SOC
+    if combined_soc > max_target_soc:
+        combined_soc = max_target_soc
+
+    if current_month in winter_months:
+        return max(0, calculate_max_charge_slots_needed(combined_soc))
 
     return 0
 
