@@ -28,7 +28,7 @@ def schedule_tasks():
 
     # Grid Charging Scheduled Tasks
     scheduler.every().day.at("09:30").do(set_charging_schedule, caller="TaskScheduler()", silent=True)
-    scheduler.every().day.at("00:10").do(set_charging_schedule, caller="TaskScheduler()", silent=True)
+    scheduler.every().day.at("22:10").do(set_charging_schedule, caller="TaskScheduler()", silent=True)
 
 
 def retrieve_latest_tibber_pricing():
