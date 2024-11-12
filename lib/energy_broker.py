@@ -28,7 +28,7 @@ def schedule_tasks():
 
     # Grid Charging Scheduled Tasks
     scheduler.every().day.at("09:30").do(set_charging_schedule, caller="TaskScheduler()", silent=True)
-    scheduler.every().day.at("22:10").do(set_charging_schedule, caller="TaskScheduler()", silent=True)
+    scheduler.every().day.at("21:30").do(set_charging_schedule, caller="TaskScheduler()", silent=True, schedule_type="48h")
 
 
 def retrieve_latest_tibber_pricing():
@@ -167,38 +167,46 @@ def manage_grid_usage_based_on_current_price(price: float = None) -> None:
             return
 
 def publish_mqtt_trigger():
-    """ Triggers the event_handler to call set_48h_charging_scheudle() function"""
+    """ Triggers the event_handler to call set_charging_scheudle() function"""
     publish_message("Cerbomoticzgx/EnergyBroker/RunTrigger", payload=f"{{\"value\": {time.localtime().tm_hour}}}", retain=False)
 
 
-def set_charging_schedule(caller=None, silent=True):
+def set_charging_schedule(caller=None, price_cap=MAX_TIBBER_BUY_PRICE, silent=True, schedule_type=None):
     batt_soc = STATE.get('batt_soc')
 
-    # set_48h_charging_schedule(caller=caller, silent=silent)
+    # Determine schedule type if not explicitly provided
+    if schedule_type is None:
+        if 90 <= batt_soc <= 100:
+            schedule_type = '48h'
+        else:
+            schedule_type = '24h'
 
-    if 90 <= batt_soc <= 100:  # batt soc is 90% or more
-        set_48h_charging_schedule(caller=caller, silent=silent)
+    # Convert forecast from Wh to kWh and subtract expected day usage
+    pv_precalc = round((STATE.get('pv_projected_remaining') / 1000 - 21), 2) or 0.0
+    pv_forecast_min_consumption_forecast = pv_precalc if pv_precalc > 0 else 0.0
+
+    # Get maximum items to charge based on current battery SOC and solar forecast
+    max_items = get_seasonally_adjusted_max_charge_slots(batt_soc, pv_forecast_min_consumption_forecast)
+
+    # Log the schedule request details
+    logging.info(f"EnergyBroker: set up {schedule_type} charging schedule request received by {caller} using batt_soc={batt_soc}% and expected solar surplus of {pv_forecast_min_consumption_forecast} kWh")
+
+    # If no charging slots are needed, return early
+    if max_items < 1:
+        return False
+
+    # Clear the existing Victron schedules
+    clear_victron_schedules()
+
+    # Determine new schedule based on schedule type
+    if schedule_type == '24h':
+        new_schedule = lowest_24h_prices(price_cap=price_cap, max_items=max_items)
+    elif schedule_type == '48h':
+        new_schedule = lowest_48h_prices(price_cap=price_cap, max_items=max_items)
     else:
-        set_24h_charging_schedule(caller=caller, silent=silent)
+        raise ValueError("Invalid schedule type. Use '24h' or '48h'.")
 
-
-def set_24h_charging_schedule(caller=None, price_cap=MAX_TIBBER_BUY_PRICE, silent=True):
-    batt_soc = STATE.get('batt_soc')
-
-    # convert forecast from Wh to kWh and substract expected day usage
-    pv_precalc = round((STATE.get('pv_projected_remaining') / 1000 - 21), 2) or 0.0
-    pv_forecast_min_consumption_forecast = pv_precalc if pv_precalc > 0 else 0.0
-
-    max_items = get_seasonally_adjusted_max_charge_slots(batt_soc, pv_forecast_min_consumption_forecast)
-
-    logging.info(f"EnergyBroker: set up daily charging schedule request received by {caller} using batt_soc={batt_soc}% and expected solar surplus of {pv_forecast_min_consumption_forecast} kWh")
-
-    if max_items < 1:
-        return False
-
-    clear_victron_schedules()
-    new_schedule = lowest_24h_prices(price_cap=price_cap, max_items=max_items)
-
+    # Schedule the Victron ESS charging based on the new schedule
     if len(new_schedule) > 0:
         schedule = 0
         for item in new_schedule:
@@ -210,34 +218,8 @@ def set_24h_charging_schedule(caller=None, price_cap=MAX_TIBBER_BUY_PRICE, silen
                 push_notification(hour, day, price)
             schedule += 1
 
+    return True
 
-def set_48h_charging_schedule(caller=None, price_cap=MAX_TIBBER_BUY_PRICE, silent=True):
-    batt_soc = STATE.get('batt_soc')
-
-    # convert forecast from Wh to kWh and substract expected day usage
-    pv_precalc = round((STATE.get('pv_projected_remaining') / 1000 - 21), 2) or 0.0
-    pv_forecast_min_consumption_forecast = pv_precalc if pv_precalc > 0 else 0.0
-
-    max_items = get_seasonally_adjusted_max_charge_slots(batt_soc, pv_forecast_min_consumption_forecast)
-
-    logging.info(f"EnergyBroker: set up daily charging schedule request received by {caller} using batt_soc={batt_soc}% and expected solar surplus of {pv_forecast_min_consumption_forecast} kWh")
-
-    if max_items < 1:
-        return False
-
-    clear_victron_schedules()
-    new_schedule = lowest_48h_prices(price_cap=price_cap, max_items=max_items)
-
-    if len(new_schedule) > 0:
-        schedule = 0
-        for item in new_schedule:
-            hour = int(item[1])
-            day = item[0]
-            price = item[3]
-            schedule_victron_ess_charging(int(hour), schedule=schedule, day=day)
-            if not silent:
-                push_notification(hour, day, price)
-            schedule += 1
 
 def schedule_victron_ess_charging(hour, schedule=0, duration=3600, day=0):
     """

@@ -8,7 +8,7 @@ from lib.victron_integration import regulate_battery_max_voltage
 from lib.global_state import GlobalStateClient
 from lib.energy_broker import (
     manage_sale_of_stored_energy_to_the_grid,
-    set_24h_charging_schedule,
+    set_charging_schedule,
     manage_grid_usage_based_on_current_price,
     Utils
 )
@@ -238,4 +238,4 @@ class Event:
 
     @staticmethod
     def trigger_ess_charge_scheduling():
-        set_24h_charging_schedule(__name__)
+        set_charging_schedule(caller=__name__, schedule_type='24h')
