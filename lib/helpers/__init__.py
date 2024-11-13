@@ -144,7 +144,7 @@ def get_seasonally_adjusted_max_charge_slots(batt_soc: float, pv_production_rema
 
     # Set the maximum target state of charge to 75% if in the specified months
     if current_month in winter_months:
-        max_target_soc = 75.0
+        max_target_soc = 90.0
     else:
         max_target_soc = 100.0
 
