@@ -43,6 +43,10 @@ def sync_tasks_start():
                 logging.info(f"Starting {module}")
                 exec(f"{module}()")
 
+            # Clean up any mqtt topics related to the ev charge module if it's not active or the UI will show it
+            if not ACTIVE_MODULES[0]['sync']['ev_charge_controller']:
+                EvCharger.cleanup()
+
     except Exception as E:
         logging.error(f"sync_tasks_start (error): {E}")
 

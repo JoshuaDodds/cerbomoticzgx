@@ -304,7 +304,7 @@ class EvCharger:
 
     @staticmethod
     def cleanup():
-        logging.info("EvCharger: Topic Housecleaning before exit...")
+        logging.info("EvCharger: Topic Housecleaning...")
         # clear out topics which toggle on functionality only this module uses
         publish_message("Tesla/vehicle0/Ac/ac_loads", payload=None, qos=0, retain=False)
         publish_message("Tesla/vehicle0/Ac/ac_in", payload=None, qos=0, retain=False)
