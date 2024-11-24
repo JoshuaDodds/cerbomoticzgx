@@ -305,7 +305,9 @@ class EvCharger:
     @staticmethod
     def cleanup():
         logging.info("EvCharger: Topic Housecleaning...")
-        # clear out topics which toggle on functionality only this module uses
-        publish_message("Tesla/vehicle0/Ac/ac_loads", payload=None, qos=0, retain=False)
-        publish_message("Tesla/vehicle0/Ac/ac_in", payload=None, qos=0, retain=False)
-        publish_message("Tesla/vehicle0/Ac/tesla_load", payload=None, qos=0, retain=False)
+        # clear out topic which activates this UI widget in dashboard
+        publish_message("Tesla", payload=None, qos=0, retain=False)
+        # Deprecated
+        # publish_message("Tesla/vehicle0/Ac/ac_loads", payload=None, qos=0, retain=False)
+        # publish_message("Tesla/vehicle0/Ac/ac_in", payload=None, qos=0, retain=False)
+        # publish_message("Tesla/vehicle0/Ac/tesla_load", payload=None, qos=0, retain=False)
