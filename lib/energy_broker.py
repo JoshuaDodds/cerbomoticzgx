@@ -13,6 +13,7 @@ from lib.victron_integration import ac_power_setpoint
 MAX_TIBBER_BUY_PRICE = float(dotenv_config('MAX_TIBBER_BUY_PRICE')) or 0.20
 SWITCH_TO_GRID_PRICE_THRESHOLD = float(dotenv_config('SWITCH_TO_GRID_PRICE_THRESHOLD')) or 0.0001
 ESS_EXPORT_AC_SETPOINT = float(dotenv_config('ESS_EXPORT_AC_SETPOINT')) or -10000.0
+DAILY_HOME_ENERGY_CONSUMPTION = float(dotenv_config('DAILY_HOME_ENERGY_CONSUMPTION')) or 12.0
 
 STATE = GlobalStateClient()
 
@@ -141,8 +142,14 @@ def manage_grid_usage_based_on_current_price(price: float = None) -> None:
     vehicle_is_charging = STATE.get('tesla_is_charging')
     grid_charging_enabled = STATE.get('grid_charging_enabled') or False
 
+    # TODO: This mode puts the system in a state where it will not recover automatically if grid power is lost.
+    #       Because of that, some additional checks should be added here before switching to this mode. For
+    #       example, is there someone home who can manually intervene if the grid has issues? Are they awake?
+    #       an additional option could be to install a zigbee 4P circuit breaker on AC IN and monitor for
+    #       issues on the grid or the breaker being thrown open in order to automatically switch the inverters back
+    #       to the correct mode and restore power to the loads.
     if not ess_net_metering_overridden:
-        # if energy is free or the provider is paying, switch to using the grid and start vehicle charging
+        # if energy is below SWITCH_TO_GRID_PRICE_THRESHOLD, switch to using the grid and try to charge vehicle
         if price <= SWITCH_TO_GRID_PRICE_THRESHOLD and not grid_charging_enabled and inverter_mode == 3:
             logging.info(f"Energy cost is {round(price, 3)} cents per kWh. Switching to grid energy.")
 
@@ -182,7 +189,7 @@ def set_charging_schedule(caller=None, price_cap=MAX_TIBBER_BUY_PRICE, silent=Tr
             schedule_type = '24h'
 
     # Convert forecast from Wh to kWh and subtract expected day usage
-    pv_precalc = round((STATE.get('pv_projected_remaining') / 1000 - 21), 2) or 0.0
+    pv_precalc = round((STATE.get('pv_projected_remaining') / 1000 - DAILY_HOME_ENERGY_CONSUMPTION), 2) or 0.0
     pv_forecast_min_consumption_forecast = pv_precalc if pv_precalc > 0 else 0.0
 
     # Get maximum items to charge based on current battery SOC and solar forecast
