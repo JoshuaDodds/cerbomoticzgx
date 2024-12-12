@@ -8,6 +8,7 @@ from lib.constants import logging, dotenv_config, systemId0
 from lib.domoticz_updater import domoticz_update
 from lib.clients.mqtt_client_factory import VictronClient
 from gql.transport.exceptions import TransportClosed
+from websockets.exceptions import ConnectionClosedError
 
 logging.getLogger("gql.transport").setLevel(logging.ERROR)
 
@@ -58,9 +59,9 @@ def live_measurements(home=_home or None):
     logging.info(f"Tibber: Live measurements starting...")
     try:
         home.start_live_feed(user_agent=f"cerbomoticzgx/{dotenv_config('VERSION')}",
-                             retries=1800,
-                             retry_interval=30)
-    except TransportClosed as e:
+                             retries=20,
+                             retry_interval=10)
+    except (TransportClosed, ConnectionClosedError) as e:
         logging.info(f"Tibber Error: {e} It seems we have a network/connectivity issue. Attempting a service restart...")
         # this will trigger event_handler to restart the whole service
         client.publish("Cerbomoticzgx/system/shutdown", payload=f"{{\"value\": \"True\"}}", retain=True)
