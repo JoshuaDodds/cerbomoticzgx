@@ -3,7 +3,7 @@ import schedule as scheduler
 
 from paho.mqtt import publish
 from lib.constants import logging, systemId0, PythonToVictronWeekdayNumberConversion, dotenv_config, cerboGxEndpoint
-from lib.helpers import get_seasonally_adjusted_max_charge_slots, calculate_max_discharge_slots_needed, publish_message
+from lib.helpers import get_seasonally_adjusted_max_charge_slots, calculate_max_discharge_slots_needed, publish_message, round_up_to_nearest_10
 from lib.tibber_api import lowest_48h_prices, lowest_24h_prices
 from lib.notifications import pushover_notification
 from lib.tibber_api import publish_pricing_data
@@ -29,7 +29,7 @@ def schedule_tasks():
 
     # Grid Charging Scheduled Tasks
     scheduler.every().day.at("09:30").do(set_charging_schedule, caller="TaskScheduler()", silent=True)
-    scheduler.every().day.at("21:30").do(set_charging_schedule, caller="TaskScheduler()", silent=True, schedule_type="48h")
+    scheduler.every().day.at("21:30").do(set_charging_schedule, caller="TaskScheduler()", silent=True)
 
 
 def retrieve_latest_tibber_pricing():
@@ -131,50 +131,55 @@ def manage_sale_of_stored_energy_to_the_grid() -> None:
                                       f"Stopped energy export at {batt_soc}% and a current price of {round(tibber_price_now, 3)}")
 
 
-def manage_grid_usage_based_on_current_price(price: float = None) -> None:
-    inverter_mode = int(STATE.get("inverter_mode"))
+def adjust_grid_setpoint(watts, override_ess_net_mettering):
+    target_watts = int(round_up_to_nearest_10(watts))
+    ac_power_setpoint(watts=target_watts, override_ess_net_mettering=override_ess_net_mettering, silent=True)
+    return target_watts
+
+
+def manage_grid_usage_based_on_current_price(price: float = None, power: any = None) -> None:
+    """
+    Manages and allows automatic or manual toggle of a "passthrough" mode control loop which matches power consumption
+    to a grid setpoint to allow consumption from grid while having a fallback to battery in case of grid instability.
+    """
     ess_net_metering_overridden = STATE.get('ess_net_metering_overridden') or False
     price = price if price is not None else STATE.get('tibber_price_now')
-    vehicle_plugged = True if STATE.get('tesla_plug_status') == "Plugged" else False
-    vehicle_home = STATE.get('tesla_is_home')
-    vehicle_soc = STATE.get('tesla_battery_soc')
-    vehicle_soc_setpoint = STATE.get('tesla_battery_soc_setpoint')
-    vehicle_is_charging = STATE.get('tesla_is_charging')
     grid_charging_enabled = STATE.get('grid_charging_enabled') or False
+    grid_charging_enabled_by_price = STATE.get('grid_charging_enabled_by_price') or False
 
-    # TODO: This mode puts the system in a state where it will not recover automatically if grid power is lost.
-    #       Because of that, some additional checks should be added here before switching to this mode. For
-    #       example, is there someone home who can manually intervene if the grid has issues? Are they awake?
-    #       an additional option could be to install a zigbee 4P circuit breaker on AC IN and monitor for
-    #       issues on the grid or the breaker being thrown open in order to automatically switch the inverters back
-    #       to the correct mode and restore power to the loads.
-    if not ess_net_metering_overridden:
-        # if energy is below SWITCH_TO_GRID_PRICE_THRESHOLD, switch to using the grid and try to charge vehicle
-        if price <= SWITCH_TO_GRID_PRICE_THRESHOLD and not grid_charging_enabled and inverter_mode == 3:
+    # Manual Mode Setpoint Management: used when grid assist has been manually toggled on
+    if ess_net_metering_overridden and grid_charging_enabled and not grid_charging_enabled_by_price and power:
+        setpoint = adjust_grid_setpoint(power, override_ess_net_mettering=True)
+        logging.debug(f"Setpoint adjusted to: {setpoint}")
+        return
+
+    # Auto Mode State Change: Toggle grid charging based on price and send a single notification on state change
+    if not ess_net_metering_overridden or grid_charging_enabled_by_price:
+        if price <= SWITCH_TO_GRID_PRICE_THRESHOLD and not grid_charging_enabled_by_price:
             logging.info(f"Energy cost is {round(price, 3)} cents per kWh. Switching to grid energy.")
+            pushover_notification(
+                "Auto Grid Assist On",
+                f"Energy cost is {round(price, 3)} cents per kWh. Switching to grid energy."
+            )
+            STATE.set('grid_charging_enabled_by_price', True)
 
-            Utils.set_inverter_mode(mode=1)
-            if vehicle_plugged and vehicle_home and (vehicle_soc < vehicle_soc_setpoint) and not vehicle_is_charging:
-                STATE.set('tesla_charge_requested', 'True')
-
-            pushover_notification("Tibber Price Alert",
-                                  f"Energy cost is {round(price, 3)} cents per kWh. Switching to grid energy.")
-            return
-
-        # reverse the above action when energy is no longer free
-        if price >= SWITCH_TO_GRID_PRICE_THRESHOLD and not grid_charging_enabled and inverter_mode == 1:
+        elif price > SWITCH_TO_GRID_PRICE_THRESHOLD and grid_charging_enabled_by_price:
             logging.info(f"Energy cost is {round(price, 3)} cents per kWh. Switching back to battery.")
+            pushover_notification(
+                "Auto Grid Assist Off",
+                f"Energy cost is {round(price, 3)} cents per kWh. Switching back to battery."
+            )
+            STATE.set('grid_charging_enabled_by_price', False)
+            ac_power_setpoint(watts="0.0", override_ess_net_mettering=False, silent=False)
 
-            Utils.set_inverter_mode(mode=3)
-            STATE.set('tesla_charge_requested', 'False')
+    # Auto Mode Setpoint Management: Manage setpoints if grid charging has been enabled by price threshold targets
+    if grid_charging_enabled_by_price and power:
+        setpoint = adjust_grid_setpoint(power, ess_net_metering_overridden)
+        logging.debug(f"Setpoint adjusted to: {setpoint}")
 
-            pushover_notification("Tibber Price Alert",
-                                  f"Energy cost is {round(price, 3)} cents per kWh. Switching back to battery.")
-
-            return
 
 def publish_mqtt_trigger():
-    """ Triggers the event_handler to call set_charging_scheudle() function"""
+    """ Triggers the event_handler to call set_charging_schedule() function"""
     publish_message("Cerbomoticzgx/EnergyBroker/RunTrigger", payload=f"{{\"value\": {time.localtime().tm_hour}}}", retain=False)
 
 

@@ -4,8 +4,9 @@ import signal
 
 from lib.helpers import get_topic_key, publish_message
 from lib.constants import dotenv_config, logging
-from lib.victron_integration import regulate_battery_max_voltage
+from lib.victron_integration import regulate_battery_max_voltage, ac_power_setpoint
 from lib.global_state import GlobalStateClient
+from lib.notifications import pushover_notification_critical
 from lib.energy_broker import (
     manage_sale_of_stored_energy_to_the_grid,
     set_charging_schedule,
@@ -50,11 +51,24 @@ class Event:
         # global state db but will just be uncaught in this event handler.
         logging.debug(f"{__name__}: Invalid method or nothing implemented for topic: '{self.mqtt_topic}'")
 
+    def ac_in_connected(self):
+        event = int(self.value)
+        if event == 0:
+            logging.info("AC Input: Grid is offline! This should not happen!")
+            # Ensure Ac Loads are powered by ensuring Inverters on are
+            Utils.set_inverter_mode(mode=3)
+            pushover_notification_critical(
+                "AC Input Gone!",
+                "Cerbomoticzgx requesting immediate attention: Grid power is offline. Check inverters and breakers!"
+            )
+        elif event == 1:
+            logging.info("AC Input: Grid is online.")
+
     def ac_power_setpoint(self):
         if float(self.value) > 0 or float(self.value) < 0:
-            logging.info(f"AC Power Setpoint changed to {self.value}")
+            logging.debug(f"AC Power Setpoint changed to {self.value}")
         else:
-            logging.info(f"AC Power Setpoint reset to {self.value}")
+            logging.debug(f"AC Power Setpoint reset to {self.value}")
 
     def ess_net_metering_batt_min_soc(self):
         if self.gs_client.get('ess_net_metering_batt_min_soc'):
@@ -123,6 +137,7 @@ class Event:
         publish_message("Tesla/vehicle0/Ac/tesla_load", message=f"{_value}", retain=True)
 
     def ac_out_power(self):
+        manage_grid_usage_based_on_current_price(price=self.gs_client.get('tibber_price_now'), power=int(self.value))
         self.adjust_ac_out_power()
 
     def ac_in_power(self):
@@ -139,10 +154,9 @@ class Event:
 
         if _value:
             grid_import_state = "Enabled"
-            Utils.set_inverter_mode(mode=1)
         else:
             grid_import_state = "Disabled"
-            Utils.set_inverter_mode(mode=3)
+            ac_power_setpoint(watts="0.0", override_ess_net_mettering=False, silent=False)
 
         logging.info(f"Grid assisted charging toggled to {grid_import_state}")
 
@@ -238,4 +252,4 @@ class Event:
 
     @staticmethod
     def trigger_ess_charge_scheduling():
-        set_charging_schedule(caller=__name__, schedule_type='24h')
+        set_charging_schedule(caller=__name__, silent=True)

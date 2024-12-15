@@ -69,6 +69,10 @@ def init():
     # Set shutdown state to false (prevent a looping restart condition)
     publish_message("Cerbomoticzgx/system/shutdown", message="False", retain=True)
 
+    # set higher than 0 zero cost at startup until actual pricing is retreived or auto sell/auto grid-assist might flap
+    publish_message(topic='Tibber/home/price_info/now/total', message="0.35", retain=True)
+    STATE.set('tibber_price_now', "0.35")
+
 
 def main():
     try:
@@ -105,9 +109,6 @@ def post_startup():
     time.sleep(2)
     logging.info(f"post_startup() actions executing...")
 
-    # set higher than 0 zero cost at startup until actual pricing is retreived
-    STATE.set('tibber_price_now', 0.15)
-
     # Re-apply previously set Dynamic ESS preferences set in the previous run
     logging.info(f"post_startup(): Re-storing previous state if available...")
 
@@ -115,6 +116,7 @@ def post_startup():
     DYNAMIC_ESS_BATT_MIN_SOC = retrieve_message('ess_net_metering_batt_min_soc') or STATE.get("ess_net_metering_batt_min_soc") or dotenv_config('DYNAMIC_ESS_BATT_MIN_SOC')
     DYNAMIC_ESS_NET_METERING_ENABLED = retrieve_message('ess_net_metering_enabled') or STATE.get("ess_net_metering_enabled") or dotenv_config('DYNAMIC_ESS_NET_METERING_ENABLED')
     GRID_CHARGING_ENABLED = retrieve_message('grid_charging_enabled') or STATE.get("grid_charging_enabled") or False
+    GRID_CHARGING_ENABLED_BY_PRICE = retrieve_message('grid_charging_enabled_by_price') or STATE.get("grid_charging_enabled_by_price") or False
     ESS_NET_METERING_OVERRIDDEN = retrieve_message('ess_net_metering_overridden') or STATE.get("ess_net_metering_overridden") or False
     TESLA_CHARGE_REQUESTED = retrieve_message('tesla_charge_requested') or STATE.get("tesla_charge_requested") or False
 
@@ -123,6 +125,9 @@ def post_startup():
 
     publish_message(topic='Tesla/settings/grid_charging_enabled', message=GRID_CHARGING_ENABLED, retain=True)
     STATE.set('grid_charging_enabled', str(GRID_CHARGING_ENABLED))
+
+    publish_message(topic='Tesla/settings/grid_charging_enabled_by_price', message=GRID_CHARGING_ENABLED, retain=True)
+    STATE.set('grid_charging_enabled_by_price', str(GRID_CHARGING_ENABLED_BY_PRICE))
 
     publish_message(topic='Tesla/vehicle0/control/charge_requested', message=TESLA_CHARGE_REQUESTED, retain=True)
     STATE.set('tesla_charge_requested', TESLA_CHARGE_REQUESTED)

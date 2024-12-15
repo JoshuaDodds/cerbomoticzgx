@@ -8,20 +8,22 @@ float_voltage = float(dotenv_config('BATTERY_FLOAT_VOLTAGE'))
 max_voltage = float(dotenv_config('BATTERY_ABSORPTION_VOLTAGE'))
 battery_full_voltage = float(dotenv_config('BATTERY_FULL_VOLTAGE'))
 
-def ac_power_setpoint(watts: str = None, override_ess_net_mettering=True):
+def ac_power_setpoint(watts: str = None, override_ess_net_mettering=True, silent: bool = False):
     # disable net metering overide whenever power setpoint returns to zero
     if watts == "0.0":
         publish_message(Topics['system0']['ess_net_metering_overridden'], message="False", retain=True)
 
     if watts:
         _msg = f"{{\"value\": {watts}}}"
-        logging.debug(f"Victron Integration: Setting AC Power Set Point to: {watts} watts")
 
         if override_ess_net_mettering:
             publish_message(Topics['system0']['ess_net_metering_overridden'], message="True", retain=True)
 
         STATE.set(key='ac_power_setpoint', value=f"{watts}")
         publish.single(TopicsWritable['system0']['ac_power_setpoint'], payload=_msg, qos=1, retain=True, hostname=cerboGxEndpoint, port=1883)
+
+        if not silent:
+            logging.info(f"Victron Integration: Set AC Power Set Point to: {watts} watts")
 
 def set_minimum_ess_soc(percent: int = 0):
     if percent:

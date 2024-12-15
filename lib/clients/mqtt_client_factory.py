@@ -99,7 +99,7 @@ class VictronClient:
                 logmsg = f"{' '.join(topic.rsplit('/', 3)[1:3])}: {value}"
                 logging.debug(logmsg)
 
-                if topic and value:
+                if topic and value is not None:
                     # capture and dispatch events which should update Domoticz
                     if topic in DzEndpoints['system0']:
                         domoticz_update(topic, value, logmsg)

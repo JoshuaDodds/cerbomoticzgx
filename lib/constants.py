@@ -44,10 +44,11 @@ Topics = dict({
             "c1_daily_yield":   f"N/{systemId0}/solarcharger/282/History/Daily/0/Yield",
 
             # AC Out Metrics
-            "ac_out_power": f"N/{systemId0}/vebus/276/Ac/Out/P",
+            "ac_out_power":     f"N/{systemId0}/vebus/276/Ac/Out/P",
 
             # AC In Metrics
-            "ac_in_power": f"N/{systemId0}/vebus/276/Ac/ActiveIn/P",
+            "ac_in_connected": f"N/{systemId0}/vebus/276/Ac/ActiveIn/Connected",
+            "ac_in_power":  f"N/{systemId0}/vebus/276/Ac/ActiveIn/P",
 
             # Control
             "ac_power_setpoint":                f"N/{systemId0}/settings/0/Settings/CGwacs/AcPowerSetPoint",
@@ -58,7 +59,7 @@ Topics = dict({
             "trigger_ess_charge_scheduling":    f"Cerbomoticzgx/EnergyBroker/RunTrigger",
             "system_shutdown":                  f"Cerbomoticzgx/system/shutdown",
             "ess_net_metering_enabled":         f"Cerbomoticzgx/system/EssNetMeteringEnabled",
-            "ess_net_metering_overridden":      f"Cerbomoticzgx/system/EssNetMeteringOverridden",
+            "ess_net_metering_overridden":      f"Cerbomoticzgx/system/EssNetMeteringOverridden",   # When this is toggled on, DynESS will not operate with automated buy/sell decisions
             "ess_net_metering_batt_min_soc":    f"Cerbomoticzgx/system/EssNetMeteringBattMinSoc",
 
             # Tibber
