@@ -1,4 +1,5 @@
 import json
+import math
 import time
 import paho.mqtt.client as mqtt
 
@@ -144,7 +145,7 @@ def get_seasonally_adjusted_max_charge_slots(batt_soc: float, pv_production_rema
 
     # Set the maximum target state of charge to 75% if in the specified months
     if current_month in winter_months:
-        max_target_soc = 90.0
+        max_target_soc = 125.0  # The point is to get as many slots as possible for the user to select as needed.
     else:
         max_target_soc = 100.0
 
@@ -170,6 +171,10 @@ def reduce_decimal(value):
             return value
     else:
         return value
+
+
+def round_up_to_nearest_10(number):
+    return math.ceil(number / 10) * 10
 
 
 # Function Aliases
