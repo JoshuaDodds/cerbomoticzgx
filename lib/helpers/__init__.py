@@ -27,6 +27,21 @@ def publish_message(topic, message=None, qos=0, retain=False, payload=None) -> N
         logging.info(f"{e}", exc_info=True)
 
 
+def remove_message(topic, qos=0, retain=True):
+    """
+    removes messages from specified topic on the Mqtt broker
+    """
+    try:
+        from lib.clients.mqtt_client_factory import VictronClient
+        client = VictronClient().get_client()
+
+        if topic:
+            client.publish(topic=topic, qos=qos, retain=retain)
+
+    except Exception as e:
+        logging.info(f"{e}", exc_info=True)
+
+
 def get_current_value_from_mqtt(topic: str, timeout: float = 1.0, raw: bool = False) -> any:
     """
     Retrieves a single message from a given topic on the MQTT broker using a separate connection.
@@ -145,7 +160,7 @@ def get_seasonally_adjusted_max_charge_slots(batt_soc: float, pv_production_rema
 
     # Set the maximum target state of charge to 75% if in the specified months
     if current_month in winter_months:
-        max_target_soc = 125.0  # The point is to get as many slots as possible for the user to select as needed.
+        max_target_soc = 150.0  # The point is to get as many slots as possible for the user to select as needed.
     else:
         max_target_soc = 100.0
 

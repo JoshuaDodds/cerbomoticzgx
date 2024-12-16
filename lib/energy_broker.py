@@ -3,7 +3,7 @@ import schedule as scheduler
 
 from paho.mqtt import publish
 from lib.constants import logging, systemId0, PythonToVictronWeekdayNumberConversion, dotenv_config, cerboGxEndpoint
-from lib.helpers import get_seasonally_adjusted_max_charge_slots, calculate_max_discharge_slots_needed, publish_message, round_up_to_nearest_10
+from lib.helpers import get_seasonally_adjusted_max_charge_slots, calculate_max_discharge_slots_needed, publish_message, round_up_to_nearest_10, remove_message
 from lib.tibber_api import lowest_48h_prices, lowest_24h_prices
 from lib.notifications import pushover_notification
 from lib.tibber_api import publish_pricing_data
@@ -183,12 +183,12 @@ def publish_mqtt_trigger():
     publish_message("Cerbomoticzgx/EnergyBroker/RunTrigger", payload=f"{{\"value\": {time.localtime().tm_hour}}}", retain=False)
 
 
-def set_charging_schedule(caller=None, price_cap=MAX_TIBBER_BUY_PRICE, silent=True, schedule_type=None):
+def set_charging_schedule(caller=None, price_cap=MAX_TIBBER_BUY_PRICE, silent=False, schedule_type=None):
     batt_soc = STATE.get('batt_soc')
 
     # Determine schedule type if not explicitly provided
     if schedule_type is None:
-        if 90 <= batt_soc <= 100:
+        if 50 <= batt_soc <= 100:
             schedule_type = '48h'
         else:
             schedule_type = '24h'
@@ -226,6 +226,7 @@ def set_charging_schedule(caller=None, price_cap=MAX_TIBBER_BUY_PRICE, silent=Tr
             day = item[0]
             price = item[3]
             schedule_victron_ess_charging(int(hour), schedule=schedule, day=day)
+            remove_message("Cerbomoticzgx/EnergyBroker/RunTrigger")  # Remove any retained messages on the topic which might retrigger scheduling again
             if not silent:
                 push_notification(hour, day, price)
             schedule += 1
