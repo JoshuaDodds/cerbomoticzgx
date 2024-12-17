@@ -252,4 +252,4 @@ class Event:
 
     @staticmethod
     def trigger_ess_charge_scheduling():
-        set_charging_schedule(caller=__name__, silent=True)
+        set_charging_schedule(caller=__name__, silent=True, schedule_type='48h', slots=5)

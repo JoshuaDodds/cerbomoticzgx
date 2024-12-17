@@ -29,7 +29,7 @@ def schedule_tasks():
 
     # Grid Charging Scheduled Tasks
     scheduler.every().day.at("09:30").do(set_charging_schedule, caller="TaskScheduler()", silent=True)
-    scheduler.every().day.at("21:30").do(set_charging_schedule, caller="TaskScheduler()", silent=True)
+    scheduler.every().day.at("21:30").do(set_charging_schedule, caller="TaskScheduler()", silent=True, schedule_type='48h')
 
 
 def retrieve_latest_tibber_pricing():
@@ -183,7 +183,7 @@ def publish_mqtt_trigger():
     publish_message("Cerbomoticzgx/EnergyBroker/RunTrigger", payload=f"{{\"value\": {time.localtime().tm_hour}}}", retain=False)
 
 
-def set_charging_schedule(caller=None, price_cap=MAX_TIBBER_BUY_PRICE, silent=False, schedule_type=None):
+def set_charging_schedule(caller=None, price_cap=MAX_TIBBER_BUY_PRICE, silent=False, schedule_type=None, slots=None):
     batt_soc = STATE.get('batt_soc')
 
     # Determine schedule type if not explicitly provided
@@ -197,8 +197,11 @@ def set_charging_schedule(caller=None, price_cap=MAX_TIBBER_BUY_PRICE, silent=Fa
     pv_precalc = round((STATE.get('pv_projected_remaining') / 1000 - DAILY_HOME_ENERGY_CONSUMPTION), 2) or 0.0
     pv_forecast_min_consumption_forecast = pv_precalc if pv_precalc > 0 else 0.0
 
-    # Get maximum items to charge based on current battery SOC and solar forecast
-    max_items = get_seasonally_adjusted_max_charge_slots(batt_soc, pv_forecast_min_consumption_forecast)
+    if slots is not None:
+        max_items = slots
+    else:
+        # Get maximum items to charge based on current battery SOC and solar forecast
+        max_items = get_seasonally_adjusted_max_charge_slots(batt_soc, pv_forecast_min_consumption_forecast)
 
     # Log the schedule request details
     logging.info(f"EnergyBroker: set up {schedule_type} charging schedule request received by {caller} using batt_soc={batt_soc}% and expected solar surplus of {pv_forecast_min_consumption_forecast} kWh")
