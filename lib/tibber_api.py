@@ -59,7 +59,7 @@ def live_measurements(home=_home or None):
     logging.info(f"Tibber: Live measurements starting...")
     try:
         home.start_live_feed(user_agent=f"cerbomoticzgx/{dotenv_config('VERSION')}",
-                             retries=3,
+                             retries=10,
                              retry_interval=10)
     except (TransportClosed, ConnectionClosedError) as e:
         logging.info(f"Tibber Error: {e} It seems we have a network/connectivity issue. Attempting a service restart...")
