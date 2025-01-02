@@ -75,9 +75,10 @@ target/
 # celery beat schedule file
 celerybeat-schedule
 
-# dotenv
+# dotenv / secrets
 .env
 .env-gitops
+.secrets
 
 # virtualenv
 .venv/
