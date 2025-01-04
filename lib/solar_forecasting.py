@@ -23,15 +23,16 @@ import requests
 from datetime import datetime
 from urllib.parse import urlencode
 
-from lib.constants import logging, dotenv_config
+from lib.config_retrieval import retrieve_setting
+from lib.constants import logging
 from lib.global_state import GlobalStateClient
 
 STATE = GlobalStateClient()
-TIMEZONE = pytz.timezone(dotenv_config('TIMEZONE'))
-IDSITE = dotenv_config('VRM_SITE_ID')
-LOGIN_URL = dotenv_config('VRM_LOGIN_URL')
-LOGIN_DATA = {"username": dotenv_config('VRM_USER'), "password": dotenv_config('VRM_PASS')}
-API_URL = dotenv_config('VRM_API_URL')
+TIMEZONE = pytz.timezone(retrieve_setting('TIMEZONE'))
+IDSITE = retrieve_setting('VRM_SITE_ID')
+LOGIN_URL = retrieve_setting('VRM_LOGIN_URL')
+LOGIN_DATA = {"username": retrieve_setting('VRM_USER'), "password": retrieve_setting('VRM_PASS')}
+API_URL = retrieve_setting('VRM_API_URL')
 
 
 def get_victron_solar_forecast():

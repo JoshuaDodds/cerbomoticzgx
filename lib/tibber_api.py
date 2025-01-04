@@ -4,7 +4,8 @@ import time
 from datetime import datetime, timezone
 from dateutil import parser, tz
 
-from lib.constants import logging, dotenv_config, systemId0
+from lib.config_retrieval import retrieve_setting
+from lib.constants import logging, systemId0
 from lib.domoticz_updater import domoticz_update
 from lib.clients.mqtt_client_factory import VictronClient
 from gql.transport.exceptions import TransportClosed
@@ -12,8 +13,8 @@ from websockets.exceptions import ConnectionClosedError
 
 logging.getLogger("gql.transport").setLevel(logging.ERROR)
 
-tzinfos = {"UTC": tz.gettz(dotenv_config('TIMEZONE'))}
-account = tibber.Account(dotenv_config('TIBBER_ACCESS_TOKEN'))
+tzinfos = {"UTC": tz.gettz(retrieve_setting('TIMEZONE'))}
+account = tibber.Account(retrieve_setting('TIBBER_ACCESS_TOKEN'))
 _home = account.homes[0]
 
 client = VictronClient().get_client()
@@ -58,7 +59,7 @@ def live_measurements(home=_home or None):
     # in most cases to resolve this.
     logging.info(f"Tibber: Live measurements starting...")
     try:
-        home.start_live_feed(user_agent=f"cerbomoticzgx/{dotenv_config('VERSION')}",
+        home.start_live_feed(user_agent=f"cerbomoticzgx/{retrieve_setting('VERSION')}",
                              retries=10,
                              retry_interval=10)
     except (TransportClosed, ConnectionClosedError) as e:
@@ -74,7 +75,7 @@ def dip_peak_data(caller=None, level="CHEAP", day=0, price_cap=0.22):
     """
     data = []
 
-    _account = tibber.Account(dotenv_config('TIBBER_ACCESS_TOKEN'))
+    _account = tibber.Account(retrieve_setting('TIBBER_ACCESS_TOKEN'))
     home = _account.homes[0]
 
     for i in range(1, 25):
@@ -94,7 +95,7 @@ def dip_peak_data(caller=None, level="CHEAP", day=0, price_cap=0.22):
 
 def publish_pricing_data(caller):
     try:
-        _account = tibber.Account(dotenv_config('TIBBER_ACCESS_TOKEN'))
+        _account = tibber.Account(retrieve_setting('TIBBER_ACCESS_TOKEN'))
         home = _account.homes[0]
 
         mqtt_publish_lowest_price_points(home)
@@ -221,7 +222,7 @@ def lowest_48h_prices(price_cap=0.22, max_items=4):
 
     :return: list: day, hour, level, price
     """
-    _account = tibber.Account(dotenv_config('TIBBER_ACCESS_TOKEN'))
+    _account = tibber.Account(retrieve_setting('TIBBER_ACCESS_TOKEN'))
     home = _account.homes[0]
 
     index = 0
@@ -254,7 +255,7 @@ def lowest_24h_prices(price_cap=0.22, max_items=4):
 
     :return: list: day, hour, level, price
     """
-    _account = tibber.Account(dotenv_config('TIBBER_ACCESS_TOKEN'))
+    _account = tibber.Account(retrieve_setting('TIBBER_ACCESS_TOKEN'))
     home = _account.homes[0]
 
     full_list = home.current_subscription.price_info.today

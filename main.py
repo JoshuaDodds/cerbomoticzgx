@@ -3,7 +3,9 @@ import threading
 import time
 import asyncio
 
-from lib.constants import logging, dotenv_config
+from lib.constants import logging
+from lib.config_retrieval import retrieve_setting
+from lib.config_change_handler import ConfigWatcher, handle_env_change
 from lib.victron_mqtt_client import mqtt_start, mqtt_stop
 from lib.ev_charge_controller import EvCharger
 from lib.task_scheduler import TaskScheduler
@@ -21,11 +23,11 @@ from lib.energy_broker import (
     retrieve_latest_tibber_pricing,
 )
 
-
-ACTIVE_MODULES = json.loads(dotenv_config('ACTIVE_MODULES'))
-ESS_NET_METERING = bool(dotenv_config('TIBBER_UPDATES_ENABLED')) or False
 GlobalStateDB = GlobalStateDatabase()
 STATE = GlobalStateClient()
+
+ACTIVE_MODULES = json.loads(retrieve_setting('ACTIVE_MODULES'))
+ESS_NET_METERING = bool(retrieve_setting('TIBBER_UPDATES_ENABLED')) or False
 
 
 def ev_charge_controller(): EvCharger().main()
@@ -53,7 +55,7 @@ def sync_tasks_start():
 def shutdown():
     logging.info("main(): Cleaning up and exiting...")
 
-    if dotenv_config('VICTRON_OPTIMIZED_CHARGING') == '1':
+    if retrieve_setting('VICTRON_OPTIMIZED_CHARGING') == '1':
         restore_default_battery_max_voltage()
 
     mqtt_stop()
@@ -113,8 +115,8 @@ def post_startup():
     logging.info(f"post_startup(): Re-storing previous state if available...")
 
     AC_POWER_SETPOINT = retrieve_message('ac_power_setpoint') or STATE.get('ac_power_setpoint') or '0.0'
-    DYNAMIC_ESS_BATT_MIN_SOC = retrieve_message('ess_net_metering_batt_min_soc') or STATE.get("ess_net_metering_batt_min_soc") or dotenv_config('DYNAMIC_ESS_BATT_MIN_SOC')
-    DYNAMIC_ESS_NET_METERING_ENABLED = retrieve_message('ess_net_metering_enabled') or STATE.get("ess_net_metering_enabled") or dotenv_config('DYNAMIC_ESS_NET_METERING_ENABLED')
+    DYNAMIC_ESS_BATT_MIN_SOC = retrieve_message('ess_net_metering_batt_min_soc') or STATE.get("ess_net_metering_batt_min_soc") or retrieve_setting('DYNAMIC_ESS_BATT_MIN_SOC')
+    DYNAMIC_ESS_NET_METERING_ENABLED = retrieve_message('ess_net_metering_enabled') or STATE.get("ess_net_metering_enabled") or retrieve_setting('DYNAMIC_ESS_NET_METERING_ENABLED')
     GRID_CHARGING_ENABLED = retrieve_message('grid_charging_enabled') or STATE.get("grid_charging_enabled") or False
     GRID_CHARGING_ENABLED_BY_PRICE = retrieve_message('grid_charging_enabled_by_price') or STATE.get("grid_charging_enabled_by_price") or False
     ESS_NET_METERING_OVERRIDDEN = retrieve_message('ess_net_metering_overridden') or STATE.get("ess_net_metering_overridden") or False
@@ -171,6 +173,10 @@ def post_startup():
 
     # Start the general scheduled tasks
     TaskScheduler()
+
+    # Start the .env config watcher
+    config_watcher = ConfigWatcher(handler=handle_env_change)
+    config_watcher.start()
 
     logging.info(f"post_startup() actions complete.")
 

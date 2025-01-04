@@ -4,7 +4,8 @@ import urllib3
 import pytz
 import threading
 
-from lib.constants import logging, dotenv_config
+from lib.config_retrieval import retrieve_setting
+from lib.constants import logging
 from lib.tesla_api import TeslaApi
 from lib.global_state import GlobalStateClient
 from lib.helpers import publish_message
@@ -61,10 +62,10 @@ class EvCharger:
             create_property(property_name, key)
 
         self.grid_charging_enabled = self.global_state.get('grid_charging_enabled')
-        self.load_reservation = int(dotenv_config("LOAD_RESERVATION"))  # see example .env.example file
+        self.load_reservation = int(retrieve_setting("LOAD_RESERVATION"))  # see example .env.example file
         self.load_reservation_is_reduced = False
-        self.load_reservation_reduction_factor = float(dotenv_config("LOAD_REDUCTION_FACTOR"))
-        self.minimum_ess_soc = int(dotenv_config("MINIMUM_ESS_SOC"))  # see example .env.example file
+        self.load_reservation_reduction_factor = float(retrieve_setting("LOAD_REDUCTION_FACTOR"))
+        self.minimum_ess_soc = int(retrieve_setting("MINIMUM_ESS_SOC"))  # see example .env.example file
 
         self.tesla = TeslaApi()
 

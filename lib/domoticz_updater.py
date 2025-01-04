@@ -1,7 +1,7 @@
 import urllib3
 
 from lib.helpers import get_topic_key
-from lib.constants import DzEndpoints, logging, systemId0, mqtt_msg_value_conversion
+from lib.constants import DzEndpoints, logging, mqtt_msg_value_conversion, systemId0
 
 http = urllib3.PoolManager(num_pools=10, maxsize=25)
 

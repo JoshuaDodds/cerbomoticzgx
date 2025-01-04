@@ -1,5 +1,6 @@
 import json
 import math
+import logging
 import time
 import paho.mqtt.client as mqtt
 
@@ -7,7 +8,11 @@ from datetime import datetime
 from math import ceil
 
 from lib.helpers.base7_math import *
-from lib.constants import Topics, logging, mosquittoEndpoint
+
+logging.basicConfig(
+    format='%(asctime)s cerbomoticzGx: %(message)s',
+    level=logging.INFO,
+    datefmt='%Y-%m-%d %H:%M:%S')
 
 
 def publish_message(topic, message=None, qos=0, retain=False, payload=None) -> None:
@@ -43,6 +48,7 @@ def remove_message(topic, qos=0, retain=True):
 
 
 def get_current_value_from_mqtt(topic: str, timeout: float = 1.0, raw: bool = False) -> any:
+    from lib.constants import mosquittoEndpoint
     """
     Retrieves a single message from a given topic on the MQTT broker using a separate connection.
     If raw is True, it retrieves the raw message.
@@ -92,6 +98,8 @@ def get_topic_key(topic, system_id="system0") -> str:
     """
     Retrieves the key name for a MQQT literal topic from the Topics dict() if one exists
     """
+    from lib.constants import Topics
+
     try:
         subscribed_topics = Topics[system_id]
     except KeyError:

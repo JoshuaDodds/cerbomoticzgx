@@ -1,6 +1,6 @@
 import requests
 
-from lib.constants import PushOverConfig, logging
+from lib.constants import logging, PushOverConfig
 
 
 def pushover_notification(topic: str, msg: str) -> bool:

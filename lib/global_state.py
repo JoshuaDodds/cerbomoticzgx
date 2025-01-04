@@ -1,7 +1,12 @@
 import sqlite3
+import logging
 
 from lib.helpers import publish_message, reduce_decimal
-from lib.constants import logging
+
+logging.basicConfig(
+    format='%(asctime)s cerbomoticzGx: %(message)s',
+    level=logging.INFO,
+    datefmt='%Y-%m-%d %H:%M:%S')
 
 
 class SQLiteConnection:
