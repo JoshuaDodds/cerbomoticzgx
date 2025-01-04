@@ -2,7 +2,8 @@ import boto3
 
 from lib.tibberios.core import Database, TibberConnector
 from lib.tibberios.visualization import GenerateViz
-from lib.constants import dotenv_config, logging
+from lib.config_retrieval import retrieve_setting
+from lib.constants import logging
 
 
 async def main():
@@ -10,7 +11,7 @@ async def main():
     records = 24 * 2
 
     db = Database('tibber.db')
-    tib = TibberConnector(dotenv_config("TIBBER_ACCESS_TOKEN"))
+    tib = TibberConnector(retrieve_setting("TIBBER_ACCESS_TOKEN"))
     price_data = await tib.get_price_data(resolution=resolution, records=records)
 
     tbl_name = "consumption"
@@ -35,8 +36,8 @@ async def main():
     db.close()
 
     # upload to s3 bucket
-    s3 = boto3.client('s3', aws_access_key_id=dotenv_config("AWS_ACCESS_KEY"),
-                      aws_secret_access_key=dotenv_config("AWS_SECRET_KEY"))
+    s3 = boto3.client('s3', aws_access_key_id=retrieve_setting("AWS_ACCESS_KEY"),
+                      aws_secret_access_key=retrieve_setting("AWS_SECRET_KEY"))
 
     logging.debug(f"Tibber Graph Generator: Uploading to s3 bucket and setting ACL...")
 

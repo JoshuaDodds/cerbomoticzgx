@@ -2,7 +2,9 @@ import time
 import schedule as scheduler
 
 from paho.mqtt import publish
-from lib.constants import logging, systemId0, PythonToVictronWeekdayNumberConversion, dotenv_config, cerboGxEndpoint
+from lib.config_retrieval import retrieve_setting
+from lib.constants import cerboGxEndpoint, systemId0
+from lib.constants import logging, PythonToVictronWeekdayNumberConversion
 from lib.helpers import get_seasonally_adjusted_max_charge_slots, calculate_max_discharge_slots_needed, publish_message, round_up_to_nearest_10, remove_message
 from lib.tibber_api import lowest_48h_prices, lowest_24h_prices
 from lib.notifications import pushover_notification
@@ -10,10 +12,9 @@ from lib.tibber_api import publish_pricing_data
 from lib.global_state import GlobalStateClient
 from lib.victron_integration import ac_power_setpoint
 
-MAX_TIBBER_BUY_PRICE = float(dotenv_config('MAX_TIBBER_BUY_PRICE')) or 0.20
-SWITCH_TO_GRID_PRICE_THRESHOLD = float(dotenv_config('SWITCH_TO_GRID_PRICE_THRESHOLD')) or 0.0001
-ESS_EXPORT_AC_SETPOINT = float(dotenv_config('ESS_EXPORT_AC_SETPOINT')) or -10000.0
-DAILY_HOME_ENERGY_CONSUMPTION = float(dotenv_config('DAILY_HOME_ENERGY_CONSUMPTION')) or 12.0
+MAX_TIBBER_BUY_PRICE = float(retrieve_setting('MAX_TIBBER_BUY_PRICE')) or 0.20
+ESS_EXPORT_AC_SETPOINT = float(retrieve_setting('ESS_EXPORT_AC_SETPOINT')) or -10000.0
+DAILY_HOME_ENERGY_CONSUMPTION = float(retrieve_setting('DAILY_HOME_ENERGY_CONSUMPTION')) or 12.0
 
 STATE = GlobalStateClient()
 
@@ -33,7 +34,7 @@ def schedule_tasks():
 
 
 def retrieve_latest_tibber_pricing():
-    if dotenv_config('TIBBER_UPDATES_ENABLED') != '1':
+    if retrieve_setting('TIBBER_UPDATES_ENABLED') != '1':
         return None
     else:
         publish_pricing_data(__name__)
@@ -146,6 +147,7 @@ def manage_grid_usage_based_on_current_price(price: float = None, power: any = N
     price = price if price is not None else STATE.get('tibber_price_now')
     grid_charging_enabled = STATE.get('grid_charging_enabled') or False
     grid_charging_enabled_by_price = STATE.get('grid_charging_enabled_by_price') or False
+    SWITCH_TO_GRID_PRICE_THRESHOLD = float(retrieve_setting('SWITCH_TO_GRID_PRICE_THRESHOLD'))
 
     # Manual Mode Setpoint Management: used when grid assist has been manually toggled on
     if ess_net_metering_overridden and grid_charging_enabled and not grid_charging_enabled_by_price and power:

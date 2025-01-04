@@ -7,7 +7,8 @@ import threading
 import lib.helpers
 
 from lib.global_state import GlobalStateClient
-from lib.constants import logging, dotenv_config
+from lib.config_retrieval import retrieve_setting
+from lib.constants import logging
 from lib.domoticz_updater import domoticz_update
 from lib.helpers import publish_message
 
@@ -15,7 +16,7 @@ STATE = GlobalStateClient()
 
 retry = teslapy.Retry(total=2, status_forcelist=(500, 502, 503, 504))
 timeout = 25
-email = dotenv_config("TESLA_EMAIL")
+email = retrieve_setting("TESLA_EMAIL")
 
 logging.getLogger('teslapy').setLevel(logging.WARNING)
 
@@ -239,8 +240,8 @@ class TeslaApi:
         return self.vehicle_name
 
     def is_vehicle_home(self, vehicle_data):
-        lat = round(float(dotenv_config('HOME_ADDRESS_LAT')), 3)
-        long = round(float(dotenv_config('HOME_ADDRESS_LONG')), 3)
+        lat = round(float(retrieve_setting('HOME_ADDRESS_LAT')), 3)
+        long = round(float(retrieve_setting('HOME_ADDRESS_LONG')), 3)
 
         try:
             vehicle_data = vehicle_data['drive_state']

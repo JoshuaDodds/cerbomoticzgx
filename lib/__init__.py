@@ -13,4 +13,6 @@ __all__ = [
     'notifications',
     'solar_forecasting',
     'global_state',
+    'config_retrieval',
+    'config_change_handler',
 ]

@@ -1,24 +1,16 @@
 import logging
-from dotenv import dotenv_values
+from lib.config_retrieval import retrieve_setting
+
+cerboGxEndpoint = retrieve_setting('CERBOGX_IP')
+mosquittoEndpoint = retrieve_setting('MOSQUITTO_IP')
+systemId0 = retrieve_setting('VRM_PORTAL_ID')
+dzEndpoint = retrieve_setting('DZ_URL_PREFIX')
+PushOverConfig = {"id": retrieve_setting('PO_USER_ID'), "key": retrieve_setting('PO_API_KEY')}
 
 logging.basicConfig(
     format='%(asctime)s cerbomoticzGx: %(message)s',
     level=logging.INFO,
     datefmt='%Y-%m-%d %H:%M:%S')
-
-
-def dotenv_config(env_variable):
-    return dotenv_values('.env')[env_variable]
-
-
-"""
-Basig Configuration
-"""
-cerboGxEndpoint = dotenv_config('CERBOGX_IP')
-mosquittoEndpoint = dotenv_config('MOSQUITTO_IP')
-systemId0 = dotenv_config('VRM_PORTAL_ID')
-dzEndpoint = dotenv_config('DZ_URL_PREFIX')
-PushOverConfig = {"id": dotenv_config('PO_USER_ID'), "key": dotenv_config('PO_API_KEY')}
 
 """
 Topics we will monitor for PV system updates to domotics system
@@ -106,6 +98,7 @@ TopicsWritable = dict({
             "system_shutdown":      f"Cerbomoticzgx/system/shutdown",
         }
 })
+
 
 mqtt_msg_value_conversion = dict({
     "system_state": lambda value: SystemState[value],

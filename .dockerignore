@@ -3,6 +3,7 @@
 README.md
 .env
 .env-gitops
+.secrets
 cache.json
 prices.png
 homeconnect_oauth_token.json

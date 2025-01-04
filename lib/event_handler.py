@@ -3,7 +3,8 @@ import math
 import signal
 
 from lib.helpers import get_topic_key, publish_message
-from lib.constants import dotenv_config, logging
+from lib.constants import logging
+from lib.config_retrieval import retrieve_setting
 from lib.victron_integration import regulate_battery_max_voltage, ac_power_setpoint
 from lib.global_state import GlobalStateClient
 from lib.notifications import pushover_notification_critical
@@ -15,9 +16,9 @@ from lib.energy_broker import (
 )
 
 
-LOAD_RESERVATION = int(dotenv_config("LOAD_RESERVATION")) or 0
-LOAD_RESERVATION_REDUCTION_FACTOR = float(dotenv_config("LOAD_REDUCTION_FACTOR")) or 1
-MINIMUM_ESS_SOC = int(dotenv_config("MINIMUM_ESS_SOC")) or 100
+LOAD_RESERVATION = int(retrieve_setting("LOAD_RESERVATION")) or 0
+LOAD_RESERVATION_REDUCTION_FACTOR = float(retrieve_setting("LOAD_REDUCTION_FACTOR")) or 1
+MINIMUM_ESS_SOC = int(retrieve_setting("MINIMUM_ESS_SOC")) or 100
 
 
 class Event:
@@ -111,9 +112,9 @@ class Event:
         _value = round(self.value, 2)
         publish_message("Tesla/vehicle0/solar/ess_soc", message=f"{_value}", retain=True)
 
-        if dotenv_config('VICTRON_OPTIMIZED_CHARGING') == '1':
+        if retrieve_setting('VICTRON_OPTIMIZED_CHARGING') == '1':
             regulate_battery_max_voltage(_value)
-        if dotenv_config('TIBBER_UPDATES_ENABLED') == '1':
+        if retrieve_setting('TIBBER_UPDATES_ENABLED') == '1':
             manage_sale_of_stored_energy_to_the_grid()
 
     def batt_power(self):
@@ -182,7 +183,7 @@ class Event:
         return math.floor(watts / 230 / 3)
 
     def calculate_surplus_watts(self):
-        if dotenv_config('ABB_METER_INTEGRATION') == '1':
+        if retrieve_setting('ABB_METER_INTEGRATION') == '1':
             self.calculate_and_set_precise_surplus_watts()
         else:
             self.calculate_and_set_surplus_watts()
