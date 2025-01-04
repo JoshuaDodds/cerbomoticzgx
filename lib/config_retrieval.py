@@ -1,6 +1,7 @@
 from dotenv import dotenv_values
 
 from lib.global_state import GlobalStateClient
+from lib.helpers import publish_message
 
 STATE = GlobalStateClient()
 
@@ -22,6 +23,9 @@ def retrieve_setting(env_variable):
     except Exception:
         pass
 
-    # Dynamically fetch the latest value from .env
+    # Dynamically fetch the latest value from .env and update config topic
     current_env_values = dotenv_values('.env')
-    return current_env_values.get(env_variable)
+    requested_value = current_env_values.get(env_variable)
+    if requested_value is not None:
+        publish_message(topic=f"Cerbomoticzgx/config/{env_variable}", message=requested_value, retain=True)
+    return requested_value

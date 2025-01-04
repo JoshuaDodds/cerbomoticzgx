@@ -29,11 +29,35 @@ class SQLiteConnection:
 
 class GlobalStateDatabase:
     def __init__(self):
-        with SQLiteConnection("/dev/shm/cerbo_state.db") as cursor:
+        self.db_path = "/dev/shm/cerbo_state.db"
+        self.init_database()
+
+    def init_database(self):
+        with SQLiteConnection(self.db_path) as cursor:
             cursor.execute("DROP TABLE IF EXISTS data")
             cursor.execute("CREATE TABLE IF NOT EXISTS data (key TEXT PRIMARY KEY, value TEXT)")
             cursor.connection.commit()
             logging.info("GlobalStateDatabase: database initialized.")
+
+    def export_to_file(self, export_path):
+        """Export the in-memory SQLite database to a file."""
+        try:
+            with SQLiteConnection(self.db_path) as cursor:
+                with sqlite3.connect(export_path) as file_conn:
+                    cursor.connection.backup(file_conn)
+                    logging.info(f"GlobalStateDatabase: Exported to {export_path}.")
+        except Exception as e:
+            logging.error(f"GlobalStateDatabase: Failed to export database - {e}")
+
+    def import_from_file(self, import_path):
+        """Import a SQLite database file into the in-memory database."""
+        try:
+            with sqlite3.connect(import_path) as file_conn:
+                with SQLiteConnection(self.db_path) as cursor:
+                    file_conn.backup(cursor.connection)
+                    logging.info(f"GlobalStateDatabase: Imported from {import_path}.")
+        except Exception as e:
+            logging.error(f"GlobalStateDatabase: Failed to import database - {e}")
 
 
 class GlobalStateClient:
