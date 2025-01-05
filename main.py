@@ -110,7 +110,7 @@ def post_startup():
     config_watcher = ConfigWatcher(handler=handle_env_change)
     config_watcher.start()
 
-    logging.info(f"post_startup() actions complete. v{retrieve_setting("VERSION")} Initialization complete.")
+    logging.info(f"post_startup() actions complete. v{retrieve_setting('VERSION')} Initialization complete.")
 
 
 def main():
