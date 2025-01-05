@@ -28,7 +28,7 @@ echo "$SVC_NAME: Using branch '$GIT_BRANCH' for sync operations."
 if [ ! -d "$GIT_PROJECT" ]; then
   git clone "$GIT_REPO" > /dev/null 2>&1
   cd "$GIT_PROJECT" || { echo "$SVC_NAME: Failed to navigate to $GIT_PROJECT. Retrying in the next interval."; false; }
-  git checkout "$GIT_BRANCH" || { echo "$SVC_NAME: Branch '$GIT_BRANCH' not found."; false; }
+  git checkout "$GIT_BRANCH" > /dev/null 2>&1 || { echo "$SVC_NAME: Branch '$GIT_BRANCH' not found."; false; }
 else
   cd "$GIT_PROJECT" || { echo "$SVC_NAME: Failed to navigate to $GIT_PROJECT."; false; }
   git fetch origin
