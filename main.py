@@ -78,7 +78,7 @@ def post_startup():
     time.sleep(2)
     logging.info(f"post_startup() actions executing...")
 
-    # Re-apply previously set Dynamic ESS preferences set in the previous run
+    # Re-apply state/configuration from previous run or sane defaults
     logging.info(f"post_startup(): Re-storing previous state if available...")
 
     restore_and_publish('ac_power_setpoint', default='0.0')
@@ -110,7 +110,7 @@ def post_startup():
     config_watcher = ConfigWatcher(handler=handle_env_change)
     config_watcher.start()
 
-    logging.info(f"post_startup() actions complete.")
+    logging.info(f"post_startup() actions complete. v{retrieve_setting("VERSION")} Initialization complete.")
 
 
 def main():

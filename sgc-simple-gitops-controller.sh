@@ -6,8 +6,10 @@ INTERVAL="60s"
 # source secrets
 source /app/.env-gitops
 
+echo "$SVC_NAME: Initializing..."
+
 # ssh setup for access to Github repo
-mkdir ~/.ssh && chmod og-rwx ~/.ssh
+[ -d ~/.ssh ] || mkdir ~/.ssh && chmod og-rwx ~/.ssh
 echo "$id_rsa" > ~/.ssh/id_rsa && chmod og-rwx ~/.ssh/id_rsa
 echo "$id_rsa_pub" > ~/.ssh/id_rsa.pub
 
