@@ -17,5 +17,5 @@ while true; do
   sleep 1h;
 done &
 
-# fork the gitops controller
+# start the gitops controller
 /app/sgc-simple-gitops-controller.sh | ts %Y-%m-%d" "%H:%M:%S

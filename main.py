@@ -3,6 +3,7 @@ import threading
 import time
 import asyncio
 
+from lib.helpers.startup_helpers import restore_and_publish, apply_energy_broker_logic
 from lib.constants import logging
 from lib.config_retrieval import retrieve_setting
 from lib.config_change_handler import ConfigWatcher, handle_env_change
@@ -17,9 +18,6 @@ from lib.solar_forecasting import get_victron_solar_forecast
 from lib.energy_broker import (
     main as energybroker,
     get_todays_n_highest_prices,
-    set_charging_schedule,
-    manage_sale_of_stored_energy_to_the_grid,
-    manage_grid_usage_based_on_current_price,
     retrieve_latest_tibber_pricing,
 )
 
@@ -76,6 +74,45 @@ def init():
     STATE.set('tibber_price_now', "0.35")
 
 
+def post_startup():
+    time.sleep(2)
+    logging.info(f"post_startup() actions executing...")
+
+    # Re-apply state/configuration from previous run or sane defaults
+    logging.info(f"post_startup(): Re-storing previous state if available...")
+
+    restore_and_publish('ac_power_setpoint', default='0.0')
+    restore_and_publish('ess_net_metering_batt_min_soc')
+    restore_and_publish('ess_net_metering_enabled')
+    restore_and_publish('grid_charging_enabled', default=False)
+    restore_and_publish('grid_charging_enabled_by_price', default=False)
+    restore_and_publish('ess_net_metering_overridden', default=False)
+    restore_and_publish('tesla_charge_requested', default=False)
+
+    # clear the energy sale scheduling status message
+    logging.info(f"post_startup(): Retrieving latest pricing data...")
+    get_todays_n_highest_prices(0, 100)
+
+    # update tibber pricing info and solar forecast
+    logging.info(f"post_startup(): Publishing latest pricing and solar forecast data to data bus...")
+    publish_pricing_data(__name__)
+    get_victron_solar_forecast()
+    retrieve_latest_tibber_pricing()
+
+    # Make sure we apply energy broker logic post startup to recover if the service restarts while in a
+    # managed state.
+    apply_energy_broker_logic()
+
+    # Start service scheduled tasks
+    TaskScheduler()
+
+    # Start the .env file config watcher / change handler
+    config_watcher = ConfigWatcher(handler=handle_env_change)
+    config_watcher.start()
+
+    logging.info(f"post_startup() actions complete. v{retrieve_setting('VERSION')} Initialization complete.")
+
+
 def main():
     try:
         init()
@@ -105,80 +142,6 @@ def main():
 
     except (KeyboardInterrupt, SystemExit):
         shutdown()
-
-
-def post_startup():
-    time.sleep(2)
-    logging.info(f"post_startup() actions executing...")
-
-    # Re-apply previously set Dynamic ESS preferences set in the previous run
-    logging.info(f"post_startup(): Re-storing previous state if available...")
-
-    AC_POWER_SETPOINT = retrieve_message('ac_power_setpoint') or STATE.get('ac_power_setpoint') or '0.0'
-    DYNAMIC_ESS_BATT_MIN_SOC = retrieve_message('ess_net_metering_batt_min_soc') or STATE.get("ess_net_metering_batt_min_soc") or retrieve_setting('DYNAMIC_ESS_BATT_MIN_SOC')
-    DYNAMIC_ESS_NET_METERING_ENABLED = retrieve_message('ess_net_metering_enabled') or STATE.get("ess_net_metering_enabled") or retrieve_setting('DYNAMIC_ESS_NET_METERING_ENABLED')
-    GRID_CHARGING_ENABLED = retrieve_message('grid_charging_enabled') or STATE.get("grid_charging_enabled") or False
-    GRID_CHARGING_ENABLED_BY_PRICE = retrieve_message('grid_charging_enabled_by_price') or STATE.get("grid_charging_enabled_by_price") or False
-    ESS_NET_METERING_OVERRIDDEN = retrieve_message('ess_net_metering_overridden') or STATE.get("ess_net_metering_overridden") or False
-    TESLA_CHARGE_REQUESTED = retrieve_message('tesla_charge_requested') or STATE.get("tesla_charge_requested") or False
-
-    # this one is victron maintained, so we just update our own state with what it is currently set to
-    STATE.set('ac_power_setpoint', AC_POWER_SETPOINT)
-
-    publish_message(topic='Tesla/settings/grid_charging_enabled', message=GRID_CHARGING_ENABLED, retain=True)
-    STATE.set('grid_charging_enabled', str(GRID_CHARGING_ENABLED))
-
-    publish_message(topic='Tesla/settings/grid_charging_enabled_by_price', message=GRID_CHARGING_ENABLED, retain=True)
-    STATE.set('grid_charging_enabled_by_price', str(GRID_CHARGING_ENABLED_BY_PRICE))
-
-    publish_message(topic='Tesla/vehicle0/control/charge_requested', message=TESLA_CHARGE_REQUESTED, retain=True)
-    STATE.set('tesla_charge_requested', TESLA_CHARGE_REQUESTED)
-
-    publish_message(topic='Cerbomoticzgx/system/EssNetMeteringBattMinSoc', message=str(DYNAMIC_ESS_BATT_MIN_SOC), retain=True)
-    STATE.set('ess_net_metering_batt_min_soc', str(DYNAMIC_ESS_BATT_MIN_SOC))
-
-    publish_message(topic='Cerbomoticzgx/system/EssNetMeteringEnabled', message=DYNAMIC_ESS_NET_METERING_ENABLED, retain=True)
-    STATE.set('ess_net_metering_enabled', DYNAMIC_ESS_NET_METERING_ENABLED)
-
-    publish_message(topic='Cerbomoticzgx/system/EssNetMeteringOverridden', message=ESS_NET_METERING_OVERRIDDEN, retain=True)
-    STATE.set('ess_net_metering_overridden', ESS_NET_METERING_OVERRIDDEN)
-
-    # clear the energy sale scheduling status message
-    logging.info(f"post_startup(): Retrieving latest pricing data...")
-    get_todays_n_highest_prices(0, 100)
-
-    # update tibber pricing info and solar forecast
-    logging.info(f"post_startup(): Publishing latest pricing and solar forecast data to data bus...")
-    publish_pricing_data(__name__)
-    get_victron_solar_forecast()
-    retrieve_latest_tibber_pricing()
-
-    # Make sure we apply energy broker logic post startup to recover if the service restarts while in a
-    # managed state.
-    if ACTIVE_MODULES[0]['sync']['energy_broker']:
-        logging.info(f"post_startup(): Re-applying Energy Broker state and logic if set...")
-        manage_sale_of_stored_energy_to_the_grid()
-        manage_grid_usage_based_on_current_price()
-
-        # re-run the charging scheduler based on current info and pricing if this was not a manual restart request
-        system_manual_restart = retrieve_message("Cerbomoticzgx/system/manual_restart")
-
-        if system_manual_restart is False or system_manual_restart is None:
-            logging.info(f"post_startup(): Updating the charging schedule based on currently available data...")
-            set_charging_schedule("main.post_startup()")
-        else:
-            logging.info(f"post_startup(): Manual restart was requested. Skipping charge schedule update.")
-            # set the system_manual_restart value back to False
-            publish_message("Cerbomoticzgx/system/manual_restart", message="False", retain=True)
-
-    # Start the general scheduled tasks
-    TaskScheduler()
-
-    # Start the .env config watcher
-    config_watcher = ConfigWatcher(handler=handle_env_change)
-    config_watcher.start()
-
-    logging.info(f"post_startup() actions complete.")
 
 
 if __name__ == "__main__":
