@@ -79,7 +79,7 @@ def post_startup():
     time.sleep(1)
 
     if HOME_CONNECT_APPLIANCE_SCHEDULING:
-        logging.info(f"HomeConnect Appliance Schedulling mode is enabled.")
+        logging.info(f"HomeConnect Appliance Scheduling module is enabled.")
 
     logging.info(f"post_startup() actions executing...")
 
