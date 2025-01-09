@@ -8,6 +8,7 @@ from lib.config_retrieval import retrieve_setting
 from lib.victron_integration import regulate_battery_max_voltage, ac_power_setpoint
 from lib.global_state import GlobalStateClient
 from lib.notifications import pushover_notification_critical
+from lib.event_handler_appliances import handle_dryer_event, handle_dishwasher_event
 from lib.energy_broker import (
     manage_sale_of_stored_energy_to_the_grid,
     set_charging_schedule,
@@ -19,7 +20,7 @@ from lib.energy_broker import (
 LOAD_RESERVATION = int(retrieve_setting("LOAD_RESERVATION")) or 0
 LOAD_RESERVATION_REDUCTION_FACTOR = float(retrieve_setting("LOAD_REDUCTION_FACTOR")) or 1
 MINIMUM_ESS_SOC = int(retrieve_setting("MINIMUM_ESS_SOC")) or 100
-
+HOME_CONNECT_APPLIANCE_SCHEDULING = bool(retrieve_setting("HOME_CONNECT_APPLIANCE_SCHEDULING")) or False
 
 class Event:
 
@@ -64,6 +65,14 @@ class Event:
             )
         elif event == 1:
             logging.info("AC Input: Grid is online.")
+
+    def dryer_state(self):
+        if HOME_CONNECT_APPLIANCE_SCHEDULING:
+            handle_dryer_event(self.value)
+
+    def dishwasher_state(self):
+        if HOME_CONNECT_APPLIANCE_SCHEDULING:
+            handle_dishwasher_event(self.value)
 
     def ac_power_setpoint(self):
         if float(self.value) > 0 or float(self.value) < 0:

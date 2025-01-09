@@ -10,6 +10,7 @@ Do you have one or more of the following devices in your home?
 - [x] Home Energy Storage System with canbus or serial control and working well with your Victron system
 - [x] an ABB B21/23/24 Kilowatt meter (optional)
 - [x] a Domoticz based Home Automation system (optional)
+- [x] HomeConnect enabled smart appliances (optional and currently requires you to run [https://github.com/hcpy2-0/hcpy](https://github.com/hcpy2-0/hcpy) as an additional service.) 
 
 If so, this project might be something you will find interesting. Have a look at what this project offers by 
 reading more below.  Also, many of the cool features the modules in this project offer are visualized and controllable 
@@ -39,7 +40,8 @@ a Domoticz server via its REST API for monitoring and historic tracking
 - deep integration with Victron system for monitoring and control via the cerbo Gx MQTT broker
 - Creates, exports, and updates a number of custom metrics to the victron MQTT broker for consumption by the [venus-nextgen Energy Dashboard](https://github.com/JoshuaDodds/venus-nextgen)
 - dynamic ESS algorithms for automated buy and sell of energy
-- solar forecasting data specific to your installation using ML models and AI for quite accurate current day production forecasts (courtesy of new VRM API features developed by Victron Energy). Note: A Victron VRM portal account is needed for this feature. 
+- solar forecasting data specific to your installation using ML models and AI for quite accurate current day production forecasts (courtesy of new VRM API features developed by Victron Energy). Note: A Victron VRM portal account is needed for this feature.
+- HomeConnect supported appliance control. Schedules appliances to run at cheapest time of day without user intervention
 
 Configuration for your CerboGX IP Address, VRM instance ID, and Domoticz IP/Port are configured in 
 the ```.env``` configuration file. 
@@ -60,7 +62,6 @@ for the things you will need to adjust in your own fork of this repo.
 **TODO: handle this issue automatically in a universal container build** 
 
 
-
 ### Running from CLI
 ```python3 main.py```
 
@@ -75,4 +76,4 @@ Finally, use the build.sh script as a template for building an arm64 image and p
 ---------------
 (This package is in its infancy, but contributions and collaborations are welcome.)
 
-Copyright 2022, 2023, 2024 Joshua Dodds - All Rights Reserved.
+Copyright 2022, 2023, 2024, 2025 Joshua Dodds - All Rights Reserved.
