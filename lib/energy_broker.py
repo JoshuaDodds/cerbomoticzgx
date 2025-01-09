@@ -59,7 +59,7 @@ def publish_export_schedule(price_list: list) -> None:
 
 
 def get_todays_n_highest_prices(batt_soc: float, ess_net_metering_batt_min_soc: float = 0.0) -> list:
-    ess_net_metering_enabled = STATE.get('ess_net_metering_enabled') or None
+    ess_net_metering_enabled = STATE.get('ess_net_metering_enabled') or False
 
     if batt_soc > ess_net_metering_batt_min_soc and ess_net_metering_enabled:
         n = calculate_max_discharge_slots_needed(batt_soc - ess_net_metering_batt_min_soc)
