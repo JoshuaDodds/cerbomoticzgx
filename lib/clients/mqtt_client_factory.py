@@ -94,7 +94,11 @@ class VictronClient:
             try:
                 # grab topic and payload from message
                 topic = msg.topic
-                value = json.loads(msg.payload.decode("utf-8"))['value']
+                payload = json.loads(msg.payload.decode("utf-8"))
+
+                # Attempt to extract 'value', fall back to entire payload if 'value' is not present
+                value = payload.get('value', payload)
+
                 # format a  logging message
                 logmsg = f"{' '.join(topic.rsplit('/', 3)[1:3])}: {value}"
                 logging.debug(logmsg)
@@ -108,4 +112,4 @@ class VictronClient:
                     Event(topic, value, logmsg).dispatch()
 
             except Exception as E:
-                logging.info(E)
+                logging.info(f"mqtt_client_factory: error processing new message: {E}")

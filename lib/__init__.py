@@ -15,4 +15,5 @@ __all__ = [
     'global_state',
     'config_retrieval',
     'config_change_handler',
+    'event_handler_appliances',
 ]

@@ -81,6 +81,10 @@ Topics = dict({
             "tesla_charge_requested":       f"Tesla/vehicle0/control/charge_requested",
             "tesla_battery_soc":            f"Tesla/vehicle0/battery_soc",
             "tesla_battery_soc_setpoint":   f"Tesla/vehicle0/battery_soc_setpoint",
+
+            # Home Connect Appliance topics
+            "dryer_state":                  f"Cerbomoticzgx/homeconnect/dryer/state",
+            "dishwasher_state":             f"Cerbomoticzgx/homeconnect/dishwasher/state",
         }
 })
 

@@ -26,6 +26,7 @@ STATE = GlobalStateClient()
 
 ACTIVE_MODULES = json.loads(retrieve_setting('ACTIVE_MODULES'))
 ESS_NET_METERING = bool(retrieve_setting('TIBBER_UPDATES_ENABLED')) or False
+HOME_CONNECT_APPLIANCE_SCHEDULING = bool(retrieve_setting("HOME_CONNECT_APPLIANCE_SCHEDULING")) or False
 
 
 def ev_charge_controller(): EvCharger().main()
@@ -75,7 +76,11 @@ def init():
 
 
 def post_startup():
-    time.sleep(2)
+    time.sleep(1)
+
+    if HOME_CONNECT_APPLIANCE_SCHEDULING:
+        logging.info(f"HomeConnect Appliance Schedulling mode is enabled.")
+
     logging.info(f"post_startup() actions executing...")
 
     # Re-apply state/configuration from previous run or sane defaults
