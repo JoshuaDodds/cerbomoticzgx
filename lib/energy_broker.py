@@ -95,7 +95,7 @@ def manage_sale_of_stored_energy_to_the_grid() -> None:
     batt_soc = STATE.get('batt_soc')
     tibber_price_now = STATE.get('tibber_price_now') or 0
     ac_setpoint = STATE.get('ac_power_setpoint')
-    ess_net_metering = STATE.get('ess_net_metering_enabled')
+    ess_net_metering = STATE.get('ess_net_metering_enabled') or False
     ess_net_metering_overridden = STATE.get('ess_net_metering_overridden') or False
     ess_net_metering_batt_min_soc = STATE.get('ess_net_metering_batt_min_soc')
 
