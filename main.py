@@ -85,11 +85,11 @@ def post_startup():
     logging.info(f"post_startup(): Re-storing previous state if available...")
 
     restore_and_publish('ac_power_setpoint', default='0.0')
-    restore_and_publish('ess_net_metering_batt_min_soc')
-    restore_and_publish('ess_net_metering_enabled')
+    restore_and_publish('ess_net_metering_batt_min_soc', default='80.0')
+    restore_and_publish('ess_net_metering_enabled', default=False)
+    restore_and_publish('ess_net_metering_overridden', default=False)
     restore_and_publish('grid_charging_enabled', default=False)
     restore_and_publish('grid_charging_enabled_by_price', default=False)
-    restore_and_publish('ess_net_metering_overridden', default=False)
     restore_and_publish('tesla_charge_requested', default=False)
 
     # clear the energy sale scheduling status message
