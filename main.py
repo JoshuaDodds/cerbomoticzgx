@@ -25,7 +25,6 @@ GlobalStateDB = GlobalStateDatabase()
 STATE = GlobalStateClient()
 
 ACTIVE_MODULES = json.loads(retrieve_setting('ACTIVE_MODULES'))
-DYNAMIC_ESS_NET_METERING_ENABLED = bool(retrieve_setting('DYNAMIC_ESS_NET_METERING_ENABLED')) or False
 HOME_CONNECT_APPLIANCE_SCHEDULING = bool(retrieve_setting("HOME_CONNECT_APPLIANCE_SCHEDULING")) or False
 
 def ev_charge_controller(): EvCharger().main()
