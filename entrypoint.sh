@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # sync any required secrets from secrets mount
-cp -a /secrets/.env* /secrets/.secrets* /secrets/* /app || exit 1
+cp -a /secrets/.env* /secrets/.secrets* /secrets/* /app || true
 
 ### Start the "services"
 
