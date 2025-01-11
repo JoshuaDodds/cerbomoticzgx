@@ -29,9 +29,12 @@ TRACKED_KEYS = [
 
 
 def send_delayed_start_to_dishwasher():
-    logging.info("Sending delayed start command to Dishwasher...")
-
     delay_seconds = determine_optimal_run_time()
+
+    # Convert delay_seconds into hours and minutes for friendly logging
+    delay_time = timedelta(seconds=delay_seconds)
+    hours, remainder = divmod(delay_time.total_seconds(), 3600)
+    minutes = remainder // 60
 
     # Send the delayed start program command
     delayed_start_command = {"program": 8203, "options": [{"uid": 558, "value": delay_seconds}]}
@@ -40,12 +43,12 @@ def send_delayed_start_to_dishwasher():
         topic=topic,
         payload=json.dumps(delayed_start_command)
     )
-    logging.info(f"Sent start command to Dishwasher.")
+
+    logging.info(f"Sent new start command to Dishwasher. Will start in {int(hours)} hr(s) {int(minutes)} min(s)")
 
 
 def send_delayed_start_to_dryer():
-    logging.info("Sending delayed start command to Dryer...")
-
+    silent_dry_runtime = 0
     delay_seconds = determine_optimal_run_time()
 
     selected_program = int(gs_client.get('Dryer_SelectedProgram'))
@@ -69,6 +72,11 @@ def send_delayed_start_to_dryer():
         silent_dry_runtime = int(gs_client.get('Dryer_FinishInRelative'))
         delay_seconds = round(determine_optimal_run_time() / 60) * 60 + silent_dry_runtime
 
+    # Get hours and minutes for friendly logging
+    delay_time = timedelta(seconds=delay_seconds - silent_dry_runtime)
+    hours, remainder = divmod(delay_time.total_seconds(), 3600)
+    minutes = remainder // 60
+
     # Send the delayed start program command
     delayed_start_command = {"program": selected_program, "options": [{"uid": 551, "value": delay_seconds}]}
     topic = "Cerbomoticzgx/homeconnect/dryer/activeProgram"
@@ -76,7 +84,7 @@ def send_delayed_start_to_dryer():
         topic=topic,
         payload=json.dumps(delayed_start_command)
     )
-    logging.info(f"Sent start command to Dryer.")
+    logging.info(f"Sent new start command to Dryer. Will start in {int(hours)} hr(s) {int(minutes)} min(s)")
 
 
 def handle_dryer_running_state():
