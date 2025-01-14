@@ -73,7 +73,7 @@ def send_delayed_start_to_dryer():
         delay_seconds = round(determine_optimal_run_time() / 60) * 60 + silent_dry_runtime
 
     # Get hours and minutes for friendly logging
-    delay_time = timedelta(seconds=delay_seconds - silent_dry_runtime)
+    delay_time = timedelta(seconds=delay_seconds)
     hours, remainder = divmod(delay_time.total_seconds(), 3600)
     minutes = remainder // 60
 
