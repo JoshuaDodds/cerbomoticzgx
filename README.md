@@ -55,7 +55,9 @@ Note: The name of this project is a nod to both Victron Energy & the Domoticz pr
 ### Configuration / Setup
 - Read the ```.env-example``` file carefully and adjust as needed. Rename to ```.env```
 - Do the same for ```.secrets-example``` and rename to ```.secrets```
-- Carefully read through lib/contstants.py and adjust to fit your situation
+- Carefully read through lib/contstants.py and adjust to fit your situation. Most logic is event driven and events topics that drive logic are 
+  defined here in this file
+- Homeconnect support is defined in constants as well but requires an external service to publish state. (see hcpy project mentioned in the introduction of this doc)  
 - IMPORTANT:  See notes below if you plan to run this from a container image.  My image won't work for you as is. Read the notes below 
 for the things you will need to adjust in your own fork of this repo.  
  

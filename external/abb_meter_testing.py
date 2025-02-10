@@ -14,9 +14,9 @@ def phase_regs(n):
 
     return [
         #  (register, topic, length, multiplier, register[index], string formatting)
-        #(0x5b00 + s2, '/Ac/L%d/Voltage' % n,        2,  10, 1, '%.1f V'),
-        #(0x5b0c + s2, '/Ac/L%d/Current' % n,        2, 100, 1, '%.1f A'),
-        #(0x5b16 + s2, '/Ac/L%d/Power' % n,          2, 100, 1, '%.1f W'),
+        # (0x5b00 + s2, '/Ac/L%d/Voltage' % n,        2,  10, 1, '%.1f V'),
+        # (0x5b0c + s2, '/Ac/L%d/Current' % n,        2, 100, 1, '%.1f A'),
+        # (0x5b16 + s2, '/Ac/L%d/Power' % n,          2, 100, 1, '%.1f W'),
         # (0x5460 + s4, '/Ac/L%d/Energy/Forward' % n, 4, 100, 1, '%.1f kWh'),
         # (0x546c + s4, '/Ac/L%d/Energy/Reverse' % n, 4, 100, 1, '%.1f kWh'),
     ]
@@ -26,8 +26,8 @@ def read_device(phases):
         (0x5b14, 'Power',  2, 100, 1, '%.1f W'),
         (0x5000, 'Import', 4, 100, 0, '%.1f kWh'),
         (0x5004, 'Export', 4, 100, 0, '%.1f kWh'),
-        #(0x5008, 'Net',    4, 100, 1, '%.1f kWh'),
-        #(0x5b2c, 'Frequency',      2, 100, 0, '%.1f Hz'),
+        # (0x5008, 'Net',    4, 100, 1, '%.1f kWh'),
+        # (0x5b2c, 'Frequency',      2, 100, 0, '%.1f Hz'),
     ]
 
     for n in range(1, phases + 1):

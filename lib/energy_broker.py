@@ -254,7 +254,7 @@ def schedule_victron_ess_charging(hour, schedule=0, duration=3600, day=0):
         raise Exception("OoBError: hour must be an integer between 0 and 23")
 
     topic_stub = f"W/{systemId0}/settings/0/Settings/CGwacs/BatteryLife/Schedule/Charge/{schedule}/"
-    soc = 95
+    soc = 100
     start = hour * 3600
 
     publish_message(f"{topic_stub}Duration", payload=f"{{\"value\": {duration}}}", retain=True)
