@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 
 from lib.constants import logging
 from lib.global_state import GlobalStateClient
-from lib.helpers import publish_message
+from lib.helpers import publish_message, is_winter_month
 from lib.tibber_api import lowest_24h_prices, lowest_48h_prices
 
 gs_client = GlobalStateClient()
@@ -48,7 +48,7 @@ def send_delayed_start_to_dishwasher():
 
 
 def send_delayed_start_to_dryer():
-    silent_dry_runtime = 0
+    silent_dry_runtime = 0  # noqa
     delay_seconds = determine_optimal_run_time()
 
     selected_program = int(gs_client.get('Dryer_SelectedProgram'))
@@ -88,40 +88,46 @@ def send_delayed_start_to_dryer():
 
 
 def handle_dryer_running_state():
-    if gs_client.get('Dryer_RemoteControlStartAllowed'):
-        try:
-            # Abort the current program
-            logging.info("Dryer is running. Sending abort command...")
-            abort_command = {"uid": 512, "value": True}  # AbortProgram command
-            publish_message(
-                topic="Cerbomoticzgx/homeconnect/dryer/set",
-                payload=json.dumps(abort_command)
-            )
-            logging.info("Sent abort command to Dryer.")
+    if is_winter_month():
+        if gs_client.get('Dryer_RemoteControlStartAllowed'):
+            try:
+                # Abort the current program
+                logging.info("Dryer is running. Sending abort command...")
+                abort_command = {"uid": 512, "value": True}  # AbortProgram command
+                publish_message(
+                    topic="Cerbomoticzgx/homeconnect/dryer/set",
+                    payload=json.dumps(abort_command)
+                )
+                logging.info("Sent abort command to Dryer.")
 
-            # Start monitoring thread to wait for 'Ready' state
-            wait_for_ready_state("Dryer", send_delayed_start_to_dryer)
+                # Start monitoring thread to wait for 'Ready' state
+                wait_for_ready_state("Dryer", send_delayed_start_to_dryer)
 
-        except Exception as e:
-            logging.error(f"Unexpected error in handle_dryer_running_state(): {e}")
+            except Exception as e:
+                logging.error(f"Unexpected error in handle_dryer_running_state(): {e}")
+    else:
+        logging.info("[Info]: Non-winter month detected. Allowing immediate runtime for Dryer.")
 
 
 def handle_dishwasher_running_state():
-    try:
-        # Abort the current program
-        logging.info("Dishwasher is running. Sending abort command...")
-        abort_command = {"uid": 512, "value": True}  # AbortProgram command
-        publish_message(
-            topic="Cerbomoticzgx/homeconnect/dishwasher/set",
-            payload=json.dumps(abort_command)
-        )
-        logging.info("Sent abort command to Dishwasher.")
+    if is_winter_month():
+        try:
+            # Abort the current program
+            logging.info("Dishwasher is running. Sending abort command...")
+            abort_command = {"uid": 512, "value": True}  # AbortProgram command
+            publish_message(
+                topic="Cerbomoticzgx/homeconnect/dishwasher/set",
+                payload=json.dumps(abort_command)
+            )
+            logging.info("Sent abort command to Dishwasher.")
 
-        # Start monitoring thread to wait for 'Ready' state
-        wait_for_ready_state("Dishwasher", send_delayed_start_to_dishwasher)
+            # Start monitoring thread to wait for 'Ready' state
+            wait_for_ready_state("Dishwasher", send_delayed_start_to_dishwasher)
 
-    except Exception as e:
-        logging.error(f"Unexpected error in handle_dishwasher_running_state(): {e}")
+        except Exception as e:
+            logging.error(f"Unexpected error in handle_dishwasher_running_state(): {e}")
+    else:
+        logging.info("[Info]: Non-winter month detected. Allowing immediate runtime for Dishwasher.")
 
 
 def handle_dryer_event(payload):

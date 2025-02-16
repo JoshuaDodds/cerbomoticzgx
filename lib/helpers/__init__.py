@@ -151,6 +151,10 @@ def calculate_max_charge_slots_needed(batt_soc: float, target_soc: float) -> int
 
     return max(0, rounded_slots)
 
+def is_winter_month():
+    winter_months = {9, 10, 11, 12, 1, 2, 3}
+    return datetime.now().month in winter_months
+
 def get_seasonally_adjusted_max_charge_slots(batt_soc: float, pv_production_remaining: float = 0.0) -> int:
     """
     Returns: (int): max number of 1 hour charge slots needed to top up the battery from the grid
