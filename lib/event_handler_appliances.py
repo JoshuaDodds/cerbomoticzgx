@@ -66,7 +66,7 @@ def send_delayed_start_to_dryer():
         logging.info("Calculated start time for Dryer is after 8:30 PM. Enforcing SilentDry programme.")
         # change program
         select_program_command = {"program": 32068}  # SilentDry program UID
-        publish_message("Cerbomoticzgx/homeconnect/dryer/selectedProgram", payload=select_program_command)
+        publish_message("Cerbomoticzgx/homeconnect/dryer/selectedProgram", payload=json.dumps(select_program_command))
 
         selected_program = int(gs_client.get('Dryer_SelectedProgram'))
         silent_dry_runtime = int(gs_client.get('Dryer_FinishInRelative'))
