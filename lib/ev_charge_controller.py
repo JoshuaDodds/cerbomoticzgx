@@ -84,10 +84,10 @@ class EvCharger:
             if self.should_manage_or_initiate_charging():
                 self.dynamic_load_reservation_adjustment()
                 self.tesla.update_vehicle_status(force=False)
-                if not self.tesla.is_vehicle_charging():
+                if not self.tesla.is_charging:
                     self.initiate_charging()
                     self.main_thread = threading.Timer(5.0, self.main)
-                elif self.tesla.is_vehicle_charging():
+                elif self.tesla.is_charging:
                     self.manage_charging()
                     self.main_thread = threading.Timer(20.0, self.main)
 
