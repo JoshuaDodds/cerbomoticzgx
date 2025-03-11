@@ -49,6 +49,7 @@ Topics = dict({
             "inverter_mode":                    f"N/{systemId0}/vebus/276/Mode",
             "grid_charging_enabled":            f"Tesla/settings/grid_charging_enabled",
             "trigger_ess_charge_scheduling":    f"Cerbomoticzgx/EnergyBroker/RunTrigger",
+            "clear_ess_charge_schedule":        f"Cerbomoticzgx/EnergyBroker/ClearSchedule",
             "system_shutdown":                  f"Cerbomoticzgx/system/shutdown",
             "ess_net_metering_enabled":         f"Cerbomoticzgx/system/ess_net_metering_enabled",
             "ess_net_metering_overridden":      f"Cerbomoticzgx/system/ess_net_metering_overridden",   # When this is toggled on, DynESS will not operate with automated buy/sell decisions

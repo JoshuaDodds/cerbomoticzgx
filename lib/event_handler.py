@@ -12,6 +12,7 @@ from lib.event_handler_appliances import handle_dryer_event, handle_dishwasher_e
 from lib.energy_broker import (
     manage_sale_of_stored_energy_to_the_grid,
     set_charging_schedule,
+    clear_victron_schedules,
     manage_grid_usage_based_on_current_price,
     Utils
 )
@@ -263,3 +264,7 @@ class Event:
     @staticmethod
     def trigger_ess_charge_scheduling():
         set_charging_schedule(caller=__name__, silent=True, schedule_type='48h', slots=5)
+
+    @staticmethod
+    def clear_ess_charge_schedule():
+        clear_victron_schedules()
