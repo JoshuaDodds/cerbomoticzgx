@@ -47,6 +47,28 @@ def send_delayed_start_to_dishwasher():
     logging.info(f"Sent new start command to Dishwasher. Will start in {int(hours)} hr(s) {int(minutes)} min(s)")
 
 
+def send_immediate_start_to_dishwasher():
+    # Send the immediate start program command
+    immediate_start_command = {"program": 8203, "options": [{"uid": 558, "value": 0}]}
+    topic = "Cerbomoticzgx/homeconnect/dishwasher/activeProgram"
+    publish_message(
+        topic=topic,
+        payload=json.dumps(immediate_start_command)
+    )
+
+    logging.info("Selected correct program and sent immediate start command to Dishwasher.")
+
+
+def abort_dishwasher():
+    logging.info("Sending abort command to Dishwasher...")
+    abort_command = {"uid": 512, "value": True}
+    publish_message(
+        topic="Cerbomoticzgx/homeconnect/dishwasher/set",
+        payload=json.dumps(abort_command)
+    )
+    logging.info("Sent abort command to Dishwasher.")
+
+
 def send_delayed_start_to_dryer():
     silent_dry_runtime = 0  # noqa
     delay_seconds = determine_optimal_run_time()
@@ -104,30 +126,24 @@ def handle_dryer_running_state():
                 wait_for_ready_state("Dryer", send_delayed_start_to_dryer)
 
             except Exception as e:
-                logging.error(f"Unexpected error in handle_dryer_running_state(): {e}")
+                logging.info(f"Unexpected error in handle_dryer_running_state(): {e}")
     else:
         logging.info("[Info]: Non-winter month detected. Allowing immediate runtime for Dryer.")
 
 
 def handle_dishwasher_running_state():
-    if is_winter_month():
-        try:
-            # Abort the current program
-            logging.info("Dishwasher is running. Sending abort command...")
-            abort_command = {"uid": 512, "value": True}  # AbortProgram command
-            publish_message(
-                topic="Cerbomoticzgx/homeconnect/dishwasher/set",
-                payload=json.dumps(abort_command)
-            )
-            logging.info("Sent abort command to Dishwasher.")
+    try:
+        abort_dishwasher()
 
-            # Start monitoring thread to wait for 'Ready' state
+        if is_winter_month():
+            logging.info("Winter month detected. Will restart Dishwasher with delayed start.")
             wait_for_ready_state("Dishwasher", send_delayed_start_to_dishwasher)
+        else:
+            logging.info("Non-winter month detected. Selecting correct program and starting Dishwasher immediately.")
+            wait_for_ready_state("Dishwasher", send_immediate_start_to_dishwasher)
 
-        except Exception as e:
-            logging.error(f"Unexpected error in handle_dishwasher_running_state(): {e}")
-    else:
-        logging.info("[Info]: Non-winter month detected. Allowing immediate runtime for Dishwasher.")
+    except Exception as e:
+        logging.info(f"Unexpected error in handle_dishwasher_running_state(): {e}")
 
 
 def handle_dryer_event(payload):
