@@ -14,7 +14,7 @@ from lib.energy_broker import (
     set_charging_schedule,
     clear_victron_schedules,
     manage_grid_usage_based_on_current_price,
-    Utils
+    # Utils
 )
 
 
@@ -59,7 +59,10 @@ class Event:
         if event == 0:
             logging.info("AC Input: Grid is offline! This should not happen!")
             # Ensure Ac Loads are powered by ensuring Inverters on are
-            Utils.set_inverter_mode(mode=3)
+            # todo: below was disabled as it was triggered when batt went offline forcing it into a mode it could not
+            # todo: use at the time because inverter mode explicitly tells it to use a non-existent battery which then
+            # todo: resulted in the inverters toggling to OFF setting.
+            # Utils.set_inverter_mode(mode=3)
             pushover_notification_critical(
                 "AC Input Gone!",
                 "Cerbomoticzgx requesting immediate attention: Grid power is offline. Check inverters and breakers!"
