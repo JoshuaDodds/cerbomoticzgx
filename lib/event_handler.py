@@ -99,9 +99,12 @@ class Event:
 
     def tibber_price_now(self):
         if self.value:
-            _value = float(self.value)
-            manage_grid_usage_based_on_current_price(_value)
-            manage_sale_of_stored_energy_to_the_grid()
+            try:
+                _value = float(self.value)
+                manage_grid_usage_based_on_current_price(_value)
+                manage_sale_of_stored_energy_to_the_grid()
+            except (ValueError, TypeError) as e:
+                logging.info(f"{__name__}: Invalid tibber_price_now value '{self.value}' - {e}")
 
     def system_shutdown(self):
         _value = self.value
