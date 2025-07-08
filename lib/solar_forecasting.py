@@ -20,7 +20,7 @@ This module relies on environment variables defined in the .env file
 import time
 import pytz
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urlencode
 
 from lib.config_retrieval import retrieve_setting
@@ -34,11 +34,63 @@ LOGIN_URL = retrieve_setting('VRM_LOGIN_URL')
 LOGIN_DATA = {"username": retrieve_setting('VRM_USER'), "password": retrieve_setting('VRM_PASS')}
 API_URL = retrieve_setting('VRM_API_URL')
 
+now_tz = datetime.now(TIMEZONE)
+start_of_today = int(now_tz.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+end_of_today = int((now_tz + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+
+def get_consumption_readings():
+    try:
+        response = requests.post(LOGIN_URL, json=LOGIN_DATA, timeout=5)
+        token = response.json().get("token")
+    except (requests.ConnectTimeout, requests.ConnectionError) as LoginError:
+        logging.info(f"Connectivity issue to VRM Login endpoint: {LoginError}")
+        return None
+
+    if not token:
+        logging.info("Failed to get the token for VRM Portal API access. Check login credentials.")
+        return None
+
+    headers = {
+        'Content-Type': 'application/json',
+        'x-authorization': f'Bearer {token}'
+    }
+
+    params = {
+        'type': "consumption",
+        'start': start_of_today,
+        'end': end_of_today,
+        'interval': "days"
+    }
+
+    url = f"{retrieve_setting('VRM_API_URL')}/installations/{retrieve_setting('VRM_SITE_ID')}/stats?{urlencode(params)}"
+    logging.debug(f"Calling VRM consumption stats endpoint: {url}")
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=5)
+        if resp.status_code != 200:
+            logging.info(f"Failed to retrieve consumption stats: {resp.status_code}")
+            return None
+
+        data = resp.json()
+        logging.debug(f"VRM Response: {data}")
+
+        totals = data.get('totals', {})
+        gc = totals.get('Gc', 0.0)
+        bc = totals.get('Bc', 0.0)
+        pc = totals.get('Pc', 0.0)
+
+        total_wh = round((gc + bc + pc) * 1000, 2)  # return in Wh
+        logging.debug(f"VRM Total Consumption: {total_wh}")
+        return total_wh
+
+    except requests.RequestException as e:
+        logging.info(f"Error calling VRM consumption stats: {e}")
+        return None
+
 
 def get_victron_solar_forecast():
-    now_tz = datetime.now(TIMEZONE)
-    start_of_today, end_of_today = (int(now_tz.replace(hour=h, minute=0, second=0, microsecond=0).timestamp()) for h in
-                                    [5, 22])
+    # now_tz = datetime.now(TIMEZONE)
+    # start_of_today, end_of_today = (int(now_tz.replace(hour=h, minute=0, second=0, microsecond=0).timestamp()) for h in [5, 22])
     now = int(now_tz.timestamp()) - 60
 
     try:
@@ -59,7 +111,7 @@ def get_victron_solar_forecast():
 
     params = {
         'type': "forecast",
-        "start": now,
+        "start": start_of_today,
         "end": end_of_today,
         "interval": "days",
     }
@@ -83,22 +135,34 @@ def get_victron_solar_forecast():
         return None
 
     data = response.json().get("records", [])
+    logging.debug(f"Full VRM stats response: {data}")
 
     if data:
         try:
-            solar_production_left = round(float(data['solar_yield_forecast'][0][1]), 2)
+            # VRM solar forecast data
             solar_production = actual_solar_generation() * 1000
+            solar_production_left = round(float(data['solar_yield_forecast'][0][1]), 2) - solar_production
             solar_forecast_kwh = round(solar_production_left + solar_production, 2)
 
-            logging.debug(f"Daily pv forecast: Actual:{actual_solar_generation()} kWh Forecasted:{solar_forecast_kwh} kWh ToGo: {solar_production_left}")
+            logging.info(
+                f"Daily pv forecast: Actual:{actual_solar_generation()} Forecasted:{solar_forecast_kwh} kWh ToGo: {solar_production_left}")
 
             STATE.set('pv_projected_today', solar_forecast_kwh)
             STATE.set('pv_projected_remaining', solar_production_left)
 
+            # VRM consumption forecast data
+            try:
+                consumption_wh = round(float(data['vrm_consumption_fc'][0][1]), 2)
+                consumption_wh_actual = round(get_consumption_readings(), 2)
+                STATE.set('consumption_projected_remaining', consumption_wh)
+                STATE.set('consumption_total_today', consumption_wh_actual)
+                logging.info(f"Consumption Today: {consumption_wh_actual} kWh Forecasted consumption remaining: {consumption_wh - consumption_wh_actual} kWh")
+            except (ValueError, TypeError, IndexError, KeyError):
+                logging.info("Consumption forecast data missing or malformed.")
+
             return solar_forecast_kwh
 
         except (ValueError, TypeError, IndexError, KeyError) as e:  # noqa
-            # catch and log unexpected or missing data and let scheduler try again in 5 minutes
             logging.info(f"Unexpected or no data received from VRM API.")
             return None
 
