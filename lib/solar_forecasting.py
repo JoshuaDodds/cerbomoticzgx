@@ -89,10 +89,10 @@ def get_consumption_readings():
 
 
 def get_victron_solar_forecast():
-    # Note: deprecated because this only grabbed data from 0500 - 2200 in 24h period
+    # Note: deprecated because this only grabbed data from 0500 to 2200 in 24h period
     # now_tz = datetime.now(TIMEZONE)
     # start_of_today, end_of_today = (int(now_tz.replace(hour=h, minute=0, second=0, microsecond=0).timestamp()) for h in [5, 22])
-    now = int(now_tz.timestamp()) - 60
+    # now = int(now_tz.timestamp()) - 60
 
     try:
         response = requests.post(LOGIN_URL, json=LOGIN_DATA, timeout=5)
@@ -153,12 +153,16 @@ def get_victron_solar_forecast():
 
             # VRM consumption forecast data
             try:
-                consumption_wh = round(float(data['vrm_consumption_fc'][0][1]), 2)
+                consumption_wh_forecasted = round(float(data['vrm_consumption_fc'][0][1]), 2)
                 consumption_wh_actual = round(get_consumption_readings(), 2)
-                consumption_wh_remaining = consumption_wh - consumption_wh_actual
+                consumption_wh_remaining = consumption_wh_forecasted - consumption_wh_actual
+
                 logging.info(f"Consumption Today: {consumption_wh_actual} kWh Forecasted consumption remaining: {consumption_wh_remaining} kWh")
+
+                STATE.set('consumption_total_projected', consumption_wh_forecasted)
                 STATE.set('consumption_projected_remaining', consumption_wh_remaining)
-                STATE.set('consumption_total_today', consumption_wh_actual)
+                STATE.set('consumption_total_cumulative', consumption_wh_actual)
+
             except (ValueError, TypeError, IndexError, KeyError):
                 logging.info("Consumption forecast data missing or malformed.")
 
