@@ -149,7 +149,7 @@ def get_victron_solar_forecast():
             solar_production_left = round(float(data['solar_yield_forecast'][0][1]), 2) - solar_production
             solar_forecast_kwh = round(solar_production_left + solar_production, 2)
 
-            logging.info(
+            logging.debug(
                 f"Daily pv forecast: Actual:{actual_solar_generation()} Forecasted:{solar_forecast_kwh} kWh ToGo: {solar_production_left}")
 
             STATE.set('pv_projected_today', solar_forecast_kwh)
@@ -161,7 +161,7 @@ def get_victron_solar_forecast():
                 consumption_wh_actual = round(get_consumption_readings(), 2)
                 consumption_wh_remaining = consumption_wh_forecasted - consumption_wh_actual
 
-                logging.info(f"Consumption Today: {consumption_wh_actual} kWh Forecasted consumption remaining: {consumption_wh_remaining} kWh")
+                logging.debug(f"Consumption Today: {consumption_wh_actual} kWh Forecasted consumption remaining: {consumption_wh_remaining} kWh")
 
                 STATE.set('consumption_total_projected', consumption_wh_forecasted)
                 STATE.set('consumption_projected_remaining', consumption_wh_remaining)
