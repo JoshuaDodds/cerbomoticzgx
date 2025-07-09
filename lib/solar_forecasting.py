@@ -34,11 +34,12 @@ LOGIN_URL = retrieve_setting('VRM_LOGIN_URL')
 LOGIN_DATA = {"username": retrieve_setting('VRM_USER'), "password": retrieve_setting('VRM_PASS')}
 API_URL = retrieve_setting('VRM_API_URL')
 
-now_tz = datetime.now(TIMEZONE)
-start_of_today = int(now_tz.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-end_of_today = int((now_tz + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
 
 def get_consumption_readings():
+    now_tz = datetime.now(TIMEZONE)
+    start_of_today = int(now_tz.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+    end_of_today = int((now_tz + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+
     try:
         response = requests.post(LOGIN_URL, json=LOGIN_DATA, timeout=5)
         token = response.json().get("token")
@@ -93,6 +94,9 @@ def get_victron_solar_forecast():
     # now_tz = datetime.now(TIMEZONE)
     # start_of_today, end_of_today = (int(now_tz.replace(hour=h, minute=0, second=0, microsecond=0).timestamp()) for h in [5, 22])
     # now = int(now_tz.timestamp()) - 60
+    now_tz = datetime.now(TIMEZONE)
+    start_of_today = int(now_tz.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+    end_of_today = int((now_tz + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
 
     try:
         response = requests.post(LOGIN_URL, json=LOGIN_DATA, timeout=5)
