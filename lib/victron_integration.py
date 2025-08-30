@@ -26,7 +26,7 @@ def ac_power_setpoint(watts: str = None, override_ess_net_mettering=True, silent
         if not silent:
             logging.info(f"Victron Integration: Set AC Power Set Point to: {watts} watts")
 
-def set_minimum_ess_soc(percent: int = 0):
+def set_minimum_ess_soc(percent: int = 20):
     if percent:
         _msg = f"{{\"value\": {percent}}}"
         logging.info(f"Setting battery sustain percent to: {percent}%")
@@ -59,8 +59,8 @@ def regulate_battery_max_voltage(ess_soc):
             publish.single(TopicsWritable["system0"]["max_charge_voltage"], payload=f"{{\"value\": \"{battery_full_voltage}\"}}", qos=1, retain=False, hostname=cerboGxEndpoint, port=1883)
             logging.info(f"Victron Integration: Adjusting max charge voltage to {battery_full_voltage} due to battery SOC reaching {retrieve_setting('MAXIMUM_ESS_SOC')}% or higher")
             publish.single("Tesla/vehicle0/solar/ess_max_charge_voltage", payload=f"{{\"value\": \"{battery_full_voltage}\"}}", qos=1, retain=True, hostname=cerboGxEndpoint, port=1883)
-            # when battery is full, return Minumum batt SOC (unless grid fails) to 0%
-            set_minimum_ess_soc(0)
+            # when battery is full, return Minumum batt SOC (unless grid fails) to 20%
+            set_minimum_ess_soc(20)
 
         else:
             logging.debug(f"Victron Integration: No Action. Battery max charge voltage is appropriately set at {current_max_charge_voltage}V with ESS SOC at {ess_soc}%")
