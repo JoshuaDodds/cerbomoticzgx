@@ -13,8 +13,22 @@ Do you have one or more of the following devices in your home?
 - [x] HomeConnect enabled smart appliances (optional and currently requires you to run [https://github.com/hcpy2-0/hcpy](https://github.com/hcpy2-0/hcpy) as an additional service.) 
 
 If so, this project might be something you will find interesting. Have a look at what this project offers by 
-reading more below.  Also, many of the cool features the modules in this project offer are visualized and controllable 
+reading more below.  Also, many of the cool features the modules in this project offer are visualized and controllable
 via a by a frontend React based Dashboard which you can find over here: [venus-nextgen Energy Dashboard](https://github.com/JoshuaDodds/venus-nextgen)
+
+### System Overview
+
+```mermaid
+flowchart LR
+    Solar["Solar Production"] -->|DC Power| Victron["Victron Cerbo GX"]
+    Grid["Tibber / Grid Rates"] -->|Pricing & Availability| EnergyBroker["Energy Broker Module"]
+    Victron -->|Metrics & Control| Domoticz["Domoticz Automation"]
+    Victron -->|Vehicle Charging| Tesla["Tesla Integration"]
+    Victron -->|Storage Control| ESS["Home Battery System"]
+    EnergyBroker -->|Charge/Discharge Strategy| ESS
+    Domoticz -->|Automations & Insights| Dashboard["venus-nextgen Dashboard"]
+    HomeConnect["HomeConnect Appliances"] -->|Scheduled Loads| Domoticz
+```
 
 ## Features
 This project is a series of modules which aim to integrate, automate and control the following systems and components.
