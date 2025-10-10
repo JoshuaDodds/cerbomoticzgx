@@ -55,11 +55,12 @@ Note: The name of this project is a nod to both Victron Energy & the Domoticz pr
 ### Configuration / Setup
 - Read the ```.env-example``` file carefully and adjust as needed. Rename to ```.env```
 - Do the same for ```.secrets-example``` and rename to ```.secrets```
-- Carefully read through lib/contstants.py and adjust to fit your situation. Most logic is event driven and events topics that drive logic are 
+- Carefully read through lib/contstants.py and adjust to fit your situation. Most logic is event driven and events topics that drive logic are
   defined here in this file
-- Homeconnect support is defined in constants as well but requires an external service to publish state. (see hcpy project mentioned in the introduction of this doc)  
-- IMPORTANT:  See notes below if you plan to run this from a container image.  My image won't work for you as is. Read the notes below 
-for the things you will need to adjust in your own fork of this repo.  
+- Homeconnect support is defined in constants as well but requires an external service to publish state. (see hcpy project mentioned in the introduction of this doc)
+- Configure the nightly charging skip guardrails if desired: `NIGHT_CHARGE_SKIP_ENABLED` toggles the behaviour and `NIGHT_CHARGE_SKIP_MIN_SOC` / `NIGHT_CHARGE_SKIP_MAX_SOC` bound the state-of-charge window that will skip the 21:30 schedule run.
+- IMPORTANT:  See notes below if you plan to run this from a container image.  My image won't work for you as is. Read the notes below
+for the things you will need to adjust in your own fork of this repo.
  
 **TODO: handle this issue automatically in a universal container build** 
 
