@@ -18,6 +18,70 @@ DAILY_HOME_ENERGY_CONSUMPTION = float(retrieve_setting('DAILY_HOME_ENERGY_CONSUM
 
 STATE = GlobalStateClient()
 
+
+def _get_float_setting(setting_name: str, default: float) -> float:
+    """Return a configuration value parsed as float with a safe default."""
+    raw_value = retrieve_setting(setting_name)
+    if raw_value in (None, "", "None"):
+        return default
+
+    try:
+        return float(raw_value)
+    except (TypeError, ValueError):
+        logging.warning(
+            "EnergyBroker: Unable to parse %s value '%s'. Falling back to default %.2f.",
+            setting_name,
+            raw_value,
+            default,
+        )
+        return default
+
+
+def _is_truthy(value: str | None, default: bool) -> bool:
+    if value in (None, "", "None"):
+        return default
+
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _should_skip_night_charge(
+    batt_soc: float | None,
+    charge_context: str | None,
+) -> tuple[bool, str | None]:
+    """Determine whether the nightly charge schedule should be skipped."""
+    if charge_context != "nightly":
+        return False, None
+
+    if batt_soc is None:
+        return False, None
+
+    if not _is_truthy(retrieve_setting("NIGHT_CHARGE_SKIP_ENABLED"), True):
+        return False, None
+
+    min_soc = _get_float_setting("NIGHT_CHARGE_SKIP_MIN_SOC", 70.0)
+    max_soc = _get_float_setting("NIGHT_CHARGE_SKIP_MAX_SOC", 100.0)
+
+    if max_soc < min_soc:
+        max_soc = min_soc
+
+    if min_soc <= batt_soc <= max_soc:
+        message = (
+            "EnergyBroker: Skipping nightly charge schedule because battery "
+            f"SoC is {round(batt_soc, 2)}% which falls within the configured "
+            f"skip range of {min_soc}-{max_soc}%."
+        )
+        return True, message
+
+    if batt_soc > max_soc:
+        message = (
+            "EnergyBroker: Skipping nightly charge schedule because battery "
+            f"SoC is {round(batt_soc, 2)}% which is above the configured skip "
+            f"maximum of {max_soc}%."
+        )
+        return True, message
+
+    return False, None
+
 def main():
     logging.info("EnergyBroker: Initializing...")
     schedule_tasks()
@@ -30,7 +94,15 @@ def schedule_tasks():
 
     # Grid Charging Scheduled Tasks
     scheduler.every().day.at("09:30").do(set_charging_schedule, caller="TaskScheduler()", silent=True)
-    scheduler.every().day.at("21:30").do(set_charging_schedule, caller="TaskScheduler()", silent=True, schedule_type='48h')
+    scheduler.every().day.at(
+        "21:30"
+    ).do(
+        set_charging_schedule,
+        caller="TaskScheduler()",
+        silent=True,
+        schedule_type='48h',
+        charge_context='nightly',
+    )
 
 
 def retrieve_latest_tibber_pricing():
@@ -185,7 +257,14 @@ def publish_mqtt_trigger():
     publish_message("Cerbomoticzgx/EnergyBroker/RunTrigger", payload=f"{{\"value\": {time.localtime().tm_hour}}}", retain=False)
 
 
-def set_charging_schedule(caller=None, price_cap=MAX_TIBBER_BUY_PRICE, silent=False, schedule_type=None, slots=None):
+def set_charging_schedule(
+    caller=None,
+    price_cap=MAX_TIBBER_BUY_PRICE,
+    silent=False,
+    schedule_type=None,
+    slots=None,
+    charge_context=None,
+):
     batt_soc = STATE.get('batt_soc')
 
     # Determine schedule type if not explicitly provided
@@ -206,7 +285,18 @@ def set_charging_schedule(caller=None, price_cap=MAX_TIBBER_BUY_PRICE, silent=Fa
         max_items = get_seasonally_adjusted_max_charge_slots(batt_soc, pv_forecast_min_consumption_forecast)
 
     # Log the schedule request details
-    logging.info(f"EnergyBroker: set up {schedule_type} charging schedule request received by {caller} using batt_soc={batt_soc}% and expected solar surplus of {pv_forecast_min_consumption_forecast} kWh")
+    logging.info(
+        "EnergyBroker: set up %s charging schedule request received by %s using batt_soc=%s%% and expected solar surplus of %s kWh",
+        schedule_type,
+        caller,
+        batt_soc,
+        pv_forecast_min_consumption_forecast,
+    )
+
+    should_skip, skip_message = _should_skip_night_charge(batt_soc, charge_context)
+    if should_skip:
+        logging.info(skip_message)
+        return False
 
     # If no charging slots are needed, return early
     if max_items < 1:
