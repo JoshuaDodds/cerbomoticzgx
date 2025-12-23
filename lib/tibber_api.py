@@ -8,8 +8,13 @@ from lib.config_retrieval import retrieve_setting
 from lib.constants import logging, systemId0
 from lib.domoticz_updater import domoticz_update
 from lib.clients.mqtt_client_factory import VictronClient
+from gql import Client
+from gql.transport.websockets import WebsocketsTransport
+from graphql import parse
 from gql.transport.exceptions import TransportClosed
 from websockets.exceptions import ConnectionClosedError
+from tibber.networking import QueryBuilder
+from tibber.types.live_measurement import LiveMeasurement
 
 logging.getLogger("gql.transport").setLevel(logging.ERROR)
 
@@ -63,7 +68,11 @@ def live_measurements(home=_home or None):
                              retries=10,
                              retry_interval=10)
     except (TransportClosed, ConnectionClosedError) as e:
-        logging.info(f"Tibber Error: {e} It seems we have a network/connectivity issue. Attempting a service restart...")
+        logging.warning(
+            "Tibber Error: %s. It seems we have a network/connectivity issue. "
+            "This can also be caused by a Tibber API outage. Attempting a service restart...",
+            e,
+        )
         # this will trigger event_handler to restart the whole service
         client.publish("Cerbomoticzgx/system/shutdown", payload=f"{{\"value\": \"True\"}}", retain=True)
 

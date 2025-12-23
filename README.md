@@ -55,6 +55,9 @@ Note: The name of this project is a nod to both Victron Energy & the Domoticz pr
 ### Configuration / Setup
 - Read the ```.env-example``` file carefully and adjust as needed. Rename to ```.env```
 - Do the same for ```.secrets-example``` and rename to ```.secrets```
+- If you rely on Tibber live measurements, set `HOME_ID` in `.secrets` to the home that has real-time data enabled.
+- If Tibber live measurements report that real-time consumption is disabled even though the developer portal works,
+  set `TIBBER_LIVE_MEASUREMENTS_FORCE=1` in `.env` to attempt a direct websocket subscription.
 - Carefully read through lib/contstants.py and adjust to fit your situation. Most logic is event driven and events topics that drive logic are
   defined here in this file
 - Homeconnect support is defined in constants as well but requires an external service to publish state. (see hcpy project mentioned in the introduction of this doc)
