@@ -1,4 +1,3 @@
-import asyncio
 import tibber
 import time
 
@@ -20,211 +19,58 @@ from tibber.types.live_measurement import LiveMeasurement
 logging.getLogger("gql.transport").setLevel(logging.ERROR)
 
 tzinfos = {"UTC": tz.gettz(retrieve_setting('TIMEZONE'))}
+account = tibber.Account(retrieve_setting('TIBBER_ACCESS_TOKEN'))
+_home = account.homes[0]
 
 client = VictronClient().get_client()
 
-def live_measurements():
-    def resolve_home(account):
-        home_id = retrieve_setting("HOME_ID")
-        homes = account.homes or []
+def live_measurements(home=_home or None):
+    @home.event("live_measurement")
+    async def log_accumulated(data):
+        try:
+            ts = datetime.now().replace(microsecond=0)
+            logging.debug(f"Tibber: Imported: {data.accumulated_consumption or 0.000} kWh / {data.accumulated_cost or 0.00} {data.currency} :: "
+                          f"Exported: {data.accumulated_production or 0.000} kWh / {data.accumulated_reward or 0.00} {data.currency} :: "
+                          f"Pwr Factor: {data.power_factor or 0.000} :: Avg Pwr: {data.average_power} Watts")
 
-        if home_id:
-            for home in homes:
-                if home.id == home_id:
-                    logging.info(
-                        "Tibber: Using HOME_ID=%s (real_time_consumption_enabled=%s).",
-                        home_id,
-                        home.features.real_time_consumption_enabled,
-                    )
-                    return home
-            logging.warning(
-                "Tibber: HOME_ID=%s not found in account homes. Falling back to first home.",
-                home_id,
-            )
+            # update mqtt topics
+            client.publish("Tibber/home/energy/day/imported", payload=f"{{\"value\": \"{data.accumulated_consumption}\"}}", retain=True)
+            client.publish("Tibber/home/energy/day/cost", payload=f"{{\"value\": \"{data.accumulated_cost or 0.00}\"}}", retain=True)
+            client.publish("Tibber/home/energy/day/exported", payload=f"{{\"value\": \"{data.accumulated_production}\"}}", retain=True)
+            client.publish("Tibber/home/energy/day/reward", payload=f"{{\"value\": \"{data.accumulated_reward or 0.00}\"}}", retain=True)
+            client.publish("Tibber/home/energy/day/import_peak", payload=f"{{\"value\": \"{data.max_power}\"}}", retain=True)
+            client.publish("Tibber/home/energy/day/export_peak", payload=f"{{\"value\": \"{data.max_power_production}\"}}", retain=True)
+            client.publish("Tibber/home/energy/day/average_power", payload=f"{{\"value\": \"{data.average_power}\"}}", retain=True)
+            client.publish("Tibber/home/energy/day/last_update", payload=f"{{\"value\": \"{ts}\"}}", retain=True)
 
-        if homes:
-            logging.info(
-                "Tibber: HOME_ID not set. Using first home %s (real_time_consumption_enabled=%s).",
-                homes[0].id,
-                homes[0].features.real_time_consumption_enabled,
-            )
-            return homes[0]
-
-        logging.error(
-            "Tibber: No Tibber homes available. "
-            "Define HOME_ID in .secrets (e.g. HOME_ID=\"your-home-id\") to select a home "
-            "for live measurements."
-        )
-        return None
-
-    async def forced_live_measurements(home, user_agent, retries=10, retry_interval=10):
-        for attempt in range(1, retries + 1):
-            try:
-                transport = WebsocketsTransport(
-                    url=home.tibber_client.viewer.websocket_subscription_url,
-                    subprotocols=[WebsocketsTransport.GRAPHQLWS_SUBPROTOCOL],
-                    init_payload={"token": home.tibber_client.token},
-                    headers={"User-Agent": f"{user_agent} tibber.py/{tibber.__version__}"},
-                    ping_interval=10,
-                    pong_timeout=10,
-                )
-                websocket_client = Client(
-                    transport=transport,
-                    fetch_schema_from_transport=True,
-                )
-                session = await websocket_client.connect_async(reconnecting=True)
-                logging.info("Tibber: Connected to forced live measurements websocket.")
-
-                query = QueryBuilder.live_measurement(home.id)
-                document_node_query = parse(query)
-                async for data in session.subscribe(document_node_query):
-                    cleaned_data = LiveMeasurement(data["liveMeasurement"], home.tibber_client)
-                    await home.broadcast_event("live_measurement", cleaned_data)
-
-                await websocket_client.close_async()
-                return
-            except Exception as error:
-                logging.warning(
-                    "Tibber: Forced live measurements websocket failed (%s). "
-                    "Retrying in %s seconds.",
-                    error,
-                    retry_interval,
-                )
-                if attempt < retries:
-                    await asyncio.sleep(retry_interval)
-                else:
-                    raise
-
-    def register_callbacks(home):
-        @home.event("live_measurement")
-        async def log_accumulated(data):
-            try:
-                ts = datetime.now().replace(microsecond=0)
-                logging.debug(f"Tibber: Imported: {data.accumulated_consumption or 0.000} kWh / {data.accumulated_cost or 0.00} {data.currency} :: "
-                              f"Exported: {data.accumulated_production or 0.000} kWh / {data.accumulated_reward or 0.00} {data.currency} :: "
-                              f"Pwr Factor: {data.power_factor or 0.000} :: Avg Pwr: {data.average_power} Watts")
-
-                # update mqtt topics
-                client.publish("Tibber/home/energy/day/imported", payload=f"{{\"value\": \"{data.accumulated_consumption}\"}}", retain=True)
-                client.publish("Tibber/home/energy/day/cost", payload=f"{{\"value\": \"{data.accumulated_cost or 0.00}\"}}", retain=True)
-                client.publish("Tibber/home/energy/day/exported", payload=f"{{\"value\": \"{data.accumulated_production}\"}}", retain=True)
-                client.publish("Tibber/home/energy/day/reward", payload=f"{{\"value\": \"{data.accumulated_reward or 0.00}\"}}", retain=True)
-                client.publish("Tibber/home/energy/day/import_peak", payload=f"{{\"value\": \"{data.max_power}\"}}", retain=True)
-                client.publish("Tibber/home/energy/day/export_peak", payload=f"{{\"value\": \"{data.max_power_production}\"}}", retain=True)
-                client.publish("Tibber/home/energy/day/average_power", payload=f"{{\"value\": \"{data.average_power}\"}}", retain=True)
-                client.publish("Tibber/home/energy/day/last_update", payload=f"{{\"value\": \"{ts}\"}}", retain=True)
-
-                # Update domoticz
-                day_total = None
-                if data.accumulated_cost and data.accumulated_reward:
-                    day_total = round(data.accumulated_reward - data.accumulated_cost, 2)
-                if day_total:
-                    if day_total > 0.00:
-                        counter_for_dz = str(day_total).replace('.', '')
-                    else:
-                        counter_for_dz = str(0.00)
+            # Update domoticz
+            day_total = None
+            if data.accumulated_cost and data.accumulated_reward:
+                day_total = round(data.accumulated_reward - data.accumulated_cost, 2)
+            if day_total:
+                if day_total > 0.00:
+                    counter_for_dz = str(day_total).replace('.', '')
                 else:
                     counter_for_dz = str(0.00)
+            else:
+                counter_for_dz = str(0.00)
 
-                domoticz_update(f"N/{systemId0}/Tibber/home/energy/day/euro_day_total", counter_for_dz, f"Tibber Total: {day_total}")
+            domoticz_update(f"N/{systemId0}/Tibber/home/energy/day/euro_day_total", counter_for_dz, f"Tibber Total: {day_total}")
 
-            except Exception as CallbackError:
-                logging.info(f"tibber_api: Error encountered during live measurement data callback method log_accumulated(). Error: {CallbackError}")
+        except Exception as CallbackError:
+            logging.info(f"tibber_api: Error encountered during live measurement data callback method log_accumulated(). Error: {CallbackError}")
 
     # Start the live feed. This runs forever unless a transport error occurs in which case we need to restart
     # in most cases to resolve this.
-    while True:
-        logging.info("Tibber: Live measurements starting...")
-        try:
-            account = tibber.Account(retrieve_setting('TIBBER_ACCESS_TOKEN'))
-            home = resolve_home(account)
-            if not home:
-                time.sleep(60)
-                continue
-            register_callbacks(home)
-            if retrieve_setting("TIBBER_LIVE_MEASUREMENTS_FORCE") == "1":
-                logging.warning(
-                    "Tibber: TIBBER_LIVE_MEASUREMENTS_FORCE=1 enabled. "
-                    "Using forced websocket subscription."
-                )
-                try:
-                    asyncio.run(
-                        forced_live_measurements(
-                            home,
-                            user_agent=f"cerbomoticzgx/{retrieve_setting('VERSION')}",
-                        )
-                    )
-                except Exception as forced_error:
-                    logging.warning(
-                        "Tibber: Forced live measurements websocket failed (%s). "
-                        "Retrying in 60 seconds.",
-                        forced_error,
-                    )
-                    time.sleep(60)
-                continue
-            home.start_live_feed(
-                user_agent=f"cerbomoticzgx/{retrieve_setting('VERSION')}",
-                retries=10,
-                retry_interval=10,
-            )
-        except ValueError as error:
-            logging.warning(
-                "Tibber: Live measurements failed to start (%s). "
-                "Retrying in 60 seconds.",
-                error,
-            )
-            try:
-                account = tibber.Account(retrieve_setting('TIBBER_ACCESS_TOKEN'))
-                home = resolve_home(account)
-                if not home:
-                    time.sleep(60)
-                    continue
-                register_callbacks(home)
-                home.tibber_client.user_agent = f"cerbomoticzgx/{retrieve_setting('VERSION')}"
-                asyncio.run(home.start_websocket_loop(retries=10, retry_interval=10))
-            except ValueError as fallback_error:
-                if retrieve_setting("TIBBER_LIVE_MEASUREMENTS_FORCE") == "1":
-                    logging.warning(
-                        "Tibber: Live measurements fallback websocket failed (%s). "
-                        "Attempting forced websocket subscription.",
-                        fallback_error,
-                    )
-                    try:
-                        asyncio.run(
-                            forced_live_measurements(
-                                home,
-                                user_agent=f"cerbomoticzgx/{retrieve_setting('VERSION')}",
-                            )
-                        )
-                    except Exception as forced_error:
-                        logging.warning(
-                            "Tibber: Forced live measurements websocket failed (%s). "
-                            "Retrying in 60 seconds.",
-                            forced_error,
-                        )
-                        time.sleep(60)
-                else:
-                    logging.warning(
-                        "Tibber: Live measurements fallback websocket failed (%s). "
-                        "Retrying in 60 seconds.",
-                        fallback_error,
-                    )
-                    time.sleep(60)
-            except (TransportClosed, ConnectionClosedError) as e:
-                logging.info(
-                    f"Tibber Error: {e} It seems we have a network/connectivity issue. "
-                    "Attempting a service restart..."
-                )
-                client.publish("Cerbomoticzgx/system/shutdown", payload=f"{{\"value\": \"True\"}}", retain=True)
-                break
-        except (TransportClosed, ConnectionClosedError) as e:
-            logging.info(
-                f"Tibber Error: {e} It seems we have a network/connectivity issue. "
-                "Attempting a service restart..."
-            )
-            # this will trigger event_handler to restart the whole service
-            client.publish("Cerbomoticzgx/system/shutdown", payload=f"{{\"value\": \"True\"}}", retain=True)
-            break
+    logging.info(f"Tibber: Live measurements starting...")
+    try:
+        home.start_live_feed(user_agent=f"cerbomoticzgx/{retrieve_setting('VERSION')}",
+                             retries=10,
+                             retry_interval=10)
+    except (TransportClosed, ConnectionClosedError) as e:
+        logging.info(f"Tibber Error: {e} It seems we have a network/connectivity issue. Attempting a service restart...")
+        # this will trigger event_handler to restart the whole service
+        client.publish("Cerbomoticzgx/system/shutdown", payload=f"{{\"value\": \"True\"}}", retain=True)
 
 
 def dip_peak_data(caller=None, level="CHEAP", day=0, price_cap=0.22):
