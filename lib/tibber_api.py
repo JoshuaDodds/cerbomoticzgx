@@ -20,6 +20,10 @@ _home = account.homes[0]
 client = VictronClient().get_client()
 
 def live_measurements(home=_home or None):
+    if home is None:
+        logging.warning("Tibber: No home configured; skipping live measurements.")
+        return
+
     @home.event("live_measurement")
     async def log_accumulated(data):
         try:
@@ -57,19 +61,31 @@ def live_measurements(home=_home or None):
 
     # Start the live feed. This runs forever unless a transport error occurs in which case we need to restart
     # in most cases to resolve this.
-    logging.info(f"Tibber: Live measurements starting...")
-    try:
-        home.start_live_feed(user_agent=f"cerbomoticzgx/{retrieve_setting('VERSION')}",
-                             retries=10,
-                             retry_interval=10)
-    except (TransportClosed, ConnectionClosedError) as e:
-        logging.warning(
-            "Tibber Error: %s. It seems we have a network/connectivity issue. "
-            "This can also be caused by a Tibber API outage. Attempting a service restart...",
-            e,
-        )
-        # this will trigger event_handler to restart the whole service
-        client.publish("Cerbomoticzgx/system/shutdown", payload=f"{{\"value\": \"True\"}}", retain=True)
+    logging.info("Tibber: Live measurements starting...")
+    while True:
+        try:
+            home.start_live_feed(
+                user_agent=f"cerbomoticzgx/{retrieve_setting('VERSION')}",
+                retries=10,
+                retry_interval=10,
+            )
+        except ValueError as e:
+            logging.warning(
+                "Tibber: Live measurements unavailable for this home (%s). "
+                "Retrying in 60 seconds.",
+                e,
+            )
+            time.sleep(60)
+            continue
+        except (TransportClosed, ConnectionClosedError) as e:
+            logging.warning(
+                "Tibber Error: %s. It seems we have a network/connectivity issue. "
+                "This can also be caused by a Tibber API outage. Attempting a service restart...",
+                e,
+            )
+            # this will trigger event_handler to restart the whole service
+            client.publish("Cerbomoticzgx/system/shutdown", payload=f"{{\"value\": \"True\"}}", retain=True)
+            time.sleep(60)
 
 
 def dip_peak_data(caller=None, level="CHEAP", day=0, price_cap=0.22):

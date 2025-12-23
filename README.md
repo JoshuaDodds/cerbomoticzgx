@@ -67,6 +67,20 @@ for the things you will need to adjust in your own fork of this repo.
  
 **TODO: handle this issue automatically in a universal container build** 
 
+### Architecture Overview
+```mermaid
+flowchart LR
+  Scheduler[Task Scheduler] -->|15 min| TibberPricing[Tibber Pricing Refresh]
+  Scheduler -->|15 min| SolarForecast[Solar Forecasting]
+  TibberPricing --> MQTT[MQTT Broker]
+  SolarForecast --> MQTT
+  MQTT --> Consumers[Energy broker & dashboards]
+```
+
+### Operations
+- Tibber pricing data refreshes at :01, :16, :31, and :46 each hour to keep spot pricing current.
+- Solar forecasting runs every 15 minutes alongside pricing refreshes.
+
 
 ### Running from CLI
 ```python3 main.py```
