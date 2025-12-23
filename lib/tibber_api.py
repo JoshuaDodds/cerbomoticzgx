@@ -1,3 +1,4 @@
+import asyncio
 import tibber
 import time
 
@@ -14,58 +15,93 @@ from websockets.exceptions import ConnectionClosedError
 logging.getLogger("gql.transport").setLevel(logging.ERROR)
 
 tzinfos = {"UTC": tz.gettz(retrieve_setting('TIMEZONE'))}
-account = tibber.Account(retrieve_setting('TIBBER_ACCESS_TOKEN'))
-_home = account.homes[0]
 
 client = VictronClient().get_client()
 
-def live_measurements(home=_home or None):
-    @home.event("live_measurement")
-    async def log_accumulated(data):
-        try:
-            ts = datetime.now().replace(microsecond=0)
-            logging.debug(f"Tibber: Imported: {data.accumulated_consumption or 0.000} kWh / {data.accumulated_cost or 0.00} {data.currency} :: "
-                          f"Exported: {data.accumulated_production or 0.000} kWh / {data.accumulated_reward or 0.00} {data.currency} :: "
-                          f"Pwr Factor: {data.power_factor or 0.000} :: Avg Pwr: {data.average_power} Watts")
+def live_measurements():
+    def register_callbacks(home):
+        @home.event("live_measurement")
+        async def log_accumulated(data):
+            try:
+                ts = datetime.now().replace(microsecond=0)
+                logging.debug(f"Tibber: Imported: {data.accumulated_consumption or 0.000} kWh / {data.accumulated_cost or 0.00} {data.currency} :: "
+                              f"Exported: {data.accumulated_production or 0.000} kWh / {data.accumulated_reward or 0.00} {data.currency} :: "
+                              f"Pwr Factor: {data.power_factor or 0.000} :: Avg Pwr: {data.average_power} Watts")
 
-            # update mqtt topics
-            client.publish("Tibber/home/energy/day/imported", payload=f"{{\"value\": \"{data.accumulated_consumption}\"}}", retain=True)
-            client.publish("Tibber/home/energy/day/cost", payload=f"{{\"value\": \"{data.accumulated_cost or 0.00}\"}}", retain=True)
-            client.publish("Tibber/home/energy/day/exported", payload=f"{{\"value\": \"{data.accumulated_production}\"}}", retain=True)
-            client.publish("Tibber/home/energy/day/reward", payload=f"{{\"value\": \"{data.accumulated_reward or 0.00}\"}}", retain=True)
-            client.publish("Tibber/home/energy/day/import_peak", payload=f"{{\"value\": \"{data.max_power}\"}}", retain=True)
-            client.publish("Tibber/home/energy/day/export_peak", payload=f"{{\"value\": \"{data.max_power_production}\"}}", retain=True)
-            client.publish("Tibber/home/energy/day/average_power", payload=f"{{\"value\": \"{data.average_power}\"}}", retain=True)
-            client.publish("Tibber/home/energy/day/last_update", payload=f"{{\"value\": \"{ts}\"}}", retain=True)
+                # update mqtt topics
+                client.publish("Tibber/home/energy/day/imported", payload=f"{{\"value\": \"{data.accumulated_consumption}\"}}", retain=True)
+                client.publish("Tibber/home/energy/day/cost", payload=f"{{\"value\": \"{data.accumulated_cost or 0.00}\"}}", retain=True)
+                client.publish("Tibber/home/energy/day/exported", payload=f"{{\"value\": \"{data.accumulated_production}\"}}", retain=True)
+                client.publish("Tibber/home/energy/day/reward", payload=f"{{\"value\": \"{data.accumulated_reward or 0.00}\"}}", retain=True)
+                client.publish("Tibber/home/energy/day/import_peak", payload=f"{{\"value\": \"{data.max_power}\"}}", retain=True)
+                client.publish("Tibber/home/energy/day/export_peak", payload=f"{{\"value\": \"{data.max_power_production}\"}}", retain=True)
+                client.publish("Tibber/home/energy/day/average_power", payload=f"{{\"value\": \"{data.average_power}\"}}", retain=True)
+                client.publish("Tibber/home/energy/day/last_update", payload=f"{{\"value\": \"{ts}\"}}", retain=True)
 
-            # Update domoticz
-            day_total = None
-            if data.accumulated_cost and data.accumulated_reward:
-                day_total = round(data.accumulated_reward - data.accumulated_cost, 2)
-            if day_total:
-                if day_total > 0.00:
-                    counter_for_dz = str(day_total).replace('.', '')
+                # Update domoticz
+                day_total = None
+                if data.accumulated_cost and data.accumulated_reward:
+                    day_total = round(data.accumulated_reward - data.accumulated_cost, 2)
+                if day_total:
+                    if day_total > 0.00:
+                        counter_for_dz = str(day_total).replace('.', '')
+                    else:
+                        counter_for_dz = str(0.00)
                 else:
                     counter_for_dz = str(0.00)
-            else:
-                counter_for_dz = str(0.00)
 
-            domoticz_update(f"N/{systemId0}/Tibber/home/energy/day/euro_day_total", counter_for_dz, f"Tibber Total: {day_total}")
+                domoticz_update(f"N/{systemId0}/Tibber/home/energy/day/euro_day_total", counter_for_dz, f"Tibber Total: {day_total}")
 
-        except Exception as CallbackError:
-            logging.info(f"tibber_api: Error encountered during live measurement data callback method log_accumulated(). Error: {CallbackError}")
+            except Exception as CallbackError:
+                logging.info(f"tibber_api: Error encountered during live measurement data callback method log_accumulated(). Error: {CallbackError}")
 
     # Start the live feed. This runs forever unless a transport error occurs in which case we need to restart
     # in most cases to resolve this.
-    logging.info(f"Tibber: Live measurements starting...")
-    try:
-        home.start_live_feed(user_agent=f"cerbomoticzgx/{retrieve_setting('VERSION')}",
-                             retries=10,
-                             retry_interval=10)
-    except (TransportClosed, ConnectionClosedError) as e:
-        logging.info(f"Tibber Error: {e} It seems we have a network/connectivity issue. Attempting a service restart...")
-        # this will trigger event_handler to restart the whole service
-        client.publish("Cerbomoticzgx/system/shutdown", payload=f"{{\"value\": \"True\"}}", retain=True)
+    while True:
+        logging.info("Tibber: Live measurements starting...")
+        try:
+            account = tibber.Account(retrieve_setting('TIBBER_ACCESS_TOKEN'))
+            home = account.homes[0]
+            register_callbacks(home)
+            home.start_live_feed(
+                user_agent=f"cerbomoticzgx/{retrieve_setting('VERSION')}",
+                retries=10,
+                retry_interval=10,
+            )
+        except ValueError as error:
+            logging.warning(
+                "Tibber: Live measurements failed to start (%s). "
+                "Retrying in 60 seconds.",
+                error,
+            )
+            try:
+                account = tibber.Account(retrieve_setting('TIBBER_ACCESS_TOKEN'))
+                home = account.homes[0]
+                register_callbacks(home)
+                home.tibber_client.user_agent = f"cerbomoticzgx/{retrieve_setting('VERSION')}"
+                asyncio.run(home.start_websocket_loop(retries=10, retry_interval=10))
+            except ValueError as fallback_error:
+                logging.warning(
+                    "Tibber: Live measurements fallback websocket failed (%s). "
+                    "Retrying in 60 seconds.",
+                    fallback_error,
+                )
+                time.sleep(60)
+            except (TransportClosed, ConnectionClosedError) as e:
+                logging.info(
+                    f"Tibber Error: {e} It seems we have a network/connectivity issue. "
+                    "Attempting a service restart..."
+                )
+                client.publish("Cerbomoticzgx/system/shutdown", payload=f"{{\"value\": \"True\"}}", retain=True)
+                break
+        except (TransportClosed, ConnectionClosedError) as e:
+            logging.info(
+                f"Tibber Error: {e} It seems we have a network/connectivity issue. "
+                "Attempting a service restart..."
+            )
+            # this will trigger event_handler to restart the whole service
+            client.publish("Cerbomoticzgx/system/shutdown", payload=f"{{\"value\": \"True\"}}", retain=True)
+            break
 
 
 def dip_peak_data(caller=None, level="CHEAP", day=0, price_cap=0.22):
