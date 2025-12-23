@@ -14,6 +14,7 @@ from gql.transport.websockets import WebsocketsTransport
 from graphql import parse
 from gql.transport.exceptions import TransportClosed
 from websockets.exceptions import ConnectionClosedError
+from tibber.networking import QueryBuilder
 from tibber.types.live_measurement import LiveMeasurement
 
 logging.getLogger("gql.transport").setLevel(logging.ERROR)
@@ -57,19 +58,6 @@ def live_measurements():
         return None
 
     async def forced_live_measurements(home, user_agent, retries=10, retry_interval=10):
-        query = """subscription{
-  liveMeasurement(homeId:"%s"){
-    timestamp
-    power
-    accumulatedConsumption
-    accumulatedCost
-    currency
-    minPower
-    averagePower
-    maxPower
-  }
-}""" % home.id
-
         for attempt in range(1, retries + 1):
             try:
                 transport = WebsocketsTransport(
@@ -86,8 +74,8 @@ def live_measurements():
                 )
                 session = await websocket_client.connect_async(reconnecting=True)
                 logging.info("Tibber: Connected to forced live measurements websocket.")
-                logging.info("Tibber: Forced live measurements query: %s", " ".join(query.split()))
 
+                query = QueryBuilder.live_measurement(home.id)
                 document_node_query = parse(query)
                 async for data in session.subscribe(document_node_query):
                     cleaned_data = LiveMeasurement(data["liveMeasurement"], home.tibber_client)
