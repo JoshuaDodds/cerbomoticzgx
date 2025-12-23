@@ -8,13 +8,8 @@ from lib.config_retrieval import retrieve_setting
 from lib.constants import logging, systemId0
 from lib.domoticz_updater import domoticz_update
 from lib.clients.mqtt_client_factory import VictronClient
-from gql import Client
-from gql.transport.websockets import WebsocketsTransport
-from graphql import parse
 from gql.transport.exceptions import TransportClosed
 from websockets.exceptions import ConnectionClosedError
-from tibber.networking import QueryBuilder
-from tibber.types.live_measurement import LiveMeasurement
 
 logging.getLogger("gql.transport").setLevel(logging.ERROR)
 
