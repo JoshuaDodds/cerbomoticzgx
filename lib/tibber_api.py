@@ -57,15 +57,29 @@ def live_measurements(home=_home or None):
 
     # Start the live feed. This runs forever unless a transport error occurs in which case we need to restart
     # in most cases to resolve this.
-    logging.info(f"Tibber: Live measurements starting...")
-    try:
-        home.start_live_feed(user_agent=f"cerbomoticzgx/{retrieve_setting('VERSION')}",
-                             retries=10,
-                             retry_interval=10)
-    except (TransportClosed, ConnectionClosedError) as e:
-        logging.info(f"Tibber Error: {e} It seems we have a network/connectivity issue. Attempting a service restart...")
-        # this will trigger event_handler to restart the whole service
-        client.publish("Cerbomoticzgx/system/shutdown", payload=f"{{\"value\": \"True\"}}", retain=True)
+    while True:
+        logging.info("Tibber: Live measurements starting...")
+        try:
+            home.start_live_feed(
+                user_agent=f"cerbomoticzgx/{retrieve_setting('VERSION')}",
+                retries=10,
+                retry_interval=10,
+            )
+        except ValueError as error:
+            logging.warning(
+                "Tibber: Live measurements failed to start (%s). "
+                "Retrying in 60 seconds.",
+                error,
+            )
+            time.sleep(60)
+        except (TransportClosed, ConnectionClosedError) as e:
+            logging.info(
+                f"Tibber Error: {e} It seems we have a network/connectivity issue. "
+                "Attempting a service restart..."
+            )
+            # this will trigger event_handler to restart the whole service
+            client.publish("Cerbomoticzgx/system/shutdown", payload=f"{{\"value\": \"True\"}}", retain=True)
+            break
 
 
 def dip_peak_data(caller=None, level="CHEAP", day=0, price_cap=0.22):
