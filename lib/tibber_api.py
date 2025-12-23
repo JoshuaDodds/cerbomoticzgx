@@ -68,7 +68,11 @@ def live_measurements(home=_home or None):
                              retries=10,
                              retry_interval=10)
     except (TransportClosed, ConnectionClosedError) as e:
-        logging.info(f"Tibber Error: {e} It seems we have a network/connectivity issue. Attempting a service restart...")
+        logging.warning(
+            "Tibber Error: %s. It seems we have a network/connectivity issue. "
+            "This can also be caused by a Tibber API outage. Attempting a service restart...",
+            e,
+        )
         # this will trigger event_handler to restart the whole service
         client.publish("Cerbomoticzgx/system/shutdown", payload=f"{{\"value\": \"True\"}}", retain=True)
 
