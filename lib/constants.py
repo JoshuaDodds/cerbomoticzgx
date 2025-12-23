@@ -6,6 +6,8 @@ mosquittoEndpoint = retrieve_setting('MOSQUITTO_IP')
 systemId0 = retrieve_setting('VRM_PORTAL_ID')
 dzEndpoint = retrieve_setting('DZ_URL_PREFIX')
 PushOverConfig = {"id": retrieve_setting('PO_USER_ID'), "key": retrieve_setting('PO_API_KEY')}
+HOME_ID = retrieve_setting('HOME_ID')
+TIBBER_LIVE_MEASUREMENTS_FORCE = retrieve_setting('TIBBER_LIVE_MEASUREMENTS_FORCE')
 
 logging.basicConfig(
     format='%(asctime)s cerbomoticzGx: %(message)s',
