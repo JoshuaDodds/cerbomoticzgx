@@ -166,7 +166,9 @@ def get_seasonally_adjusted_max_charge_slots(batt_soc: float, pv_production_rema
 
     if pv_production_remaining:
         # convert pv_forecasted from kWh to a percentage assuming battery capacity of 40kWh
-        pv_production_remaining = round((pv_production_remaining / 40) * 100, 2)
+        from lib.config_retrieval import retrieve_setting
+        battery_capacity = float(retrieve_setting('BATTERY_CAPACITY_KWH') or 45.0)
+        pv_production_remaining = round((pv_production_remaining / battery_capacity) * 100, 2)
 
     current_month = datetime.now().month
 

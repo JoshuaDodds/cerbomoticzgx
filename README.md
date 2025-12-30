@@ -41,6 +41,7 @@ a Domoticz server via its REST API for monitoring and historic tracking
 - Creates, exports, and updates a number of custom metrics to the victron MQTT broker for consumption by the [venus-nextgen Energy Dashboard](https://github.com/JoshuaDodds/venus-nextgen)
 - dynamic ESS algorithms for automated buy and sell of energy
 - solar forecasting data specific to your installation using ML models and AI for quite accurate current day production forecasts (courtesy of new VRM API features developed by Victron Energy). Note: A Victron VRM portal account is needed for this feature.
+- **AI Powered ESS Optimization**: A feature-flagged module that optimizes battery charging and discharging schedules based on 15-minute price data, PV forecasts, and efficiency models. It aims to minimize costs or maximize revenue while respecting battery health and reserve constraints.
 - HomeConnect supported appliance control. Schedules appliances to run at cheapest time of day without user intervention
 
 Configuration for your CerboGX IP Address, VRM instance ID, and Domoticz IP/Port are configured in 
@@ -62,6 +63,11 @@ Note: The name of this project is a nod to both Victron Energy & the Domoticz pr
   defined here in this file
 - Homeconnect support is defined in constants as well but requires an external service to publish state. (see hcpy project mentioned in the introduction of this doc)
 - Configure the nightly charging skip guardrails if desired: `NIGHT_CHARGE_SKIP_ENABLED` toggles the behaviour and `NIGHT_CHARGE_SKIP_MIN_SOC` / `NIGHT_CHARGE_SKIP_MAX_SOC` bound the state-of-charge window that will skip the 21:30 schedule run.
+- **AI Optimization Configuration**:
+  - `AI_POWERED_ESS_ALGORITHM=True`: Enable the new AI optimizer.
+  - `BATTERY_CAPACITY_KWH`: Your battery capacity in kWh (default 45.0).
+  - `AC_DC_CHARGE_EFFICIENCY`: Efficiency of charging (e.g. 0.90).
+  - `AC_DC_DISCHARGE_EFFICIENCY`: Efficiency of discharging (e.g. 0.90).
 - IMPORTANT:  See notes below if you plan to run this from a container image.  My image won't work for you as is. Read the notes below
 for the things you will need to adjust in your own fork of this repo.
  
