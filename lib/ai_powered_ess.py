@@ -217,6 +217,6 @@ class OptimizationEngine:
             'setpoint': setpoint
         }
 
-def optimize_schedule(current_soc, price_data):
+def optimize_schedule(current_soc, price_data, load_forecast=None, pv_forecast=None):
     engine = OptimizationEngine()
-    return engine.optimize(current_soc, price_data)
+    return engine.optimize(current_soc, price_data, load_forecast, pv_forecast)
