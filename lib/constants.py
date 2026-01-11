@@ -74,6 +74,7 @@ Topics = dict({
             "tibber_export_schedule_status":    f"Tibber/home/price_info/today/tibber_export_schedule_status",
 
             # Tesla specific metrics
+            # Verified: Tesla metrics use acload
             "tesla_power":                  f"N/{systemId0}/acload/42/Ac/Power",
             "tesla_l1_current":             f"N/{systemId0}/acload/42/Ac/L1/Current",
             "tesla_l2_current":             f"N/{systemId0}/acload/42/Ac/L2/Current",
