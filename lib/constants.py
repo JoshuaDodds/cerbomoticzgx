@@ -74,10 +74,10 @@ Topics = dict({
             "tibber_export_schedule_status":    f"Tibber/home/price_info/today/tibber_export_schedule_status",
 
             # Tesla specific metrics
-            "tesla_power":                  f"N/{systemId0}/evcharger/42/Ac/Power",
-            "tesla_l1_current":             f"N/{systemId0}/evcharger/42/L1/Current",
-            "tesla_l2_current":             f"N/{systemId0}/evcharger/42/L2/Current",
-            "tesla_l3_current":             f"N/{systemId0}/evcharger/42/L3/Current",
+            "tesla_power":                  f"N/{systemId0}/acload/42/Ac/Power",
+            "tesla_l1_current":             f"N/{systemId0}/acload/42/Ac/L1/Current",
+            "tesla_l2_current":             f"N/{systemId0}/acload/42/Ac/L2/Current",
+            "tesla_l3_current":             f"N/{systemId0}/acload/42/Ac/L3/Current",
             "tesla_plug_status":            f"Tesla/vehicle0/plugged_status",
             "tesla_is_home":                f"Tesla/vehicle0/is_home",
             "tesla_is_charging":            f"Tesla/vehicle0/is_charging",
@@ -179,7 +179,6 @@ SystemState = dict({
     252: "External Control",
     256: "Discharging",
     257: "Sustain",
-    258: "Recharge",
     259: "Scheduled Charging",
 })
 
