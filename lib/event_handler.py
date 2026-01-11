@@ -68,7 +68,7 @@ class Event:
                 "Cerbomoticzgx requesting immediate attention: Grid power is offline. Check inverters and breakers!"
             )
         elif event == 1:
-            logging.info("AC Input: Grid is online.")
+            logging.debug("AC Input: Grid is online.")
 
     def dryer_state(self):
         if HOME_CONNECT_APPLIANCE_SCHEDULING:
