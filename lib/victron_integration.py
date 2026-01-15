@@ -8,6 +8,7 @@ STATE = GlobalStateClient()
 float_voltage = float(retrieve_setting('BATTERY_FLOAT_VOLTAGE'))
 max_voltage = float(retrieve_setting('BATTERY_ABSORPTION_VOLTAGE'))
 battery_full_voltage = float(retrieve_setting('BATTERY_FULL_VOLTAGE'))
+battery_sustain_percent = float(retrieve_setting('BATTERY_SUSTAIN_PERCENT')) or 20
 
 def ac_power_setpoint(watts: str = None, override_ess_net_mettering=True, silent: bool = False):
     # disable net metering overide whenever power setpoint returns to zero
@@ -26,7 +27,7 @@ def ac_power_setpoint(watts: str = None, override_ess_net_mettering=True, silent
         if not silent:
             logging.info(f"Victron Integration: Set AC Power Set Point to: {watts} watts")
 
-def set_minimum_ess_soc(percent: int = 20):
+def set_minimum_ess_soc(percent: int = battery_sustain_percent):
     if percent:
         _msg = f"{{\"value\": {percent}}}"
         logging.info(f"Setting battery sustain percent to: {percent}%")
