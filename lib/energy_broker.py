@@ -8,9 +8,10 @@ from lib.constants import logging, PythonToVictronWeekdayNumberConversion
 from lib.helpers import get_seasonally_adjusted_max_charge_slots, calculate_max_discharge_slots_needed, publish_message, round_up_to_nearest_10, remove_message
 from lib.tibber_api import lowest_48h_prices, lowest_24h_prices
 from lib.notifications import pushover_notification
-from lib.tibber_api import publish_pricing_data
+from lib.tibber_api import publish_pricing_data, get_all_price_points
 from lib.global_state import GlobalStateClient
 from lib.victron_integration import ac_power_setpoint
+from lib.ai_powered_ess import optimize_schedule
 
 MAX_TIBBER_BUY_PRICE = float(retrieve_setting('MAX_TIBBER_BUY_PRICE')) or 0.20
 ESS_EXPORT_AC_SETPOINT = float(retrieve_setting('ESS_EXPORT_AC_SETPOINT')) or -10000.0
@@ -92,6 +93,9 @@ def schedule_tasks():
     # ESS Scheduled Tasks
     scheduler.every().hour.at(":00").do(manage_sale_of_stored_energy_to_the_grid)
 
+    # AI Optimization Loop (every 15 mins)
+    scheduler.every(15).minutes.do(run_ai_optimizer)
+
     # Grid Charging Scheduled Tasks
     scheduler.every().day.at("09:30").do(set_charging_schedule, caller="TaskScheduler()", silent=True)
     scheduler.every().day.at(
@@ -164,6 +168,15 @@ def should_start_selling(price_now: float, batt_soc: float, ess_net_metering_bat
 
 
 def manage_sale_of_stored_energy_to_the_grid() -> None:
+    # Check if AI algorithm is enabled and healthy
+    if _is_truthy(retrieve_setting('AI_POWERED_ESS_ALGORITHM'), False):
+        last_ai_success = STATE.get('ai_success_timestamp')
+        if last_ai_success and (time.time() - float(last_ai_success) < 3600):
+            logging.info("EnergyBroker: AI Optimizer is active and healthy. Skipping legacy manage_sale logic.")
+            return
+        else:
+             logging.warning("EnergyBroker: AI Optimizer is enabled but seems unhealthy (no recent success). Falling back to legacy logic.")
+
     batt_soc = STATE.get('batt_soc')
     tibber_price_now = STATE.get('tibber_price_now') or 0
     ac_setpoint = STATE.get('ac_power_setpoint')
@@ -265,6 +278,15 @@ def set_charging_schedule(
     slots=None,
     charge_context=None,
 ):
+    # Check if AI algorithm is enabled and healthy
+    if _is_truthy(retrieve_setting('AI_POWERED_ESS_ALGORITHM'), False):
+        last_ai_success = STATE.get('ai_success_timestamp')
+        if last_ai_success and (time.time() - float(last_ai_success) < 3600):
+            logging.info(f"EnergyBroker: AI Algorithm active. Skipping legacy charging schedule request from {caller}.")
+            return True
+        else:
+             logging.warning("EnergyBroker: AI Optimizer enabled but stale. Running legacy set_charging_schedule as fallback.")
+
     batt_soc = STATE.get('batt_soc')
 
     # Determine schedule type if not explicitly provided
@@ -364,6 +386,74 @@ def push_notification(hour, day, price):
     topic = f"Energy Broker Alert"
     msg = f"ESS Charge scheduled for {hour}:00 {'Today' if day == 0 else 'Tomorrow'} @ {price}"
     pushover_notification(topic, msg)
+
+def run_ai_optimizer():
+    """
+    Runs the AI optimizer if enabled.
+    """
+    if not _is_truthy(retrieve_setting('AI_POWERED_ESS_ALGORITHM'), False):
+        return
+
+    try:
+        # 1. Retrieve data
+        batt_soc = STATE.get('batt_soc')
+        if batt_soc is None:
+             logging.warning("AI_ESS: Battery SoC not available. Skipping.")
+             return
+
+        prices = get_all_price_points()
+
+        if not prices:
+            logging.warning("AI_ESS: No prices available.")
+            return
+
+        # Get forecasts (dummy for now, or from STATE if available)
+        # TODO: Retrieve actual forecasts from solar_forecasting module if available
+        load_forecast = None # Default to avg in optimizer
+        pv_forecast = None # Default to 0 or avg
+
+        # 2. Optimize
+        result = optimize_schedule(batt_soc, prices, load_forecast, pv_forecast)
+
+        if not result:
+            logging.warning("AI_ESS: Optimization failed or returned nothing.")
+            return
+
+        # 3. Apply results
+
+        # Setpoint
+        setpoint = result.get('setpoint', 0.0)
+
+        ac_power_setpoint(watts=str(setpoint), override_ess_net_mettering=False)
+
+        # Schedule Victron Slots
+        victron_slots = result.get('victron_slots', [])
+        clear_victron_schedules()
+
+        for i, slot in enumerate(victron_slots):
+            if i >= 5: break
+            start_dt = slot['start']
+
+            seconds_from_midnight = start_dt.hour * 3600 + start_dt.minute * 60
+
+            weekday = PythonToVictronWeekdayNumberConversion[start_dt.weekday()]
+
+            topic_stub = f"W/{systemId0}/settings/0/Settings/CGwacs/BatteryLife/Schedule/Charge/{i}/"
+
+            publish_message(f"{topic_stub}Duration", payload=f"{{\"value\": {slot['duration']}}}", retain=True)
+            publish_message(f"{topic_stub}Soc", payload=f"{{\"value\": 100}}", retain=True) # Target SoC 100 for charging slot
+            publish_message(f"{topic_stub}Start", payload=f"{{\"value\": {seconds_from_midnight}}}", retain=True)
+            publish_message(f"{topic_stub}Day", payload=f"{{\"value\": {weekday}}}", retain=True)
+
+            logging.info(f"AI_ESS: Scheduled charge slot {i}: {weekday} at {start_dt.strftime('%H:%M')} for {slot['duration']}s")
+
+        logging.info(f"AI_ESS: Optimization complete. Setpoint: {setpoint}W. Scheduled {len(victron_slots)} charge slots.")
+
+        # Record success
+        STATE.set('ai_success_timestamp', time.time())
+
+    except Exception as e:
+        logging.error(f"AI_ESS: Error in run_ai_optimizer: {e}", exc_info=True)
 
 class Utils:
     @staticmethod

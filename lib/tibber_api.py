@@ -82,7 +82,12 @@ def dip_peak_data(caller=None, level="CHEAP", day=0, price_cap=0.22):
     _account = tibber.Account(retrieve_setting('TIBBER_ACCESS_TOKEN'))
     home = _account.homes[0]
 
-    for i in range(1, 25):
+    prices = home.current_subscription.price_info.today if day == 0 else home.current_subscription.price_info.tomorrow
+
+    if not prices:
+        return data
+
+    for i in range(1, len(prices) + 1):
         if day == 0:
             hour = today_price_points(home, i)
             if level in hour[2] and time.localtime()[3] <= today_price_points(home, i)[0].hour and hour[3] <= price_cap:
@@ -106,6 +111,10 @@ def publish_pricing_data(caller):
         mqtt_publish_highest_price_points(home)
         mqtt_publish_current_price(home)
 
+        # Publish all price points for AI optimizer
+        if retrieve_setting('AI_POWERED_ESS_ALGORITHM') == 'True':
+            mqtt_publish_all_prices(home)
+
         # c = _account.websession.close()
         # c.close()
         # del home, _account
@@ -114,6 +123,59 @@ def publish_pricing_data(caller):
 
     except Exception as e:
         logging.error(f"Tibber: (publish_pricing_data) (Error): {e}")
+
+def mqtt_publish_all_prices(home):
+    """
+    Publishes all available price points (today and tomorrow) to MQTT for the AI optimizer.
+    """
+    try:
+        prices = []
+        if home.current_subscription.price_info.today:
+            prices.extend(home.current_subscription.price_info.today)
+        if home.current_subscription.price_info.tomorrow:
+            prices.extend(home.current_subscription.price_info.tomorrow)
+
+        if prices:
+            # Sort by time just in case, though usually they are sorted
+            prices.sort(key=lambda x: x.starts_at)
+
+            # Create a simplified list of dicts
+            price_list = []
+            for p in prices:
+                 price_list.append({
+                     "start": p.starts_at,
+                     "total": p.total,
+                     "level": p.level
+                 })
+
+            # Publish as a single JSON blob
+            import json
+            payload = json.dumps(price_list)
+            client.publish("Tibber/home/price_info/all", payload=payload, qos=0, retain=True)
+            logging.debug(f"Tibber: Published {len(price_list)} price points to Tibber/home/price_info/all")
+
+    except Exception as e:
+        logging.error(f"Tibber: Error publishing all prices: {e}")
+
+def get_all_price_points():
+    """
+    Returns a list of all available price points (today and tomorrow) as dicts.
+    Used by AI optimizer.
+    """
+    try:
+        _account = tibber.Account(retrieve_setting('TIBBER_ACCESS_TOKEN'))
+        home = _account.homes[0]
+
+        prices = []
+        if home.current_subscription.price_info.today:
+             prices.extend([{'start': p.starts_at, 'total': p.total, 'level': p.level} for p in home.current_subscription.price_info.today])
+        if home.current_subscription.price_info.tomorrow:
+             prices.extend([{'start': p.starts_at, 'total': p.total, 'level': p.level} for p in home.current_subscription.price_info.tomorrow])
+
+        return prices
+    except Exception as e:
+        logging.error(f"Tibber: Error getting all prices: {e}")
+        return []
 
 def mqtt_publish_current_price(home):
     value = home.current_subscription.price_info.current.total
