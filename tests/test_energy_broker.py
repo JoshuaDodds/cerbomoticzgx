@@ -42,6 +42,46 @@ class DummyState:
         return self._values.get(key)
 
 
+def test_hourly_load_profile_normalised(monkeypatch):
+    monkeypatch.setattr(energy_broker, "retrieve_setting", lambda name: None)
+    profile = energy_broker._hourly_load_profile()
+    assert len(profile) == 24
+    assert abs(sum(profile) - 1.0) < 1e-9
+    # Evening peak hour should be weighted heavier than the small hours.
+    assert profile[19] > profile[3]
+
+
+def test_build_load_forecast_distributes_daily_total(monkeypatch):
+    from datetime import datetime
+    monkeypatch.setattr(energy_broker, "retrieve_setting", lambda name: None)
+    # 20 kWh forecast for the day (VRM consumption forecast is in Wh).
+    monkeypatch.setattr(energy_broker, "STATE", DummyState({"consumption_total_projected": 20000}))
+
+    slots = [{"start": datetime(2026, 6, 13, h, 0, 0)} for h in range(24)]
+    forecast = energy_broker._build_load_forecast_by_slot(slots, 1.0)
+
+    assert abs(sum(forecast.values()) - 20.0) < 1e-6
+    # Evening consumption greater than overnight.
+    assert forecast[datetime(2026, 6, 13, 19, 0, 0)] > forecast[datetime(2026, 6, 13, 3, 0, 0)]
+
+
+def test_estimate_daily_consumption_prefers_vrm_forecast(monkeypatch):
+    monkeypatch.setattr(energy_broker, "STATE", DummyState({"consumption_total_projected": 18500}))
+    assert abs(energy_broker._estimate_daily_consumption_kwh() - 18.5) < 1e-6
+
+
+def test_grid_assist_setpoint_subtracts_pv(monkeypatch):
+    # House load 3000W, PV 1200W -> import only the 1800W deficit.
+    monkeypatch.setattr(energy_broker, "STATE", DummyState({"ac_out_power": 3000, "pv_power": 1200}))
+    assert energy_broker._grid_assist_setpoint_watts() == 1800
+
+
+def test_grid_assist_setpoint_zero_when_pv_covers_load(monkeypatch):
+    # PV exceeds load -> do not import; setpoint 0 so surplus PV charges/exports.
+    monkeypatch.setattr(energy_broker, "STATE", DummyState({"ac_out_power": 1000, "pv_power": 4000}))
+    assert energy_broker._grid_assist_setpoint_watts() == 0
+
+
 def _patch_common_dependencies(monkeypatch, state_values=None, settings=None):
     state = DummyState(state_values or {})
     monkeypatch.setattr(energy_broker, "STATE", state)

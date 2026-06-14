@@ -10,12 +10,8 @@ from lib.tibber_api import lowest_48h_prices, lowest_24h_prices
 from lib.notifications import pushover_notification
 from lib.tibber_api import publish_pricing_data, get_all_price_points
 from lib.global_state import GlobalStateClient
-from lib.victron_integration import ac_power_setpoint
+from lib.victron_integration import ac_power_setpoint, limit_grid_feed_in
 from lib.ai_powered_ess import optimize_schedule
-
-MAX_TIBBER_BUY_PRICE = float(retrieve_setting('MAX_TIBBER_BUY_PRICE')) or 0.20
-ESS_EXPORT_AC_SETPOINT = float(retrieve_setting('ESS_EXPORT_AC_SETPOINT')) or -10000.0
-DAILY_HOME_ENERGY_CONSUMPTION = float(retrieve_setting('DAILY_HOME_ENERGY_CONSUMPTION')) or 12.0
 
 STATE = GlobalStateClient()
 
@@ -36,6 +32,13 @@ def _get_float_setting(setting_name: str, default: float) -> float:
             default,
         )
         return default
+
+
+# Module configuration parsed safely so a missing/blank setting can never crash
+# the import of this module (which controls critical power infrastructure).
+MAX_TIBBER_BUY_PRICE = _get_float_setting('MAX_TIBBER_BUY_PRICE', 0.20)
+ESS_EXPORT_AC_SETPOINT = _get_float_setting('ESS_EXPORT_AC_SETPOINT', -10000.0)
+DAILY_HOME_ENERGY_CONSUMPTION = _get_float_setting('DAILY_HOME_ENERGY_CONSUMPTION', 12.0)
 
 
 def _is_truthy(value: str | None, default: bool) -> bool:
@@ -83,6 +86,33 @@ def _should_skip_night_charge(
 
     return False, None
 
+# Tracks the last-logged AI optimizer health state so we log only on transitions
+# (active<->fallback) instead of on every event-driven invocation.
+_ai_health_last_logged = {"state": None}
+
+
+def _ai_optimizer_active_and_healthy() -> bool:
+    """True when the AI optimizer is enabled and has succeeded within the last hour."""
+    if not _is_truthy(retrieve_setting('AI_POWERED_ESS_ALGORITHM'), False):
+        return False
+    last_ai_success = STATE.get('ai_success_timestamp')
+    try:
+        return bool(last_ai_success) and (time.time() - float(last_ai_success) < 3600)
+    except (TypeError, ValueError):
+        return False
+
+
+def _log_ai_health_transition(healthy: bool) -> None:
+    """Log the AI health state only when it changes, to avoid log spam."""
+    if _ai_health_last_logged["state"] == healthy:
+        return
+    _ai_health_last_logged["state"] = healthy
+    if healthy:
+        logging.info("EnergyBroker: AI Optimizer active and healthy; legacy buy/sell logic standing down.")
+    else:
+        logging.warning("EnergyBroker: AI Optimizer enabled but stale/unhealthy; legacy logic active as fallback.")
+
+
 def main():
     logging.info("EnergyBroker: Initializing...")
     schedule_tasks()
@@ -95,6 +125,13 @@ def schedule_tasks():
 
     # AI Optimization Loop (every 15 mins)
     scheduler.every(15).minutes.do(run_ai_optimizer)
+
+    # Daily next-day pricing refresh + (re)optimization.
+    # Tibber publishes the next day's day-ahead prices around 13:00 local time.
+    # At 13:05 we refresh pricing so the optimizer can plan over the full
+    # today+tomorrow (48h) horizon and place charge/discharge across the day
+    # boundary when that maximises revenue over the monthly settlement period.
+    scheduler.every().day.at("13:05").do(run_daily_price_update_and_optimize)
 
     # Grid Charging Scheduled Tasks
     scheduler.every().day.at("09:30").do(set_charging_schedule, caller="TaskScheduler()", silent=True)
@@ -168,14 +205,12 @@ def should_start_selling(price_now: float, batt_soc: float, ess_net_metering_bat
 
 
 def manage_sale_of_stored_energy_to_the_grid() -> None:
-    # Check if AI algorithm is enabled and healthy
+    # Defer to the AI optimizer when it is enabled and healthy (log only on change).
     if _is_truthy(retrieve_setting('AI_POWERED_ESS_ALGORITHM'), False):
-        last_ai_success = STATE.get('ai_success_timestamp')
-        if last_ai_success and (time.time() - float(last_ai_success) < 3600):
-            logging.info("EnergyBroker: AI Optimizer is active and healthy. Skipping legacy manage_sale logic.")
+        healthy = _ai_optimizer_active_and_healthy()
+        _log_ai_health_transition(healthy)
+        if healthy:
             return
-        else:
-             logging.warning("EnergyBroker: AI Optimizer is enabled but seems unhealthy (no recent success). Falling back to legacy logic.")
 
     batt_soc = STATE.get('batt_soc')
     tibber_price_now = STATE.get('tibber_price_now') or 0
@@ -228,6 +263,17 @@ def manage_grid_usage_based_on_current_price(price: float = None, power: any = N
     Manages and allows automatic or manual toggle of a "passthrough" mode control loop which matches power consumption
     to a grid setpoint to allow consumption from grid while having a fallback to battery in case of grid instability.
     """
+    # When the AI optimizer is in control, the legacy auto/manual grid logic must
+    # stand down so it does not clobber the AI's setpoint. The one exception is
+    # AI grid-assist ("retain") mode, where we DO match the grid setpoint to the
+    # live house load so the battery is held.
+    if _ai_optimizer_active_and_healthy():
+        if STATE.get('ai_grid_assist') == 'on':
+            # Retain mode: import only what PV can't cover; stay at 0 when PV
+            # covers the load so surplus PV charges the battery / exports.
+            _apply_grid_assist_setpoint(power)
+        return
+
     ess_net_metering_overridden = STATE.get('ess_net_metering_overridden') or False
     price = price if price is not None else STATE.get('tibber_price_now')
     grid_charging_enabled = STATE.get('grid_charging_enabled') or False
@@ -278,14 +324,12 @@ def set_charging_schedule(
     slots=None,
     charge_context=None,
 ):
-    # Check if AI algorithm is enabled and healthy
+    # Defer to the AI optimizer when it is enabled and healthy (log only on change).
     if _is_truthy(retrieve_setting('AI_POWERED_ESS_ALGORITHM'), False):
-        last_ai_success = STATE.get('ai_success_timestamp')
-        if last_ai_success and (time.time() - float(last_ai_success) < 3600):
-            logging.info(f"EnergyBroker: AI Algorithm active. Skipping legacy charging schedule request from {caller}.")
+        healthy = _ai_optimizer_active_and_healthy()
+        _log_ai_health_transition(healthy)
+        if healthy:
             return True
-        else:
-             logging.warning("EnergyBroker: AI Optimizer enabled but stale. Running legacy set_charging_schedule as fallback.")
 
     batt_soc = STATE.get('batt_soc')
 
@@ -387,9 +431,209 @@ def push_notification(hour, day, price):
     msg = f"ESS Charge scheduled for {hour}:00 {'Today' if day == 0 else 'Tomorrow'} @ {price}"
     pushover_notification(topic, msg)
 
+def run_daily_price_update_and_optimize():
+    """Refresh Tibber pricing (so the just-published next-day prices are
+    available) and immediately re-run the optimizer over the full 48h horizon.
+
+    Scheduled for 13:05 local time, shortly after Tibber publishes day-ahead
+    prices for tomorrow."""
+    retrieve_latest_tibber_pricing()
+    logging.info("EnergyBroker: 13:05 next-day pricing refresh complete; running optimizer over 48h horizon.")
+    run_ai_optimizer()
+
+
+def _build_pv_forecast_by_slot(price_slots: list, slot_duration_h: float) -> dict:
+    """Build a per-slot PV generation forecast (kWh) keyed by slot start time.
+
+    Uses the remaining-PV-today estimate from the solar_forecasting module
+    (STATE['pv_projected_remaining'], in Wh) distributed evenly across the
+    remaining daylight slots of *today*. Tomorrow's PV is left at 0.0 (unknown
+    from this data source) so the optimizer treats next-day solar conservatively.
+    """
+    pv_remaining_wh = STATE.get('pv_projected_remaining')
+    try:
+        pv_remaining_kwh = float(pv_remaining_wh) / 1000.0
+    except (TypeError, ValueError):
+        pv_remaining_kwh = 0.0
+
+    if pv_remaining_kwh <= 0:
+        return {}
+
+    # Daylight window heuristic (local time). Conservative but avoids assigning
+    # PV to night-time slots.
+    daylight_start_h, daylight_end_h = 6, 22
+    today = time.localtime()
+
+    daylight_slots = []
+    for slot in price_slots:
+        start = slot['start']
+        is_today = (start.year, start.month, start.day) == (today.tm_year, today.tm_mon, today.tm_mday)
+        if is_today and daylight_start_h <= start.hour < daylight_end_h:
+            daylight_slots.append(start)
+
+    if not daylight_slots:
+        return {}
+
+    per_slot = pv_remaining_kwh / len(daylight_slots)
+    return {start: per_slot for start in daylight_slots}
+
+
+def _set_grid_assist(enabled: bool) -> None:
+    """Track AI grid-assist ("retain") mode in global state.
+
+    We deliberately do NOT publish the legacy ``grid_charging_enabled`` topic
+    here: that topic's event handler zeroes the AC setpoint (clobbering the AI's
+    export/charge setpoint) and is also tied to Tesla grid-charging logic. The
+    setpoint matching for retain mode is instead handled directly via
+    ``manage_grid_usage_based_on_current_price`` / ``adjust_grid_setpoint`` while
+    ``ai_grid_assist`` is on. Idempotent — logs only on change."""
+    desired = "on" if enabled else "off"
+    if STATE.get('ai_grid_assist') == desired:
+        return
+
+    STATE.set('ai_grid_assist', desired)
+    logging.info(f"AI_ESS: Grid-assist (retain) mode {'ENABLED' if enabled else 'disabled'}.")
+
+
+def _grid_assist_setpoint_watts(load_watts=None) -> int:
+    """Grid setpoint (W) for retain mode: import only the load the PV cannot cover.
+
+    Returns max(0, house_load - PV). A value of 0 means "do not import" — PV is
+    already covering the load, so we leave the grid setpoint at 0 and let excess
+    PV charge the battery (and export when the battery is full) rather than pulling
+    from the grid while solar is available.
+    """
+    if load_watts is None:
+        load_watts = STATE.get('ac_out_power')
+    pv_watts = STATE.get('pv_power')
+    try:
+        net = float(load_watts or 0) - float(pv_watts or 0)
+    except (TypeError, ValueError):
+        net = 0.0
+    return max(0, int(round(net)))
+
+
+def _apply_grid_assist_setpoint(load_watts=None, deadband_w: int = 50) -> None:
+    """Apply the retain-mode grid setpoint (PV-aware), avoiding redundant writes."""
+    target = _grid_assist_setpoint_watts(load_watts)
+    try:
+        current_sp = float(STATE.get('ac_power_setpoint') or 0)
+    except (TypeError, ValueError):
+        current_sp = 0.0
+
+    if target > 0:
+        # Import only the PV deficit; skip tiny changes to avoid MQTT churn.
+        if abs(target - max(current_sp, 0.0)) >= deadband_w:
+            adjust_grid_setpoint(target, override_ess_net_mettering=True)
+    else:
+        # PV covers the load: don't import. Leave the setpoint at 0 so surplus PV
+        # charges the battery / exports when full. Only write if not already 0.
+        if current_sp != 0:
+            ac_power_setpoint(watts="0.0", override_ess_net_mettering=False)
+
+
+# Default relative residential load shape (per clock hour, 0-23). Normalised at
+# use; only the relative magnitudes matter. Low overnight, morning + evening peaks.
+DEFAULT_LOAD_PROFILE_RELATIVE = [
+    0.6, 0.5, 0.5, 0.5, 0.5, 0.7,      # 00-05
+    1.1, 1.4, 1.3, 1.0, 0.9, 0.9,      # 06-11
+    1.0, 1.0, 0.9, 0.9, 1.1, 1.6,      # 12-17
+    1.8, 1.8, 1.6, 1.4, 1.0, 0.7,      # 18-23
+]
+
+
+def _hourly_load_profile() -> list:
+    """Return a 24-element load profile normalised to sum to 1.0.
+
+    Override the default shape with LOAD_PROFILE_HOURLY (24 comma-separated
+    relative weights) if your home has a known consumption pattern.
+    """
+    raw = retrieve_setting('LOAD_PROFILE_HOURLY')
+    weights = DEFAULT_LOAD_PROFILE_RELATIVE
+    if raw:
+        try:
+            parsed = [float(x) for x in str(raw).split(',')]
+            if len(parsed) == 24 and sum(parsed) > 0:
+                weights = parsed
+        except (TypeError, ValueError):
+            logging.warning("EnergyBroker: Invalid LOAD_PROFILE_HOURLY; using default profile.")
+
+    total = sum(weights)
+    return [w / total for w in weights]
+
+
+def _estimate_daily_consumption_kwh() -> float:
+    """Estimate today's total house consumption (kWh).
+
+    Prefers the VRM consumption forecast (consumption_total_projected, Wh).
+    Falls back to extrapolating today's measured consumption so far, then to the
+    configured DAILY_HOME_ENERGY_CONSUMPTION default.
+    """
+    try:
+        projected_kwh = float(STATE.get('consumption_total_projected')) / 1000.0
+    except (TypeError, ValueError):
+        projected_kwh = 0.0
+    if projected_kwh > 0:
+        return projected_kwh
+
+    try:
+        cum_kwh = float(STATE.get('consumption_total_cumulative')) / 1000.0
+    except (TypeError, ValueError):
+        cum_kwh = 0.0
+
+    lt = time.localtime()
+    elapsed_h = lt.tm_hour + lt.tm_min / 60.0
+    if cum_kwh > 0 and elapsed_h >= 1.0:
+        return cum_kwh * 24.0 / elapsed_h  # extrapolate today's rate to a full day
+
+    return DAILY_HOME_ENERGY_CONSUMPTION
+
+
+def _build_load_forecast_by_slot(price_slots: list, slot_duration_h: float) -> dict:
+    """Build a per-slot house-load forecast (kWh) keyed by slot start time.
+
+    Distributes the estimated daily consumption across slots using a diurnal
+    profile, so the optimizer accounts for self-usage (notably the evening peak)
+    and does not over-estimate how much stored energy is available to sell.
+    """
+    daily_kwh = _estimate_daily_consumption_kwh()
+    profile = _hourly_load_profile()
+    out = {}
+    for slot in price_slots:
+        start = slot['start']
+        # profile[hour] is the fraction of the daily load in that clock hour;
+        # scale by the native slot length so sub-slots sum back to the hour.
+        out[start] = daily_kwh * profile[start.hour] * slot_duration_h
+    return out
+
+
+def get_today_energy_actuals() -> dict:
+    """Return today's accumulated energy actuals from the MQTT bus (retained).
+
+    Used to combine today's measured import cost / export reward with the
+    optimizer's remaining-day forecast for a full-day cost summary.
+    """
+    from lib.helpers import retrieve_message
+
+    def _f(topic):
+        try:
+            return float(retrieve_message(topic))
+        except (TypeError, ValueError):
+            return 0.0
+
+    return {
+        'imp_kwh': _f("Tibber/home/energy/day/imported"),
+        'imp_cost': _f("Tibber/home/energy/day/cost"),
+        'exp_kwh': _f("Tibber/home/energy/day/exported"),
+        'exp_rev': _f("Tibber/home/energy/day/reward"),
+    }
+
+
 def run_ai_optimizer():
     """
-    Runs the AI optimizer if enabled.
+    Runs the AI optimizer if enabled and applies the resulting plan to the
+    Victron system (charge schedule, AC setpoint, grid-assist/retain, and
+    negative-price feed-in protection).
     """
     if not _is_truthy(retrieve_setting('AI_POWERED_ESS_ALGORITHM'), False):
         return
@@ -397,59 +641,118 @@ def run_ai_optimizer():
     try:
         # 1. Retrieve data
         batt_soc = STATE.get('batt_soc')
-        if batt_soc is None:
-             logging.warning("AI_ESS: Battery SoC not available. Skipping.")
-             return
+        if batt_soc in (None, 0):
+            logging.warning("AI_ESS: Battery SoC not available. Skipping optimization.")
+            return
 
         prices = get_all_price_points()
-
         if not prices:
             logging.warning("AI_ESS: No prices available.")
             return
 
-        # Get forecasts (dummy for now, or from STATE if available)
-        # TODO: Retrieve actual forecasts from solar_forecasting module if available
-        load_forecast = None # Default to avg in optimizer
-        pv_forecast = None # Default to 0 or avg
+        # 2. Build forecasts from available system data.
+        # Normalise price slot starts for the PV forecast distribution.
+        from lib.ai_powered_ess import _coerce_datetime
+        normalised_slots = []
+        for p in prices:
+            try:
+                normalised_slots.append({'start': _coerce_datetime(p['start'])})
+            except (KeyError, TypeError, ValueError):
+                continue
+        slot_duration_h = 1.0
+        if len(normalised_slots) > 1:
+            normalised_slots.sort(key=lambda x: x['start'])
+            gaps = [
+                (normalised_slots[i]['start'] - normalised_slots[i - 1]['start']).total_seconds()
+                for i in range(1, len(normalised_slots))
+            ]
+            positive_gaps = [g for g in gaps if g > 0]
+            if positive_gaps:
+                slot_duration_h = min(positive_gaps) / 3600.0
 
-        # 2. Optimize
+        pv_forecast = _build_pv_forecast_by_slot(normalised_slots, slot_duration_h)
+        # Self-consumption: forecast house load per slot from VRM consumption
+        # data shaped by a diurnal profile, so SoC predictions reflect real usage.
+        load_forecast = _build_load_forecast_by_slot(normalised_slots, slot_duration_h)
+
+        # 3. Optimize
         result = optimize_schedule(batt_soc, prices, load_forecast, pv_forecast)
-
         if not result:
             logging.warning("AI_ESS: Optimization failed or returned nothing.")
             return
 
-        # 3. Apply results
+        # 4. Negative-price grid feed-in protection.
+        # When the current price is negative, exporting costs money, so limit
+        # system feed-in to 0W. Auto-revert to unlimited otherwise.
+        if _is_truthy(retrieve_setting('NEGATIVE_PRICE_FEED_IN_LIMIT_ENABLED'), True):
+            if result.get('limit_feed_in'):
+                limit_grid_feed_in(enabled=True, watts=0)
+            else:
+                limit_grid_feed_in(enabled=False)
 
-        # Setpoint
+        # Publish the current mode/reason for dashboards and automation.
+        STATE.set('ai_mode', result.get('mode'))
+        STATE.set('ai_reason', result.get('reason'))
+        STATE.set('ai_reason_code', result.get('reason_code'))
+
+        # 5. Apply immediate control for the current slot.
         setpoint = result.get('setpoint', 0.0)
+        if result.get('grid_assist'):  # HOLD (retain)
+            # Cover the PV-deficit portion of the house load from the grid so the
+            # battery is held; when PV covers the load, stay at 0 so surplus PV
+            # charges the battery / exports. Applied immediately here and
+            # maintained on ac_out_power events via manage_grid_usage_based_on_current_price.
+            _set_grid_assist(True)
+            _apply_grid_assist_setpoint()
+            applied_setpoint = _grid_assist_setpoint_watts()
+        else:
+            # Ensure HOLD is off, then apply the planned setpoint
+            # (export for SELL, 0W for BUY/SELF-SUPPLY).
+            _set_grid_assist(False)
+            ac_power_setpoint(watts=str(setpoint), override_ess_net_mettering=False)
+            applied_setpoint = setpoint
 
-        ac_power_setpoint(watts=str(setpoint), override_ess_net_mettering=False)
-
-        # Schedule Victron Slots
+        # 6. Program the Victron grid-charge schedule slots.
         victron_slots = result.get('victron_slots', [])
         clear_victron_schedules()
 
         for i, slot in enumerate(victron_slots):
-            if i >= 5: break
+            if i >= 5:
+                break
             start_dt = slot['start']
-
             seconds_from_midnight = start_dt.hour * 3600 + start_dt.minute * 60
-
             weekday = PythonToVictronWeekdayNumberConversion[start_dt.weekday()]
-
+            target_soc = int(slot.get('target_soc', 100))
             topic_stub = f"W/{systemId0}/settings/0/Settings/CGwacs/BatteryLife/Schedule/Charge/{i}/"
 
             publish_message(f"{topic_stub}Duration", payload=f"{{\"value\": {slot['duration']}}}", retain=True)
-            publish_message(f"{topic_stub}Soc", payload=f"{{\"value\": 100}}", retain=True) # Target SoC 100 for charging slot
+            publish_message(f"{topic_stub}Soc", payload=f"{{\"value\": {target_soc}}}", retain=True)
             publish_message(f"{topic_stub}Start", payload=f"{{\"value\": {seconds_from_midnight}}}", retain=True)
             publish_message(f"{topic_stub}Day", payload=f"{{\"value\": {weekday}}}", retain=True)
 
-            logging.info(f"AI_ESS: Scheduled charge slot {i}: {weekday} at {start_dt.strftime('%H:%M')} for {slot['duration']}s")
+            logging.info(
+                f"AI_ESS: Scheduled charge slot {i}: weekday={weekday} at {start_dt.strftime('%H:%M')} "
+                f"for {slot['duration']}s to {target_soc}% SoC"
+            )
 
-        logging.info(f"AI_ESS: Optimization complete. Setpoint: {setpoint}W. Scheduled {len(victron_slots)} charge slots.")
+        # Log the full plan (same view as scripts/ai_ess_dryrun.py) so the
+        # service log shows the active plan and how it changes over time.
+        from lib.ai_powered_ess import format_plan_summary
+        logging.info(
+            "AI_ESS: Optimization complete.\n%s",
+            format_plan_summary(
+                result,
+                batt_soc=batt_soc,
+                source="live STATE",
+                price_points=len(prices),
+                pv_remaining=STATE.get('pv_projected_remaining'),
+                max_hours=12,
+                today_actuals=get_today_energy_actuals(),
+                applied_setpoint=applied_setpoint,
+            ),
+        )
 
-        # Record success
+        # Record success for the legacy-fallback health check.
         STATE.set('ai_success_timestamp', time.time())
 
     except Exception as e:

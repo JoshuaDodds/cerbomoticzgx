@@ -101,6 +101,10 @@ TopicsWritable = dict({
             "ac_power_setpoint":    f"W/{systemId0}/settings/0/Settings/CGwacs/AcPowerSetPoint",
             "max_charge_voltage":   f"W/{systemId0}/settings/0/Settings/SystemSetup/MaxChargeVoltage",
             "minimum_ess_soc":      f"W/{systemId0}/settings/0/Settings/CGwacs/BatteryLife/MinimumSocLimit",
+            # ESS grid feed-in limit ("Limit system feed-in"). Value is in Watts;
+            # -1 disables the limit (unlimited feed-in). Setting 0 limits feed-in to 0W.
+            # NOTE: verify this dbus path matches your Venus OS version before relying on it.
+            "max_feed_in_power":    f"W/{systemId0}/settings/0/Settings/CGwacs/MaxFeedInPower",
             "inverter_mode":        f"N/{systemId0}/vebus/276/Mode",
             "system_shutdown":      f"Cerbomoticzgx/system/shutdown",
         }

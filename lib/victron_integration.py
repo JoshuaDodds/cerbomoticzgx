@@ -26,6 +26,44 @@ def ac_power_setpoint(watts: str = None, override_ess_net_mettering=True, silent
         if not silent:
             logging.info(f"Victron Integration: Set AC Power Set Point to: {watts} watts")
 
+def limit_grid_feed_in(enabled: bool, watts: int = 0):
+    """Toggle the Victron "Limit system feed-in" ESS setting (MaxFeedInPower).
+
+    :param enabled: True limits feed-in to ``watts`` (default 0W); False restores
+                    unlimited feed-in by writing -1.
+    :param watts: feed-in limit in Watts to apply when ``enabled`` is True.
+
+    The write is idempotent: it only publishes to the broker when the desired
+    state differs from the last applied state recorded in global state. This
+    avoids hammering the dbus/MQTT bus on a critical system when the optimizer
+    runs frequently.
+    """
+    # Venus OS stores MaxFeedInPower as a float (W); -1.0 disables the limit.
+    # Emit a float to exactly match the value type the dbus/MQTT bus expects.
+    desired_value = float(watts) if enabled else -1.0
+    desired_state = f"limited:{int(watts)}" if enabled else "unlimited"
+
+    last_state = STATE.get('feed_in_limit_state')
+    if last_state == desired_state:
+        return
+
+    try:
+        _msg = f"{{\"value\": {desired_value}}}"
+        publish.single(
+            TopicsWritable['system0']['max_feed_in_power'],
+            payload=_msg, qos=1, retain=False, hostname=cerboGxEndpoint, port=1883,
+        )
+        STATE.set('feed_in_limit_state', desired_state)
+        STATE.set('max_feed_in_power', desired_value)
+
+        if enabled:
+            logging.info(f"Victron Integration: Limiting system grid feed-in to {watts}W (negative price protection).")
+        else:
+            logging.info("Victron Integration: Restored unlimited system grid feed-in.")
+    except Exception as e:
+        logging.error(f"Victron Integration: Failed to set grid feed-in limit ({desired_state}): {e}")
+
+
 def set_minimum_ess_soc(percent: int = 20):
     if percent:
         _msg = f"{{\"value\": {percent}}}"

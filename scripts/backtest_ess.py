@@ -58,7 +58,10 @@ def run_backtest():
 
     print("\nSimulation Step-by-Step:")
     for step in schedule[:10]: # Print first 10 steps
-        print(f"{step['time'].strftime('%H:%M')} | Action: {step['action']:<10} | Price: {step['price']:.3f} | SoC: {step['soc']:.1f}%")
+        print(
+            f"{step['time'].strftime('%H:%M')} | Action: {step['action']:<10} | "
+            f"Price: {step['price']:.3f} | SoC: {step['soc_start']:.1f}% -> {step['soc_end']:.1f}%"
+        )
 
     # Simple cost analysis
     cost_with_ess = 0.0

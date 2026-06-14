@@ -1,8 +1,13 @@
 import tibber
 import time
+import requests
 
 from datetime import datetime, timezone
 from dateutil import parser, tz
+
+# Tibber GraphQL endpoint used for direct price queries (needed to request
+# quarter-hourly resolution, which the tibber python library does not expose).
+TIBBER_GQL_URL = "https://api.tibber.com/v1-beta/gql"
 
 from lib.config_retrieval import retrieve_setting
 from lib.constants import logging, systemId0
@@ -111,8 +116,11 @@ def publish_pricing_data(caller):
         mqtt_publish_highest_price_points(home)
         mqtt_publish_current_price(home)
 
-        # Publish all price points for AI optimizer
-        if retrieve_setting('AI_POWERED_ESS_ALGORITHM') == 'True':
+        # Publish all price points for AI optimizer. Accept any truthy form of
+        # the flag ("1", "true", "yes", "on", "True") for consistency with the
+        # EnergyBroker truthiness check.
+        ai_flag = str(retrieve_setting('AI_POWERED_ESS_ALGORITHM') or "").strip().lower()
+        if ai_flag in {"1", "true", "yes", "on"}:
             mqtt_publish_all_prices(home)
 
         # c = _account.websession.close()
@@ -157,11 +165,56 @@ def mqtt_publish_all_prices(home):
     except Exception as e:
         logging.error(f"Tibber: Error publishing all prices: {e}")
 
-def get_all_price_points():
+def _fetch_price_points_graphql(resolution: str) -> list:
+    """Query the Tibber GraphQL API directly for price points at the requested
+    resolution.
+
+    Tibber added ``priceInfo(resolution: QUARTER_HOURLY)`` (15-minute prices),
+    which it bills on; the tibber python library does not expose this argument,
+    so we issue the query ourselves. ``resolution`` is 'QUARTER_HOURLY' or
+    'HOURLY'. Returns [] on any failure so the caller can fall back.
     """
-    Returns a list of all available price points (today and tomorrow) as dicts.
-    Used by AI optimizer.
-    """
+    token = retrieve_setting('TIBBER_ACCESS_TOKEN')
+    if not token:
+        return []
+
+    query = (
+        "{ viewer { homes { currentSubscription { priceInfo("
+        f"resolution: {resolution}"
+        ") { today { total startsAt level } tomorrow { total startsAt level } } } } } }"
+    )
+    try:
+        resp = requests.post(
+            TIBBER_GQL_URL,
+            json={"query": query},
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            logging.warning("Tibber: priceInfo(%s) query failed with HTTP %s", resolution, resp.status_code)
+            return []
+
+        payload = resp.json()
+        if payload.get("errors"):
+            logging.warning("Tibber: priceInfo(%s) returned GraphQL errors: %s", resolution, payload["errors"])
+            return []
+
+        homes = payload["data"]["viewer"]["homes"]
+        price_info = homes[0]["currentSubscription"]["priceInfo"]
+
+        points = []
+        for bucket in ("today", "tomorrow"):
+            for p in (price_info.get(bucket) or []):
+                points.append({"start": p["startsAt"], "total": p["total"], "level": p.get("level")})
+        return points
+
+    except (requests.RequestException, KeyError, TypeError, ValueError, IndexError) as e:
+        logging.warning("Tibber: priceInfo(%s) fetch error: %s", resolution, e)
+        return []
+
+
+def _get_all_price_points_via_library() -> list:
+    """Fallback: hourly price points via the tibber python library."""
     try:
         _account = tibber.Account(retrieve_setting('TIBBER_ACCESS_TOKEN'))
         home = _account.homes[0]
@@ -176,6 +229,36 @@ def get_all_price_points():
     except Exception as e:
         logging.error(f"Tibber: Error getting all prices: {e}")
         return []
+
+
+def get_all_price_points():
+    """
+    Returns a list of all available price points (today and tomorrow) as dicts
+    of {'start': ISO-8601 str, 'total': float, 'level': str}. Used by the AI
+    optimizer.
+
+    Prefers quarter-hourly (15-minute) prices via a direct GraphQL query, which
+    is how Tibber bills as of October 2025. Configure with TIBBER_PRICE_RESOLUTION
+    ('QUARTER_HOURLY' default, or 'HOURLY'). Falls back to hourly library data if
+    the direct query yields nothing (e.g. market/home does not support it yet).
+    """
+    resolution = str(retrieve_setting('TIBBER_PRICE_RESOLUTION') or 'QUARTER_HOURLY').strip().upper()
+    if resolution not in ('QUARTER_HOURLY', 'HOURLY'):
+        resolution = 'QUARTER_HOURLY'
+
+    points = _fetch_price_points_graphql(resolution)
+    if points:
+        return points
+
+    if resolution == 'QUARTER_HOURLY':
+        # Try hourly via GraphQL before falling all the way back to the library.
+        points = _fetch_price_points_graphql('HOURLY')
+        if points:
+            logging.info("Tibber: Quarter-hourly prices unavailable; using hourly GraphQL prices.")
+            return points
+
+    logging.warning("Tibber: Falling back to hourly price points via the tibber library.")
+    return _get_all_price_points_via_library()
 
 def mqtt_publish_current_price(home):
     value = home.current_subscription.price_info.current.total
