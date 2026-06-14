@@ -96,7 +96,9 @@ def get_victron_solar_forecast():
     # now = int(now_tz.timestamp()) - 60
     now_tz = datetime.now(TIMEZONE)
     start_of_today = int(now_tz.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-    end_of_today = int((now_tz + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+    # Request a 2-day window so the forecast returns today AND tomorrow (used by
+    # the AI optimizer to plan day-2 charging around expected solar).
+    end_of_window = int((now_tz + timedelta(days=2)).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
 
     try:
         response = requests.post(LOGIN_URL, json=LOGIN_DATA, timeout=5)
@@ -117,7 +119,7 @@ def get_victron_solar_forecast():
     params = {
         'type': "forecast",
         "start": start_of_today,
-        "end": end_of_today,
+        "end": end_of_window,
         "interval": "days",
     }
 
@@ -154,6 +156,16 @@ def get_victron_solar_forecast():
 
             STATE.set('pv_projected_today', solar_forecast_kwh)
             STATE.set('pv_projected_remaining', solar_production_left)
+
+            # Tomorrow's forecast daily solar total (Wh) for day-2 planning. The
+            # 2-day window returns index [1] for tomorrow; guarded so a missing
+            # second day never affects today's values.
+            try:
+                pv_tomorrow_wh = round(float(data['solar_yield_forecast'][1][1]), 2)
+                STATE.set('pv_projected_tomorrow', pv_tomorrow_wh)
+                logging.debug(f"Tomorrow pv forecast: {pv_tomorrow_wh} Wh")
+            except (ValueError, TypeError, IndexError, KeyError):
+                STATE.set('pv_projected_tomorrow', 0.0)
 
             # VRM consumption forecast data
             try:

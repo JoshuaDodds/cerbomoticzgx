@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>cerbomoticzGx · ESS Dashboard</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">cerbomoticzGx<span> · ESS</span></div>
+    <div id="status-strip" class="status-strip">
+      <span class="muted">loading…</span>
+    </div>
+  </header>
+
+  <section class="overview">
+    <div id="metrics" class="metrics"></div>
+    <div id="decision" class="card decision"></div>
+  </section>
+
+  <nav class="tabs">
+    <button class="tab active" data-tab="schedule">Schedule</button>
+    <button class="tab" data-tab="config">Configuration</button>
+  </nav>
+
+  <main>
+    <section id="tab-schedule" class="tab-panel active">
+      <div class="legend">
+        <span class="chip mode-buy">BUY</span>
+        <span class="chip mode-sell">SELL</span>
+        <span class="chip mode-hold">HOLD</span>
+        <span class="chip mode-self_supply">SELF-SUPPLY</span>
+        <span class="muted">— click an hour to expand to 15-min, click a slot for the reason</span>
+      </div>
+
+      <div id="day-summary" class="card"></div>
+
+      <div class="card">
+        <div class="table-head hour-row">
+          <span class="col-time">Hour</span>
+          <span class="col-bar">Timeline</span>
+          <span class="col-num">Avg €/kWh</span>
+          <span class="col-num">Import</span>
+          <span class="col-num">Export</span>
+          <span class="col-num">SoC</span>
+          <span class="col-num">Net</span>
+        </div>
+        <div id="hours"></div>
+      </div>
+    </section>
+
+    <section id="tab-config" class="tab-panel">
+      <div id="config"></div>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <span id="meta" class="muted"></span>
+    <button id="refresh" class="btn">Refresh</button>
+  </footer>
+
+  <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>

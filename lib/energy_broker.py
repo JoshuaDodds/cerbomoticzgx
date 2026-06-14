@@ -445,37 +445,49 @@ def run_daily_price_update_and_optimize():
 def _build_pv_forecast_by_slot(price_slots: list, slot_duration_h: float) -> dict:
     """Build a per-slot PV generation forecast (kWh) keyed by slot start time.
 
-    Uses the remaining-PV-today estimate from the solar_forecasting module
-    (STATE['pv_projected_remaining'], in Wh) distributed evenly across the
-    remaining daylight slots of *today*. Tomorrow's PV is left at 0.0 (unknown
-    from this data source) so the optimizer treats next-day solar conservatively.
+    Distributes the VRM solar-yield forecast across the daylight slots of each
+    day so day-1 AND day-2 buy/charge decisions account for expected solar:
+      * today    -> STATE['pv_projected_remaining'] (Wh remaining today)
+      * tomorrow -> STATE['pv_projected_tomorrow']  (Wh forecast full day)
+    Spread evenly across a daylight window (a reasonable first-order shape; a
+    finer hourly curve can replace this later).
     """
-    pv_remaining_wh = STATE.get('pv_projected_remaining')
-    try:
-        pv_remaining_kwh = float(pv_remaining_wh) / 1000.0
-    except (TypeError, ValueError):
-        pv_remaining_kwh = 0.0
+    from datetime import date as _date, timedelta as _td
 
-    if pv_remaining_kwh <= 0:
-        return {}
+    def _kwh(key):
+        try:
+            return max(0.0, float(STATE.get(key)) / 1000.0)
+        except (TypeError, ValueError):
+            return 0.0
 
-    # Daylight window heuristic (local time). Conservative but avoids assigning
-    # PV to night-time slots.
+    today_kwh = _kwh('pv_projected_remaining')
+    tomorrow_kwh = _kwh('pv_projected_tomorrow')
+
+    today = _date.today()
+    tomorrow = today + _td(days=1)
     daylight_start_h, daylight_end_h = 6, 22
-    today = time.localtime()
 
-    daylight_slots = []
+    today_slots, tomorrow_slots = [], []
     for slot in price_slots:
         start = slot['start']
-        is_today = (start.year, start.month, start.day) == (today.tm_year, today.tm_mon, today.tm_mday)
-        if is_today and daylight_start_h <= start.hour < daylight_end_h:
-            daylight_slots.append(start)
+        if not (daylight_start_h <= start.hour < daylight_end_h):
+            continue
+        d = start.date()
+        if d == today:
+            today_slots.append(start)
+        elif d == tomorrow:
+            tomorrow_slots.append(start)
 
-    if not daylight_slots:
-        return {}
-
-    per_slot = pv_remaining_kwh / len(daylight_slots)
-    return {start: per_slot for start in daylight_slots}
+    out = {}
+    if today_kwh > 0 and today_slots:
+        per = today_kwh / len(today_slots)
+        for s in today_slots:
+            out[s] = per
+    if tomorrow_kwh > 0 and tomorrow_slots:
+        per = tomorrow_kwh / len(tomorrow_slots)
+        for s in tomorrow_slots:
+            out[s] = per
+    return out
 
 
 def _set_grid_assist(enabled: bool) -> None:
@@ -629,6 +641,74 @@ def get_today_energy_actuals() -> dict:
     }
 
 
+def _publish_plan_json(result, *, batt_soc, price_points, pv_remaining,
+                       applied_setpoint, today_actuals) -> None:
+    """Write the current plan to a JSON file for the frontend dashboard to read.
+
+    Best-effort and read-only-friendly: any failure is logged and ignored so it
+    can never affect ESS control. The path is configurable via AI_PLAN_EXPORT_PATH
+    (default /dev/shm/cerbo_ai_plan.json — shared, in-memory, same-host sidecar).
+    """
+    import json
+    from datetime import datetime as _dt
+
+    def _iso(v):
+        try:
+            return v.isoformat()
+        except AttributeError:
+            return v
+
+    try:
+        path = retrieve_setting('AI_PLAN_EXPORT_PATH') or '/dev/shm/cerbo_ai_plan.json'
+
+        schedule = [{
+            'time': _iso(s['time']),
+            'mode': s['action'],
+            'price': s['price'],
+            'sell': s.get('sell'),
+            'soc_start': s['soc_start'],
+            'soc_end': s['soc_end'],
+            'grid_energy': s['grid_energy'],
+            'reason': s.get('reason'),
+            'reason_code': s.get('reason_code'),
+        } for s in result.get('schedule', [])]
+
+        victron_slots = [{
+            'start': _iso(s['start']),
+            'duration': s['duration'],
+            'target_soc': s['target_soc'],
+        } for s in result.get('victron_slots', [])]
+
+        payload = {
+            'generated_at': _dt.now().astimezone().isoformat(),
+            'battery_soc': batt_soc,
+            'price_points': price_points,
+            'pv_remaining_wh': pv_remaining,
+            'pv_tomorrow_wh': STATE.get('pv_projected_tomorrow'),
+            'slot_duration_h': result.get('slot_duration_h'),
+            'current': {
+                'mode': result.get('mode'),
+                'reason': result.get('reason'),
+                'reason_code': result.get('reason_code'),
+                'price': result.get('current_price'),
+                'setpoint': result.get('setpoint'),
+                'applied_setpoint': applied_setpoint,
+                'limit_feed_in': result.get('limit_feed_in'),
+            },
+            'today_actuals': today_actuals,
+            'victron_slots': victron_slots,
+            'schedule': schedule,
+        }
+
+        tmp = f"{path}.tmp"
+        with open(tmp, 'w') as fh:
+            json.dump(payload, fh)
+        import os
+        os.replace(tmp, path)  # atomic publish so the reader never sees a partial file
+    except Exception as e:
+        logging.warning(f"AI_ESS: Failed to publish plan JSON for frontend: {e}")
+
+
 def run_ai_optimizer():
     """
     Runs the AI optimizer if enabled and applies the resulting plan to the
@@ -735,6 +815,18 @@ def run_ai_optimizer():
                 f"for {slot['duration']}s to {target_soc}% SoC"
             )
 
+        # Publish the plan as JSON for the frontend dashboard (best-effort).
+        pv_remaining = STATE.get('pv_projected_remaining')
+        today_actuals = get_today_energy_actuals()
+        _publish_plan_json(
+            result,
+            batt_soc=batt_soc,
+            price_points=len(prices),
+            pv_remaining=pv_remaining,
+            applied_setpoint=applied_setpoint,
+            today_actuals=today_actuals,
+        )
+
         # Log the full plan (same view as scripts/ai_ess_dryrun.py) so the
         # service log shows the active plan and how it changes over time.
         from lib.ai_powered_ess import format_plan_summary
@@ -745,9 +837,9 @@ def run_ai_optimizer():
                 batt_soc=batt_soc,
                 source="live STATE",
                 price_points=len(prices),
-                pv_remaining=STATE.get('pv_projected_remaining'),
+                pv_remaining=pv_remaining,
                 max_hours=12,
-                today_actuals=get_today_energy_actuals(),
+                today_actuals=today_actuals,
                 applied_setpoint=applied_setpoint,
             ),
         )

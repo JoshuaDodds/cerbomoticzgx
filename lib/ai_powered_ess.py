@@ -123,6 +123,12 @@ class OptimizationEngine:
         # grid (PV surplus feed-in is still allowed). 0.0 disables the floor.
         self.min_sell_price = _safe_float('ESS_MIN_SELL_PRICE', 0.0)
 
+        # Battery wear cost charged per kWh discharged from the battery. Discourages
+        # cycling for marginal arbitrage that round-trip losses would otherwise
+        # eat. 0.0 disables (no wear cost). Applied on discharge so a full
+        # charge+discharge cycle is charged once.
+        self.cycle_cost = _safe_float('ESS_BATTERY_CYCLE_COST', 0.0)
+
         # Planning resolution in minutes. When the native price data is coarser
         # than this (e.g. hourly Tibber prices with a 15-minute target) each
         # native price slot is sub-divided so the engine is ready for true
@@ -327,6 +333,12 @@ class OptimizationEngine:
 
                     step_cost = import_kwh * buy - export_kwh * sell
 
+                    # Battery wear: charge a per-kWh cost on energy drawn from the
+                    # battery (discharge), so the optimizer only cycles when the
+                    # price spread clearly beats round-trip losses + wear.
+                    if self.cycle_cost > 0 and dc_change_kwh < -EPS:
+                        step_cost += (-dc_change_kwh) * self.cycle_cost
+
                     total = base_cost + step_cost
                     if total < dp[t + 1][nsoc] - EPS:
                         dp[t + 1][nsoc] = total
@@ -409,9 +421,9 @@ class OptimizationEngine:
             return 'self_supply'
         return 'hold'
 
-    def _explain_action(self, schedule):
-        """Return ``(reason_code, reason_text)`` explaining the current-slot mode."""
-        cur = schedule[0]
+    def _explain_action(self, schedule, idx=0):
+        """Return ``(reason_code, reason_text)`` explaining the mode of slot ``idx``."""
+        cur = schedule[idx]
         mode = cur['action']
         price = cur['price']
         soc = cur['soc_start']
@@ -422,8 +434,8 @@ class OptimizationEngine:
             except Exception:
                 return str(s['time'])
 
-        next_sell = next((s for s in schedule[1:] if s['action'] == 'sell'), None)
-        horizon_max = max((s['price'] for s in schedule), default=price)
+        next_sell = next((s for s in schedule[idx + 1:] if s['action'] == 'sell'), None)
+        horizon_max = max((s['price'] for s in schedule[idx:]), default=price)
 
         if mode == 'buy':
             if next_sell:
@@ -467,6 +479,12 @@ class OptimizationEngine:
                 f"Using stored energy — cheaper than buying from the grid at €{price:.3f}/kWh")
 
     def _post_process(self, schedule, slot_seconds):
+        # Attach a per-slot reason so the UI can show "why" at every increment.
+        for i, step in enumerate(schedule):
+            code, text = self._explain_action(schedule, i)
+            step['reason_code'] = code
+            step['reason'] = text
+
         # Group consecutive grid-charge (buy) slots into Victron charge windows.
         victron_slots = []
         current_slot = None
@@ -518,15 +536,13 @@ class OptimizationEngine:
             # by the caller via the PV-aware grid-assist control loop.
             setpoint = 0.0
 
-        reason_code, reason_text = self._explain_action(schedule)
-
         return {
             'schedule': schedule,
             'victron_slots': formatted_slots,
             'setpoint': setpoint,
             'mode': mode,
-            'reason': reason_text,
-            'reason_code': reason_code,
+            'reason': first.get('reason'),
+            'reason_code': first.get('reason_code'),
             'grid_assist': mode == 'hold',
             'current_price': first['price'],
             'limit_feed_in': first['price'] < 0,

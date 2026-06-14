@@ -22,6 +22,7 @@ class TestAIPoweredESS(unittest.TestCase):
         self.engine.terminal_value_factor = 1.0
         self.engine.expected_peak_price = 0.0
         self.engine.min_sell_price = 0.0
+        self.engine.cycle_cost = 0.0
         # Plan at native (hourly) resolution by default in tests; individual
         # tests override this to exercise sub-slot resampling.
         self.engine.slot_minutes = 60.0
@@ -139,6 +140,7 @@ class TestAIPoweredESS(unittest.TestCase):
             e.export_fee = 0.0
             e.expected_peak_price = 0.0
             e.min_sell_price = 0.0
+            e.cycle_cost = 0.0
             e.slot_minutes = 60.0
             e.terminal_value_factor = terminal_factor
             return e
@@ -195,6 +197,36 @@ class TestAIPoweredESS(unittest.TestCase):
         result = self.engine.optimize(90.0, prices)
         self.assertIsNotNone(result)
         self.assertFalse(any(s['action'] == 'sell' for s in result['schedule']))
+
+    def test_battery_cycle_cost_reduces_cycling(self):
+        # Cheap early, expensive later -> arbitrage is profitable with no wear cost.
+        base_time = datetime.now(tz.UTC).replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        prices = []
+        for i in range(24):
+            t = base_time + timedelta(hours=i)
+            prices.append({'start': t, 'total': 0.10 if i < 12 else 0.30, 'level': 'NORMAL'})
+
+        def make(cycle_cost):
+            from lib.ai_powered_ess import OptimizationEngine
+            e = OptimizationEngine()
+            e.battery_capacity = 45.0
+            e.charge_efficiency = 0.90
+            e.discharge_efficiency = 0.90
+            e.min_soc = 5.0
+            e.export_price_factor = 1.0
+            e.export_fee = 0.0
+            e.expected_peak_price = 0.0
+            e.min_sell_price = 0.0
+            e.terminal_value_factor = 0.0
+            e.slot_minutes = 60.0
+            e.cycle_cost = cycle_cost
+            return e
+
+        sells_zero = sum(s['action'] == 'sell' for s in make(0.0).optimize(50.0, prices)['schedule'])
+        sells_high = sum(s['action'] == 'sell' for s in make(1.0).optimize(50.0, prices)['schedule'])
+        self.assertGreater(sells_zero, 0)
+        self.assertLessEqual(sells_high, sells_zero)
+        self.assertEqual(sells_high, 0)  # 1.0/kWh wear dwarfs the 0.20 spread
 
 if __name__ == '__main__':
     unittest.main()
