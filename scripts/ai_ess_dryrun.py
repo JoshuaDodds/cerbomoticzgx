@@ -23,7 +23,7 @@ sys.path.append(os.getcwd())
 
 from lib.global_state import GlobalStateClient
 from lib.tibber_api import get_all_price_points
-from lib.ai_powered_ess import optimize_schedule, format_plan_summary
+from lib.ai_powered_ess import OptimizationEngine, format_plan_summary
 from lib.energy_broker import (
     _build_pv_forecast_by_slot,
     _build_load_forecast_by_slot,
@@ -57,8 +57,11 @@ def main():
         batt_soc = STATE.get("batt_soc")
         soc_source = "live STATE"
 
-    if batt_soc in (None, 0):
-        print(f"!! Battery SoC unavailable from {soc_source} (got {batt_soc!r}).")
+    # A real 0% SoC is valid (STATE returns 0 for both 0% and missing); use
+    # battery voltage to tell them apart so a true 0% doesn't block the dry run.
+    battery_reporting = bool(STATE.get("batt_voltage")) or args.soc is not None
+    if batt_soc is None or (batt_soc == 0 and not battery_reporting):
+        print(f"!! Battery data unavailable from {soc_source} (SoC={batt_soc!r}, no voltage).")
         print("   Pass --soc <percent> to run with an assumed value.")
         return 1
 
@@ -94,9 +97,27 @@ def main():
     print(f"Native price resolution: ~{slot_duration_h:.2f}h | PV remaining: {pv_remaining} Wh "
           f"-> {len(pv_forecast)} daylight slots | forecast house load (horizon): {horizon_load_kwh:.1f} kWh")
 
+    # --- Engine tunables (what the optimizer ACTUALLY loaded at runtime) -----
+    # Surfaced so we can confirm .env values (e.g. ESS_BATTERY_CYCLE_COST) are
+    # really reaching the DP rather than silently falling back to defaults.
+    engine = OptimizationEngine()
+    print("-" * 78)
+    print("ENGINE TUNABLES (resolved via .secrets > STATE > .env):")
+    print(f"  battery_cycle_cost   : {engine.cycle_cost:.4f} €/kWh   "
+          f"(.env ESS_BATTERY_CYCLE_COST)")
+    print(f"  export_price_factor  : {engine.export_price_factor:.3f}")
+    print(f"  export_fee           : {getattr(engine, 'export_fee', 0.0):.4f} €/kWh")
+    print(f"  min_sell_price       : {engine.min_sell_price:.3f} €/kWh")
+    print(f"  expected_peak_price  : {engine.expected_peak_price:.3f} €/kWh")
+    print(f"  terminal_value_factor: {getattr(engine, 'terminal_value_factor', 1.0):.3f}")
+    print(f"  min_soc_reserve      : {engine.min_soc:.1f} %   soc_step: {engine.soc_step:.1f} %")
+    print(f"  max charge/discharge : {engine.max_charge_power:.1f} / {engine.max_discharge_power:.1f} kW")
+    print(f"  max import/export    : {engine.max_power_import:.1f} / {engine.max_power_export:.1f} kW")
+    print("-" * 78)
+
     # --- Optimize -----------------------------------------------------------
     t0 = datetime.now()
-    result = optimize_schedule(batt_soc, prices, load_forecast, pv_forecast)
+    result = engine.optimize(batt_soc, prices, load_forecast, pv_forecast)
     elapsed = (datetime.now() - t0).total_seconds()
 
     if not result:

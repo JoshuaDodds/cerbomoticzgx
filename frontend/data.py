@@ -35,6 +35,23 @@ def _parse_time(s):
         return None
 
 
+def is_stored_surplus(slot) -> bool:
+    """True when a slot's forecast "export" is really surplus solar being stored.
+
+    A PV_SURPLUS slot below a full battery does not actually export (the setpoint
+    is neutral, so Victron charges from the surplus). That energy is realised
+    later when the battery discharges and sells — counting it as export revenue
+    now would overstate profit, so the accounting treats it as unrealised.
+    Surplus at a full battery (SoC ~100%) genuinely exports and stays realised.
+    """
+    rc = str(slot.get("reason_code") or "")
+    try:
+        soc = float(slot.get("soc_start") or 0)
+    except (TypeError, ValueError):
+        soc = 0.0
+    return rc.startswith("PV_SURPLUS") and soc < 99.0
+
+
 def load_raw_plan() -> dict | None:
     """Return the parsed plan JSON, or None if it has not been published yet."""
     path = plan_path()
@@ -74,6 +91,7 @@ def group_by_hour(schedule: list) -> list:
                 "slots": [],
                 "import_kwh": 0.0, "export_kwh": 0.0,
                 "import_cost": 0.0, "export_rev": 0.0,
+                "unrealized_solar_kwh": 0.0, "unrealized_solar_rev": 0.0,
                 "prices": [],
                 "mode_counts": {},
             }
@@ -82,7 +100,13 @@ def group_by_hour(schedule: list) -> list:
         g = slot.get("grid_energy", 0.0) or 0.0
         buy = slot.get("price", 0.0) or 0.0
         sell = slot.get("sell", buy) or buy
-        if g > 0:
+        if is_stored_surplus(slot):
+            # Stored surplus solar: not realised export. Track separately so the
+            # net cost/profit reflects only energy actually bought/sold.
+            if g < 0:
+                h["unrealized_solar_kwh"] += -g
+                h["unrealized_solar_rev"] += -g * sell
+        elif g > 0:
             h["import_kwh"] += g
             h["import_cost"] += g * buy
         elif g < 0:
@@ -109,6 +133,7 @@ def group_by_hour(schedule: list) -> list:
             "avg_price": sum(h["prices"]) / n,
             "import_kwh": round(h["import_kwh"], 2),
             "export_kwh": round(h["export_kwh"], 2),
+            "unrealized_solar_kwh": round(h["unrealized_solar_kwh"], 2),
             "net_kwh": round(h["import_kwh"] - h["export_kwh"], 2),
             "net_cost": round(h["import_cost"] - h["export_rev"], 3),
             "soc_start": h["slots"][0].get("soc_start"),
@@ -130,12 +155,17 @@ def day_summary(schedule: list, today_actuals: dict | None) -> dict:
         if d not in days:
             days[d] = {"date": d, "label": dt.strftime("%a %d %b"),
                        "import_kwh": 0.0, "import_cost": 0.0,
-                       "export_kwh": 0.0, "export_rev": 0.0}
+                       "export_kwh": 0.0, "export_rev": 0.0,
+                       "unrealized_solar_kwh": 0.0, "unrealized_solar_rev": 0.0}
             order.append(d)
         g = slot.get("grid_energy", 0.0) or 0.0
         buy = slot.get("price", 0.0) or 0.0
         sell = slot.get("sell", buy) or buy
-        if g > 0:
+        if is_stored_surplus(slot):
+            if g < 0:
+                days[d]["unrealized_solar_kwh"] += -g
+                days[d]["unrealized_solar_rev"] += -g * sell
+        elif g > 0:
             days[d]["import_kwh"] += g
             days[d]["import_cost"] += g * buy
         elif g < 0:
@@ -144,12 +174,15 @@ def day_summary(schedule: list, today_actuals: dict | None) -> dict:
 
     today = datetime.now().date().isoformat()
     rows = []
-    tot = {"import_kwh": 0.0, "import_cost": 0.0, "export_kwh": 0.0, "export_rev": 0.0}
+    _keys = ("import_kwh", "import_cost", "export_kwh", "export_rev",
+             "unrealized_solar_kwh", "unrealized_solar_rev")
+    tot = {k: 0.0 for k in _keys}
     for d in order:
         row = days[d]
-        forecast = {k: round(row[k], 3) for k in ("import_kwh", "import_cost", "export_kwh", "export_rev")}
+        forecast = {k: round(row[k], 3) for k in _keys}
         actual = None
         if d == today and today_actuals:
+            # Actuals are realised grid flows only (no unrealised solar bucket).
             actual = {
                 "import_kwh": round(float(today_actuals.get("imp_kwh", 0) or 0), 3),
                 "import_cost": round(float(today_actuals.get("imp_cost", 0) or 0), 3),
@@ -159,7 +192,7 @@ def day_summary(schedule: list, today_actuals: dict | None) -> dict:
         combined = dict(forecast)
         if actual:
             for k in combined:
-                combined[k] = round(combined[k] + actual[k], 3)
+                combined[k] = round(combined[k] + actual.get(k, 0.0), 3)
         for k in tot:
             tot[k] += combined[k]
         rows.append({

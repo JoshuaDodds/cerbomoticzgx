@@ -27,6 +27,33 @@ class TestAIPoweredESS(unittest.TestCase):
         # tests override this to exercise sub-slot resampling.
         self.engine.slot_minutes = 60.0
 
+    def _step(self, action, soc_start, soc_end, grid_energy, price=0.20):
+        return {
+            'time': datetime.now(tz.UTC).replace(second=0, microsecond=0),
+            'action': action, 'soc_start': soc_start, 'soc_end': soc_end,
+            'grid_energy': grid_energy, 'price': price, 'sell': price,
+        }
+
+    def test_pv_surplus_sell_uses_neutral_setpoint(self):
+        # Exporting while SoC is flat = PV surplus. Must NOT impose a forced
+        # (capping) export setpoint; leave it neutral so the Victron ESS routes
+        # surplus in real time (charge if room, feed-in if full).
+        sched = [self._step('sell', 50.0, 50.0, -0.09, price=0.15)]
+        result = self.engine._post_process(sched, 900)
+        self.assertEqual(result['mode'], 'sell')
+        self.assertTrue(result['pv_surplus'])
+        self.assertEqual(result['setpoint'], 0.0)
+
+    def test_stored_discharge_sell_keeps_forced_setpoint(self):
+        # Real battery discharge to grid (SoC falling) must keep the planned
+        # negative export setpoint so the discharge is rate-controlled/spread.
+        sched = [self._step('sell', 100.0, 94.0, -2.29, price=0.25)]
+        result = self.engine._post_process(sched, 900)
+        self.assertEqual(result['mode'], 'sell')
+        self.assertFalse(result['pv_surplus'])
+        # planned_w = -2.29 / 0.25h * 1000 = -9160 W
+        self.assertEqual(result['setpoint'], -9160.0)
+
     def test_optimization_basic(self):
         # Generate dummy price data
         base_time = datetime.now(tz.UTC).replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)

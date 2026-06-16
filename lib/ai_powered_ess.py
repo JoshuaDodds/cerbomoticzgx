@@ -141,12 +141,10 @@ class OptimizationEngine:
         self.daily_load_kwh = _safe_float('DAILY_HOME_ENERGY_CONSUMPTION', 16.0)
 
         # Seasonal SoC reserve (percentage) kept in the battery at all times.
-        winter_reserve = _safe_float('MIN_SOC_RESERVE_WINTER', MIN_SOC_RESERVE_WINTER)
-        summer_reserve = _safe_float('MIN_SOC_RESERVE_SUMMER', MIN_SOC_RESERVE_SUMMER)
-
-        current_month = datetime.now().month
-        self.is_winter = current_month in (11, 12, 1, 2, 3)
-        self.min_soc = winter_reserve if self.is_winter else summer_reserve
+        # Single source of truth shared with the Victron hardware floor.
+        from lib.helpers import current_min_soc_reserve, is_winter_month
+        self.is_winter = is_winter_month()
+        self.min_soc = current_min_soc_reserve()
         self.max_soc = 100.0
 
         # DP SoC discretization step (percentage points).
@@ -427,6 +425,7 @@ class OptimizationEngine:
         mode = cur['action']
         price = cur['price']
         soc = cur['soc_start']
+        soc_end = cur['soc_end']
 
         def _hm(s):
             try:
@@ -445,12 +444,20 @@ class OptimizationEngine:
             return ('PRICE_LOW', f"Charging while the price is low (€{price:.3f}/kWh)")
 
         if mode == 'sell':
-            if soc >= 100.0 - self.soc_step:
-                return ('PV_SURPLUS_BATTERY_FULL',
-                        f"Battery full — exporting surplus solar at €{price:.3f}/kWh")
+            # Exporting while the battery is NOT discharging (SoC flat/rising) =
+            # surplus solar feeding in, not selling stored energy. Only this case
+            # is PV surplus — a discharge from any SoC (incl. 100%) is a real sell.
+            if soc_end >= soc - EPS:
+                # Battery is not discharging and the setpoint is left neutral, so
+                # Victron routes the surplus in real time — it charges the battery
+                # while there is room and only feeds the grid once full. Don't
+                # assert "exporting": at low SoC the surplus is banked, not sold.
+                return ('PV_SURPLUS',
+                        f"Surplus solar at €{price:.3f}/kWh — battery not discharging; "
+                        f"Victron charges from it, or exports the excess once the battery is full")
             if price >= horizon_max - EPS:
                 return ('PRICE_PEAK',
-                        f"Selling at €{price:.3f}/kWh — the highest price in the horizon")
+                        f"Selling stored energy at €{price:.3f}/kWh — the highest price in the horizon")
             return ('PRICE_HIGH',
                     f"Selling stored energy at €{price:.3f}/kWh (a profitable high price)")
 
@@ -524,16 +531,26 @@ class OptimizationEngine:
         mode = first['action']
         export_setpoint = _safe_float('ESS_EXPORT_AC_SETPOINT', -10000.0)
         slot_h = slot_seconds / 3600.0
-        if mode == 'sell':
-            # Apply the export power the plan actually calls for this slot (grid
-            # energy / slot length), not a blanket max-export, so the real SoC
-            # trajectory tracks the forecast. Clamp to the configured export limit
-            # (both values are negative; never export more than the limit).
+        # PV surplus = exporting while the battery is NOT discharging (SoC flat or
+        # rising). This is solar feed-in, not a stored-energy sell.
+        pv_surplus = mode == 'sell' and first['soc_end'] >= first['soc_start'] - EPS
+        if mode == 'sell' and not pv_surplus:
+            # Active battery discharge to the grid: apply the export power the plan
+            # actually calls for this slot (grid energy / slot length), not a
+            # blanket max-export, so the real SoC trajectory tracks the forecast
+            # and the discharge is spread across the peak window. Clamp to the
+            # configured export limit (both values are negative; never export more
+            # than the limit).
             planned_w = (first['grid_energy'] / slot_h * 1000.0) if slot_h else export_setpoint
             setpoint = float(round(max(planned_w, export_setpoint)))
         else:
-            # buy -> Victron charge schedule; self_supply -> 0W; hold is applied
-            # by the caller via the PV-aware grid-assist control loop.
+            # PV surplus -> leave the setpoint NEUTRAL (0W) and let the Victron ESS
+            # route surplus in real time: charge the battery when there is room,
+            # feed the grid when it is full. A static forecast-sized export
+            # setpoint here would CAP grid export at the forecast surplus and dump
+            # real-time excess PV into the battery, so we must not impose one.
+            # buy -> Victron charge schedule; self_supply -> 0W; hold is applied by
+            # the caller via the PV-aware grid-assist control loop.
             setpoint = 0.0
 
         return {
@@ -544,6 +561,7 @@ class OptimizationEngine:
             'reason': first.get('reason'),
             'reason_code': first.get('reason_code'),
             'grid_assist': mode == 'hold',
+            'pv_surplus': pv_surplus,
             'current_price': first['price'],
             'limit_feed_in': first['price'] < 0,
             'slot_duration_h': slot_seconds / 3600.0,
@@ -584,11 +602,18 @@ def format_plan_summary(result, *, batt_soc=None, source="", price_points=None,
     shown = 0
     rows = []
     total_import_cost = total_export_rev = total_import_kwh = total_export_kwh = 0.0
+    unrealized_solar_kwh = unrealized_solar_rev = 0.0
     day_totals = {}  # date -> {imp_kwh, imp_cost, exp_kwh, exp_rev, slots}
     for step in schedule:
         g = step['grid_energy']
         buy = step['price']
         sell = step.get('sell', buy)
+
+        # A PV_SURPLUS slot below a full battery does not actually export (neutral
+        # setpoint -> Victron charges from the surplus); that value is realised
+        # later when the battery sells. Count it as unrealised, not profit.
+        stored_surplus = (str(step.get('reason_code', '')).startswith('PV_SURPLUS')
+                          and step.get('soc_start', 0) < 99.0)
 
         try:
             day_key = step['time'].date()
@@ -598,7 +623,11 @@ def format_plan_summary(result, *, batt_soc=None, source="", price_points=None,
                                              'exp_kwh': 0.0, 'exp_rev': 0.0, 'slots': 0})
         dt['slots'] += 1
 
-        if g > 0:
+        if stored_surplus:
+            if g < 0:
+                unrealized_solar_kwh += -g
+                unrealized_solar_rev += -g * sell
+        elif g > 0:
             total_import_kwh += g
             total_import_cost += g * buy
             dt['imp_kwh'] += g
@@ -664,7 +693,14 @@ def format_plan_summary(result, *, batt_soc=None, source="", price_points=None,
     if result.get('reason'):
         out.append(f"  Reason      : {result.get('reason')}")
     out.append(f"  Price       : {result.get('current_price', 0):.4f} /kWh")
-    out.append(f"  Battery     : {MODE_BATTERY.get(mode, '-')}")
+    # A PV-surplus "sell" is not a battery discharge: the setpoint is neutral and
+    # Victron decides (charge while there's room, export once full) — describe it
+    # accurately rather than asserting an export.
+    if str(result.get('reason_code', '')).startswith('PV_SURPLUS'):
+        battery_state = "solar surplus — Victron-managed (charge or export when full)"
+    else:
+        battery_state = MODE_BATTERY.get(mode, '-')
+    out.append(f"  Battery     : {battery_state}")
 
     # Live grid flow: use the actually-applied setpoint when provided, else the
     # planned setpoint. Positive = importing, negative = exporting, 0 = idle.
@@ -730,6 +766,10 @@ def format_plan_summary(result, *, batt_soc=None, source="", price_points=None,
 
     out.append("  " + "─" * 74)
     out.append(_row("TOTAL", g_imp_kwh, g_imp_cost, g_exp_kwh, g_exp_rev))
+    if unrealized_solar_kwh > 0.005:
+        out.append(f"  {'+ potential (stored solar)':<24}"
+                   f"{unrealized_solar_kwh:6.2f} kWh of surplus charged to the battery "
+                   f"(~€{unrealized_solar_rev:.2f} if later sold) — not counted as profit")
     out.append(f"  ({len(schedule)} forecast slots, ~{len(schedule) * result.get('slot_duration_h', 0):.1f}h"
                + (" + today's actuals)" if has_actuals else ")"))
     out.append(line)

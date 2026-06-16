@@ -155,6 +155,27 @@ def is_winter_month():
     winter_months = {9, 10, 11, 12, 1, 2}
     return datetime.now().month in winter_months
 
+
+def current_min_soc_reserve() -> float:
+    """Single source of truth for the battery minimum-SoC reserve (%).
+
+    Resolves the seasonal reserve from .env (MIN_SOC_RESERVE_WINTER / SUMMER)
+    using the one season rule (is_winter_month). Both the optimizer's planning
+    floor AND the Victron hardware MinimumSocLimit derive from this, so they can
+    never diverge. The cells' own BMS remains the ultimate low-SoC cutoff.
+    """
+    from lib.config_retrieval import retrieve_setting
+
+    def _f(name, default):
+        try:
+            return float(retrieve_setting(name))
+        except (TypeError, ValueError):
+            return default
+
+    if is_winter_month():
+        return _f('MIN_SOC_RESERVE_WINTER', 20.0)
+    return _f('MIN_SOC_RESERVE_SUMMER', 5.0)
+
 def get_seasonally_adjusted_max_charge_slots(batt_soc: float, pv_production_remaining: float = 0.0) -> int:
     """
     Returns: (int): max number of 1 hour charge slots needed to top up the battery from the grid

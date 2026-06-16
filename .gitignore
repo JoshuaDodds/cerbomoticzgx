@@ -95,3 +95,6 @@ cache.json
 homeconnect_oauth_token.json
 tibber.db
 prices.png
+
+# ESS performance history (per-cycle NDJSON logs)
+data/history/

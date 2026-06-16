@@ -9,6 +9,7 @@ import threading
 from flask import Flask, jsonify, render_template, request
 
 from frontend import data
+from frontend.live import live
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 
@@ -44,6 +45,11 @@ def api_config_set():
         return jsonify({"ok": False, "error": f"write failed: {e}"}), 500
 
 
+@app.route("/api/live")
+def api_live():
+    return jsonify(live.snapshot())
+
+
 @app.route("/healthz")
 def healthz():
     return jsonify({"ok": True})
@@ -61,6 +67,7 @@ def _host_port():
 
 def run():
     """Run the server in the foreground (blocking)."""
+    live.start()  # begin caching live MQTT values
     host, port = _host_port()
     # threaded=True so concurrent requests don't block each other; the process
     # itself is independent of the main service threads.

@@ -134,14 +134,32 @@ def main():
             mqtt_thread.start()
 
         if ACTIVE_MODULES[0]['async']['tibber_api']:
-            try:
-                post_startup()
-                asyncio.run(live_measurements())  # This blocks & acts as the parent pid of the cerbomoticGx service
-
-            except Exception as E:
-                logging.error(f"Tibber: live measurements stopped with reason: {E}. Restarting...")
-                time.sleep(5.0)
-                asyncio.run(live_measurements())  # This would also block if reached and would be our service's parent pid
+            post_startup()
+            # The live feed blocks & acts as the parent pid of the service. A
+            # transient Tibber transport error must not hard-crash the whole
+            # controller, so retry with exponential backoff instead of a single
+            # retry. Recoverable transport errors are handled inside
+            # live_measurements() (which requests a supervised restart); this loop
+            # is the safety net for anything that still bubbles up.
+            backoff = 5.0
+            while True:
+                started = time.monotonic()
+                try:
+                    asyncio.run(live_measurements())
+                    # A clean return means a handled transport error requested a
+                    # restart; loop to re-establish the feed.
+                    logging.warning("Tibber: live feed ended; re-establishing in %.0fs...", backoff)
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except Exception as E:
+                    logging.error("Tibber: live measurements stopped with reason: %s. Retrying in %.0fs...", E, backoff)
+                # A feed that ran for a meaningful duration was healthy; reset the
+                # backoff so an isolated drop reconnects quickly. Only escalate on
+                # rapid, repeated failures.
+                if time.monotonic() - started > 120.0:
+                    backoff = 5.0
+                time.sleep(backoff)
+                backoff = min(backoff * 2.0, 60.0)
 
     except (KeyboardInterrupt, SystemExit):
         shutdown()

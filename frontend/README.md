@@ -79,16 +79,30 @@ Only keys in `config_schema.py` are writable. Runtime *control* values that live
 `GlobalState`/the MQTT bus (e.g. `ess_net_metering_enabled`) are a separate future
 class of knob and will be written via `STATE.set()` instead of `.env`.
 
+## Real-time data
+
+`frontend/live.py` subscribes (read-only) to the same broker the main service uses
+(`MOSQUITTO_IP`) and caches the latest value for SoC, price, grid/PV/battery/load
+power, AC setpoint, and the published `ai_mode`/`ai_reason`/`feed_in_limit_state`.
+The UI polls `/api/live` every ~5s and overlays these live values on the slower
+plan snapshot, so the Overview (mode, SoC, price, grid flow, power-flow strip) is
+truly live. A green/grey dot on the "Now" card shows whether the live feed is
+connected; if it's offline the UI falls back to plan values. No new config — it
+reuses `MOSQUITTO_IP` and `VRM_PORTAL_ID`.
+
 ## API
 
 - `GET /api/plan` — current decision, hour-grouped schedule, day summary, staleness.
+- `GET /api/live` — live MQTT values (SoC, price, grid/PV/battery/load W, mode, …).
 - `GET /api/config` — settings schema with current values.
 - `POST /api/config` — `{ "key": ..., "value": ... }`, writes one allow-listed setting.
 - `GET /healthz` — liveness.
 
-## Notes / next steps
+## Notes / roadmap
 
 - No authentication in v1 (intended for a trusted LAN). Add a reverse proxy / auth
   before exposing beyond the LAN, especially now that config is writable.
-- Future: control toggles (via `STATE.set`), live metrics, per-module control, and a
-  SoC/price chart across the day.
+- Roadmap (next up): (1) SoC + price line chart across the horizon (bundled, no CDN);
+  (2) live power-flow mini-diagram (grid↔battery↔PV↔house); (3) control toggles
+  (enable optimizer, net metering) written via `STATE.set` (the second write path);
+  (4) historical performance (daily realised €).

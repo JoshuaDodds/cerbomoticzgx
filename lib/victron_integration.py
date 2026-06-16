@@ -64,11 +64,26 @@ def limit_grid_feed_in(enabled: bool, watts: int = 0):
         logging.error(f"Victron Integration: Failed to set grid feed-in limit ({desired_state}): {e}")
 
 
-def set_minimum_ess_soc(percent: int = 20):
-    if percent:
-        _msg = f"{{\"value\": {percent}}}"
-        logging.info(f"Setting battery sustain percent to: {percent}%")
-        publish.single(TopicsWritable['system0']['minimum_ess_soc'], payload=_msg, qos=1, retain=True, hostname=cerboGxEndpoint, port=1883)
+def set_minimum_ess_soc(percent=None):
+    """Set the Victron ESS MinimumSocLimit (the hard discharge floor).
+
+    Defaults to the single source of truth (helpers.current_min_soc_reserve)
+    so the hardware floor always matches the optimizer's seasonal reserve.
+    Idempotent: only publishes when the value actually changes.
+    """
+    if percent is None:
+        from lib.helpers import current_min_soc_reserve
+        percent = current_min_soc_reserve()
+
+    percent = int(round(float(percent)))
+
+    if STATE.get('min_ess_soc_applied') == percent:
+        return
+
+    _msg = f"{{\"value\": {percent}}}"
+    logging.info(f"Victron Integration: Setting ESS minimum SoC limit to: {percent}%")
+    publish.single(TopicsWritable['system0']['minimum_ess_soc'], payload=_msg, qos=1, retain=True, hostname=cerboGxEndpoint, port=1883)
+    STATE.set('min_ess_soc_applied', percent)
 
 def restore_default_battery_max_voltage():
     logging.info(f"Victron Integration: Restoring max charge voltage to {float_voltage}V before shutdown...")
@@ -97,8 +112,9 @@ def regulate_battery_max_voltage(ess_soc):
             publish.single(TopicsWritable["system0"]["max_charge_voltage"], payload=f"{{\"value\": \"{battery_full_voltage}\"}}", qos=1, retain=False, hostname=cerboGxEndpoint, port=1883)
             logging.info(f"Victron Integration: Adjusting max charge voltage to {battery_full_voltage} due to battery SOC reaching {retrieve_setting('MAXIMUM_ESS_SOC')}% or higher")
             publish.single("Tesla/vehicle0/solar/ess_max_charge_voltage", payload=f"{{\"value\": \"{battery_full_voltage}\"}}", qos=1, retain=True, hostname=cerboGxEndpoint, port=1883)
-            # when battery is full, return Minumum batt SOC (unless grid fails) to 20%
-            set_minimum_ess_soc(20)
+            # On full charge, re-assert the ESS minimum-SoC floor from the single
+            # source of truth (seasonal reserve), not a hardcoded value.
+            set_minimum_ess_soc()
 
         else:
             logging.debug(f"Victron Integration: No Action. Battery max charge voltage is appropriately set at {current_max_charge_voltage}V with ESS SOC at {ess_soc}%")

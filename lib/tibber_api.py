@@ -13,7 +13,7 @@ from lib.config_retrieval import retrieve_setting
 from lib.constants import logging, systemId0
 from lib.domoticz_updater import domoticz_update
 from lib.clients.mqtt_client_factory import VictronClient
-from gql.transport.exceptions import TransportClosed
+from gql.transport.exceptions import TransportClosed, TransportQueryError
 from websockets.exceptions import ConnectionClosedError
 
 logging.getLogger("gql.transport").setLevel(logging.ERROR)
@@ -67,10 +67,15 @@ def live_measurements(home=_home or None):
         home.start_live_feed(user_agent=f"cerbomoticzgx/{retrieve_setting('VERSION')}",
                              retries=10,
                              retry_interval=10)
-    except (TransportClosed, ConnectionClosedError) as e:
+    except (TransportClosed, ConnectionClosedError, TransportQueryError) as e:
+        # TransportQueryError covers Tibber refusing to start the live stream
+        # (e.g. "unable to start stream ... for device") — typically a transient
+        # Tibber-side issue or a stale/duplicate session. Route it through the
+        # same supervised restart instead of letting it crash main().
         logging.warning(
             "Tibber Error: %s. It seems we have a network/connectivity issue. "
-            "This can also be caused by a Tibber API outage. Attempting a service restart...",
+            "This can also be caused by a Tibber API outage or a stale live-feed "
+            "session. Attempting a service restart...",
             e,
         )
         # this will trigger event_handler to restart the whole service
@@ -260,8 +265,43 @@ def get_all_price_points():
     logging.warning("Tibber: Falling back to hourly price points via the tibber library.")
     return _get_all_price_points_via_library()
 
+def _current_quarter_hour_price():
+    """Return the price of the 15-minute slot containing 'now', or None.
+
+    Uses the same quarter-hourly feed the optimizer uses so the published
+    'now' price matches the AI's view (the tibber library's current price is
+    hourly).
+    """
+    try:
+        points = get_all_price_points()
+        if not points:
+            return None
+        parsed = []
+        for p in points:
+            start = p['start']
+            if not isinstance(start, datetime):
+                start = parser.parse(start, tzinfos=tzinfos)
+            parsed.append((start, p['total']))
+        parsed.sort(key=lambda x: x[0])
+        now = datetime.now(parsed[0][0].tzinfo)
+        current = None
+        for start, total in parsed:
+            if start <= now:
+                current = total
+            else:
+                break
+        return current
+    except Exception as e:
+        logging.debug(f"Tibber: could not derive 15-min current price: {e}")
+        return None
+
+
 def mqtt_publish_current_price(home):
-    value = home.current_subscription.price_info.current.total
+    # Publish the current 15-minute price when available (matches the optimizer);
+    # fall back to the library's hourly current price.
+    value = _current_quarter_hour_price()
+    if value is None:
+        value = home.current_subscription.price_info.current.total
     client.publish("Tibber/home/price_info/now/total", payload=f"{{\"value\": \"{value}\"}}", qos=0, retain=True)
 
 def current_price(home):

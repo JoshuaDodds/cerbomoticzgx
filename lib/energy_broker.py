@@ -5,12 +5,12 @@ from paho.mqtt import publish
 from lib.config_retrieval import retrieve_setting
 from lib.constants import cerboGxEndpoint, systemId0
 from lib.constants import logging, PythonToVictronWeekdayNumberConversion
-from lib.helpers import get_seasonally_adjusted_max_charge_slots, calculate_max_discharge_slots_needed, publish_message, round_up_to_nearest_10, remove_message
+from lib.helpers import get_seasonally_adjusted_max_charge_slots, calculate_max_discharge_slots_needed, publish_message, round_up_to_nearest_10, remove_message, current_min_soc_reserve
 from lib.tibber_api import lowest_48h_prices, lowest_24h_prices
 from lib.notifications import pushover_notification
 from lib.tibber_api import publish_pricing_data, get_all_price_points
 from lib.global_state import GlobalStateClient
-from lib.victron_integration import ac_power_setpoint, limit_grid_feed_in
+from lib.victron_integration import ac_power_setpoint, limit_grid_feed_in, set_minimum_ess_soc
 from lib.ai_powered_ess import optimize_schedule
 
 STATE = GlobalStateClient()
@@ -123,8 +123,11 @@ def schedule_tasks():
     # ESS Scheduled Tasks
     scheduler.every().hour.at(":00").do(manage_sale_of_stored_energy_to_the_grid)
 
-    # AI Optimization Loop (every 15 mins)
-    scheduler.every(15).minutes.do(run_ai_optimizer)
+    # AI Optimization Loop — aligned to the clock quarter-hours (:00/:15/:30/:45)
+    # so each 15-minute price slot's decision is applied right at its boundary,
+    # not offset by however many minutes after start the loop happens to fire.
+    for _qh in (":00", ":15", ":30", ":45"):
+        scheduler.every().hour.at(_qh).do(run_ai_optimizer)
 
     # Daily next-day pricing refresh + (re)optimization.
     # Tibber publishes the next day's day-ahead prices around 13:00 local time.
@@ -709,6 +712,67 @@ def _publish_plan_json(result, *, batt_soc, price_points, pv_remaining,
         logging.warning(f"AI_ESS: Failed to publish plan JSON for frontend: {e}")
 
 
+def _append_history(result, *, batt_soc, applied_setpoint, today_actuals, realized_power=None) -> None:
+    """Append one analytics-ready record per optimizer cycle to a per-day NDJSON
+    file (one JSON object per line) under HISTORY_DIR.
+
+    The ``mode``/``setpoint`` fields are the decision being applied this cycle;
+    the ``*_w`` power fields are the *realized* steady-state power measured at the
+    start of the cycle (i.e. the outcome of the previous decision), so plan-vs-
+    actual analysis is clean. Best-effort — any failure is logged and ignored so
+    it can never affect ESS control.
+    """
+    import os
+    import json
+    from datetime import datetime as _dt
+
+    try:
+        history_dir = retrieve_setting('HISTORY_DIR') or 'data/history'
+        os.makedirs(history_dir, exist_ok=True)
+
+        now = _dt.now().astimezone()
+        sched0 = (result.get('schedule') or [{}])[0]
+        act = today_actuals or {}
+        rp = realized_power or {}
+
+        def _num(value):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        record = {
+            "ts": now.isoformat(),
+            "soc": batt_soc,
+            "mode": result.get('mode'),
+            "reason_code": result.get('reason_code'),
+            "price_buy": result.get('current_price'),
+            "price_sell": sched0.get('sell'),
+            "applied_setpoint_w": applied_setpoint,
+            "limit_feed_in": result.get('limit_feed_in'),
+            "min_soc_reserve": current_min_soc_reserve(),
+            # Realized power (W) measured at cycle start = outcome of prior decision.
+            "grid_w": _num(rp.get('grid_w')),
+            "pv_w": _num(rp.get('pv_w')),
+            "load_w": _num(rp.get('load_w')),
+            "batt_w": _num(rp.get('batt_w')),
+            # Forecast context.
+            "pv_remaining_wh": STATE.get('pv_projected_remaining'),
+            "pv_tomorrow_wh": STATE.get('pv_projected_tomorrow'),
+            # Running daily actuals (reset by Tibber at midnight).
+            "day_import_kwh": act.get('imp_kwh'),
+            "day_import_cost": act.get('imp_cost'),
+            "day_export_kwh": act.get('exp_kwh'),
+            "day_export_reward": act.get('exp_rev'),
+        }
+
+        path = os.path.join(history_dir, f"ess-{now.strftime('%Y-%m-%d')}.ndjson")
+        with open(path, "a") as fh:
+            fh.write(json.dumps(record) + "\n")
+    except Exception as e:
+        logging.warning(f"AI_ESS: Failed to append history record: {e}")
+
+
 def run_ai_optimizer():
     """
     Runs the AI optimizer if enabled and applies the resulting plan to the
@@ -721,9 +785,24 @@ def run_ai_optimizer():
     try:
         # 1. Retrieve data
         batt_soc = STATE.get('batt_soc')
-        if batt_soc in (None, 0):
-            logging.warning("AI_ESS: Battery SoC not available. Skipping optimization.")
+        # NOTE: STATE.get() returns 0 for BOTH a missing key and a real 0%. With a
+        # 0% summer reserve the battery can legitimately sit at 0%, so use battery
+        # voltage as the "is the battery actually reporting" signal — only skip when
+        # there's genuinely no battery data, not when SoC is a valid 0%.
+        battery_reporting = bool(STATE.get('batt_voltage'))
+        if batt_soc is None or (batt_soc == 0 and not battery_reporting):
+            logging.warning("AI_ESS: Battery data not available (no SoC/voltage). Skipping optimization.")
             return
+
+        # Snapshot the realized power NOW, before we apply this cycle's setpoint,
+        # so the history record reflects the steady-state outcome of the prior
+        # decision (not a just-applied/transient value).
+        realized_power = {
+            'grid_w': STATE.get('ac_in_power'),
+            'pv_w': STATE.get('pv_power'),
+            'load_w': STATE.get('ac_out_power'),
+            'batt_w': STATE.get('batt_power'),
+        }
 
         prices = get_all_price_points()
         if not prices:
@@ -770,6 +849,10 @@ def run_ai_optimizer():
             else:
                 limit_grid_feed_in(enabled=False)
 
+        # Keep the Victron hardware MinimumSocLimit in sync with the seasonal
+        # reserve (single source of truth). Idempotent — only writes on change.
+        set_minimum_ess_soc()
+
         # Publish the current mode/reason for dashboards and automation.
         STATE.set('ai_mode', result.get('mode'))
         STATE.set('ai_reason', result.get('reason'))
@@ -815,9 +898,15 @@ def run_ai_optimizer():
                 f"for {slot['duration']}s to {target_soc}% SoC"
             )
 
-        # Publish the plan as JSON for the frontend dashboard (best-effort).
+        # Snapshot today's actuals once, reused by history + plan publish.
         pv_remaining = STATE.get('pv_projected_remaining')
         today_actuals = get_today_energy_actuals()
+
+        # Append an analytics-ready history record for this cycle (best-effort).
+        _append_history(result, batt_soc=batt_soc, applied_setpoint=applied_setpoint,
+                        today_actuals=today_actuals, realized_power=realized_power)
+
+        # Publish the plan as JSON for the frontend dashboard (best-effort).
         _publish_plan_json(
             result,
             batt_soc=batt_soc,

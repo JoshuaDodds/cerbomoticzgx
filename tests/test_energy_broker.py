@@ -9,10 +9,13 @@ stub_tibber_api = types.ModuleType("lib.tibber_api")
 stub_tibber_api.lowest_48h_prices = MagicMock(return_value=[])
 stub_tibber_api.lowest_24h_prices = MagicMock(return_value=[])
 stub_tibber_api.publish_pricing_data = MagicMock()
+stub_tibber_api.get_all_price_points = MagicMock(return_value=[])
 sys.modules.setdefault("lib.tibber_api", stub_tibber_api)
 
 stub_victron_integration = types.ModuleType("lib.victron_integration")
 stub_victron_integration.ac_power_setpoint = MagicMock()
+stub_victron_integration.limit_grid_feed_in = MagicMock()
+stub_victron_integration.set_minimum_ess_soc = MagicMock()
 sys.modules.setdefault("lib.victron_integration", stub_victron_integration)
 
 stub_config_retrieval = types.ModuleType("lib.config_retrieval")
@@ -80,6 +83,20 @@ def test_grid_assist_setpoint_zero_when_pv_covers_load(monkeypatch):
     # PV exceeds load -> do not import; setpoint 0 so surplus PV charges/exports.
     monkeypatch.setattr(energy_broker, "STATE", DummyState({"ac_out_power": 1000, "pv_power": 4000}))
     assert energy_broker._grid_assist_setpoint_watts() == 0
+
+
+def test_current_min_soc_reserve_is_seasonal(monkeypatch):
+    import sys
+    import lib.helpers as helpers
+    cr = sys.modules.get("lib.config_retrieval")
+    monkeypatch.setattr(cr, "retrieve_setting",
+                        lambda n: {"MIN_SOC_RESERVE_WINTER": "40", "MIN_SOC_RESERVE_SUMMER": "0"}.get(n))
+
+    monkeypatch.setattr(helpers, "is_winter_month", lambda: True)
+    assert helpers.current_min_soc_reserve() == 40.0
+
+    monkeypatch.setattr(helpers, "is_winter_month", lambda: False)
+    assert helpers.current_min_soc_reserve() == 0.0
 
 
 def _patch_common_dependencies(monkeypatch, state_values=None, settings=None):
