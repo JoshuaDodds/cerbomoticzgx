@@ -741,6 +741,37 @@ def _append_history(result, *, batt_soc, applied_setpoint, today_actuals, realiz
             except (TypeError, ValueError):
                 return None
 
+        # Forecast net € over the planned horizon (profit positive), so we can
+        # later compare it against the realised net and learn the optimizer's
+        # bias. Excludes stored PV surplus (it isn't sold, so it isn't realised
+        # revenue) to stay comparable with grid-measured actuals.
+        f_imp_cost = f_exp_rev = 0.0
+        for s in (result.get('schedule') or []):
+            try:
+                g = float(s.get('grid_energy') or 0.0)
+                b = float(s.get('price') or 0.0)
+                sl = float(s.get('sell', b) or b)
+            except (TypeError, ValueError):
+                continue
+            stored = (str(s.get('reason_code', '')).startswith('PV_SURPLUS')
+                      and float(s.get('soc_start') or 0.0) < 99.0)
+            if stored:
+                continue
+            if g > 0:
+                f_imp_cost += g * b
+            elif g < 0:
+                f_exp_rev += -g * sl
+        plan_horizon_net_eur = round(f_exp_rev - f_imp_cost, 4)
+
+        # Realised net so far today (profit positive) = export reward - import cost.
+        _exp_rev = _num(act.get('exp_rev')) or 0.0
+        _imp_cost = _num(act.get('imp_cost')) or 0.0
+        realized_net_eur = round(_exp_rev - _imp_cost, 4)
+
+        # Actual PV produced so far today (kWh) from the two MPPT daily yields.
+        pv_actual_today_kwh = round((_num(STATE.get('c1_daily_yield')) or 0.0)
+                                    + (_num(STATE.get('c2_daily_yield')) or 0.0), 3)
+
         record = {
             "ts": now.isoformat(),
             "soc": batt_soc,
@@ -759,6 +790,13 @@ def _append_history(result, *, batt_soc, applied_setpoint, today_actuals, realiz
             # Forecast context.
             "pv_remaining_wh": STATE.get('pv_projected_remaining'),
             "pv_tomorrow_wh": STATE.get('pv_projected_tomorrow'),
+            # Forecast vs actual (for learning VRM/optimizer bias over time).
+            "pv_forecast_today_kwh": _num(STATE.get('pv_projected_today')),
+            "pv_actual_today_kwh": pv_actual_today_kwh,
+            "load_forecast_today_wh": _num(STATE.get('consumption_total_projected')),
+            "load_actual_today_wh": _num(STATE.get('consumption_total_cumulative')),
+            "plan_horizon_net_eur": plan_horizon_net_eur,
+            "realized_net_eur": realized_net_eur,
             # Running daily actuals (reset by Tibber at midnight).
             "day_import_kwh": act.get('imp_kwh'),
             "day_import_cost": act.get('imp_cost'),

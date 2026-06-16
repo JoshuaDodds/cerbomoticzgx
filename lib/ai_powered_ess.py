@@ -129,6 +129,24 @@ class OptimizationEngine:
         # charge+discharge cycle is charged once.
         self.cycle_cost = _safe_float('ESS_BATTERY_CYCLE_COST', 0.0)
 
+        # (#1) Arbitrage hurdle: an extra per-kWh-discharged cost ON TOP of wear,
+        # acting as a required profit cushion so thin-spread cycles (which barely
+        # clear round-trip losses and are most exposed to forecast error) are
+        # pruned while fat-spread cycles still clear easily. Separate knob from
+        # cycle_cost so wear and trading-margin stay conceptually distinct.
+        self.arbitrage_margin = _safe_float('ESS_ARBITRAGE_MARGIN', 0.0)
+
+        # (#3) Grid-charge price ceilings — only charge the battery FROM THE GRID
+        # when energy is genuinely cheap, so we don't store expensive grid energy
+        # for a thin resale margin (PV charging is never gated). A charge slot
+        # must satisfy BOTH limits that are enabled:
+        #   * absolute: buy price must be <= ESS_MAX_GRID_CHARGE_PRICE (0 = off)
+        #   * relative: buy price must sit in the cheapest ESS_GRID_CHARGE_CHEAP_PCT
+        #               percent of the horizon (0 or >=100 = off)
+        # Charging only to reach the seasonal reserve (safety) is always allowed.
+        self.max_grid_charge_price = _safe_float('ESS_MAX_GRID_CHARGE_PRICE', 0.0)
+        self.grid_charge_cheap_pct = _safe_float('ESS_GRID_CHARGE_CHEAP_PCT', 0.0)
+
         # Planning resolution in minutes. When the native price data is coarser
         # than this (e.g. hourly Tibber prices with a 15-minute target) each
         # native price slot is sub-divided so the engine is ready for true
@@ -274,6 +292,19 @@ class OptimizationEngine:
         sell_prices = [self._sell_price(b) for b in buy_prices]
         net_loads = [p['load'] - p['pv'] for p in future_prices]
 
+        # (#3) Effective grid-charge price ceiling for this horizon: the lowest of
+        # any enabled absolute/relative limit. Grid-sourced charging above this is
+        # blocked (PV charging and reaching the safety reserve are never blocked).
+        charge_ceilings = []
+        if self.max_grid_charge_price > 0:
+            charge_ceilings.append(self.max_grid_charge_price)
+        if 0 < self.grid_charge_cheap_pct < 100 and buy_prices:
+            ordered = sorted(buy_prices)
+            idx = min(len(ordered) - 1,
+                      max(0, int(len(ordered) * self.grid_charge_cheap_pct / 100.0)))
+            charge_ceilings.append(ordered[idx])
+        grid_charge_ceiling = min(charge_ceilings) if charge_ceilings else None
+
         # DP tables. dp[t][soc] = minimum cost to reach soc at slot boundary t.
         dp = [{s: float('inf') for s in self.soc_states} for _ in range(steps + 1)]
         parent = [{s: None for s in self.soc_states} for _ in range(steps + 1)]
@@ -329,13 +360,27 @@ class OptimizationEngine:
                     if export_kwh > EPS and dc_change_kwh < -EPS and sell < self.min_sell_price - EPS:
                         continue
 
+                    # (#3) Block grid-sourced charging when the price is above the
+                    # cheap-charge ceiling. Only applies to charging that draws
+                    # from the grid (import) and lifts SoC ABOVE the seasonal
+                    # reserve — PV charging (no import) and topping up to the
+                    # safety reserve are always allowed.
+                    if (grid_charge_ceiling is not None
+                            and dc_change_kwh > EPS
+                            and import_kwh > EPS
+                            and nsoc > self.min_soc + EPS
+                            and buy > grid_charge_ceiling + EPS):
+                        continue
+
                     step_cost = import_kwh * buy - export_kwh * sell
 
-                    # Battery wear: charge a per-kWh cost on energy drawn from the
-                    # battery (discharge), so the optimizer only cycles when the
-                    # price spread clearly beats round-trip losses + wear.
-                    if self.cycle_cost > 0 and dc_change_kwh < -EPS:
-                        step_cost += (-dc_change_kwh) * self.cycle_cost
+                    # Battery wear (cycle_cost) + (#1) arbitrage margin: a per-kWh
+                    # cost on energy drawn from the battery (discharge), so the
+                    # optimizer only cycles when the price spread clearly beats
+                    # round-trip losses + wear + the required profit cushion.
+                    discharge_hurdle = self.cycle_cost + self.arbitrage_margin
+                    if discharge_hurdle > 0 and dc_change_kwh < -EPS:
+                        step_cost += (-dc_change_kwh) * discharge_hurdle
 
                     total = base_cost + step_cost
                     if total < dp[t + 1][nsoc] - EPS:

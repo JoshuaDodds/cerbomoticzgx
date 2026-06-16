@@ -23,6 +23,11 @@ class TestAIPoweredESS(unittest.TestCase):
         self.engine.expected_peak_price = 0.0
         self.engine.min_sell_price = 0.0
         self.engine.cycle_cost = 0.0
+        # New hurdle/ceiling knobs: disabled by default so tests are deterministic
+        # regardless of the host .env values.
+        self.engine.arbitrage_margin = 0.0
+        self.engine.max_grid_charge_price = 0.0
+        self.engine.grid_charge_cheap_pct = 0.0
         # Plan at native (hourly) resolution by default in tests; individual
         # tests override this to exercise sub-slot resampling.
         self.engine.slot_minutes = 60.0
@@ -247,6 +252,9 @@ class TestAIPoweredESS(unittest.TestCase):
             e.terminal_value_factor = 0.0
             e.slot_minutes = 60.0
             e.cycle_cost = cycle_cost
+            e.arbitrage_margin = 0.0
+            e.max_grid_charge_price = 0.0
+            e.grid_charge_cheap_pct = 0.0
             return e
 
         sells_zero = sum(s['action'] == 'sell' for s in make(0.0).optimize(50.0, prices)['schedule'])
@@ -254,6 +262,70 @@ class TestAIPoweredESS(unittest.TestCase):
         self.assertGreater(sells_zero, 0)
         self.assertLessEqual(sells_high, sells_zero)
         self.assertEqual(sells_high, 0)  # 1.0/kWh wear dwarfs the 0.20 spread
+
+    def _arb_engine(self, **overrides):
+        """A deterministic engine for hurdle/ceiling tests."""
+        from lib.ai_powered_ess import OptimizationEngine
+        e = OptimizationEngine()
+        e.battery_capacity = 45.0
+        e.charge_efficiency = 0.95
+        e.discharge_efficiency = 0.95
+        e.min_soc = 5.0
+        e.export_price_factor = 1.0
+        e.export_fee = 0.0
+        e.expected_peak_price = 0.0
+        e.min_sell_price = 0.0
+        e.terminal_value_factor = 0.0
+        e.slot_minutes = 60.0
+        e.cycle_cost = 0.0
+        e.arbitrage_margin = 0.0
+        e.max_grid_charge_price = 0.0
+        e.grid_charge_cheap_pct = 0.0
+        for k, v in overrides.items():
+            setattr(e, k, v)
+        return e
+
+    def test_arbitrage_margin_prunes_thin_spread_cycles(self):
+        # Thin spread (0.20 -> 0.23) is profitable with no hurdle but not once a
+        # margin larger than the spread is required.
+        base_time = datetime.now(tz.UTC).replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        prices = []
+        for i in range(24):
+            t = base_time + timedelta(hours=i)
+            prices.append({'start': t, 'total': 0.20 if i < 12 else 0.23, 'level': 'NORMAL'})
+
+        # Start at the reserve floor so any sell requires a charge-then-sell cycle
+        # (no pre-charged energy to fire-sale against the zero terminal value).
+        sells_none = sum(s['action'] == 'sell'
+                         for s in self._arb_engine(arbitrage_margin=0.0).optimize(5.0, prices)['schedule'])
+        sells_marg = sum(s['action'] == 'sell'
+                         for s in self._arb_engine(arbitrage_margin=0.10).optimize(5.0, prices)['schedule'])
+        self.assertGreater(sells_none, 0)
+        self.assertEqual(sells_marg, 0)  # 0.10/kWh hurdle dwarfs the 0.03 spread
+
+    def test_grid_charge_ceiling_blocks_expensive_charging(self):
+        # Expensive window (0.30), cheap window (0.10), then a high peak (0.60).
+        # With a ceiling of 0.15, grid charging may only happen in the cheap
+        # window; no 'buy' slot should have a price above the ceiling.
+        base_time = datetime.now(tz.UTC).replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        prices = []
+        for i in range(12):
+            t = base_time + timedelta(hours=i)
+            if i < 3:
+                p = 0.30          # expensive overnight
+            elif i < 7:
+                p = 0.10          # cheap window
+            else:
+                p = 0.60          # peak to sell into
+            prices.append({'start': t, 'total': p, 'level': 'NORMAL'})
+
+        # No PV, so any charge is grid-sourced. Start low so charging is needed.
+        pv = [0.0] * 12
+        sched = self._arb_engine(max_grid_charge_price=0.15).optimize(10.0, prices, pv_forecast=pv)['schedule']
+        buys = [s for s in sched if s['action'] == 'buy']
+        self.assertTrue(buys, "expected some grid charging in the cheap window")
+        self.assertTrue(all(s['price'] <= 0.15 + 1e-9 for s in buys),
+                        "grid charging must not occur above the 0.15 ceiling")
 
 if __name__ == '__main__':
     unittest.main()

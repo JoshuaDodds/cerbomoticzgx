@@ -105,6 +105,14 @@ def main():
     print("ENGINE TUNABLES (resolved via .secrets > STATE > .env):")
     print(f"  battery_cycle_cost   : {engine.cycle_cost:.4f} €/kWh   "
           f"(.env ESS_BATTERY_CYCLE_COST)")
+    print(f"  arbitrage_margin     : {engine.arbitrage_margin:.4f} €/kWh   "
+          f"(.env ESS_ARBITRAGE_MARGIN)")
+    _mgcp = engine.max_grid_charge_price
+    print(f"  max_grid_charge_price: {('off' if _mgcp <= 0 else f'{_mgcp:.4f} €/kWh')}   "
+          f"(.env ESS_MAX_GRID_CHARGE_PRICE)")
+    _gccp = engine.grid_charge_cheap_pct
+    print(f"  grid_charge_cheap_pct: {('off' if not (0 < _gccp < 100) else f'cheapest {_gccp:.0f}%')}   "
+          f"(.env ESS_GRID_CHARGE_CHEAP_PCT)")
     print(f"  export_price_factor  : {engine.export_price_factor:.3f}")
     print(f"  export_fee           : {getattr(engine, 'export_fee', 0.0):.4f} €/kWh")
     print(f"  min_sell_price       : {engine.min_sell_price:.3f} €/kWh")

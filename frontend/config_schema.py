@@ -23,6 +23,12 @@ CONFIG_SCHEMA = [
              "desc": "Battery is never actively exported below this price (PV surplus still exports)."},
             {"key": "ESS_BATTERY_CYCLE_COST", "label": "Battery cycle cost", "type": "float",
              "desc": "Wear cost per kWh discharged; discourages cycling for marginal arbitrage. 0 disables."},
+            {"key": "ESS_ARBITRAGE_MARGIN", "label": "Arbitrage margin", "type": "float",
+             "desc": "Extra profit cushion per kWh discharged (on top of wear); prunes thin-spread cycles. 0 disables."},
+            {"key": "ESS_MAX_GRID_CHARGE_PRICE", "label": "Max grid-charge price", "type": "float",
+             "desc": "Only grid-charge when the buy price is at/below this (PV charging never gated). 0 disables."},
+            {"key": "ESS_GRID_CHARGE_CHEAP_PCT", "label": "Grid-charge cheap %", "type": "float",
+             "desc": "Only grid-charge when the price is in the cheapest N% of the horizon. 0 or >=100 disables."},
         ],
     },
     {
