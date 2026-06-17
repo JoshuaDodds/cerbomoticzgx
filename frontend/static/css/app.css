@@ -28,6 +28,13 @@ body {
 .brand { font-weight: 700; letter-spacing: .3px; }
 .brand span { color: var(--muted); font-weight: 400; }
 .status-strip { display: flex; gap: 18px; flex-wrap: wrap; margin-left: auto; }
+
+/* Sticky-header clock + sunrise/sunset (top-right, globally useful) */
+.header-clock { display: flex; flex-direction: column; align-items: flex-end; margin-left: 22px; line-height: 1.1; }
+.header-clock .hc-time { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; color: var(--text); }
+.header-clock .hc-sun { display: flex; align-items: center; gap: 5px; color: var(--muted); font-size: 12px; margin-top: 2px; }
+.header-clock .hc-sun .ic { display: inline-flex; color: var(--muted); }
+.header-clock .hc-sun .ic + * { margin-right: 4px; }
 .status-strip .kv { display: flex; flex-direction: column; }
 .status-strip .kv b { font-size: 15px; }
 .status-strip .kv small { color: var(--muted); }
@@ -57,6 +64,23 @@ body {
 main { padding: 12px 16px 80px; max-width: 1100px; margin: 0 auto; }
 .tab-panel { display: none; }
 .tab-panel.active { display: block; }
+
+/* Live power-flow diagram + horizon chart (modular views) */
+.powerflow { max-width: 720px; margin: 0 auto; }
+.pf-legend { text-align: center; font-size: 12px; margin-top: 6px; }
+.pf-legend b { color: var(--text); font-weight: 600; }
+.chart { width: 100%; }
+.chart-legend { display: flex; gap: 18px; justify-content: center; font-size: 12px; margin-top: 6px; }
+.chart-legend .swatch { display: inline-block; width: 11px; height: 11px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
+
+/* HA-style energy metric cards (Trends tab) */
+.metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin-bottom: 14px; }
+.metric-card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; text-align: center; }
+.metric-card .metric-label { color: var(--muted); font-size: 13px; margin-top: 4px; }
+.gridbar { display: flex; height: 16px; border-radius: 8px; overflow: hidden; background: var(--line); margin: 4px 0 8px; }
+.gridbar span { display: block; height: 100%; }
+.gridbar-legend { display: flex; gap: 14px; justify-content: center; font-size: 12px; flex-wrap: wrap; }
+.gridbar-legend b { font-weight: 700; }
 
 .card {
   background: var(--panel); border: 1px solid var(--line); border-radius: 10px;

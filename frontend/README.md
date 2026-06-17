@@ -16,14 +16,19 @@ frontend/
   config_schema.py   # declarative settings schema (drives the config view, future knobs)
   templates/index.html
   static/css/app.css
-  static/js/app.js
+  static/js/app.js         # core render + polling; calls the view modules defensively
+  static/js/powerflow.js   # self-contained Live power-flow SVG (window.renderPowerFlow)
+  static/js/charts.js      # self-contained SoC+price horizon SVG (window.renderHorizonChart)
 ```
+
+The two view modules are loaded before `app.js` and invoked inside `try/catch`, so a
+failure in either is isolated and cannot break the core dashboard.
 
 - The **main service** publishes its plan as JSON (atomic write) to
   `AI_PLAN_EXPORT_PATH` (default `/dev/shm/cerbo_ai_plan.json`) on every optimizer
   run. The dashboard only *reads* that file plus `.env` — it never imports the
   control path or touches MQTT, so it cannot interfere with the optimizer.
-- Mode colors: BUY (blue), SELL (green), HOLD (amber), SELF-SUPPLY (teal).
+- Control-action colors: IDLE (grey), RETAIN (amber), BUY (blue), SELL (green).
 
 ## Running
 
@@ -34,7 +39,9 @@ pip install -r requirements.txt          # adds flask
 python -m frontend                        # serves on FRONTEND_HOST:FRONTEND_PORT
 ```
 
-Optional in-process (daemon thread) from the main service:
+Optional in-process (daemon thread) from the main service — set `FRONTEND_ENABLED=True`
+in `.env` and the main service launches it during `post_startup()`. The launch is
+guarded (try/except), so a dashboard failure can never crash the controller:
 
 ```python
 from frontend.server import run_in_thread
@@ -51,18 +58,30 @@ sharing the host's `/dev/shm` (so it can read the published plan). Expose
 
 | Setting | Default | Purpose |
 |---|---|---|
+| `FRONTEND_ENABLED` | `False` | run the dashboard in-process (daemon thread) from the main service |
 | `AI_PLAN_EXPORT_PATH` | `/dev/shm/cerbo_ai_plan.json` | where main publishes the plan / dashboard reads it |
 | `FRONTEND_HOST` | `0.0.0.0` | bind address |
 | `FRONTEND_PORT` | `8080` | bind port |
 
 ## Views
 
-- **Overview** (always visible): metric cards (mode, SoC, price, day net, next SELL,
+- **Overview** (always visible): metric cards (action, SoC, price, day net, next SELL,
   PV remaining) + the current decision and its plain-English reason.
-- **Schedule**: expandable hour → 15-min → reasoning tree, color-coded by mode, with
-  a per-hour timeline bar and aggregates. The current hour/slot are highlighted
-  (`NOW`) and the view auto-scrolls to "now" on open.
-- **Configuration**: click any value to edit it (number/select), confirm, and Save.
+- **Live** (tab): real-time power-flow diagram — Solar / Grid / Battery / House —
+  with curved connectors and animated flow dots whose direction follows real power
+  (import/export, charge/discharge), per-node live Watts + today's kWh totals, SoC
+  in the battery node, and a clock. Dependency-free SVG, updating every ~5s from
+  `/api/live` (+ daily totals from the plan's `today` block). An **EV** node appears
+  automatically when an `ev_w` live value is present (see note below).
+- **Trends** (tab): HA-style metric cards — **self-sufficiency %**, **self-consumed
+  solar %**, and a **grid balance** bar (import vs export, net) — above a gradient
+  SoC% + buy-price line chart across the full horizon with a `now` marker. The
+  derived metrics come from the plan's `today` block (computed server-side from
+  daily yields, consumption, and grid actuals).
+- **Schedule** (tab): expandable hour → 15-min → reasoning tree, color-coded by
+  control action, with a per-hour timeline bar and aggregates. The current hour/slot
+  are highlighted (`NOW`) and the view auto-scrolls to "now" on open.
+- **Configuration** (tab): click any value to edit it (number/select), confirm, and Save.
 
 ## Config knobs — how writes propagate
 
@@ -102,7 +121,16 @@ reuses `MOSQUITTO_IP` and `VRM_PORTAL_ID`.
 
 - No authentication in v1 (intended for a trusted LAN). Add a reverse proxy / auth
   before exposing beyond the LAN, especially now that config is writable.
-- Roadmap (next up): (1) SoC + price line chart across the horizon (bundled, no CDN);
-  (2) live power-flow mini-diagram (grid↔battery↔PV↔house); (3) control toggles
-  (enable optimizer, net metering) written via `STATE.set` (the second write path);
-  (4) historical performance (daily realised €).
+- **Done:** ✅ (1) SoC + price horizon chart (Trends tab, no CDN); ✅ (2) live
+  power-flow mini-diagram (Live tab, no CDN). Both are isolated modules.
+- Roadmap (next up):
+  - (3) **Control toggles** (enable optimizer, net metering) written via `STATE.set`
+    — the second write path, distinct from `.env` config knobs.
+  - (4) **Historical performance** view — realised daily € from the history NDJSON.
+  - (5) **Forecast-accuracy** view — predicted-vs-actual per slot from the `kind:
+    "settlement"` records (net-€ error, PV/load forecast bias over time).
+  - (6) **Timeline** — unified past-actuals + forward-plan strip (the settlement
+    data is the backbone; the horizon chart is the forward half).
+  - (7) **Battery-health** widget — cycles/day and €-per-cycle, to watch wear vs gain.
+  - (8) **Auth / reverse-proxy** hardening + a mobile-responsive layout.
+  - (9) **CSV export** of plan + history for offline analysis.

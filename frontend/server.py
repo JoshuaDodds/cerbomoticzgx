@@ -4,6 +4,7 @@ Runs standalone (own process / container sidecar) via ``python -m frontend`` or
 can be started as a daemon thread from the main service via ``run_in_thread()``.
 """
 import os
+import logging
 import threading
 
 from flask import Flask, jsonify, render_template, request
@@ -12,6 +13,10 @@ from frontend import data
 from frontend.live import live
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
+# Don't let browsers cache the dashboard's JS/CSS — it's edited often and served
+# on a trusted LAN, so always revalidate (avoids stale powerflow.js/charts.js
+# after an update without needing a hard refresh).
+app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 
 
 @app.route("/")
@@ -65,8 +70,19 @@ def _host_port():
     return host, port
 
 
+def _debug_enabled() -> bool:
+    env = data._env()
+    raw = env.get("FRONTEND_DEBUG") or os.environ.get("FRONTEND_DEBUG") or ""
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
 def run():
     """Run the server in the foreground (blocking)."""
+    # Per-request HTTP logging (werkzeug) is noisy and, when the dashboard runs
+    # in-process, pollutes the main service log — silence it unless FRONTEND_DEBUG
+    # is on. Errors still surface (level ERROR).
+    if not _debug_enabled():
+        logging.getLogger("werkzeug").setLevel(logging.ERROR)
     live.start()  # begin caching live MQTT values
     host, port = _host_port()
     # threaded=True so concurrent requests don't block each other; the process

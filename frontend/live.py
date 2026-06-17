@@ -42,6 +42,9 @@ class MqttLive:
             "pv_w": f"N/{sid}/system/0/Dc/Pv/Power",
             "load_w": f"N/{sid}/vebus/276/Ac/Out/P",
             "batt_w": f"N/{sid}/battery/277/Dc/0/Power",
+            # EV charging power (Watts) — the main service reads it from Domoticz
+            # and publishes it here. Absent => the EV node stays hidden.
+            "ev_w": "Cerbomoticzgx/GlobalState/ev_power",
             "setpoint_w": f"N/{sid}/settings/0/Settings/CGwacs/AcPowerSetPoint",
             "mode": "Cerbomoticzgx/GlobalState/ai_mode",
             "control_action": "Cerbomoticzgx/GlobalState/ai_control_action",
@@ -111,6 +114,7 @@ class MqttLive:
         out["pv_w"] = _num("pv_w")
         out["load_w"] = _num("load_w")
         out["batt_w"] = _num("batt_w")
+        out["ev_w"] = _num("ev_w")
         out["setpoint_w"] = _num("setpoint_w")
         out["mode"] = vals.get("mode")
         out["control_action"] = vals.get("control_action")

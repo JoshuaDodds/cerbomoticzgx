@@ -8,7 +8,8 @@ from lib.energy_broker import (
     manage_sale_of_stored_energy_to_the_grid,
     manage_grid_usage_based_on_current_price,
     set_charging_schedule,
-    run_ai_optimizer)
+    run_ai_optimizer,
+    _publish_domoticz_aux)
 
 
 STATE = GlobalStateClient()
@@ -32,6 +33,11 @@ def apply_energy_broker_logic():
     """Applies energy broker state and logic post startup."""
     if not ACTIVE_MODULES[0]['sync']['energy_broker']:
         return
+
+    # Run the once-a-minute Domoticz poll immediately so EV/gas/sunrise-sunset are
+    # populated for the FIRST plan publish (otherwise they're blank on restart
+    # until the next scheduled poll).
+    _publish_domoticz_aux()
 
     run_ai_optimizer()
 

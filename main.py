@@ -113,6 +113,17 @@ def post_startup():
     config_watcher = ConfigWatcher(handler=handle_env_change)
     config_watcher.start()
 
+    # Optionally run the read-only dashboard in-process (daemon thread). Guarded
+    # so a frontend failure can NEVER crash the controller; default off (the
+    # dashboard normally runs as its own process / container sidecar).
+    if str(retrieve_setting('FRONTEND_ENABLED') or '').strip().lower() in ('1', 'true', 'yes', 'on'):
+        try:
+            from frontend.server import run_in_thread
+            run_in_thread()
+            logging.info("Frontend dashboard started in-process (FRONTEND_ENABLED).")
+        except Exception as FrontendError:
+            logging.warning(f"Frontend dashboard failed to start; continuing without it: {FrontendError}")
+
     logging.info(f"post_startup() actions complete. v{retrieve_setting('VERSION')} Initialization complete.")
 
 

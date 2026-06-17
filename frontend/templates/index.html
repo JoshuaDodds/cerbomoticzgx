@@ -12,6 +12,7 @@
     <div id="status-strip" class="status-strip">
       <span class="muted">loading…</span>
     </div>
+    <div id="header-clock" class="header-clock"></div>
   </header>
 
   <section class="overview">
@@ -20,14 +21,33 @@
       <div id="solar" class="card solar"></div>
       <div id="decision" class="card decision"></div>
     </div>
+    <!-- Day cost summary lives here (above the tabs) so it's visible on every tab. -->
+    <div id="day-summary" class="card"></div>
   </section>
 
   <nav class="tabs">
+    <button class="tab" data-tab="live">Live</button>
+    <button class="tab" data-tab="trends">Trends</button>
     <button class="tab active" data-tab="schedule">Schedule</button>
     <button class="tab" data-tab="config">Configuration</button>
   </nav>
 
   <main>
+    <section id="tab-live" class="tab-panel">
+      <div class="card">
+        <h3 style="margin:2px 0 10px">Live power flow</h3>
+        <div id="powerflow" class="powerflow"><span class="muted">waiting for live feed…</span></div>
+      </div>
+    </section>
+
+    <section id="tab-trends" class="tab-panel">
+      <div id="energy-metrics" class="metrics-grid"></div>
+      <div class="card">
+        <h3 style="margin:2px 0 10px">SoC &amp; price across the horizon</h3>
+        <div id="horizon-chart" class="chart"><span class="muted">no plan yet…</span></div>
+      </div>
+    </section>
+
     <section id="tab-schedule" class="tab-panel active">
       <div class="legend">
         <span class="chip mode-idle">IDLE</span>
@@ -36,8 +56,6 @@
         <span class="chip mode-sell">SELL</span>
         <span class="muted">— click an hour to expand to 15-min, click a slot for the reason</span>
       </div>
-
-      <div id="day-summary" class="card"></div>
 
       <div class="card">
         <div class="table-head hour-row">
@@ -63,6 +81,10 @@
     <button id="refresh" class="btn">Refresh</button>
   </footer>
 
+  <!-- Self-contained, dependency-free view modules. Loaded before app.js, which
+       calls them defensively (try/catch) so a failure here can't break the rest. -->
+  <script src="{{ url_for('static', filename='js/powerflow.js') }}"></script>
+  <script src="{{ url_for('static', filename='js/charts.js') }}"></script>
   <script src="{{ url_for('static', filename='js/app.js') }}"></script>
 </body>
 </html>

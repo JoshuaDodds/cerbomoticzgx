@@ -129,6 +129,9 @@ def schedule_tasks():
     for _qh in (":00", ":15", ":30", ":45"):
         scheduler.every().hour.at(_qh).do(run_ai_optimizer)
 
+    # Poll Domoticz for EV charging power + gas usage for the dashboard (best-effort).
+    scheduler.every(1).minutes.do(_publish_domoticz_aux)
+
     # Daily next-day pricing refresh + (re)optimization.
     # Tibber publishes the next day's day-ahead prices around 13:00 local time.
     # At 13:05 we refresh pricing so the optimizer can plan over the full
@@ -147,6 +150,40 @@ def schedule_tasks():
         schedule_type='48h',
         charge_context='nightly',
     )
+
+
+def _publish_domoticz_aux():
+    """Read EV charging power + gas usage from Domoticz and publish them to STATE
+    (mirrored to the MQTT GlobalState topics) so the dashboard can show an EV node
+    and gas usage. Best-effort and read-only — any failure is ignored and never
+    affects ESS control. IDXs are configurable (DOMOTICZ_EV_IDX / DOMOTICZ_GAS_IDX).
+    """
+    try:
+        from lib.domoticz_updater import domoticz_device_number, domoticz_sun_times
+        ev_idx = retrieve_setting('DOMOTICZ_EV_IDX') or '627'
+        gas_idx = retrieve_setting('DOMOTICZ_GAS_IDX') or '291'
+        ev_w = domoticz_device_number(int(ev_idx), fields=("Usage", "Data"))     # live W
+        if ev_w is not None:
+            STATE.set('ev_power', round(ev_w, 1))
+        ev_kwh = domoticz_device_number(int(ev_idx), fields=("CounterToday",))   # today kWh
+        if ev_kwh is not None:
+            STATE.set('ev_today_kwh', round(ev_kwh, 3))
+        gas_m3 = domoticz_device_number(int(gas_idx), fields=("CounterToday", "Data"))
+        if gas_m3 is not None:
+            STATE.set('gas_today_m3', round(gas_m3, 3))
+        sunrise, sunset = domoticz_sun_times()
+        if sunrise:
+            STATE.set('sun_rise', sunrise)
+        if sunset:
+            STATE.set('sun_set', sunset)
+        if ev_w is None and gas_m3 is None:
+            logging.warning("AI_ESS: Domoticz aux read returned nothing — check DZ_URL_PREFIX "
+                            "and IDXs (ev=%s, gas=%s).", ev_idx, gas_idx)
+        else:
+            logging.debug("AI_ESS: Domoticz aux — ev=%sW gas=%sm3 sun=%s/%s",
+                          ev_w, gas_m3, sunrise, sunset)
+    except Exception as e:
+        logging.warning(f"AI_ESS: Domoticz aux publish failed: {e}")
 
 
 def retrieve_latest_tibber_pricing():
@@ -604,21 +641,90 @@ def _estimate_daily_consumption_kwh() -> float:
     return DAILY_HOME_ENERGY_CONSUMPTION
 
 
+def _historical_load_by_slot(days: int = 3) -> dict:
+    """Average realised house load (kW) per quarter-hour-of-day over the last
+    ``days`` days of history, keyed by ``'HH:MM'`` (15-min buckets).
+
+    This is the empirical, per-slot consumption model: e.g. the 06:00 bucket
+    reflects what the house actually drew at 06:00 across recent days, so the
+    optimizer stops assuming free morning solar covers the load. Samples taken
+    during heavy battery activity (|batt_w| > 4 kW) are excluded because the
+    AC-out reading is unreliable then. Returns {} when there's no usable history.
+    """
+    import os
+    import json
+    from datetime import datetime as _dt, timedelta as _td
+
+    try:
+        history_dir = retrieve_setting('HISTORY_DIR') or 'data/history'
+        buckets = {}  # "HH:MM" -> [load_kw, ...]
+        today = _dt.now().date()
+        for i in range(max(1, days)):
+            d = today - _td(days=i)
+            path = os.path.join(history_dir, f"ess-{d.strftime('%Y-%m-%d')}.ndjson")
+            if not os.path.exists(path):
+                continue
+            with open(path) as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        r = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if r.get('kind') == 'settlement':
+                        continue
+                    load, batt, ts = r.get('load_w'), r.get('batt_w'), r.get('ts')
+                    if load is None or ts is None:
+                        continue
+                    try:
+                        if batt is not None and abs(float(batt)) > 4000:
+                            continue
+                        when = _dt.fromisoformat(ts)
+                        key = f"{when.hour:02d}:{(when.minute // 15) * 15:02d}"
+                        buckets.setdefault(key, []).append(float(load) / 1000.0)
+                    except (TypeError, ValueError):
+                        continue
+        return {k: sum(v) / len(v) for k, v in buckets.items() if v}
+    except Exception as e:
+        logging.debug(f"EnergyBroker: historical load read failed: {e}")
+        return {}
+
+
 def _build_load_forecast_by_slot(price_slots: list, slot_duration_h: float) -> dict:
     """Build a per-slot house-load forecast (kWh) keyed by slot start time.
 
-    Distributes the estimated daily consumption across slots using a diurnal
-    profile, so the optimizer accounts for self-usage (notably the evening peak)
-    and does not over-estimate how much stored energy is available to sell.
+    Primary model: the trailing 3-day average of the *realised* load for that
+    slot-of-day (so 06:00 reflects the real morning draw rather than assuming
+    solar covers it). Falls back to the diurnal-profile distribution of the
+    estimated daily consumption for any slot without recent history.
     """
+    from datetime import timedelta as _td
+    hist = _historical_load_by_slot(3)
     daily_kwh = _estimate_daily_consumption_kwh()
     profile = _hourly_load_profile()
     out = {}
     for slot in price_slots:
         start = slot['start']
-        # profile[hour] is the fraction of the daily load in that clock hour;
-        # scale by the native slot length so sub-slots sum back to the hour.
-        out[start] = daily_kwh * profile[start.hour] * slot_duration_h
+        load_kwh = None
+        if hist:
+            # Average the 15-min buckets this slot spans (1 for a 15-min slot, 4
+            # for an hourly slot), then scale to the slot length.
+            n_buckets = max(1, int(round(slot_duration_h * 4)))
+            kws = []
+            for b in range(n_buckets):
+                t = start + _td(minutes=15 * b)
+                key = f"{t.hour:02d}:{(t.minute // 15) * 15:02d}"
+                if key in hist:
+                    kws.append(hist[key])
+            if kws:
+                load_kwh = (sum(kws) / len(kws)) * slot_duration_h
+        if load_kwh is None:
+            # Fallback: profile[hour] is the fraction of daily load in that clock
+            # hour; scale by the native slot length so sub-slots sum to the hour.
+            load_kwh = daily_kwh * profile[start.hour] * slot_duration_h
+        out[start] = load_kwh
     return out
 
 
@@ -683,6 +789,41 @@ def _publish_plan_json(result, *, batt_soc, price_points, pv_remaining,
             'target_soc': s['target_soc'],
         } for s in result.get('victron_slots', [])]
 
+        # Daily totals + HA-style derived metrics for the dashboard (computed here
+        # where STATE is available; refreshed each optimizer cycle).
+        _act = today_actuals or {}
+
+        def _fnum(v):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+
+        solar_kwh = (_fnum(STATE.get('c1_daily_yield')) or 0.0) + (_fnum(STATE.get('c2_daily_yield')) or 0.0)
+        _cons_wh = _fnum(STATE.get('consumption_total_cumulative'))
+        cons_kwh = (_cons_wh / 1000.0) if _cons_wh is not None else None
+        g_imp = _fnum(_act.get('imp_kwh')) or 0.0
+        g_exp = _fnum(_act.get('exp_kwh')) or 0.0
+        self_cons_solar = (max(0.0, min(100.0, (solar_kwh - g_exp) / solar_kwh * 100.0))
+                           if solar_kwh > 0.01 else None)
+        self_suff = (max(0.0, min(100.0, (cons_kwh - g_imp) / cons_kwh * 100.0))
+                     if (cons_kwh and cons_kwh > 0.01) else None)
+        today_block = {
+            'solar_kwh': round(solar_kwh, 2),
+            'consumption_kwh': round(cons_kwh, 2) if cons_kwh is not None else None,
+            'grid_import_kwh': round(g_imp, 2),
+            'grid_export_kwh': round(g_exp, 2),
+            'grid_import_cost': _fnum(_act.get('imp_cost')),
+            'grid_export_reward': _fnum(_act.get('exp_rev')),
+            'net_imported_kwh': round(g_imp - g_exp, 2),
+            'self_consumed_solar_pct': round(self_cons_solar) if self_cons_solar is not None else None,
+            'self_sufficiency_pct': round(self_suff) if self_suff is not None else None,
+            'gas_m3': _fnum(STATE.get('gas_today_m3')),   # from Domoticz (best-effort)
+            'ev_kwh': _fnum(STATE.get('ev_today_kwh')),
+            'sun_rise': STATE.get('sun_rise') or None,
+            'sun_set': STATE.get('sun_set') or None,
+        }
+
         payload = {
             'generated_at': _dt.now().astimezone().isoformat(),
             'battery_soc': batt_soc,
@@ -701,6 +842,7 @@ def _publish_plan_json(result, *, batt_soc, price_points, pv_remaining,
                 'limit_feed_in': result.get('limit_feed_in'),
             },
             'today_actuals': today_actuals,
+            'today': today_block,
             'victron_slots': victron_slots,
             'schedule': schedule,
         }
@@ -1087,21 +1229,14 @@ def run_ai_optimizer():
             today_actuals=today_actuals,
         )
 
-        # Log the full plan (same view as scripts/ai_ess_dryrun.py) so the
-        # service log shows the active plan and how it changes over time.
-        from lib.ai_powered_ess import format_plan_summary
+        # The full plan view is available via the web UI and scripts/ai_ess_dryrun.py,
+        # so we keep the service log clean with a one-line summary instead of the
+        # multi-line plan table.
         logging.info(
-            "AI_ESS: Optimization complete.\n%s",
-            format_plan_summary(
-                result,
-                batt_soc=batt_soc,
-                source="live STATE",
-                price_points=len(prices),
-                pv_remaining=pv_remaining,
-                max_hours=12,
-                today_actuals=today_actuals,
-                applied_setpoint=applied_setpoint,
-            ),
+            "AI_ESS: Optimization complete — action=%s setpoint=%sW SoC=%.0f%% price=%.3f",
+            result.get('control_action'), applied_setpoint,
+            (batt_soc if batt_soc is not None else float('nan')),
+            (result.get('current_price') or 0.0),
         )
 
         # Record success for the legacy-fallback health check.

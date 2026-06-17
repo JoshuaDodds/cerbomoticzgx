@@ -60,6 +60,8 @@ def test_build_load_forecast_distributes_daily_total(monkeypatch):
     monkeypatch.setattr(energy_broker, "retrieve_setting", lambda name: None)
     # 20 kWh forecast for the day (VRM consumption forecast is in Wh).
     monkeypatch.setattr(energy_broker, "STATE", DummyState({"consumption_total_projected": 20000}))
+    # No history -> exercise the diurnal-profile fallback deterministically.
+    monkeypatch.setattr(energy_broker, "_historical_load_by_slot", lambda days=3: {})
 
     slots = [{"start": datetime(2026, 6, 13, h, 0, 0)} for h in range(24)]
     forecast = energy_broker._build_load_forecast_by_slot(slots, 1.0)
@@ -67,6 +69,18 @@ def test_build_load_forecast_distributes_daily_total(monkeypatch):
     assert abs(sum(forecast.values()) - 20.0) < 1e-6
     # Evening consumption greater than overnight.
     assert forecast[datetime(2026, 6, 13, 19, 0, 0)] > forecast[datetime(2026, 6, 13, 3, 0, 0)]
+
+
+def test_load_forecast_prefers_historical_average(monkeypatch):
+    from datetime import datetime
+    # Realised 0.8 kW for the 06:00 quarter-hours over the last few days.
+    monkeypatch.setattr(energy_broker, "_historical_load_by_slot",
+                        lambda days=3: {"06:00": 0.8, "06:15": 0.8, "06:30": 0.8, "06:45": 0.8})
+    slots = [{"start": datetime(2026, 6, 17, 6, m, 0)} for m in (0, 15, 30, 45)]
+    fc = energy_broker._build_load_forecast_by_slot(slots, 0.25)
+    # 0.8 kW * 0.25 h = 0.20 kWh per 15-min slot (empirical, not profile-derived).
+    for s in slots:
+        assert abs(fc[s["start"]] - 0.20) < 1e-6
 
 
 def test_estimate_daily_consumption_prefers_vrm_forecast(monkeypatch):

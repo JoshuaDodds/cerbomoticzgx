@@ -445,6 +445,19 @@ async function loadConfig() {
   }
 }
 
+// Optional view modules (powerflow.js / charts.js). Called defensively so a
+// failure in a module can never break the core dashboard render.
+function safeRenderPowerFlow() {
+  try { if (window.renderPowerFlow) window.renderPowerFlow("powerflow", lastLive, lastPlan); }
+  catch (e) { /* isolated: module failure must not affect the rest */ }
+}
+function safeRenderChart() {
+  try { if (window.renderHorizonChart) window.renderHorizonChart("horizon-chart", lastPlan); }
+  catch (e) { /* isolated */ }
+  try { if (window.renderEnergyMetrics) window.renderEnergyMetrics("energy-metrics", lastPlan); }
+  catch (e) { /* isolated */ }
+}
+
 async function refreshPlan() {
   try {
     lastPlan = await fetch("/api/plan").then((r) => r.json());
@@ -456,6 +469,7 @@ async function refreshPlan() {
       renderHours(lastPlan);
       lastHoursGen = lastPlan.generated_at;
     }
+    safeRenderChart();
     renderMeta(lastPlan);
   } catch (e) {
     $("#status-strip").innerHTML = `<span class="cost">error loading: ${e}</span>`;
@@ -466,8 +480,26 @@ async function pollLive() {
   try {
     lastLive = await fetch("/api/live").then((r) => r.json());
     renderOverview();           // overlay live values onto the plan
+    safeRenderPowerFlow();
     if (lastPlan) renderMeta(lastPlan);
   } catch (e) { /* keep last values on transient errors */ }
+}
+
+// Sticky-header clock + sunrise/sunset (globally useful info). The clock ticks
+// every second; sun times come from the plan's `today` block.
+const SUN_ICON = {
+  rise: '<svg width="15" height="15" viewBox="0 0 24 24" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="20" x2="21" y2="20"/><path d="M7 16 a5 5 0 0 1 10 0"/><line x1="12" y1="8" x2="12" y2="4"/><polyline points="9,7 12,4 15,7"/></g></svg>',
+  set: '<svg width="15" height="15" viewBox="0 0 24 24" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="20" x2="21" y2="20"/><path d="M7 16 a5 5 0 0 1 10 0"/><line x1="12" y1="4" x2="12" y2="8"/><polyline points="9,5 12,8 15,5"/></g></svg>',
+};
+function renderHeaderClock() {
+  const el = $("#header-clock");
+  if (!el) return;
+  const now = new Date().toLocaleTimeString([], { hour12: false });
+  const t = (lastPlan && lastPlan.today) || {};
+  const sun = (t.sun_rise && t.sun_set)
+    ? `<span class="hc-sun"><span class="ic">${SUN_ICON.rise}</span>${t.sun_rise}<span class="ic">${SUN_ICON.set}</span>${t.sun_set}</span>`
+    : "";
+  el.innerHTML = `<span class="hc-time">${now}</span>${sun}`;
 }
 
 async function load() {
@@ -478,6 +510,8 @@ async function load() {
 
 $("#refresh").addEventListener("click", load);
 load();
+renderHeaderClock();
 // Plan refreshes slowly (changes only when the optimizer runs); live values fast.
 setInterval(refreshPlan, 30000);
 setInterval(pollLive, 5000);
+setInterval(renderHeaderClock, 1000);

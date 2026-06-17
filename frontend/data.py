@@ -233,6 +233,7 @@ def get_plan() -> dict:
         "price_points": raw.get("price_points"),
         "slot_duration_h": raw.get("slot_duration_h"),
         "current": raw.get("current", {}),
+        "today": raw.get("today", {}),
         "victron_slots": raw.get("victron_slots", []),
         "hours": group_by_hour(schedule),
         "day_summary": day_summary(schedule, raw.get("today_actuals")),
