@@ -30,6 +30,16 @@ const netHtml = (net) => {
   const profit = net < 0;
   return `<span class="${profit ? "profit" : "cost"}">${eur(Math.abs(net))} ${profit ? "profit" : "cost"}</span>`;
 };
+// Signed grid flow (+ import / − export), plain. Production/consumption are
+// always positive; show "—" (muted) when ~0.
+const fmtGrid = (v) => {
+  if (v == null) return "—";
+  v = Number(v);
+  if (Math.abs(v) < 0.005) return '<span class="muted">0.00</span>';
+  return `${v > 0 ? "+" : "−"}${Math.abs(v).toFixed(2)}`;
+};
+const prodCell = (v) => (v == null || Math.abs(Number(v)) < 0.005) ? '<span class="muted">—</span>' : Number(v).toFixed(2);
+const consCell = (v) => (v == null || Math.abs(Number(v)) < 0.005) ? '<span class="muted">—</span>' : Number(v).toFixed(2);
 // Consistent power formatting: watts under 1 kW, kW at or above.
 const fmtPower = (w) => {
   if (w == null) return "—";
@@ -257,7 +267,9 @@ function slotDetail(s) {
     <div class="grid">
       <div><small>buy / sell</small>€${Number(s.price).toFixed(4)} / €${Number(s.sell).toFixed(4)}</div>
       <div><small>SoC</small>${Number(s.soc_start).toFixed(0)}% → ${Number(s.soc_end).toFixed(0)}%</div>
-      <div><small>grid energy</small>${Number(s.grid_energy).toFixed(2)} kWh</div>
+      <div><small>grid (+imp/−exp)</small>${fmtGrid(s.grid_energy)} kWh</div>
+      <div><small>production</small>${s.pv != null ? Number(s.pv).toFixed(2) + " kWh" : "—"}</div>
+      <div><small>consumption</small>${s.load != null ? Number(s.load).toFixed(2) + " kWh" : "—"}</div>
       <div><small>reason code</small>${s.reason_code || "—"}</div>
     </div>`;
   return d;
@@ -276,8 +288,9 @@ function renderHours(plan) {
       `<span class="col-time"><span class="caret">▸</span>${h.label}${nowTag}</span>` +
       `<span class="col-bar"></span>` +
       `<span class="col-num">€${h.avg_price.toFixed(3)}</span>` +
-      `<span class="col-num">${h.import_kwh.toFixed(2)}</span>` +
-      `<span class="col-num">${h.export_kwh.toFixed(2)}</span>` +
+      `<span class="col-num">${fmtGrid(h.grid_kwh)}</span>` +
+      `<span class="col-num">${prodCell(h.production_kwh)}</span>` +
+      `<span class="col-num">${consCell(h.consumption_kwh)}</span>` +
       `<span class="col-num">${Math.round(h.soc_start)}→${Math.round(h.soc_end)}%</span>` +
       `<span class="col-num">${netHtml(h.net_cost)}</span>`;
     row.querySelector(".col-bar").appendChild(timelineBar(h));
@@ -293,12 +306,14 @@ function renderHours(plan) {
       const idle = isIdle(s);   // IDLE flow is projected, not committed
       const slotNet = imp * Number(s.price) - exp * sell;
       const muted = (v) => `<span class='muted'>${v}</span>`;
+      const gridStr = fmtGrid(g);
       sr.innerHTML =
         `<span><span class="slot-dot" style="background:var(--${slotColorVar(s)})"></span>${s.time.slice(11, 16)}</span>` +
         `<span>${caOf(s)}</span>` +
         `<span class="col-num">€${Number(s.price).toFixed(3)}</span>` +
-        `<span class="col-num">${idle ? muted(imp > 0 ? imp.toFixed(2) : "·") : (imp > 0 ? imp.toFixed(2) : "—")}</span>` +
-        `<span class="col-num">${idle ? muted(exp > 0 ? exp.toFixed(2) : "·") : (exp > 0 ? exp.toFixed(2) : "—")}</span>` +
+        `<span class="col-num">${idle ? muted(gridStr) : gridStr}</span>` +
+        `<span class="col-num">${prodCell(s.pv)}</span>` +
+        `<span class="col-num">${consCell(s.load)}</span>` +
         `<span class="col-num">${Math.round(s.soc_start)}→${Math.round(s.soc_end)}%</span>` +
         `<span class="col-num">${idle ? muted("projected") : netHtml(slotNet)}</span>`;
       const detail = slotDetail(s);

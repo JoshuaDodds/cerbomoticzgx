@@ -85,6 +85,7 @@ def group_by_hour(schedule: list) -> list:
                 "import_kwh": 0.0, "export_kwh": 0.0,
                 "import_cost": 0.0, "export_rev": 0.0,
                 "idle_imp_cost": 0.0, "idle_exp_rev": 0.0,
+                "grid_kwh": 0.0, "production_kwh": 0.0, "consumption_kwh": 0.0,
                 "prices": [],
                 "mode_counts": {},
             }
@@ -93,6 +94,10 @@ def group_by_hour(schedule: list) -> list:
         g = slot.get("grid_energy", 0.0) or 0.0
         buy = slot.get("price", 0.0) or 0.0
         sell = slot.get("sell", buy) or buy
+        # Physical energy balance per hour (signed grid: + import / − export).
+        h["grid_kwh"] += g
+        h["production_kwh"] += slot.get("pv", 0.0) or 0.0
+        h["consumption_kwh"] += slot.get("load", 0.0) or 0.0
         if is_idle(slot):
             # IDLE = projected only (Victron decides), kept out of committed net.
             if g > 0:
@@ -126,6 +131,9 @@ def group_by_hour(schedule: list) -> list:
             "avg_price": sum(h["prices"]) / n,
             "import_kwh": round(h["import_kwh"], 2),
             "export_kwh": round(h["export_kwh"], 2),
+            "grid_kwh": round(h["grid_kwh"], 2),
+            "production_kwh": round(h["production_kwh"], 2),
+            "consumption_kwh": round(h["consumption_kwh"], 2),
             "projected_idle_net": round(h["idle_exp_rev"] - h["idle_imp_cost"], 3),
             "net_kwh": round(h["import_kwh"] - h["export_kwh"], 2),
             "net_cost": round(h["import_cost"] - h["export_rev"], 3),

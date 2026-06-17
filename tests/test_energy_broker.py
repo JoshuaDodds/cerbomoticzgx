@@ -71,6 +71,21 @@ def test_build_load_forecast_distributes_daily_total(monkeypatch):
     assert forecast[datetime(2026, 6, 13, 19, 0, 0)] > forecast[datetime(2026, 6, 13, 3, 0, 0)]
 
 
+def test_pv_forecast_uses_learned_shape(monkeypatch):
+    from datetime import datetime, date
+    # 10 kWh remaining today; learned shape: nothing at 06:00, everything midday.
+    monkeypatch.setattr(energy_broker, "STATE",
+                        DummyState({"pv_projected_remaining": 10000, "pv_projected_tomorrow": 0}))
+    monkeypatch.setattr(energy_broker, "_pv_shape_by_slot", lambda days=5: {"06:00": 0.0, "12:00": 4.0})
+    t = date.today()
+    slots = [{"start": datetime(t.year, t.month, t.day, 6, 0)},
+             {"start": datetime(t.year, t.month, t.day, 12, 0)}]
+    fc = energy_broker._build_pv_forecast_by_slot(slots, 0.25)
+    # All 10 kWh is shaped onto the midday slot; the shaded 06:00 slot gets ~0.
+    assert abs(fc[slots[1]["start"]] - 10.0) < 1e-6
+    assert fc.get(slots[0]["start"], 0.0) < 1e-6
+
+
 def test_load_forecast_prefers_historical_average(monkeypatch):
     from datetime import datetime
     # Realised 0.8 kW for the 06:00 quarter-hours over the last few days.

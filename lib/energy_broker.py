@@ -482,15 +482,64 @@ def run_daily_price_update_and_optimize():
     run_ai_optimizer()
 
 
+def _pv_shape_by_slot(days: int = 5) -> dict:
+    """Learned PV *shape*: mean realised PV power (kW) per quarter-hour-of-day
+    over the last ``days`` days, keyed by ``'HH:MM'``.
+
+    Used only as relative weights to redistribute the VRM daily total — so the
+    magnitude still comes from VRM (which captures today's weather), while the
+    intraday SHAPE comes from your panels' actual curve (e.g. shaded/near-zero
+    early morning, peak midday). This is weather-robust precisely because it's a
+    normalised shape, not an average of absolute generation. Returns {} when no
+    usable history (caller falls back to an even spread).
+    """
+    import os
+    import json
+    from datetime import datetime as _dt, timedelta as _td
+
+    try:
+        history_dir = retrieve_setting('HISTORY_DIR') or 'data/history'
+        buckets = {}
+        today = _dt.now().date()
+        for i in range(max(1, days)):
+            d = today - _td(days=i)
+            path = os.path.join(history_dir, f"ess-{d.strftime('%Y-%m-%d')}.ndjson")
+            if not os.path.exists(path):
+                continue
+            with open(path) as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        r = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if r.get('kind') == 'settlement':
+                        continue
+                    pv, ts = r.get('pv_w'), r.get('ts')
+                    if pv is None or ts is None:
+                        continue
+                    try:
+                        when = _dt.fromisoformat(ts)
+                        key = f"{when.hour:02d}:{(when.minute // 15) * 15:02d}"
+                        buckets.setdefault(key, []).append(max(0.0, float(pv)) / 1000.0)
+                    except (TypeError, ValueError):
+                        continue
+        return {k: sum(v) / len(v) for k, v in buckets.items() if v}
+    except Exception as e:
+        logging.debug(f"EnergyBroker: PV shape read failed: {e}")
+        return {}
+
+
 def _build_pv_forecast_by_slot(price_slots: list, slot_duration_h: float) -> dict:
     """Build a per-slot PV generation forecast (kWh) keyed by slot start time.
 
-    Distributes the VRM solar-yield forecast across the daylight slots of each
-    day so day-1 AND day-2 buy/charge decisions account for expected solar:
-      * today    -> STATE['pv_projected_remaining'] (Wh remaining today)
-      * tomorrow -> STATE['pv_projected_tomorrow']  (Wh forecast full day)
-    Spread evenly across a daylight window (a reasonable first-order shape; a
-    finer hourly curve can replace this later).
+    Keeps the VRM daily magnitude (today's remaining + tomorrow's full day, which
+    reflect today's weather) but distributes it across the day using the LEARNED
+    per-slot shape from history (`_pv_shape_by_slot`) so e.g. shaded early-morning
+    slots get ~0 instead of an even share. Falls back to an even daylight spread
+    when there's no usable history.
     """
     from datetime import date as _date, timedelta as _td
 
@@ -505,7 +554,7 @@ def _build_pv_forecast_by_slot(price_slots: list, slot_duration_h: float) -> dic
 
     today = _date.today()
     tomorrow = today + _td(days=1)
-    daylight_start_h, daylight_end_h = 6, 22
+    daylight_start_h, daylight_end_h = 5, 22
 
     today_slots, tomorrow_slots = [], []
     for slot in price_slots:
@@ -518,16 +567,20 @@ def _build_pv_forecast_by_slot(price_slots: list, slot_duration_h: float) -> dic
         elif d == tomorrow:
             tomorrow_slots.append(start)
 
-    out = {}
-    if today_kwh > 0 and today_slots:
-        per = today_kwh / len(today_slots)
-        for s in today_slots:
-            out[s] = per
-    if tomorrow_kwh > 0 and tomorrow_slots:
-        per = tomorrow_kwh / len(tomorrow_slots)
-        for s in tomorrow_slots:
-            out[s] = per
-    return out
+    shape = _pv_shape_by_slot(5)
+
+    def _distribute(total, slots):
+        if total <= 0 or not slots:
+            return {}
+        if shape:
+            weights = [shape.get(f"{s.hour:02d}:{(s.minute // 15) * 15:02d}", 0.0) for s in slots]
+            wsum = sum(weights)
+            if wsum > 0:
+                return {s: total * w / wsum for s, w in zip(slots, weights)}
+        per = total / len(slots)          # fallback: even spread
+        return {s: per for s in slots}
+
+    return {**_distribute(today_kwh, today_slots), **_distribute(tomorrow_kwh, tomorrow_slots)}
 
 
 def _set_grid_assist(enabled: bool) -> None:
@@ -779,6 +832,8 @@ def _publish_plan_json(result, *, batt_soc, price_points, pv_remaining,
             'soc_start': s['soc_start'],
             'soc_end': s['soc_end'],
             'grid_energy': s['grid_energy'],
+            'pv': s.get('pv'),
+            'load': s.get('load'),
             'reason': s.get('reason'),
             'reason_code': s.get('reason_code'),
         } for s in result.get('schedule', [])]

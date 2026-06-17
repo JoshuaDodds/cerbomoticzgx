@@ -110,10 +110,10 @@ main { padding: 12px 16px 80px; max-width: 1100px; margin: 0 auto; }
 .day-sub { color: var(--muted); font-size: 13px; margin: 4px 0 2px 8px; }
 .day-sub b { color: var(--text); font-weight: 600; }
 
-/* hour table */
+/* hour table — Hour | Timeline | Avg | Grid | Prod | Cons | SoC | Net */
 .table-head, .hour-row, .slot-row {
   display: grid;
-  grid-template-columns: 120px 1fr 90px 90px 90px 96px 96px;
+  grid-template-columns: 116px 1fr 82px 74px 64px 64px 88px 100px;
   align-items: center; gap: 8px;
 }
 .table-head { color: var(--muted); font-size: 12px; padding: 4px 8px; }
@@ -138,7 +138,7 @@ main { padding: 12px 16px 80px; max-width: 1100px; margin: 0 auto; }
 .slots { margin: 2px 0 8px 8px; border-left: 2px solid var(--line); }
 .slot-row {
   padding: 5px 8px 5px 14px; cursor: pointer; font-size: 13px;
-  grid-template-columns: 112px 1fr 90px 90px 90px 96px 96px;
+  grid-template-columns: 108px 1fr 82px 74px 64px 64px 88px 100px;
 }
 .slot-row:hover { background: var(--panel-2); }
 .slot-dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; margin-right: 8px; }

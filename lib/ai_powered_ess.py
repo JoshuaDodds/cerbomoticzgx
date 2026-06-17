@@ -444,7 +444,9 @@ class OptimizationEngine:
                 'action': action,
                 'soc_start': prev_soc,
                 'soc_end': curr_soc,
-                'grid_energy': round(grid_energy, 4),
+                'grid_energy': round(grid_energy, 4),       # + import / − export (kWh)
+                'pv': round(future_prices[t - 1].get('pv', 0.0), 4),     # production (kWh)
+                'load': round(future_prices[t - 1].get('load', 0.0), 4), # consumption (kWh)
                 'price': buy,
                 'sell': round(self._sell_price(buy), 4),
             })
