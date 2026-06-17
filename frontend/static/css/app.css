@@ -6,12 +6,11 @@
   --text: #e6edf3;
   --muted: #8b98a5;
   --accent: #4aa8ff;
-  /* mode colors */
-  --buy: #3b82f6;        /* blue - storing */
-  --sell: #22c55e;       /* green - earning (battery export) */
-  --sell-pv: #86efac;    /* lighter green - solar surplus (Victron-managed: charge or export) */
-  --hold: #f59e0b;       /* amber - holding */
-  --self: #14b8a6;       /* teal - self-supply */
+  /* control-action colors (IDLE / RETAIN / BUY / SELL) */
+  --buy: #3b82f6;        /* blue  - charging from grid */
+  --sell: #22c55e;       /* green - discharging to grid */
+  --retain: #f59e0b;     /* amber - grid covers load, battery held */
+  --idle: #6b7785;       /* grey  - Victron-managed, projected */
 }
 
 * { box-sizing: border-box; }
@@ -68,9 +67,8 @@ main { padding: 12px 16px 80px; max-width: 1100px; margin: 0 auto; }
 .chip { font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 999px; color: #08121c; }
 .mode-buy { background: var(--buy); }
 .mode-sell { background: var(--sell); }
-.mode-sell-pv { background: var(--sell-pv); }
-.mode-hold { background: var(--hold); }
-.mode-self_supply { background: var(--self); }
+.mode-retain { background: var(--retain); }
+.mode-idle { background: var(--idle); }
 
 /* decision card */
 .decision h2 { margin: 0 0 8px; font-size: 16px; }

@@ -1,19 +1,20 @@
 "use strict";
 
-const MODE_LABEL = { buy: "BUY", sell: "SELL", hold: "HOLD", self_supply: "SELF-SUPPLY" };
-const BATTERY = {
-  buy: "charging", sell: "discharging to grid",
-  hold: "held (idle)", self_supply: "powering house loads",
+// Canonical control action (what we COMMAND): IDLE / RETAIN / BUY / SELL.
+// One label everywhere so the console, UI and history agree.
+const CONTROL_CLASS = { IDLE: "mode-idle", RETAIN: "mode-retain", BUY: "mode-buy", SELL: "mode-sell" };
+const CONTROL_COLORVAR = { IDLE: "idle", RETAIN: "retain", BUY: "buy", SELL: "sell" };
+const CONTROL_BATTERY = {
+  IDLE: "Victron-managed (self-consume / charge surplus PV / export when full)",
+  RETAIN: "held — house load covered from the grid",
+  BUY: "charging from the grid",
+  SELL: "discharging to the grid",
 };
-
-// A "sell" slot that is just surplus solar feeding in (battery not discharging).
-const isPvSurplus = (s) => s && typeof s.reason_code === "string" && s.reason_code.indexOf("PV_SURPLUS") === 0;
-// PV surplus below a full battery is stored, not exported — its forecast "export"
-// is unrealised, so it must not render as export/profit (mirrors backend logic).
-const isStoredSurplus = (s) => isPvSurplus(s) && Number(s.soc_start || 0) < 99;
-const slotLabel = (s) => (s.mode === "sell" && isPvSurplus(s)) ? "SOLAR" : (MODE_LABEL[s.mode] || s.mode);
-const slotColorVar = (s) =>
-  (s.mode === "sell" && isPvSurplus(s)) ? "sell-pv" : (s.mode === "self_supply" ? "self" : s.mode);
+// Control action of a plan slot / current object (defaults to IDLE).
+const caOf = (o) => (o && o.control_action) ? String(o.control_action).toUpperCase() : "IDLE";
+const isIdle = (o) => caOf(o) === "IDLE";  // IDLE flow is projected, not committed
+const slotColorVar = (s) => CONTROL_COLORVAR[caOf(s)] || "idle";
+const chipFor = (cact) => `<span class="chip ${CONTROL_CLASS[cact] || "mode-idle"}">${cact}</span>`;
 
 const $ = (sel) => document.querySelector(sel);
 const el = (tag, cls, html) => {
@@ -24,12 +25,6 @@ const el = (tag, cls, html) => {
 };
 const eur = (v) => (v == null ? "—" : "€" + Number(v).toFixed(2));
 const kwh = (v) => (v == null ? "—" : Number(v).toFixed(2) + " kWh");
-// PV surplus (battery not discharging) renders as a distinct "SOLAR" chip rather
-// than "SELL", since with a neutral setpoint Victron may charge or export it.
-const modeChip = (m, rc) =>
-  (m === "sell" && rc && String(rc).indexOf("PV_SURPLUS") === 0)
-    ? `<span class="chip mode-sell-pv">SOLAR</span>`
-    : `<span class="chip mode-${m}">${MODE_LABEL[m] || m}</span>`;
 const netHtml = (net) => {
   if (net == null) return "—";
   const profit = net < 0;
@@ -84,11 +79,15 @@ function nextSell(plan) {
   if (!plan.hours) return null;
   for (const h of plan.hours) {
     for (const s of h.slots) {
-      if (s.mode === "sell" && !s.is_current) return s;
+      if (caOf(s) === "SELL" && !s.is_current) return s;
     }
   }
   return null;
 }
+
+// Current control action: prefer the live feed when connected, else the plan.
+const currentCA = (c) =>
+  (liveOn() && lastLive.control_action) ? String(lastLive.control_action).toUpperCase() : caOf(c);
 
 // ---- Render: overview (status, metrics, solar, decision) ----
 function renderStatus(plan) {
@@ -97,13 +96,12 @@ function renderStatus(plan) {
   if (!plan.available) { strip.appendChild(el("span", "muted", plan.message || "No plan yet")); return; }
   const c = plan.current || {};
   const total = plan.day_summary && plan.day_summary.total;
-  const mode = pick(c.mode, lastLive && lastLive.mode);
   const soc = pick(plan.battery_soc, lastLive && lastLive.soc);
   // Price comes from the 15-min plan (the live MQTT topic is hourly), so the
   // header matches the Now card and the slot table.
   const price = c.price;
   const kv = (b, s) => { const d = el("div", "kv"); d.innerHTML = `<b>${b}</b><small>${s}</small>`; return d; };
-  strip.appendChild(kv(modeChip(mode, c.reason_code), "mode"));
+  strip.appendChild(kv(chipFor(currentCA(c)), "action"));
   strip.appendChild(kv((soc != null ? Number(soc).toFixed(1) : "—") + "%", "battery SoC"));
   strip.appendChild(kv("€" + Number(price || 0).toFixed(3), "price /kWh"));
   if (total) strip.appendChild(kv(netHtml(total.net), "horizon net"));
@@ -118,10 +116,9 @@ function renderMetrics(plan) {
   const ns = nextSell(plan);
   const card = (label, value) => { const d = el("div", "metric"); d.innerHTML = `<div class="label">${label}</div><div class="value">${value}</div>`; return d; };
   const tNet = todayNet(plan);
-  const mode = pick(c.mode, lastLive && lastLive.mode);
   const soc = pick(plan.battery_soc, lastLive && lastLive.soc);
   const price = c.price;  // 15-min plan price (live topic is hourly)
-  box.appendChild(card("Current mode", modeChip(mode, c.reason_code)));
+  box.appendChild(card("Current action", chipFor(currentCA(c))));
   box.appendChild(card("Battery SoC", (soc != null ? Number(soc).toFixed(1) : "—") + "<small> %</small>"));
   box.appendChild(card("Price now", "€" + Number(price || 0).toFixed(3) + "<small> /kWh</small>"));
   if (tNet != null) box.appendChild(card("Today net", netHtml(tNet)));
@@ -146,13 +143,13 @@ function renderDecision(plan) {
   const box = $("#decision");
   if (!plan.available) { box.innerHTML = `<div class="banner">${plan.message || "No plan published yet."}</div>`; return; }
   const c = plan.current || {};
-  const mode = pick(c.mode, lastLive && lastLive.mode);
+  const cact = currentCA(c);
   const reason = pick(c.reason, lastLive && lastLive.reason);
   const price = c.price;  // 15-min plan price
   const sp = Number(pick(c.applied_setpoint, lastLive && lastLive.setpoint_w) || 0);
 
   let control;
-  if (mode === "buy" && Math.abs(sp) < 50) control = "Charge schedule active";
+  if (cact === "BUY" && Math.abs(sp) < 50) control = "Charge schedule active";
   else if (sp < -50) control = `export ${fmtPower(-sp)}`;
   else if (sp > 50) control = `import ${fmtPower(sp)}`;
   else control = "idle (0 W)";
@@ -166,25 +163,19 @@ function renderDecision(plan) {
     : '<span class="live-dot live-off" title="live feed offline — showing plan values"></span>';
 
   box.innerHTML = "";
-  box.appendChild(el("h2", null, `Now: ${modeChip(mode, c.reason_code)} ${dot}`));
+  box.appendChild(el("h2", null, `Now: ${chipFor(cact)} ${dot}`));
   if (reason) box.appendChild(el("div", "reason", reason));
   // Economic / control row (power flows live below).
-  const pvSurplus = String(c.reason_code || "").indexOf("PV_SURPLUS") === 0;
-  // For PV surplus the setpoint is neutral, so describe what the battery is
-  // ACTUALLY doing from the live feed (charging from solar, holding, or — when
-  // full — letting the excess export) rather than asserting one outcome.
+  // In IDLE the setpoint is neutral, so describe what the battery is ACTUALLY
+  // doing from the live feed rather than asserting one outcome.
   let batteryState;
-  if (pvSurplus) {
-    if (liveOn() && lastLive.batt_w != null) {
-      const bw = Number(lastLive.batt_w);
-      batteryState = bw > 50 ? "charging from solar"
-                   : bw < -50 ? "discharging"
-                   : "held — surplus exporting";
-    } else {
-      batteryState = "solar surplus (Victron-managed)";
-    }
+  if (cact === "IDLE" && liveOn() && lastLive.batt_w != null) {
+    const bw = Number(lastLive.batt_w);
+    batteryState = bw > 50 ? "charging (Victron-managed)"
+                 : bw < -50 ? "powering loads / exporting"
+                 : "idle (Victron-managed)";
   } else {
-    batteryState = BATTERY[mode] || "—";
+    batteryState = CONTROL_BATTERY[cact] || "—";
   }
   // Live Victron AC setpoint straight from MQTT (negative = export, positive =
   // import). Lets you watch the actual commanded setpoint update in real time.
@@ -237,11 +228,12 @@ function renderDaySummary(plan) {
     <span>export ${kwh(t.export_kwh)} (${eur(t.export_rev)})</span>
     <span>${netHtml(t.net)}</span>`;
   box.appendChild(tr);
-  // Surplus solar charged to the battery is not realised profit (it's sold later
-  // when the battery discharges). Show it separately as potential, not in net.
-  if (t.unrealized_solar_kwh > 0.005) {
+  // IDLE slots are Victron-managed (self-consume / surplus PV) — their flow is a
+  // projection that settles per slot, so it's shown apart from the committed net.
+  if (t.projected_idle_net != null && Math.abs(t.projected_idle_net) > 0.005) {
+    const p = t.projected_idle_net;            // +profit (export>import), −cost
     box.appendChild(el("div", "day-sub",
-      `+ potential &nbsp;—&nbsp; <b>${kwh(t.unrealized_solar_kwh)}</b> surplus solar stored in the battery (${eur(t.unrealized_solar_rev)} if later sold) — not counted as profit`));
+      `+ projected (idle) &nbsp;—&nbsp; <b>~${eur(Math.abs(p))} ${p >= 0 ? "profit" : "cost"}</b> from Victron-managed slots (self-consume / surplus PV) — settles per slot, not in committed net`));
   }
 }
 
@@ -253,7 +245,7 @@ function timelineBar(hour) {
     const seg = el("span", "", "");
     seg.style.width = w;
     seg.style.background = `var(--${slotColorVar(s)})`;
-    seg.title = `${s.time.slice(11, 16)} ${slotLabel(s)}`;
+    seg.title = `${s.time.slice(11, 16)} ${caOf(s)}`;
     bar.appendChild(seg);
   });
   return bar;
@@ -261,7 +253,7 @@ function timelineBar(hour) {
 
 function slotDetail(s) {
   const d = el("div", "slot-detail");
-  d.innerHTML = `<div><b>${modeChip(s.mode, s.reason_code)}</b> &nbsp; ${s.reason || ""}</div>
+  d.innerHTML = `<div><b>${chipFor(caOf(s))}</b> &nbsp; ${s.reason || ""}</div>
     <div class="grid">
       <div><small>buy / sell</small>€${Number(s.price).toFixed(4)} / €${Number(s.sell).toFixed(4)}</div>
       <div><small>SoC</small>${Number(s.soc_start).toFixed(0)}% → ${Number(s.soc_end).toFixed(0)}%</div>
@@ -298,16 +290,17 @@ function renderHours(plan) {
       const sell = Number(s.sell != null ? s.sell : s.price);
       const imp = g > 0 ? g : 0;
       const exp = g < 0 ? -g : 0;
-      const stored = isStoredSurplus(s);
+      const idle = isIdle(s);   // IDLE flow is projected, not committed
       const slotNet = imp * Number(s.price) - exp * sell;
+      const muted = (v) => `<span class='muted'>${v}</span>`;
       sr.innerHTML =
         `<span><span class="slot-dot" style="background:var(--${slotColorVar(s)})"></span>${s.time.slice(11, 16)}</span>` +
-        `<span>${slotLabel(s)}</span>` +
+        `<span>${caOf(s)}</span>` +
         `<span class="col-num">€${Number(s.price).toFixed(3)}</span>` +
-        `<span class="col-num">${imp > 0 ? imp.toFixed(2) : "—"}</span>` +
-        `<span class="col-num">${stored ? "<span class='muted'>stored</span>" : (exp > 0 ? exp.toFixed(2) : "—")}</span>` +
+        `<span class="col-num">${idle ? muted(imp > 0 ? imp.toFixed(2) : "·") : (imp > 0 ? imp.toFixed(2) : "—")}</span>` +
+        `<span class="col-num">${idle ? muted(exp > 0 ? exp.toFixed(2) : "·") : (exp > 0 ? exp.toFixed(2) : "—")}</span>` +
         `<span class="col-num">${Math.round(s.soc_start)}→${Math.round(s.soc_end)}%</span>` +
-        `<span class="col-num">${stored ? "<span class='muted'>stored</span>" : netHtml(slotNet)}</span>`;
+        `<span class="col-num">${idle ? muted("projected") : netHtml(slotNet)}</span>`;
       const detail = slotDetail(s);
       detail.style.display = "none";
       sr.addEventListener("click", (e) => {

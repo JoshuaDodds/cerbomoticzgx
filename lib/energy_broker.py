@@ -667,6 +667,7 @@ def _publish_plan_json(result, *, batt_soc, price_points, pv_remaining,
         schedule = [{
             'time': _iso(s['time']),
             'mode': s['action'],
+            'control_action': s.get('control_action'),
             'price': s['price'],
             'sell': s.get('sell'),
             'soc_start': s['soc_start'],
@@ -691,6 +692,7 @@ def _publish_plan_json(result, *, batt_soc, price_points, pv_remaining,
             'slot_duration_h': result.get('slot_duration_h'),
             'current': {
                 'mode': result.get('mode'),
+                'control_action': result.get('control_action'),
                 'reason': result.get('reason'),
                 'reason_code': result.get('reason_code'),
                 'price': result.get('current_price'),
@@ -774,7 +776,9 @@ def _append_history(result, *, batt_soc, applied_setpoint, today_actuals, realiz
 
         record = {
             "ts": now.isoformat(),
+            "kind": "cycle",
             "soc": batt_soc,
+            "control_action": result.get('control_action'),
             "mode": result.get('mode'),
             "reason_code": result.get('reason_code'),
             "price_buy": result.get('current_price'),
@@ -809,6 +813,122 @@ def _append_history(result, *, batt_soc, applied_setpoint, today_actuals, realiz
             fh.write(json.dumps(record) + "\n")
     except Exception as e:
         logging.warning(f"AI_ESS: Failed to append history record: {e}")
+
+
+# Snapshot of the previous cycle (prediction + counters) used to settle each slot.
+_LAST_SLOT_PATH = '/dev/shm/cerbo_ai_last_slot.json'
+
+
+def _settle_prior_slot(result, *, batt_soc, today_actuals) -> None:
+    """At each quarter-hour boundary, write one ``kind: "settlement"`` record to
+    the same daily NDJSON pairing the prediction we made for the slot that just
+    closed with what ACTUALLY happened (derived by diffing the cumulative daily
+    counters). Handles the midnight counter reset and service gaps. Best-effort —
+    any failure is logged and never affects ESS control.
+    """
+    import os
+    import json
+    from datetime import datetime as _dt
+
+    try:
+        history_dir = retrieve_setting('HISTORY_DIR') or 'data/history'
+        os.makedirs(history_dir, exist_ok=True)
+        now = _dt.now().astimezone()
+        act = today_actuals or {}
+
+        def _f(v):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+
+        cur = {
+            'ts': now.isoformat(),
+            'day_import_kwh': _f(act.get('imp_kwh')),
+            'day_import_cost': _f(act.get('imp_cost')),
+            'day_export_kwh': _f(act.get('exp_kwh')),
+            'day_export_reward': _f(act.get('exp_rev')),
+            'soc': _f(batt_soc),
+            'pv_kwh': (_f(STATE.get('c1_daily_yield')) or 0.0) + (_f(STATE.get('c2_daily_yield')) or 0.0),
+        }
+        sched0 = (result.get('schedule') or [{}])[0]
+        cur['prediction'] = {
+            'control_action': result.get('control_action'),
+            'predicted_grid_kwh': _f(sched0.get('grid_energy')),
+            'price_buy': _f(sched0.get('price')),
+            'price_sell': _f(sched0.get('sell')),
+        }
+
+        prev = None
+        try:
+            with open(_LAST_SLOT_PATH) as fh:
+                prev = json.load(fh)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            prev = None
+
+        if prev:
+            def _diff(key):
+                a, b = cur.get(key), prev.get(key)
+                if a is None or b is None:
+                    return None
+                d = a - b
+                return d if d >= -1e-6 else None   # negative => midnight reset, unknown
+
+            slot_h = float(result.get('slot_duration_h') or 0.25)
+            try:
+                gap_s = (now - _dt.fromisoformat(prev['ts'])).total_seconds()
+            except Exception:
+                gap_s = None
+            incomplete = (gap_s is None) or (gap_s > slot_h * 3600 * 1.6)
+
+            imp_kwh, exp_kwh = _diff('day_import_kwh'), _diff('day_export_kwh')
+            imp_cost, exp_rev = _diff('day_import_cost'), _diff('day_export_reward')
+            pv_kwh = _diff('pv_kwh')
+            soc_start, soc_end = prev.get('soc'), cur.get('soc')
+            soc_delta = (soc_end - soc_start) if (soc_start is not None and soc_end is not None) else None
+            actual_net = (exp_rev - imp_cost) if (exp_rev is not None and imp_cost is not None) else None
+
+            pred = prev.get('prediction') or {}
+            pg = pred.get('predicted_grid_kwh')
+            pbuy = pred.get('price_buy') or 0.0
+            psell = pred.get('price_sell') if pred.get('price_sell') is not None else pbuy
+            predicted_net = None
+            if pg is not None:
+                # +export revenue (pg<0) / -import cost (pg>0)
+                predicted_net = (-pg * psell) if pg < 0 else (-pg * pbuy)
+
+            settlement = {
+                'ts': now.isoformat(),
+                'kind': 'settlement',
+                'slot_start': prev.get('ts'),
+                'slot_end': now.isoformat(),
+                'incomplete': incomplete,
+                'predicted_control_action': pred.get('control_action'),
+                'predicted_grid_kwh': pg,
+                'predicted_net_eur': round(predicted_net, 4) if predicted_net is not None else None,
+                'actual_import_kwh': round(imp_kwh, 3) if imp_kwh is not None else None,
+                'actual_export_kwh': round(exp_kwh, 3) if exp_kwh is not None else None,
+                'actual_cost': round(imp_cost, 4) if imp_cost is not None else None,
+                'actual_reward': round(exp_rev, 4) if exp_rev is not None else None,
+                'actual_net_eur': round(actual_net, 4) if actual_net is not None else None,
+                'actual_pv_kwh': round(pv_kwh, 3) if pv_kwh is not None else None,
+                'soc_start': soc_start,
+                'soc_end': soc_end,
+                'soc_delta': round(soc_delta, 2) if soc_delta is not None else None,
+                'price_buy': pred.get('price_buy'),
+                'price_sell': pred.get('price_sell'),
+            }
+            path = os.path.join(history_dir, f"ess-{now.strftime('%Y-%m-%d')}.ndjson")
+            with open(path, "a") as fh:
+                fh.write(json.dumps(settlement) + "\n")
+
+        # Persist this cycle's snapshot for the next settlement (atomic).
+        tmp = _LAST_SLOT_PATH + '.tmp'
+        with open(tmp, 'w') as fh:
+            json.dump(cur, fh)
+        os.replace(tmp, _LAST_SLOT_PATH)
+    except Exception as e:
+        logging.warning(f"AI_ESS: Failed to settle prior slot: {e}")
 
 
 def run_ai_optimizer():
@@ -891,11 +1011,6 @@ def run_ai_optimizer():
         # reserve (single source of truth). Idempotent — only writes on change.
         set_minimum_ess_soc()
 
-        # Publish the current mode/reason for dashboards and automation.
-        STATE.set('ai_mode', result.get('mode'))
-        STATE.set('ai_reason', result.get('reason'))
-        STATE.set('ai_reason_code', result.get('reason_code'))
-
         # 5. Apply immediate control for the current slot.
         setpoint = result.get('setpoint', 0.0)
         if result.get('grid_assist'):  # HOLD (retain)
@@ -906,12 +1021,26 @@ def run_ai_optimizer():
             _set_grid_assist(True)
             _apply_grid_assist_setpoint()
             applied_setpoint = _grid_assist_setpoint_watts()
+            # RETAIN only when we actually import to cover load; if PV covers it,
+            # the setpoint is neutral and Victron decides -> IDLE.
+            applied_control_action = 'RETAIN' if applied_setpoint > 0 else 'IDLE'
         else:
             # Ensure HOLD is off, then apply the planned setpoint
-            # (export for SELL, 0W for BUY/SELF-SUPPLY).
+            # (export for SELL, 0W for BUY/IDLE).
             _set_grid_assist(False)
             ac_power_setpoint(watts=str(setpoint), override_ess_net_mettering=False)
             applied_setpoint = setpoint
+            # BUY / SELL / IDLE is unaffected by live PV, so the planned label holds.
+            applied_control_action = result.get('control_action') or 'IDLE'
+
+        # Make the published result reflect what we ACTUALLY applied this cycle.
+        result['control_action'] = applied_control_action
+
+        # Publish the current action/reason for dashboards and automation.
+        STATE.set('ai_control_action', applied_control_action)
+        STATE.set('ai_mode', result.get('mode'))
+        STATE.set('ai_reason', result.get('reason'))
+        STATE.set('ai_reason_code', result.get('reason_code'))
 
         # 6. Program the Victron grid-charge schedule slots.
         victron_slots = result.get('victron_slots', [])
@@ -943,6 +1072,10 @@ def run_ai_optimizer():
         # Append an analytics-ready history record for this cycle (best-effort).
         _append_history(result, batt_soc=batt_soc, applied_setpoint=applied_setpoint,
                         today_actuals=today_actuals, realized_power=realized_power)
+
+        # Settle the slot that just closed (predicted vs actual) for accuracy
+        # learning + the future timeline view. Best-effort.
+        _settle_prior_slot(result, batt_soc=batt_soc, today_actuals=today_actuals)
 
         # Publish the plan as JSON for the frontend dashboard (best-effort).
         _publish_plan_json(

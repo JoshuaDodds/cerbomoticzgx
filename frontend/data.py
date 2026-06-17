@@ -35,21 +35,14 @@ def _parse_time(s):
         return None
 
 
-def is_stored_surplus(slot) -> bool:
-    """True when a slot's forecast "export" is really surplus solar being stored.
+def is_idle(slot) -> bool:
+    """True when a slot is IDLE (Victron-managed, neutral setpoint).
 
-    A PV_SURPLUS slot below a full battery does not actually export (the setpoint
-    is neutral, so Victron charges from the surplus). That energy is realised
-    later when the battery discharges and sells — counting it as export revenue
-    now would overstate profit, so the accounting treats it as unrealised.
-    Surplus at a full battery (SoC ~100%) genuinely exports and stays realised.
+    IDLE flow (self-consumption, surplus PV) is not a commanded action — it's a
+    projection that settles retroactively — so it's kept OUT of the committed net
+    (Option A) and shown separately as projected.
     """
-    rc = str(slot.get("reason_code") or "")
-    try:
-        soc = float(slot.get("soc_start") or 0)
-    except (TypeError, ValueError):
-        soc = 0.0
-    return rc.startswith("PV_SURPLUS") and soc < 99.0
+    return str(slot.get("control_action") or "").upper() == "IDLE"
 
 
 def load_raw_plan() -> dict | None:
@@ -91,7 +84,7 @@ def group_by_hour(schedule: list) -> list:
                 "slots": [],
                 "import_kwh": 0.0, "export_kwh": 0.0,
                 "import_cost": 0.0, "export_rev": 0.0,
-                "unrealized_solar_kwh": 0.0, "unrealized_solar_rev": 0.0,
+                "idle_imp_cost": 0.0, "idle_exp_rev": 0.0,
                 "prices": [],
                 "mode_counts": {},
             }
@@ -100,12 +93,12 @@ def group_by_hour(schedule: list) -> list:
         g = slot.get("grid_energy", 0.0) or 0.0
         buy = slot.get("price", 0.0) or 0.0
         sell = slot.get("sell", buy) or buy
-        if is_stored_surplus(slot):
-            # Stored surplus solar: not realised export. Track separately so the
-            # net cost/profit reflects only energy actually bought/sold.
-            if g < 0:
-                h["unrealized_solar_kwh"] += -g
-                h["unrealized_solar_rev"] += -g * sell
+        if is_idle(slot):
+            # IDLE = projected only (Victron decides), kept out of committed net.
+            if g > 0:
+                h["idle_imp_cost"] += g * buy
+            elif g < 0:
+                h["idle_exp_rev"] += -g * sell
         elif g > 0:
             h["import_kwh"] += g
             h["import_cost"] += g * buy
@@ -113,8 +106,8 @@ def group_by_hour(schedule: list) -> list:
             h["export_kwh"] += -g
             h["export_rev"] += -g * sell
         h["prices"].append(buy)
-        mode = slot.get("mode", "")
-        h["mode_counts"][mode] = h["mode_counts"].get(mode, 0) + 1
+        act = (slot.get("control_action") or "").upper()
+        h["mode_counts"][act] = h["mode_counts"].get(act, 0) + 1
         h["slots"].append(slot)
 
     result = []
@@ -127,13 +120,13 @@ def group_by_hour(schedule: list) -> list:
             "key": h["key"],
             "label": h["label"],
             "is_current": (h["key"] == current_hour_key),
-            "dominant_mode": dominant,
+            "dominant_action": dominant,
             "mixed": len(modes) > 1,
-            "modes": sorted(modes.keys()),
+            "actions": sorted(modes.keys()),
             "avg_price": sum(h["prices"]) / n,
             "import_kwh": round(h["import_kwh"], 2),
             "export_kwh": round(h["export_kwh"], 2),
-            "unrealized_solar_kwh": round(h["unrealized_solar_kwh"], 2),
+            "projected_idle_net": round(h["idle_exp_rev"] - h["idle_imp_cost"], 3),
             "net_kwh": round(h["import_kwh"] - h["export_kwh"], 2),
             "net_cost": round(h["import_cost"] - h["export_rev"], 3),
             "soc_start": h["slots"][0].get("soc_start"),
@@ -156,15 +149,16 @@ def day_summary(schedule: list, today_actuals: dict | None) -> dict:
             days[d] = {"date": d, "label": dt.strftime("%a %d %b"),
                        "import_kwh": 0.0, "import_cost": 0.0,
                        "export_kwh": 0.0, "export_rev": 0.0,
-                       "unrealized_solar_kwh": 0.0, "unrealized_solar_rev": 0.0}
+                       "idle_imp_cost": 0.0, "idle_exp_rev": 0.0}
             order.append(d)
         g = slot.get("grid_energy", 0.0) or 0.0
         buy = slot.get("price", 0.0) or 0.0
         sell = slot.get("sell", buy) or buy
-        if is_stored_surplus(slot):
-            if g < 0:
-                days[d]["unrealized_solar_kwh"] += -g
-                days[d]["unrealized_solar_rev"] += -g * sell
+        if is_idle(slot):
+            if g > 0:
+                days[d]["idle_imp_cost"] += g * buy
+            elif g < 0:
+                days[d]["idle_exp_rev"] += -g * sell
         elif g > 0:
             days[d]["import_kwh"] += g
             days[d]["import_cost"] += g * buy
@@ -175,14 +169,14 @@ def day_summary(schedule: list, today_actuals: dict | None) -> dict:
     today = datetime.now().date().isoformat()
     rows = []
     _keys = ("import_kwh", "import_cost", "export_kwh", "export_rev",
-             "unrealized_solar_kwh", "unrealized_solar_rev")
+             "idle_imp_cost", "idle_exp_rev")
     tot = {k: 0.0 for k in _keys}
     for d in order:
         row = days[d]
         forecast = {k: round(row[k], 3) for k in _keys}
         actual = None
         if d == today and today_actuals:
-            # Actuals are realised grid flows only (no unrealised solar bucket).
+            # Actuals are realised grid flows only (no projected-idle bucket).
             actual = {
                 "import_kwh": round(float(today_actuals.get("imp_kwh", 0) or 0), 3),
                 "import_cost": round(float(today_actuals.get("imp_cost", 0) or 0), 3),
@@ -198,13 +192,17 @@ def day_summary(schedule: list, today_actuals: dict | None) -> dict:
         rows.append({
             "date": d, "label": row["label"], "is_today": d == today,
             "forecast": forecast, "actual": actual, "combined": combined,
+            # Committed net (Option A): only BUY/RETAIN/SELL flows.
             "net": round(combined["import_cost"] - combined["export_rev"], 3),
+            # IDLE projection (export rev − import cost), shown apart from net.
+            "projected_idle_net": round(combined["idle_exp_rev"] - combined["idle_imp_cost"], 3),
         })
 
     return {
         "days": rows,
         "total": {**{k: round(v, 3) for k, v in tot.items()},
-                  "net": round(tot["import_cost"] - tot["export_rev"], 3)},
+                  "net": round(tot["import_cost"] - tot["export_rev"], 3),
+                  "projected_idle_net": round(tot["idle_exp_rev"] - tot["idle_imp_cost"], 3)},
     }
 
 

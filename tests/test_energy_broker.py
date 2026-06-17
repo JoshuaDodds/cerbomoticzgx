@@ -1,5 +1,6 @@
 from pathlib import Path
 import sys
+import json
 import types
 from unittest.mock import MagicMock
 
@@ -97,6 +98,44 @@ def test_current_min_soc_reserve_is_seasonal(monkeypatch):
 
     monkeypatch.setattr(helpers, "is_winter_month", lambda: False)
     assert helpers.current_min_soc_reserve() == 0.0
+
+
+def test_settlement_writes_predicted_vs_actual(monkeypatch, tmp_path):
+    # First cycle writes only the snapshot; the next cycle settles the slot that
+    # just closed by diffing the cumulative counters.
+    monkeypatch.setattr(energy_broker, "retrieve_setting",
+                        lambda name: str(tmp_path) if name == "HISTORY_DIR" else None)
+    monkeypatch.setattr(energy_broker, "STATE",
+                        DummyState({"c1_daily_yield": 1.0, "c2_daily_yield": 0.5}))
+    monkeypatch.setattr(energy_broker, "_LAST_SLOT_PATH", str(tmp_path / "last_slot.json"))
+
+    res = {"control_action": "SELL", "slot_duration_h": 0.25,
+           "schedule": [{"grid_energy": -2.0, "price": 0.30, "sell": 0.30}]}
+
+    # Cycle 1: counters at import 1.0 kWh (€0.20), no export; SoC 80%.
+    energy_broker._settle_prior_slot(
+        res, batt_soc=80.0,
+        today_actuals={"imp_kwh": 1.0, "imp_cost": 0.20, "exp_kwh": 0.0, "exp_rev": 0.0})
+    assert (tmp_path / "last_slot.json").exists()
+    assert not list(tmp_path.glob("ess-*.ndjson"))  # nothing settled yet
+
+    # Cycle 2: +2.0 kWh exported (+€0.60), SoC fell to 72%.
+    energy_broker._settle_prior_slot(
+        res, batt_soc=72.0,
+        today_actuals={"imp_kwh": 1.0, "imp_cost": 0.20, "exp_kwh": 2.0, "exp_rev": 0.60})
+
+    files = list(tmp_path.glob("ess-*.ndjson"))
+    assert files
+    recs = [json.loads(l) for l in files[0].read_text().splitlines() if l.strip()]
+    settlements = [r for r in recs if r.get("kind") == "settlement"]
+    assert len(settlements) == 1
+    s = settlements[0]
+    assert s["predicted_control_action"] == "SELL"
+    assert not s["incomplete"]
+    assert abs(s["actual_export_kwh"] - 2.0) < 1e-6
+    assert abs(s["actual_net_eur"] - 0.60) < 1e-6   # +0.60 reward − 0 added import
+    assert abs(s["predicted_net_eur"] - 0.60) < 1e-6  # 2 kWh export @ €0.30
+    assert abs(s["soc_delta"] - (-8.0)) < 1e-6
 
 
 def _patch_common_dependencies(monkeypatch, state_values=None, settings=None):

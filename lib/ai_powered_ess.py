@@ -44,21 +44,38 @@ SOC_STEP = 5.0
 # Numerical tolerance used for float comparisons.
 EPS = 1e-6
 
-# Internal mode code -> user-facing label.
-MODE_LABELS = {
-    'buy': 'BUY',
-    'sell': 'SELL',
-    'hold': 'HOLD',
-    'self_supply': 'SELF-SUPPLY',
+# Canonical CONTROL ACTION (what we COMMAND) — the single label shown by the
+# console, web UI, plan JSON and history so every surface agrees. Labelled by the
+# commanded setpoint, not the predicted energy flow.
+CONTROL_ACTIONS = ('IDLE', 'RETAIN', 'BUY', 'SELL')
+
+# What the battery is doing under each control action (for the "Battery" line).
+CONTROL_BATTERY = {
+    'IDLE': 'Victron-managed (self-consume / charge surplus PV / export when full)',
+    'RETAIN': 'held — house load covered from the grid',
+    'BUY': 'charging from the grid',
+    'SELL': 'discharging to the grid',
 }
 
-# Internal mode code -> what the battery is physically doing.
-MODE_BATTERY = {
-    'buy': 'charging',
-    'sell': 'discharging to grid',
-    'hold': 'held (idle)',
-    'self_supply': 'powering house loads',
-}
+
+def control_action_for(action, soc_start, soc_end, grid_energy):
+    """Map an internal plan step to the canonical control action we command.
+
+    * ``BUY``    — force charge from the grid (``action == 'buy'``).
+    * ``SELL``   — force discharge to the grid (battery actually discharges, SoC falls).
+    * ``RETAIN`` — force the grid to cover the load so the battery is held
+                   (grid-assist: a hold that imports).
+    * ``IDLE``   — neutral setpoint; Victron decides. Covers PV surplus, self-supply,
+                   and a hold where PV already covers the load. The real import/export
+                   is only known retroactively.
+    """
+    if action == 'buy':
+        return 'BUY'
+    if action == 'sell' and soc_end < soc_start - EPS:
+        return 'SELL'
+    if action == 'hold' and grid_energy > EPS:
+        return 'RETAIN'
+    return 'IDLE'
 
 
 def _safe_float(setting_name: str, default: float) -> float:
@@ -478,14 +495,21 @@ class OptimizationEngine:
             except Exception:
                 return str(s['time'])
 
-        next_sell = next((s for s in schedule[idx + 1:] if s['action'] == 'sell'), None)
+        # "Next sell" must be the next REAL discharge-to-grid (control action
+        # SELL), not a PV-surplus slot (internal action 'sell' but actually IDLE),
+        # so "sell later at HH:MM" points at the genuine peak, not a surplus slot.
+        def _is_real_sell(s):
+            return control_action_for(s['action'], s['soc_start'],
+                                      s['soc_end'], s['grid_energy']) == 'SELL'
+        next_sell = next((s for s in schedule[idx + 1:] if _is_real_sell(s)), None)
         horizon_max = max((s['price'] for s in schedule[idx:]), default=price)
 
         if mode == 'buy':
             if next_sell:
+                ns_sell = next_sell.get('sell', next_sell['price'])
                 return ('PRECHARGE_FOR_PEAK',
                         f"Charging at €{price:.3f}/kWh to sell later at "
-                        f"{_hm(next_sell)} (€{next_sell['price']:.3f}/kWh)")
+                        f"{_hm(next_sell)} (€{ns_sell:.3f}/kWh)")
             return ('PRICE_LOW', f"Charging while the price is low (€{price:.3f}/kWh)")
 
         if mode == 'sell':
@@ -511,9 +535,10 @@ class OptimizationEngine:
                 return ('RESERVE_POLICY',
                         f"At minimum reserve ({self.min_soc:.0f}%); holding — loads covered by grid/PV")
             if next_sell:
+                ns_sell = next_sell.get('sell', next_sell['price'])
                 return ('BUY_CHEAPER_THAN_STORED_VALUE',
                         f"Holding the battery; grid (€{price:.3f}/kWh) is cheaper than the stored "
-                        f"energy's value at {_hm(next_sell)} (€{next_sell['price']:.3f}/kWh) — "
+                        f"energy's value at {_hm(next_sell)} (€{ns_sell:.3f}/kWh) — "
                         f"covering loads from grid/PV")
             return ('HOLD_PRESERVE',
                     f"Holding the battery; covering loads from grid/PV (€{price:.3f}/kWh)")
@@ -524,18 +549,22 @@ class OptimizationEngine:
                     f"Price €{price:.3f}/kWh is below the sell floor (€{self.min_sell_price:.3f}); "
                     f"using stored energy rather than exporting")
         if next_sell and next_sell['price'] > price:
+            ns_sell = next_sell.get('sell', next_sell['price'])
             return ('AVOID_PRICE_AWAIT_DIP',
                     f"Running off the battery at €{price:.3f}/kWh; cheaper than the grid now, "
-                    f"recharging before the {_hm(next_sell)} peak (€{next_sell['price']:.3f}/kWh)")
+                    f"recharging before the {_hm(next_sell)} peak (€{ns_sell:.3f}/kWh)")
         return ('STORED_CHEAPER_THAN_GRID',
                 f"Using stored energy — cheaper than buying from the grid at €{price:.3f}/kWh")
 
     def _post_process(self, schedule, slot_seconds):
-        # Attach a per-slot reason so the UI can show "why" at every increment.
+        # Attach a per-slot reason + canonical control action so every surface
+        # (console, web UI, plan JSON, history) shows the same label.
         for i, step in enumerate(schedule):
             code, text = self._explain_action(schedule, i)
             step['reason_code'] = code
             step['reason'] = text
+            step['control_action'] = control_action_for(
+                step['action'], step['soc_start'], step['soc_end'], step['grid_energy'])
 
         # Group consecutive grid-charge (buy) slots into Victron charge windows.
         victron_slots = []
@@ -603,6 +632,9 @@ class OptimizationEngine:
             'victron_slots': formatted_slots,
             'setpoint': setpoint,
             'mode': mode,
+            # Canonical control action for the current slot (forecast-based here;
+            # the caller refines RETAIN vs IDLE from live PV/load when applying).
+            'control_action': first.get('control_action'),
             'reason': first.get('reason'),
             'reason_code': first.get('reason_code'),
             'grid_assist': mode == 'hold',
@@ -647,18 +679,14 @@ def format_plan_summary(result, *, batt_soc=None, source="", price_points=None,
     shown = 0
     rows = []
     total_import_cost = total_export_rev = total_import_kwh = total_export_kwh = 0.0
-    unrealized_solar_kwh = unrealized_solar_rev = 0.0
+    idle_imp_cost = idle_exp_rev = 0.0  # IDLE = projected only, not committed
     day_totals = {}  # date -> {imp_kwh, imp_cost, exp_kwh, exp_rev, slots}
     for step in schedule:
         g = step['grid_energy']
         buy = step['price']
         sell = step.get('sell', buy)
-
-        # A PV_SURPLUS slot below a full battery does not actually export (neutral
-        # setpoint -> Victron charges from the surplus); that value is realised
-        # later when the battery sells. Count it as unrealised, not profit.
-        stored_surplus = (str(step.get('reason_code', '')).startswith('PV_SURPLUS')
-                          and step.get('soc_start', 0) < 99.0)
+        ca = step.get('control_action') or control_action_for(
+            step['action'], step['soc_start'], step['soc_end'], g)
 
         try:
             day_key = step['time'].date()
@@ -668,10 +696,13 @@ def format_plan_summary(result, *, batt_soc=None, source="", price_points=None,
                                              'exp_kwh': 0.0, 'exp_rev': 0.0, 'slots': 0})
         dt['slots'] += 1
 
-        if stored_surplus:
-            if g < 0:
-                unrealized_solar_kwh += -g
-                unrealized_solar_rev += -g * sell
+        # IDLE is not a commanded flow — its import/export is a projection that
+        # settles retroactively, so keep it OUT of the committed net (Option A).
+        if ca == 'IDLE':
+            if g > 0:
+                idle_imp_cost += g * buy
+            elif g < 0:
+                idle_exp_rev += -g * sell
         elif g > 0:
             total_import_kwh += g
             total_import_cost += g * buy
@@ -690,9 +721,10 @@ def format_plan_summary(result, *, batt_soc=None, source="", price_points=None,
             when = step['time'].strftime('%a %H:%M')
         except Exception:
             when = str(step['time'])
-        mode_label = MODE_LABELS.get(step['action'], step['action'])
-        rows.append(f"  {when:<12} {mode_label:<11} {buy:>8.4f} {sell:>8.4f} "
-                    f"{step['soc_start']:>5.0f}->{step['soc_end']:<5.0f} {g:>9.2f}")
+        # IDLE grid flow is a projection (Victron decides) — show it muted.
+        grid_cell = f"{g:>9.2f}" if ca != 'IDLE' else f"{('~%.2f' % g):>9}"
+        rows.append(f"  {when:<12} {ca:<11} {buy:>8.4f} {sell:>8.4f} "
+                    f"{step['soc_start']:>5.0f}->{step['soc_end']:<5.0f} {grid_cell}")
 
     net_cost = total_import_cost - total_export_rev
 
@@ -734,18 +766,13 @@ def format_plan_summary(result, *, batt_soc=None, source="", price_points=None,
     out.append(line)
     out.append("IMMEDIATE DECISION (current slot, live)")
     mode = result.get('mode', '')
-    out.append(f"  Mode        : {MODE_LABELS.get(mode, mode)}")
+    ca = result.get('control_action') or control_action_for(
+        mode, 0.0, 0.0, 0.0)
+    out.append(f"  Action      : {ca}")
     if result.get('reason'):
         out.append(f"  Reason      : {result.get('reason')}")
     out.append(f"  Price       : {result.get('current_price', 0):.4f} /kWh")
-    # A PV-surplus "sell" is not a battery discharge: the setpoint is neutral and
-    # Victron decides (charge while there's room, export once full) — describe it
-    # accurately rather than asserting an export.
-    if str(result.get('reason_code', '')).startswith('PV_SURPLUS'):
-        battery_state = "solar surplus — Victron-managed (charge or export when full)"
-    else:
-        battery_state = MODE_BATTERY.get(mode, '-')
-    out.append(f"  Battery     : {battery_state}")
+    out.append(f"  Battery     : {CONTROL_BATTERY.get(ca, '-')}")
 
     # Live grid flow: use the actually-applied setpoint when provided, else the
     # planned setpoint. Positive = importing, negative = exporting, 0 = idle.
@@ -810,11 +837,13 @@ def format_plan_summary(result, *, batt_soc=None, source="", price_points=None,
     g_exp_rev = total_export_rev + (a_exp_rev if has_actuals else 0.0)
 
     out.append("  " + "─" * 74)
-    out.append(_row("TOTAL", g_imp_kwh, g_imp_cost, g_exp_kwh, g_exp_rev))
-    if unrealized_solar_kwh > 0.005:
-        out.append(f"  {'+ potential (stored solar)':<24}"
-                   f"{unrealized_solar_kwh:6.2f} kWh of surplus charged to the battery "
-                   f"(~€{unrealized_solar_rev:.2f} if later sold) — not counted as profit")
+    out.append(_row("TOTAL (committed)", g_imp_kwh, g_imp_cost, g_exp_kwh, g_exp_rev))
+    idle_net = idle_exp_rev - idle_imp_cost
+    if abs(idle_net) > 0.005:
+        sign = 'profit' if idle_net >= 0 else 'cost'
+        out.append(f"  {'+ projected (idle)':<24}"
+                   f"~€{abs(idle_net):.2f} {sign} from Victron-managed slots "
+                   f"(self-consume / surplus PV) — settles per slot, not in committed net")
     out.append(f"  ({len(schedule)} forecast slots, ~{len(schedule) * result.get('slot_duration_h', 0):.1f}h"
                + (" + today's actuals)" if has_actuals else ")"))
     out.append(line)

@@ -139,7 +139,40 @@ def build_rollup(records):
             "samples": len(ld),
         })
 
-    return {"days": days, "hours": hours, "modes_overall": dict(Counter(r.get("mode") for r in records))}
+    def _action(r):
+        return r.get("control_action") or r.get("mode")
+
+    return {"days": days, "hours": hours,
+            "actions_overall": dict(Counter(_action(r) for r in records))}
+
+
+def build_accuracy(settlements):
+    """Predicted-vs-actual accuracy from per-slot settlement records."""
+    net_abs_err = []
+    pv_pred, pv_act = [], []
+    rows_by_date = defaultdict(lambda: {"n": 0, "pred_net": 0.0, "act_net": 0.0})
+    for r in settlements:
+        if r.get("incomplete"):
+            continue
+        d = _date(r)
+        pn, an = _num(r.get("predicted_net_eur")), _num(r.get("actual_net_eur"))
+        if pn is not None and an is not None:
+            net_abs_err.append(abs(pn - an))
+            rows_by_date[d]["n"] += 1
+            rows_by_date[d]["pred_net"] += pn
+            rows_by_date[d]["act_net"] += an
+    days = []
+    for d in sorted(rows_by_date):
+        v = rows_by_date[d]
+        days.append({"date": d, "slots": v["n"],
+                     "predicted_net": round(v["pred_net"], 2),
+                     "actual_net": round(v["act_net"], 2),
+                     "delta": round(v["act_net"] - v["pred_net"], 2)})
+    return {
+        "settled_slots": len(net_abs_err),
+        "net_mae_eur": round(mean(net_abs_err), 4) if net_abs_err else None,
+        "days": days,
+    }
 
 
 def print_report(rollup):
@@ -168,10 +201,21 @@ def print_report(rollup):
         print(f"  {h['hour']:02d}:00{load:>10}{pv:>10}{price:>12}{h['samples']:>6}")
     print(line)
 
-    print("MODE DISTRIBUTION (cycles)")
-    for m, n in sorted(rollup["modes_overall"].items(), key=lambda x: -x[1]):
+    print("ACTION DISTRIBUTION (cycles)")
+    for m, n in sorted(rollup["actions_overall"].items(), key=lambda x: -x[1]):
         print(f"  {str(m):<14}{n}")
     print(line)
+
+    acc = rollup.get("accuracy")
+    if acc and acc.get("settled_slots"):
+        print("FORECAST ACCURACY  (settled slots: predicted vs actual)")
+        mae = acc.get("net_mae_eur")
+        print(f"  net €/slot MAE: {('€%.4f' % mae) if mae is not None else '—'}  "
+              f"over {acc['settled_slots']} slots")
+        for d in acc["days"]:
+            print(f"  {d['date']:<12} predicted €{d['predicted_net']:>7.2f}  "
+                  f"actual €{d['actual_net']:>7.2f}  Δ €{d['delta']:>7.2f}  ({d['slots']} slots)")
+        print(line)
     print("Note: load excludes heavy charge/discharge cycles (|batt|>4kW) where the")
     print("AC-out meter is unreliable. PV median is the realised generation shape —")
     print("compare it to the forecast over time to learn this installation's curve.")
@@ -191,7 +235,13 @@ def main():
         print(f"No history records found in {history_dir}", file=sys.stderr)
         return 1
 
-    rollup = build_rollup(records)
+    # Split the per-cycle decision log from the per-slot settlement records
+    # (older files have no "kind" -> treat as cycle).
+    cycles = [r for r in records if r.get("kind", "cycle") == "cycle"]
+    settlements = [r for r in records if r.get("kind") == "settlement"]
+
+    rollup = build_rollup(cycles)
+    rollup["accuracy"] = build_accuracy(settlements)
     if args.json:
         print(json.dumps(rollup, indent=2))
     else:

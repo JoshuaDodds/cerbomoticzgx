@@ -44,6 +44,7 @@ class MqttLive:
             "batt_w": f"N/{sid}/battery/277/Dc/0/Power",
             "setpoint_w": f"N/{sid}/settings/0/Settings/CGwacs/AcPowerSetPoint",
             "mode": "Cerbomoticzgx/GlobalState/ai_mode",
+            "control_action": "Cerbomoticzgx/GlobalState/ai_control_action",
             "reason": "Cerbomoticzgx/GlobalState/ai_reason",
             "feed_in_state": "Cerbomoticzgx/GlobalState/feed_in_limit_state",
         }
@@ -112,6 +113,7 @@ class MqttLive:
         out["batt_w"] = _num("batt_w")
         out["setpoint_w"] = _num("setpoint_w")
         out["mode"] = vals.get("mode")
+        out["control_action"] = vals.get("control_action")
         out["reason"] = vals.get("reason")
         out["feed_in_state"] = vals.get("feed_in_state")
         return out

@@ -7,7 +7,7 @@ import os
 # Add repo root to path
 sys.path.append(os.getcwd())
 
-from lib.ai_powered_ess import OptimizationEngine
+from lib.ai_powered_ess import OptimizationEngine, control_action_for
 
 class TestAIPoweredESS(unittest.TestCase):
     def setUp(self):
@@ -39,13 +39,26 @@ class TestAIPoweredESS(unittest.TestCase):
             'grid_energy': grid_energy, 'price': price, 'sell': price,
         }
 
-    def test_pv_surplus_sell_uses_neutral_setpoint(self):
-        # Exporting while SoC is flat = PV surplus. Must NOT impose a forced
-        # (capping) export setpoint; leave it neutral so the Victron ESS routes
-        # surplus in real time (charge if room, feed-in if full).
+    def test_control_action_mapping(self):
+        # BUY: charging from grid.
+        self.assertEqual(control_action_for('buy', 20.0, 30.0, 2.5), 'BUY')
+        # SELL: real discharge to grid (SoC falls).
+        self.assertEqual(control_action_for('sell', 100.0, 94.0, -2.3), 'SELL')
+        # RETAIN: hold that imports to cover the load (battery held).
+        self.assertEqual(control_action_for('hold', 50.0, 50.0, 0.4), 'RETAIN')
+        # IDLE: hold where PV covers the load (no import).
+        self.assertEqual(control_action_for('hold', 50.0, 50.0, -0.1), 'IDLE')
+        # IDLE: PV surplus (export while SoC flat — not a real discharge).
+        self.assertEqual(control_action_for('sell', 50.0, 50.0, -0.09), 'IDLE')
+        # IDLE: self-supply (battery powers loads, no export).
+        self.assertEqual(control_action_for('self_supply', 50.0, 45.0, 0.0), 'IDLE')
+
+    def test_pv_surplus_sell_is_idle_neutral_setpoint(self):
+        # Exporting while SoC is flat = PV surplus -> IDLE, neutral setpoint (no
+        # forced/capping export); Victron routes surplus in real time.
         sched = [self._step('sell', 50.0, 50.0, -0.09, price=0.15)]
         result = self.engine._post_process(sched, 900)
-        self.assertEqual(result['mode'], 'sell')
+        self.assertEqual(result['control_action'], 'IDLE')
         self.assertTrue(result['pv_surplus'])
         self.assertEqual(result['setpoint'], 0.0)
 
@@ -54,7 +67,7 @@ class TestAIPoweredESS(unittest.TestCase):
         # negative export setpoint so the discharge is rate-controlled/spread.
         sched = [self._step('sell', 100.0, 94.0, -2.29, price=0.25)]
         result = self.engine._post_process(sched, 900)
-        self.assertEqual(result['mode'], 'sell')
+        self.assertEqual(result['control_action'], 'SELL')
         self.assertFalse(result['pv_surplus'])
         # planned_w = -2.29 / 0.25h * 1000 = -9160 W
         self.assertEqual(result['setpoint'], -9160.0)
