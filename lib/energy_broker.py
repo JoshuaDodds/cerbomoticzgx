@@ -1350,7 +1350,7 @@ def run_ai_optimizer():
             # Ensure HOLD is off, then apply the planned setpoint
             # (export for SELL, 0W for BUY/IDLE).
             _set_grid_assist(False)
-            ac_power_setpoint(watts=str(setpoint), override_ess_net_mettering=False)
+            ac_power_setpoint(watts=str(setpoint), override_ess_net_mettering=False, silent=True)
             applied_setpoint = setpoint
             # BUY / SELL / IDLE is unaffected by live PV, so the planned label holds.
             applied_control_action = result.get('control_action') or 'IDLE'
@@ -1382,7 +1382,7 @@ def run_ai_optimizer():
             publish_message(f"{topic_stub}Start", payload=f"{{\"value\": {seconds_from_midnight}}}", retain=True)
             publish_message(f"{topic_stub}Day", payload=f"{{\"value\": {weekday}}}", retain=True)
 
-            logging.info(
+            logging.debug(
                 f"AI_ESS: Scheduled charge slot {i}: weekday={weekday} at {start_dt.strftime('%H:%M')} "
                 f"for {slot['duration']}s to {target_soc}% SoC"
             )
@@ -1412,11 +1412,13 @@ def run_ai_optimizer():
         # The full plan view is available via the web UI and scripts/ai_ess_dryrun.py,
         # so we keep the service log clean with a one-line summary instead of the
         # multi-line plan table.
+        charge_slot_note = ". Victron charge slots scheduled." if victron_slots else ""
         logging.info(
-            "AI_ESS: Optimization complete — action=%s setpoint=%sW SoC=%.0f%% price=%.3f",
+            "AI_ESS: Optimization complete — action=%s setpoint=%sW SoC=%.0f%% price=%.3f%s",
             result.get('control_action'), applied_setpoint,
             (batt_soc if batt_soc is not None else float('nan')),
             (result.get('current_price') or 0.0),
+            charge_slot_note,
         )
 
         # Record success for the legacy-fallback health check.

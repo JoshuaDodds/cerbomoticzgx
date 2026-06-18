@@ -79,10 +79,64 @@ document.querySelectorAll(".tab").forEach((t) => {
 let firstRender = true;
 
 function todayNet(plan) {
+  plan = planWithLiveActuals(plan);
+  if (!plan) return null;
   const days = plan.day_summary && plan.day_summary.days;
   if (!days) return null;
   const t = days.find((d) => d.is_today);
   return t ? t.net : null;
+}
+
+function liveTodayActuals() {
+  if (!liveOn()) return null;
+  const vals = {
+    import_kwh: lastLive.day_import_kwh,
+    import_cost: lastLive.day_import_cost,
+    export_kwh: lastLive.day_export_kwh,
+    export_rev: lastLive.day_export_reward,
+  };
+  return Object.values(vals).every((v) => v != null) ? vals : null;
+}
+
+function planWithLiveActuals(plan) {
+  const actual = liveTodayActuals();
+  if (!plan || !plan.available || !actual || !plan.day_summary) return plan;
+
+  const keys = ["import_kwh", "import_cost", "export_kwh", "export_rev", "idle_imp_cost", "idle_exp_rev"];
+  let changed = false;
+  const days = (plan.day_summary.days || []).map((d) => {
+    if (!d.is_today) return d;
+    changed = true;
+    const cleanActual = {
+      import_kwh: Number(actual.import_kwh || 0),
+      import_cost: Number(actual.import_cost || 0),
+      export_kwh: Number(actual.export_kwh || 0),
+      export_rev: Number(actual.export_rev || 0),
+    };
+    const forecast = d.forecast || {};
+    const combined = {};
+    keys.forEach((k) => {
+      combined[k] = Number(forecast[k] || 0) + Number(cleanActual[k] || 0);
+    });
+    return {
+      ...d,
+      actual: cleanActual,
+      combined,
+      net: combined.import_cost - combined.export_rev,
+      projected_idle_net: combined.idle_exp_rev - combined.idle_imp_cost,
+    };
+  });
+  if (!changed) return plan;
+
+  const total = keys.reduce((acc, k) => ({ ...acc, [k]: 0 }), {});
+  days.forEach((d) => {
+    const combined = d.combined || {};
+    keys.forEach((k) => { total[k] += Number(combined[k] || 0); });
+  });
+  total.net = total.import_cost - total.export_rev;
+  total.projected_idle_net = total.idle_exp_rev - total.idle_imp_cost;
+
+  return { ...plan, day_summary: { ...plan.day_summary, days, total } };
 }
 
 function nextSell(plan) {
@@ -101,6 +155,7 @@ const currentCA = (c) =>
 
 // ---- Render: overview (status, metrics, solar, decision) ----
 function renderStatus(plan) {
+  plan = planWithLiveActuals(plan);
   const strip = $("#status-strip");
   strip.innerHTML = "";
   if (!plan.available) { strip.appendChild(el("span", "muted", plan.message || "No plan yet")); return; }
@@ -118,6 +173,7 @@ function renderStatus(plan) {
 }
 
 function renderMetrics(plan) {
+  plan = planWithLiveActuals(plan);
   const box = $("#metrics");
   box.innerHTML = "";
   if (!plan.available) return;
@@ -215,6 +271,7 @@ function renderDecision(plan) {
 }
 
 function renderDaySummary(plan) {
+  plan = planWithLiveActuals(plan);
   const box = $("#day-summary");
   box.innerHTML = "<h3 style='margin:2px 0 12px'>Day cost summary (actuals + forecast)</h3>";
   if (!plan.available || !plan.day_summary) { box.innerHTML += "<span class='muted'>—</span>"; return; }
@@ -530,6 +587,7 @@ async function refreshPlan() {
 function applyLive(data) {
   lastLive = data;
   renderOverview();             // overlay live values onto the plan
+  if (lastPlan) renderDaySummary(lastPlan);
   safeRenderPowerFlow();
   if (lastPlan) renderMeta(lastPlan);
 }

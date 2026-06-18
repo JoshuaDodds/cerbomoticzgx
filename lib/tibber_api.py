@@ -1,8 +1,10 @@
 import tibber
 import time
 import requests
+import json
+import os
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dateutil import parser, tz
 
 # Tibber GraphQL endpoint used for direct price queries (needed to request
@@ -23,6 +25,9 @@ account = tibber.Account(retrieve_setting('TIBBER_ACCESS_TOKEN'))
 _home = account.homes[0]
 
 client = VictronClient().get_client()
+
+_PRICE_CACHE = {}
+DEFAULT_PRICE_CACHE_PATH = "/dev/shm/cerbo_tibber_price_cache.json"
 
 def live_measurements(home=_home or None):
     @home.event("live_measurement")
@@ -170,7 +175,119 @@ def mqtt_publish_all_prices(home):
     except Exception as e:
         logging.error(f"Tibber: Error publishing all prices: {e}")
 
-def _fetch_price_points_graphql(resolution: str) -> list:
+def _price_cache_path(resolution: str) -> str:
+    configured = retrieve_setting('TIBBER_PRICE_CACHE_PATH') or DEFAULT_PRICE_CACHE_PATH
+    root, ext = os.path.splitext(configured)
+    ext = ext or ".json"
+    return f"{root}_{resolution}{ext}"
+
+
+def _parse_price_start(value):
+    if isinstance(value, datetime):
+        return value
+    text = str(value)
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return parser.parse(text, tzinfos=tzinfos)
+
+
+def _normalise_price_points(points: list) -> list:
+    normalised = []
+    for p in points or []:
+        start = p.get("start")
+        try:
+            start_iso = _parse_price_start(start).isoformat()
+            normalised.append({
+                "start": start_iso,
+                "total": float(p["total"]),
+                "level": p.get("level"),
+            })
+        except (KeyError, TypeError, ValueError):
+            continue
+    normalised.sort(key=lambda x: x["start"])
+    return normalised
+
+
+def _cache_price_points(resolution: str, points: list) -> None:
+    """Persist the last good price horizon in memory and /dev/shm.
+
+    This gives the optimizer a safe fallback when Tibber has a transient API
+    timeout. Best-effort only: cache write failures must never block planning.
+    """
+    normalised = _normalise_price_points(points)
+    if not normalised:
+        return
+
+    payload = {
+        "resolution": resolution,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "points": normalised,
+    }
+    _PRICE_CACHE[resolution] = payload
+
+    try:
+        path = _price_cache_path(resolution)
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        tmp = f"{path}.tmp"
+        with open(tmp, "w") as fh:
+            json.dump(payload, fh)
+        os.replace(tmp, path)
+    except OSError as e:
+        logging.debug("Tibber: could not write %s price cache: %s", resolution, e)
+
+
+def _load_price_cache(resolution: str) -> dict | None:
+    cached = _PRICE_CACHE.get(resolution)
+    if cached:
+        return cached
+
+    try:
+        with open(_price_cache_path(resolution)) as fh:
+            cached = json.load(fh)
+        if cached.get("resolution") == resolution:
+            _PRICE_CACHE[resolution] = cached
+            return cached
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    return None
+
+
+def _cached_price_points(resolution: str) -> list:
+    """Return cached prices only when they still cover the current slot horizon."""
+    cached = _load_price_cache(resolution)
+    if not cached:
+        return []
+
+    points = _normalise_price_points(cached.get("points") or [])
+    if not points:
+        return []
+
+    try:
+        starts = [_parse_price_start(p["start"]) for p in points]
+        starts.sort()
+        now = datetime.now(starts[0].tzinfo)
+        if len(starts) > 1:
+            gaps = [(starts[i] - starts[i - 1]).total_seconds() for i in range(1, len(starts))]
+            positive_gaps = [g for g in gaps if g > 0]
+            slot_h = min(positive_gaps) / 3600.0 if positive_gaps else 0.25
+        else:
+            slot_h = 0.25 if resolution == "QUARTER_HOURLY" else 1.0
+
+        # Need at least one slot whose window has not fully elapsed. Old cache
+        # from yesterday must not drive today's optimizer.
+        current_slot_cutoff = now - timedelta(hours=slot_h)
+        if starts[-1] <= current_slot_cutoff:
+            return []
+        return points
+    except (TypeError, ValueError) as e:
+        logging.debug("Tibber: ignoring malformed %s price cache: %s", resolution, e)
+        return []
+
+
+def _fetch_price_points_graphql_once(resolution: str) -> list:
     """Query the Tibber GraphQL API directly for price points at the requested
     resolution.
 
@@ -218,6 +335,23 @@ def _fetch_price_points_graphql(resolution: str) -> list:
         return []
 
 
+def _fetch_price_points_graphql(resolution: str, attempts: int = 3, retry_delay_s: float = 2.0) -> list:
+    """Fetch GraphQL prices with short retry/backoff for transient failures."""
+    attempts = max(1, int(attempts or 1))
+    for attempt in range(1, attempts + 1):
+        points = _fetch_price_points_graphql_once(resolution)
+        if points:
+            _cache_price_points(resolution, points)
+            return points
+        if attempt < attempts:
+            logging.info(
+                "Tibber: priceInfo(%s) unavailable; retrying (%s/%s).",
+                resolution, attempt + 1, attempts,
+            )
+            time.sleep(max(0.0, retry_delay_s))
+    return []
+
+
 def _get_all_price_points_via_library() -> list:
     """Fallback: hourly price points via the tibber python library."""
     try:
@@ -256,10 +390,15 @@ def get_all_price_points():
         return points
 
     if resolution == 'QUARTER_HOURLY':
+        cached = _cached_price_points('QUARTER_HOURLY')
+        if cached:
+            logging.warning("Tibber: Quarter-hourly fetch failed; using cached quarter-hourly prices.")
+            return cached
+
         # Try hourly via GraphQL before falling all the way back to the library.
         points = _fetch_price_points_graphql('HOURLY')
         if points:
-            logging.info("Tibber: Quarter-hourly prices unavailable; using hourly GraphQL prices.")
+            logging.warning("Tibber: Quarter-hourly prices unavailable and cache unusable; using hourly GraphQL prices.")
             return points
 
     logging.warning("Tibber: Falling back to hourly price points via the tibber library.")

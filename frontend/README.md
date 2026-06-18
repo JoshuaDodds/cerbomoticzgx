@@ -71,8 +71,8 @@ sharing the host's `/dev/shm` (so it can read the published plan). Expose
   with curved connectors and animated flow dots whose direction follows real power
   (import/export, charge/discharge), per-node live Watts + today's kWh totals, SoC
   in the battery node, and a clock. Dependency-free SVG, updating every ~5s from
-  `/api/live` (+ daily totals from the plan's `today` block). An **EV** node appears
-  automatically when an `ev_w` live value is present (see note below).
+  `/api/live` (+ live Tibber daily import/export/cost counters). An **EV** node
+  appears automatically when an `ev_w` live value is present (see note below).
 - **Trends** (tab): HA-style metric cards — **self-sufficiency %**, **self-consumed
   solar %**, and a **grid balance** bar (import vs export, net) — above a gradient
   SoC% + buy-price line chart across the full horizon with a `now` marker. The
@@ -102,12 +102,14 @@ class of knob and will be written via `STATE.set()` instead of `.env`.
 
 `frontend/live.py` subscribes (read-only) to the same broker the main service uses
 (`MOSQUITTO_IP`) and caches the latest value for SoC, price, grid/PV/battery/load
-power, AC setpoint, and the published `ai_mode`/`ai_reason`/`feed_in_limit_state`.
+power, AC setpoint, Tibber daily import/export/cost counters, and the published
+`ai_mode`/`ai_reason`/`feed_in_limit_state`.
 The UI receives these via a **Server-Sent Events push** (`/api/live/stream`) — the
 server streams a fresh snapshot the instant a new MQTT value arrives, so the
-Overview and Live diagram update in real time with no polling lag. A slow 20s
-poll of `/api/live` remains as a fallback if the stream drops or is proxy-buffered.
-The values overlay the slower plan snapshot. A green/grey dot on the "Now" card shows whether the live feed is
+Overview, day summary, and Live diagram update in real time with no polling lag.
+A slow 20s poll of `/api/live` remains as a fallback if the stream drops or is
+proxy-buffered. The values overlay the slower plan snapshot. A green/grey dot on
+the "Now" card shows whether the live feed is
 connected; if it's offline the UI falls back to plan values. No new config — it
 reuses `MOSQUITTO_IP` and `VRM_PORTAL_ID`.
 

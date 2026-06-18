@@ -51,6 +51,10 @@ class MqttLive:
             "control_action": "Cerbomoticzgx/GlobalState/ai_control_action",
             "reason": "Cerbomoticzgx/GlobalState/ai_reason",
             "feed_in_state": "Cerbomoticzgx/GlobalState/feed_in_limit_state",
+            "day_import_kwh": "Tibber/home/energy/day/imported",
+            "day_import_cost": "Tibber/home/energy/day/cost",
+            "day_export_kwh": "Tibber/home/energy/day/exported",
+            "day_export_reward": "Tibber/home/energy/day/reward",
         }
 
     def start(self):
@@ -140,6 +144,10 @@ class MqttLive:
         out["control_action"] = vals.get("control_action")
         out["reason"] = vals.get("reason")
         out["feed_in_state"] = vals.get("feed_in_state")
+        out["day_import_kwh"] = _num("day_import_kwh")
+        out["day_import_cost"] = _num("day_import_cost")
+        out["day_export_kwh"] = _num("day_export_kwh")
+        out["day_export_reward"] = _num("day_export_reward")
         return out
 
 
