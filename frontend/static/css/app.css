@@ -27,7 +27,7 @@ body {
 }
 .brand { font-weight: 700; letter-spacing: .3px; display: flex; align-items: center; gap: 8px; }
 .brand span { color: var(--muted); font-weight: 400; }
-.brand-logo { height: 30px; width: auto; display: block; }
+.brand-logo { height: 50px; width: auto; display: block; }
 .status-strip { display: flex; gap: 18px; flex-wrap: wrap; margin-left: auto; }
 
 /* Sticky-header clock + sunrise/sunset (top-right, globally useful) */
