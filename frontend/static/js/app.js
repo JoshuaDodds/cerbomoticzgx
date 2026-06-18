@@ -164,7 +164,7 @@ function renderStatus(plan) {
   strip.innerHTML = "";
   if (!plan.available) { strip.appendChild(el("span", "muted", plan.message || "No plan yet")); return; }
   const c = plan.current || {};
-  const total = plan.day_summary && plan.day_summary.total;
+  const tNet = todayNet(plan);
   const soc = pick(plan.battery_soc, lastLive && lastLive.soc);
   // Price comes from the 15-min plan (the live MQTT topic is hourly), so the
   // header matches the Now card and the slot table.
@@ -173,7 +173,7 @@ function renderStatus(plan) {
   strip.appendChild(kv(chipFor(currentCA(c)), "action"));
   strip.appendChild(kv((soc != null ? Number(soc).toFixed(1) : "—") + "%", "battery SoC"));
   strip.appendChild(kv("€" + Number(price || 0).toFixed(3), "price /kWh"));
-  if (total) strip.appendChild(kv(netHtml(total.net), "horizon net"));
+  if (tNet != null) strip.appendChild(kv(netHtml(tNet), "Today"));
 }
 
 function renderMetrics(plan) {

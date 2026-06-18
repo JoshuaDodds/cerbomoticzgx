@@ -116,7 +116,10 @@ main { padding: 12px 16px 80px; max-width: 1100px; margin: 0 auto; }
   grid-template-columns: 116px 1fr 82px 74px 64px 64px 88px 100px;
   align-items: center; gap: 8px;
 }
-.table-head { color: var(--muted); font-size: 12px; padding: 4px 8px; }
+.table-head {
+  color: var(--muted); font-size: 12px; padding: 4px 8px;
+  position: sticky; top: 69px; z-index: 4; background: var(--panel);
+}
 .col-num { text-align: right; }
 
 .hour-row {
