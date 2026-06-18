@@ -79,8 +79,11 @@ sharing the host's `/dev/shm` (so it can read the published plan). Expose
   derived metrics come from the plan's `today` block (computed server-side from
   daily yields, consumption, and grid actuals).
 - **Schedule** (tab): expandable hour → 15-min → reasoning tree, color-coded by
-  control action, with a per-hour timeline bar and aggregates. The current hour/slot
-  are highlighted (`NOW`) and the view auto-scrolls to "now" on open.
+  control action, with a per-hour timeline bar and aggregates. For today, the
+  timeline starts at midnight with settled history rows (actual import/export,
+  net, SoC, and PV production from `kind: "settlement"` records), then flows into
+  the forward plan from the active slot onward. The current hour/slot are
+  highlighted (`NOW`) and the view auto-scrolls to "now" on open.
 - **Configuration** (tab): click any value to edit it (number/select), confirm, and Save.
 
 ## Config knobs — how writes propagate
@@ -127,15 +130,14 @@ reuses `MOSQUITTO_IP` and `VRM_PORTAL_ID`.
 - No authentication in v1 (intended for a trusted LAN). Add a reverse proxy / auth
   before exposing beyond the LAN, especially now that config is writable.
 - **Done:** ✅ (1) SoC + price horizon chart (Trends tab, no CDN); ✅ (2) live
-  power-flow mini-diagram (Live tab, no CDN). Both are isolated modules.
+  power-flow mini-diagram (Live tab, no CDN); ✅ (6) unified past-actuals +
+  forward-plan timeline in Schedule. These are isolated modules.
 - Roadmap (next up):
   - (3) **Control toggles** (enable optimizer, net metering) written via `STATE.set`
     — the second write path, distinct from `.env` config knobs.
   - (4) **Historical performance** view — realised daily € from the history NDJSON.
   - (5) **Forecast-accuracy** view — predicted-vs-actual per slot from the `kind:
     "settlement"` records (net-€ error, PV/load forecast bias over time).
-  - (6) **Timeline** — unified past-actuals + forward-plan strip (the settlement
-    data is the backbone; the horizon chart is the forward half).
   - (7) **Battery-health** widget — cycles/day and €-per-cycle, to watch wear vs gain.
   - (8) **Auth / reverse-proxy** hardening + a mobile-responsive layout.
   - (9) **CSV export** of plan + history for offline analysis.

@@ -40,6 +40,9 @@ const fmtGrid = (v) => {
 };
 const prodCell = (v) => (v == null || Math.abs(Number(v)) < 0.005) ? '<span class="muted">—</span>' : Number(v).toFixed(2);
 const consCell = (v) => (v == null || Math.abs(Number(v)) < 0.005) ? '<span class="muted">—</span>' : Number(v).toFixed(2);
+const socPair = (a, b) => (a == null || b == null)
+  ? '<span class="muted">—</span>'
+  : `${Math.round(a)}→${Math.round(b)}%`;
 // Consistent power formatting: watts under 1 kW, kW at or above.
 const fmtPower = (w) => {
   if (w == null) return "—";
@@ -52,6 +55,7 @@ let lastPlan = null;
 let lastLive = null;
 let expandedHours = new Set();   // hour keys the user has expanded (survive refreshes)
 let lastHoursGen = null;          // generated_at of the last tree we built
+let lastCurrentHourKey = null;
 
 const liveOn = () => !!(lastLive && lastLive.connected);
 // Prefer a live MQTT value when the feed is connected and the value is present.
@@ -329,8 +333,8 @@ function slotDetail(s) {
   const d = el("div", "slot-detail");
   d.innerHTML = `<div><b>${chipFor(caOf(s))}</b> &nbsp; ${s.reason || ""}</div>
     <div class="grid">
-      <div><small>buy / sell</small>€${Number(s.price).toFixed(4)} / €${Number(s.sell).toFixed(4)}</div>
-      <div><small>SoC</small>${Number(s.soc_start).toFixed(0)}% → ${Number(s.soc_end).toFixed(0)}%</div>
+      <div><small>buy / sell</small>€${Number(s.price || 0).toFixed(4)} / €${Number(s.sell || s.price || 0).toFixed(4)}</div>
+      <div><small>SoC</small>${socPair(s.soc_start, s.soc_end)}</div>
       <div><small>grid (+imp/−exp)</small>${fmtGrid(s.grid_energy)} kWh</div>
       <div><small>production</small>${s.pv != null ? Number(s.pv).toFixed(2) + " kWh" : "—"}</div>
       <div><small>consumption</small>${s.load != null ? Number(s.load).toFixed(2) + " kWh" : "—"}</div>
@@ -344,6 +348,13 @@ function renderHours(plan) {
   box.innerHTML = "";
   if (!plan.available) return;
   let currentRow = null;
+  const currentHour = (plan.hours || []).find((h) => h.is_current);
+  const currentKey = currentHour && currentHour.key;
+  if ((firstRender || currentKey !== lastCurrentHourKey) && currentKey) {
+    if (lastCurrentHourKey) expandedHours.delete(lastCurrentHourKey);
+    expandedHours.add(currentKey);
+    lastCurrentHourKey = currentKey;
+  }
   plan.hours.forEach((h) => {
     const row = el("div", "hour-row" + (h.is_current ? " current" : ""));
     if (h.is_current) currentRow = row;
@@ -355,7 +366,7 @@ function renderHours(plan) {
       `<span class="col-num">${fmtGrid(h.grid_kwh)}</span>` +
       `<span class="col-num">${prodCell(h.production_kwh)}</span>` +
       `<span class="col-num">${consCell(h.consumption_kwh)}</span>` +
-      `<span class="col-num">${Math.round(h.soc_start)}→${Math.round(h.soc_end)}%</span>` +
+      `<span class="col-num">${socPair(h.soc_start, h.soc_end)}</span>` +
       `<span class="col-num">${netHtml(h.net_cost)}</span>`;
     row.querySelector(".col-bar").appendChild(timelineBar(h));
 
@@ -368,18 +379,21 @@ function renderHours(plan) {
       const imp = g > 0 ? g : 0;
       const exp = g < 0 ? -g : 0;
       const idle = isIdle(s);   // IDLE flow is projected, not committed
-      const slotNet = imp * Number(s.price) - exp * sell;
+      const settled = !!s.settled;
+      const slotNet = settled
+        ? Number(s.actual_cost || 0) - Number(s.actual_reward || 0)
+        : imp * Number(s.price) - exp * sell;
       const muted = (v) => `<span class='muted'>${v}</span>`;
       const gridStr = fmtGrid(g);
       sr.innerHTML =
         `<span><span class="slot-dot" style="background:var(--${slotColorVar(s)})"></span>${s.time.slice(11, 16)}</span>` +
         `<span>${caOf(s)}</span>` +
-        `<span class="col-num">€${Number(s.price).toFixed(3)}</span>` +
-        `<span class="col-num">${idle ? muted(gridStr) : gridStr}</span>` +
+        `<span class="col-num">€${Number(s.price || 0).toFixed(3)}</span>` +
+        `<span class="col-num">${idle && !settled ? muted(gridStr) : gridStr}</span>` +
         `<span class="col-num">${prodCell(s.pv)}</span>` +
         `<span class="col-num">${consCell(s.load)}</span>` +
-        `<span class="col-num">${Math.round(s.soc_start)}→${Math.round(s.soc_end)}%</span>` +
-        `<span class="col-num">${idle ? muted("projected") : netHtml(slotNet)}</span>`;
+        `<span class="col-num">${socPair(s.soc_start, s.soc_end)}</span>` +
+        `<span class="col-num">${idle && !settled ? muted("projected") : netHtml(slotNet)}</span>`;
       const detail = slotDetail(s);
       detail.style.display = "none";
       sr.addEventListener("click", (e) => {

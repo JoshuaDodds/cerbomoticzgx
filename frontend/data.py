@@ -28,6 +28,10 @@ def plan_path() -> str:
     return _env().get("AI_PLAN_EXPORT_PATH") or DEFAULT_PLAN_PATH
 
 
+def history_dir() -> str:
+    return _env().get("HISTORY_DIR") or "data/history"
+
+
 def _parse_time(s):
     try:
         return datetime.fromisoformat(s)
@@ -55,13 +59,94 @@ def load_raw_plan() -> dict | None:
         return None
 
 
+def _today_history_path() -> str:
+    today = datetime.now().date().isoformat()
+    return os.path.join(history_dir(), f"ess-{today}.ndjson")
+
+
+def settled_slots_for_today(forecast_start: str | None = None) -> list:
+    """Read today's settled slots from history as schedule-shaped rows.
+
+    Settlement records are actuals for a slot that has closed. We expose them in
+    the same hour tree as the forward plan, using ``time`` as the original slot
+    start so the schedule can begin at midnight and flow naturally into "now".
+    """
+    today = datetime.now().date()
+    cutoff = _parse_time(forecast_start)
+    slots = []
+    try:
+        with open(_today_history_path()) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("kind") != "settlement":
+                    continue
+                start = _parse_time(rec.get("slot_start"))
+                if start is None or start.date() != today:
+                    continue
+                # Once the forward plan starts, let the plan own the active and
+                # future slots. History rows before that are closed/actual.
+                if cutoff is not None and start >= cutoff:
+                    continue
+
+                imp = rec.get("actual_import_kwh")
+                exp = rec.get("actual_export_kwh")
+                actual_cost = rec.get("actual_cost")
+                actual_reward = rec.get("actual_reward")
+
+                def _num(v):
+                    try:
+                        return float(v)
+                    except (TypeError, ValueError):
+                        return None
+
+                imp_f = _num(imp)
+                exp_f = _num(exp)
+                grid = None
+                if imp_f is not None or exp_f is not None:
+                    grid = (imp_f or 0.0) - (exp_f or 0.0)
+
+                slots.append({
+                    "time": start.isoformat(),
+                    "settled": True,
+                    "closed_at": rec.get("slot_end"),
+                    "control_action": rec.get("predicted_control_action") or "IDLE",
+                    "reason": "Settled actuals from history",
+                    "reason_code": "SETTLED_ACTUAL",
+                    "grid_energy": grid,
+                    "price": _num(rec.get("price_buy")) or 0.0,
+                    "sell": _num(rec.get("price_sell")) or _num(rec.get("price_buy")) or 0.0,
+                    "pv": _num(rec.get("actual_pv_kwh")),
+                    "load": None,
+                    "soc_start": _num(rec.get("soc_start")),
+                    "soc_end": _num(rec.get("soc_end")),
+                    "actual_import_kwh": imp_f,
+                    "actual_export_kwh": exp_f,
+                    "actual_cost": _num(actual_cost),
+                    "actual_reward": _num(actual_reward),
+                    "actual_net_eur": _num(rec.get("actual_net_eur")),
+                    "incomplete": bool(rec.get("incomplete")),
+                })
+    except (FileNotFoundError, OSError):
+        return []
+
+    slots.sort(key=lambda s: s["time"])
+    return slots
+
+
 def group_by_hour(schedule: list) -> list:
     """Group 15-minute slots into hour buckets with aggregates for the tree view.
 
     The first slot in the schedule is "now"; its slot and hour are flagged
     ``is_current`` so the UI can highlight and jump to it.
     """
-    current_time = schedule[0].get("time") if schedule else None
+    current_slot = next((s for s in schedule if not s.get("settled")), None)
+    current_time = current_slot.get("time") if current_slot else None
     current_hour_key = None
     if current_time:
         cdt = _parse_time(current_time)
@@ -74,7 +159,7 @@ def group_by_hour(schedule: list) -> list:
         dt = _parse_time(slot.get("time"))
         if dt is None:
             continue
-        slot["is_current"] = (slot.get("time") == current_time)
+        slot["is_current"] = (slot.get("time") == current_time and not slot.get("settled"))
         key = dt.strftime("%Y-%m-%d %H")
         if key not in hours:
             hours[key] = {
@@ -98,7 +183,20 @@ def group_by_hour(schedule: list) -> list:
         h["grid_kwh"] += g
         h["production_kwh"] += slot.get("pv", 0.0) or 0.0
         h["consumption_kwh"] += slot.get("load", 0.0) or 0.0
-        if is_idle(slot):
+        if slot.get("settled"):
+            imp = slot.get("actual_import_kwh")
+            exp = slot.get("actual_export_kwh")
+            imp_cost = slot.get("actual_cost")
+            exp_rev = slot.get("actual_reward")
+            if imp is not None:
+                h["import_kwh"] += imp
+            if imp_cost is not None:
+                h["import_cost"] += imp_cost
+            if exp is not None:
+                h["export_kwh"] += exp
+            if exp_rev is not None:
+                h["export_rev"] += exp_rev
+        elif is_idle(slot):
             # IDLE = projected only (Victron decides), kept out of committed net.
             if g > 0:
                 h["idle_imp_cost"] += g * buy
@@ -230,6 +328,8 @@ def get_plan() -> dict:
             age_s = None
 
     schedule = raw.get("schedule", [])
+    forecast_start = schedule[0].get("time") if schedule else None
+    timeline_schedule = settled_slots_for_today(forecast_start) + schedule
     return {
         "available": True,
         "generated_at": raw.get("generated_at"),
@@ -244,7 +344,7 @@ def get_plan() -> dict:
         "current": raw.get("current", {}),
         "today": raw.get("today", {}),
         "victron_slots": raw.get("victron_slots", []),
-        "hours": group_by_hour(schedule),
+        "hours": group_by_hour(timeline_schedule),
         "day_summary": day_summary(schedule, raw.get("today_actuals")),
     }
 

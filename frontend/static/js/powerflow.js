@@ -220,8 +220,8 @@
         ${EDGES.map(edgeSvg).join("")}
         ${nodes.join("")}
         <g transform="translate(${HUB.x},${HUB.y})">
-          <circle r="${HUB_R}" fill="#ffffff"/>
-          <path d="M3,-18 L-9,4 L-1,4 L-4,18 L9,-3 L1,-3 Z" fill="#0b0f14"/>
+          <circle r="${HUB_R}" fill="none" stroke="#ffffff" stroke-width="2"/>
+          <path d="M3,-18 L-9,4 L-1,4 L-4,18 L9,-3 L1,-3 Z" fill="#ffffff"/>
         </g>
       </svg>`;
   };
