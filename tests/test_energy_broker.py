@@ -137,6 +137,9 @@ def test_settlement_writes_predicted_vs_actual(monkeypatch, tmp_path):
     monkeypatch.setattr(energy_broker, "STATE",
                         DummyState({"c1_daily_yield": 1.0, "c2_daily_yield": 0.5}))
     monkeypatch.setattr(energy_broker, "_LAST_SLOT_PATH", str(tmp_path / "last_slot.json"))
+    # Keep the cost-basis tracker's file inside the tmp dir (don't touch the repo).
+    import lib.ess_cost_basis as _cb
+    monkeypatch.setattr(_cb, "_path", lambda: str(tmp_path / "cost_basis.json"))
 
     res = {"control_action": "SELL", "slot_duration_h": 0.25,
            "schedule": [{"grid_energy": -2.0, "price": 0.30, "sell": 0.30}]}
@@ -165,6 +168,8 @@ def test_settlement_writes_predicted_vs_actual(monkeypatch, tmp_path):
     assert abs(s["actual_net_eur"] - 0.60) < 1e-6   # +0.60 reward − 0 added import
     assert abs(s["predicted_net_eur"] - 0.60) < 1e-6  # 2 kWh export @ €0.30
     assert abs(s["soc_delta"] - (-8.0)) < 1e-6
+    # Cost-basis field is recorded (discharge slot -> basis present, may be 0).
+    assert "cost_basis_eur_per_kwh" in s
 
 
 def _patch_common_dependencies(monkeypatch, state_values=None, settings=None):
@@ -240,3 +245,61 @@ def test_nightly_schedule_runs_when_skip_disabled(monkeypatch):
     lowest_48h_mock.assert_called_once()
     schedule_mock.assert_called_once_with(22, schedule=0, day=0)
     remove_mock.assert_called()
+
+
+# --- Manual grid-charge override -------------------------------------------
+
+def test_manual_grid_charge_on_reads_toggle(monkeypatch):
+    monkeypatch.setattr(energy_broker, "STATE", DummyState({"grid_charging_enabled": "True"}))
+    assert energy_broker._manual_grid_charge_on() is True
+    monkeypatch.setattr(energy_broker, "STATE", DummyState({"grid_charging_enabled": "False"}))
+    assert energy_broker._manual_grid_charge_on() is False
+    monkeypatch.setattr(energy_broker, "STATE", DummyState({}))
+    assert energy_broker._manual_grid_charge_on() is False
+
+
+# --- SELL hysteresis (minimum dwell + price band) ---------------------------
+
+def test_sell_hysteresis_suppresses_quick_reentry(monkeypatch, tmp_path):
+    # We stopped selling moments ago at €0.30; a fresh SELL at ~the same price
+    # within the dwell window must be damped to a hold (RETAIN).
+    monkeypatch.setattr(energy_broker, "_SELL_STATE_PATH", str(tmp_path / "sell.json"))
+    monkeypatch.setattr(energy_broker, "retrieve_setting", lambda name: None)  # defaults: 20min / €0.03
+    (tmp_path / "sell.json").write_text(json.dumps(
+        {"sell_on": False, "ts": __import__("time").time(), "price": 0.30}))
+
+    result = {"control_action": "SELL", "grid_assist": False, "mode": "sell",
+              "setpoint": -5000.0, "current_price": 0.305}
+    out = energy_broker._apply_sell_hysteresis(result)
+    assert out["control_action"] == "RETAIN"
+    assert out["grid_assist"] is True
+    assert out["setpoint"] == 0.0
+    assert out["reason_code"] == "SELL_DAMPED_HYSTERESIS"
+
+
+def test_sell_hysteresis_allows_reentry_on_big_price_move(monkeypatch, tmp_path):
+    # Same recent stop at €0.30, but the price has jumped to €0.40 (> €0.03 band)
+    # -> the SELL is allowed through.
+    monkeypatch.setattr(energy_broker, "_SELL_STATE_PATH", str(tmp_path / "sell.json"))
+    monkeypatch.setattr(energy_broker, "retrieve_setting", lambda name: None)
+    (tmp_path / "sell.json").write_text(json.dumps(
+        {"sell_on": False, "ts": __import__("time").time(), "price": 0.30}))
+
+    result = {"control_action": "SELL", "grid_assist": False, "mode": "sell",
+              "setpoint": -5000.0, "current_price": 0.40}
+    out = energy_broker._apply_sell_hysteresis(result)
+    assert out["control_action"] == "SELL"
+
+
+def test_sell_hysteresis_never_blocks_exit(monkeypatch, tmp_path):
+    # Currently selling; the optimizer now wants to hold. Exiting SELL is always
+    # allowed (the guard only ever suppresses *entering* a sell).
+    monkeypatch.setattr(energy_broker, "_SELL_STATE_PATH", str(tmp_path / "sell.json"))
+    monkeypatch.setattr(energy_broker, "retrieve_setting", lambda name: None)
+    (tmp_path / "sell.json").write_text(json.dumps(
+        {"sell_on": True, "ts": __import__("time").time(), "price": 0.30}))
+
+    result = {"control_action": "RETAIN", "grid_assist": True, "mode": "hold",
+              "setpoint": 0.0, "current_price": 0.305}
+    out = energy_broker._apply_sell_hysteresis(result)
+    assert out["control_action"] == "RETAIN"

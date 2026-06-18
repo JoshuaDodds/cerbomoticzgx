@@ -4,10 +4,11 @@ Runs standalone (own process / container sidecar) via ``python -m frontend`` or
 can be started as a daemon thread from the main service via ``run_in_thread()``.
 """
 import os
+import json
 import logging
 import threading
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, render_template, request, Response
 
 from frontend import data
 from frontend.live import live
@@ -17,6 +18,10 @@ app = Flask(__name__, static_folder="static", template_folder="templates")
 # on a trusted LAN, so always revalidate (avoids stale powerflow.js/charts.js
 # after an update without needing a hard refresh).
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
+# Also re-read templates/index.html on each request (otherwise Jinja caches it at
+# startup and template edits — new tabs, the logo — need a full restart to show).
+app.config["TEMPLATES_AUTO_RELOAD"] = True
+app.jinja_env.auto_reload = True
 
 
 @app.route("/")
@@ -53,6 +58,36 @@ def api_config_set():
 @app.route("/api/live")
 def api_live():
     return jsonify(live.snapshot())
+
+
+@app.route("/api/live/stream")
+def api_live_stream():
+    """Server-Sent Events: push the live snapshot the instant a new MQTT value
+    arrives (no browser polling). Falls back gracefully — the browser also keeps a
+    slow poll in case the stream drops or is buffered by a proxy."""
+    def gen():
+        yield f"data: {json.dumps(live.snapshot())}\n\n"
+        while True:
+            live.wait_for_change(timeout=15)        # wakes instantly on a new value; 15s = keepalive
+            yield f"data: {json.dumps(live.snapshot())}\n\n"
+    return Response(gen(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                             "Connection": "keep-alive"})
+
+
+@app.route("/api/replan", methods=["POST"])
+def api_replan():
+    """Re-run the optimizer now (the dashboard 'Replan' button) — the very same
+    function the 15-minute scheduler calls. Works when the dashboard runs
+    in-process (FRONTEND_ENABLED=True); a deliberate, explicit action. It runs
+    synchronously and republishes the plan, so the caller can reload immediately."""
+    try:
+        from lib.energy_broker import run_ai_optimizer
+        run_ai_optimizer()
+        return jsonify({"ok": True})
+    except Exception as e:
+        logging.warning("Replan failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/healthz")

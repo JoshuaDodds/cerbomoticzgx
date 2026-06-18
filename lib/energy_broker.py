@@ -308,9 +308,12 @@ def manage_grid_usage_based_on_current_price(price: float = None, power: any = N
     # AI grid-assist ("retain") mode, where we DO match the grid setpoint to the
     # live house load so the battery is held.
     if _ai_optimizer_active_and_healthy():
-        if STATE.get('ai_grid_assist') == 'on':
-            # Retain mode: import only what PV can't cover; stay at 0 when PV
-            # covers the load so surplus PV charges the battery / exports.
+        if STATE.get('ai_grid_assist') == 'on' or _manual_grid_charge_on():
+            # Retain mode (AI plan OR manual grid-charge override): import only what
+            # PV can't cover; stay at 0 when PV covers the load so surplus PV charges
+            # the battery / exports. The manual override keeps the setpoint tracking
+            # live load between 15-min cycles so a full-power EV charge is covered by
+            # the grid the instant it ramps, without draining the battery.
             _apply_grid_assist_setpoint(power)
         return
 
@@ -600,6 +603,85 @@ def _set_grid_assist(enabled: bool) -> None:
     logging.info(f"AI_ESS: Grid-assist (retain) mode {'ENABLED' if enabled else 'disabled'}.")
 
 
+_SELL_STATE_PATH = '/dev/shm/cerbo_ai_sell_state.json'
+
+
+def _manual_grid_charge_on() -> bool:
+    """Manual override toggle (legacy ``grid_charging_enabled`` topic).
+
+    When on, force RETAIN: hold the battery and let the grid cover ALL house loads
+    — including a full-power EV charge — instead of draining the pack. This
+    overrides the AI plan; toggling it off hands control back to the optimizer.
+    Dual-purpose by design: it is both a "charge the car from the grid now"
+    button and a "retain the battery" hold.
+    """
+    return _is_truthy(STATE.get('grid_charging_enabled'), False)
+
+
+def _apply_sell_hysteresis(result):
+    """Damp SELL flapping between 15-minute re-plans (minimum dwell + price band).
+
+    The optimizer rebuilds from scratch each cycle, so on a flat price curve it can
+    flip SELL<->HOLD on sub-cent noise. This guard only ever *suppresses entering*
+    SELL — it never forces or prolongs a discharge — so it is safe for the battery:
+    if a SELL is planned but we stopped (or weren't) selling within
+    ``ESS_SELL_MIN_DWELL_MIN`` and the price hasn't risen by ``ESS_SELL_HYSTERESIS_EUR``
+    since, we hold (RETAIN) instead. Exiting SELL is always allowed immediately.
+    """
+    import os
+    import json
+    try:
+        want_sell = (result.get('control_action') or '') == 'SELL'
+        dwell_min = _get_float_setting('ESS_SELL_MIN_DWELL_MIN', 20.0)
+        hyst = _get_float_setting('ESS_SELL_HYSTERESIS_EUR', 0.03)
+        price = float(result.get('current_price') or 0.0)
+        now = time.time()
+
+        state = {}
+        try:
+            with open(_SELL_STATE_PATH) as fh:
+                state = json.load(fh)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            state = {}
+        was_sell = bool(state.get('sell_on'))
+        last_ts = float(state.get('ts') or 0.0)
+        last_price = state.get('price')
+
+        if want_sell and not was_sell:
+            mins = (now - last_ts) / 60.0 if last_ts else 1e9
+            moved = abs(price - float(last_price)) if last_price is not None else 1e9
+            if mins < dwell_min and moved < hyst:
+                # Suppress: turn the planned SELL into a hold. Leave the persisted
+                # state untouched (we remain "not selling").
+                result['control_action'] = 'RETAIN'
+                result['grid_assist'] = True
+                result['mode'] = 'hold'
+                result['setpoint'] = 0.0
+                result['reason_code'] = 'SELL_DAMPED_HYSTERESIS'
+                result['reason'] = (
+                    f"Holding — sell suppressed by hysteresis (price moved "
+                    f"€{moved:.3f} < €{hyst:.3f} and only {mins:.0f} < {dwell_min:.0f} min "
+                    f"since last sell)"
+                )
+                logging.info(
+                    "AI_ESS: SELL suppressed by hysteresis (Δ€%.3f<%.3f, %.0f<%.0f min).",
+                    moved, hyst, mins, dwell_min,
+                )
+                return result
+
+        # Record a genuine sell<->not-sell transition (with the price/time it
+        # happened) so the next cycle can measure dwell + price movement.
+        new_sell = (result.get('control_action') or '') == 'SELL'
+        if new_sell != was_sell:
+            tmp = _SELL_STATE_PATH + '.tmp'
+            with open(tmp, 'w') as fh:
+                json.dump({'sell_on': new_sell, 'ts': now, 'price': price}, fh)
+            os.replace(tmp, _SELL_STATE_PATH)
+    except Exception as e:
+        logging.warning(f"AI_ESS: sell-hysteresis check failed: {e}")
+    return result
+
+
 def _grid_assist_setpoint_watts(load_watts=None) -> int:
     """Grid setpoint (W) for retain mode: import only the load the PV cannot cover.
 
@@ -632,9 +714,12 @@ def _apply_grid_assist_setpoint(load_watts=None, deadband_w: int = 50) -> None:
             adjust_grid_setpoint(target, override_ess_net_mettering=True)
     else:
         # PV covers the load: don't import. Leave the setpoint at 0 so surplus PV
-        # charges the battery / exports when full. Only write if not already 0.
-        if current_sp != 0:
-            ac_power_setpoint(watts="0.0", override_ess_net_mettering=False)
+        # charges the battery / exports when full. Apply the same deadband as the
+        # import branch so we don't thrash 0 <-> import as PV flickers around the
+        # load level (e.g. at sunrise). silent=True to match the import write
+        # above — otherwise only the zero-writes log, spamming the service log.
+        if abs(current_sp) >= deadband_w:
+            ac_power_setpoint(watts="0.0", override_ess_net_mettering=False, silent=True)
 
 
 # Default relative residential load shape (per clock hour, 0-23). Normalised at
@@ -884,6 +969,7 @@ def _publish_plan_json(result, *, batt_soc, price_points, pv_remaining,
             'battery_soc': batt_soc,
             'price_points': price_points,
             'pv_remaining_wh': pv_remaining,
+            'pv_today_total_kwh': STATE.get('pv_projected_today'),
             'pv_tomorrow_wh': STATE.get('pv_projected_tomorrow'),
             'slot_duration_h': result.get('slot_duration_h'),
             'current': {
@@ -1094,6 +1180,27 @@ def _settle_prior_slot(result, *, batt_soc, today_actuals) -> None:
                 # +export revenue (pg<0) / -import cost (pg>0)
                 predicted_net = (-pg * psell) if pg < 0 else (-pg * pbuy)
 
+            # Update the persisted battery cost-basis from this slot's measured
+            # outcome (grid-charge raises it, PV-charge dilutes it). The optimizer
+            # reads it next cycle so it won't sell stored energy below cost.
+            # Best-effort: never let an accounting error affect ESS control.
+            cost_basis_now = None
+            try:
+                from lib import ess_cost_basis
+                if soc_start is not None and soc_end is not None:
+                    cb = ess_cost_basis.update_from_slot(
+                        soc_start=soc_start,
+                        soc_end=soc_end,
+                        capacity_kwh=_get_float_setting('BATTERY_CAPACITY_KWH', 45.0),
+                        import_kwh=imp_kwh or 0.0,
+                        pv_kwh=pv_kwh or 0.0,
+                        price_buy=pbuy,
+                        charge_efficiency=_get_float_setting('AC_DC_CHARGE_EFFICIENCY', 0.90),
+                    )
+                    cost_basis_now = cb.get('basis')
+            except Exception as e:
+                logging.warning(f"AI_ESS: cost-basis update failed: {e}")
+
             settlement = {
                 'ts': now.isoformat(),
                 'kind': 'settlement',
@@ -1114,6 +1221,7 @@ def _settle_prior_slot(result, *, batt_soc, today_actuals) -> None:
                 'soc_delta': round(soc_delta, 2) if soc_delta is not None else None,
                 'price_buy': pred.get('price_buy'),
                 'price_sell': pred.get('price_sell'),
+                'cost_basis_eur_per_kwh': round(cost_basis_now, 4) if cost_basis_now is not None else None,
             }
             path = os.path.join(history_dir, f"ess-{now.strftime('%Y-%m-%d')}.ndjson")
             with open(path, "a") as fh:
@@ -1207,6 +1315,23 @@ def run_ai_optimizer():
         # Keep the Victron hardware MinimumSocLimit in sync with the seasonal
         # reserve (single source of truth). Idempotent — only writes on change.
         set_minimum_ess_soc()
+
+        # 4b. Manual override wins over the plan; otherwise damp SELL flapping.
+        # The manual grid-charge toggle forces a retain hold (grid covers all
+        # loads incl. a full-power EV charge). When it's off, suppress jittery
+        # SELL<->HOLD flips that the stateless re-plan would otherwise produce.
+        if _manual_grid_charge_on():
+            result['control_action'] = 'RETAIN'
+            result['grid_assist'] = True
+            result['mode'] = 'hold'
+            result['setpoint'] = 0.0
+            result['reason_code'] = 'MANUAL_GRID_CHARGE'
+            result['reason'] = (
+                "Manual grid-charge override active: holding the battery; grid "
+                "covers all loads (including full-power EV charging)"
+            )
+        else:
+            result = _apply_sell_hysteresis(result)
 
         # 5. Apply immediate control for the current slot.
         setpoint = result.get('setpoint', 0.0)

@@ -142,10 +142,11 @@ function renderSolar(plan) {
   // "Remaining today" can go negative when actual production already exceeded
   // the day's forecast — clamp to 0 (forecast met).
   const today = plan.pv_remaining_wh != null ? Math.max(0, plan.pv_remaining_wh / 1000).toFixed(1) : "—";
+  const totalToday = plan.pv_today_total_kwh != null ? Number(plan.pv_today_total_kwh).toFixed(1) : null;
   const tom = plan.pv_tomorrow_wh != null ? (plan.pv_tomorrow_wh / 1000).toFixed(1) : "—";
   const pvnow = (liveOn() && lastLive.pv_w != null) ? fmtPower(lastLive.pv_w) : null;
   box.innerHTML = `<div class="label">Solar forecast</div>
-    <div class="big">${today}<small style="font-size:13px;color:var(--muted)"> kWh remaining today</small></div>
+    <div class="big">${today}<small style="font-size:13px;color:var(--muted)"> kWh${totalToday ? ` (of ${totalToday})` : ""} remaining today</small></div>
     <div class="sub">${tom} kWh forecast tomorrow${pvnow ? ` &nbsp;·&nbsp; producing ${pvnow} now` : ""}</div>`;
 }
 
@@ -215,36 +216,42 @@ function renderDecision(plan) {
 
 function renderDaySummary(plan) {
   const box = $("#day-summary");
-  box.innerHTML = "<h3 style='margin:2px 0 10px'>Day cost summary (actuals + forecast)</h3>";
+  box.innerHTML = "<h3 style='margin:2px 0 12px'>Day cost summary (actuals + forecast)</h3>";
   if (!plan.available || !plan.day_summary) { box.innerHTML += "<span class='muted'>—</span>"; return; }
+  // Four aligned columns: label | import | export | net. The day-row and day-sub
+  // rows share the same grid template so the numbers line up vertically.
+  const cells = (lbl, impKwh, impC, expKwh, expC, netCell) =>
+    `<span class="lbl">${lbl}</span>` +
+    `<span class="num"><span class="t">import</span> <b>${impKwh}</b> <small>${impC}</small></span>` +
+    `<span class="num"><span class="t">export</span> <b>${expKwh}</b> <small>${expC}</small></span>` +
+    `<span class="net">${netCell}</span>`;
   plan.day_summary.days.forEach((d) => {
     const r = el("div", "day-row");
-    r.innerHTML = `<span class="lbl">${d.label}${d.is_today ? " (today)" : ""}</span>
-      <span>import ${kwh(d.combined.import_kwh)} (${eur(d.combined.import_cost)})</span>
-      <span>export ${kwh(d.combined.export_kwh)} (${eur(d.combined.export_rev)})</span>
-      <span>${netHtml(d.net)}</span>`;
+    r.innerHTML = cells(`${d.label}${d.is_today ? " (today)" : ""}`,
+      kwh(d.combined.import_kwh), eur(d.combined.import_cost),
+      kwh(d.combined.export_kwh), eur(d.combined.export_rev), netHtml(d.net));
     box.appendChild(r);
     if (d.actual) {
-      box.appendChild(el("div", "day-sub",
-        `actual so far &nbsp;—&nbsp; import <b>${kwh(d.actual.import_kwh)}</b> (${eur(d.actual.import_cost)}) &nbsp;&nbsp; export <b>${kwh(d.actual.export_kwh)}</b> (${eur(d.actual.export_rev)})`));
-      box.appendChild(el("div", "day-sub",
-        `forecast rest &nbsp;—&nbsp; import <b>${kwh(d.forecast.import_kwh)}</b> (${eur(d.forecast.import_cost)}) &nbsp;&nbsp; export <b>${kwh(d.forecast.export_kwh)}</b> (${eur(d.forecast.export_rev)})`));
+      const actNet = d.actual.import_cost - d.actual.export_rev;
+      const fcNet = d.forecast.import_cost - d.forecast.export_rev;
+      const a = el("div", "day-sub");
+      a.innerHTML = cells("actual so far",
+        kwh(d.actual.import_kwh), eur(d.actual.import_cost),
+        kwh(d.actual.export_kwh), eur(d.actual.export_rev), netHtml(actNet));
+      box.appendChild(a);
+      const f = el("div", "day-sub");
+      f.innerHTML = cells("forecast rest",
+        kwh(d.forecast.import_kwh), eur(d.forecast.import_cost),
+        kwh(d.forecast.export_kwh), eur(d.forecast.export_rev), netHtml(fcNet));
+      box.appendChild(f);
     }
   });
   const t = plan.day_summary.total;
-  const tr = el("div", "day-row");
-  tr.innerHTML = `<span class="lbl">TOTAL</span>
-    <span>import ${kwh(t.import_kwh)} (${eur(t.import_cost)})</span>
-    <span>export ${kwh(t.export_kwh)} (${eur(t.export_rev)})</span>
-    <span>${netHtml(t.net)}</span>`;
+  const tr = el("div", "day-row day-total");
+  tr.innerHTML = cells("TOTAL",
+    kwh(t.import_kwh), eur(t.import_cost),
+    kwh(t.export_kwh), eur(t.export_rev), netHtml(t.net));
   box.appendChild(tr);
-  // IDLE slots are Victron-managed (self-consume / surplus PV) — their flow is a
-  // projection that settles per slot, so it's shown apart from the committed net.
-  if (t.projected_idle_net != null && Math.abs(t.projected_idle_net) > 0.005) {
-    const p = t.projected_idle_net;            // +profit (export>import), −cost
-    box.appendChild(el("div", "day-sub",
-      `+ projected (idle) &nbsp;—&nbsp; <b>~${eur(Math.abs(p))} ${p >= 0 ? "profit" : "cost"}</b> from Victron-managed slots (self-consume / surplus PV) — settles per slot, not in committed net`));
-  }
 }
 
 // ---- Render: hours tree ----
@@ -431,6 +438,34 @@ function renderConfig(cfg) {
   });
 }
 
+// ---- Render: Victron scheduled-charge slots (CerboGX style) ----
+function fmtDur(sec) {
+  sec = Number(sec) || 0;
+  const h = Math.floor(sec / 3600), m = Math.round((sec % 3600) / 60);
+  return (h ? h + "h " : "") + m + "m";
+}
+function renderVictron(plan) {
+  const box = $("#victron-schedules");
+  if (!box) return;
+  if (!plan || !plan.available) { box.innerHTML = "<span class='muted'>no plan yet…</span>"; return; }
+  const slots = plan.victron_slots || [];
+  let html = "";
+  for (let i = 0; i < 5; i++) {
+    const s = slots[i];
+    let right;
+    if (s) {
+      let day = "";
+      try { day = new Date(s.start).toLocaleDateString([], { weekday: "long" }); } catch (_) {}
+      const time = (s.start || "").slice(11, 16);
+      right = `<span class="vic-on">${day} ${time} <span class="muted">(${fmtDur(s.duration)})</span> &nbsp;→ ${s.target_soc}%</span>`;
+    } else {
+      right = `<span class="muted">Disabled</span>`;
+    }
+    html += `<div class="vic-row"><span class="vic-name">Schedule ${i + 1}</span>${right}<span class="vic-chev">›</span></div>`;
+  }
+  box.innerHTML = html;
+}
+
 function renderMeta(plan) {
   const m = $("#meta");
   if (!plan.available) { m.textContent = ""; return; }
@@ -485,19 +520,34 @@ async function refreshPlan() {
       lastHoursGen = lastPlan.generated_at;
     }
     safeRenderChart();
+    renderVictron(lastPlan);
     renderMeta(lastPlan);
   } catch (e) {
     $("#status-strip").innerHTML = `<span class="cost">error loading: ${e}</span>`;
   }
 }
 
-async function pollLive() {
+function applyLive(data) {
+  lastLive = data;
+  renderOverview();             // overlay live values onto the plan
+  safeRenderPowerFlow();
+  if (lastPlan) renderMeta(lastPlan);
+}
+
+async function pollLive() {     // backup path (and the initial fetch)
+  try { applyLive(await fetch("/api/live").then((r) => r.json())); }
+  catch (e) { /* keep last values on transient errors */ }
+}
+
+// Push stream: update the instant a new MQTT value arrives (no polling lag).
+let _liveES = null;
+function startLiveStream() {
+  if (!window.EventSource || _liveES) return;
   try {
-    lastLive = await fetch("/api/live").then((r) => r.json());
-    renderOverview();           // overlay live values onto the plan
-    safeRenderPowerFlow();
-    if (lastPlan) renderMeta(lastPlan);
-  } catch (e) { /* keep last values on transient errors */ }
+    _liveES = new EventSource("/api/live/stream");
+    _liveES.onmessage = (e) => { try { applyLive(JSON.parse(e.data)); } catch (_) {} };
+    // On error the browser auto-reconnects; the slow poll below covers any gap.
+  } catch (_) { _liveES = null; }
 }
 
 // Sticky-header clock + sunrise/sunset (globally useful info). The clock ticks
@@ -523,10 +573,31 @@ async function load() {
   await pollLive();
 }
 
-$("#refresh").addEventListener("click", load);
+// Replan: ask the main service to re-run the optimizer now (same as the 15-min
+// cycle), then reload the freshly published plan.
+async function replan() {
+  const btn = $("#replan");
+  if (btn) { btn.disabled = true; btn.textContent = "Replanning…"; }
+  try {
+    // Runs the optimizer synchronously server-side and republishes the plan,
+    // so by the time this resolves the new plan is ready to load.
+    const r = await fetch("/api/replan", { method: "POST" }).then((x) => x.json());
+    if (!r.ok) throw new Error(r.error || "replan failed");
+    await refreshPlan();
+  } catch (e) {
+    if (btn) btn.title = "Replan failed — is the service running?";
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "Replan"; }
+  }
+}
+const _replanBtn = $("#replan");
+if (_replanBtn) _replanBtn.addEventListener("click", replan);
+
 load();
 renderHeaderClock();
-// Plan refreshes slowly (changes only when the optimizer runs); live values fast.
+startLiveStream();              // instant live updates via SSE
+// Plan refreshes slowly (changes only when the optimizer runs). Live values now
+// arrive via the SSE push; keep a slow poll as a fallback if the stream drops.
 setInterval(refreshPlan, 30000);
-setInterval(pollLive, 5000);
+setInterval(pollLive, 20000);
 setInterval(renderHeaderClock, 1000);

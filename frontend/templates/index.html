@@ -8,7 +8,7 @@
 </head>
 <body>
   <header class="topbar">
-    <div class="brand">cerbomoticzGx<span> · ESS</span></div>
+    <div class="brand"><img src="{{ url_for('static', filename='img/logo.svg') }}" alt="CerbomoticzGX" class="brand-logo"/><span> · ESS</span></div>
     <div id="status-strip" class="status-strip">
       <span class="muted">loading…</span>
     </div>
@@ -29,6 +29,7 @@
     <button class="tab" data-tab="live">Live</button>
     <button class="tab" data-tab="trends">Trends</button>
     <button class="tab active" data-tab="schedule">Schedule</button>
+    <button class="tab" data-tab="victron">Victron</button>
     <button class="tab" data-tab="config">Configuration</button>
   </nav>
 
@@ -72,6 +73,12 @@
       </div>
     </section>
 
+    <section id="tab-victron" class="tab-panel">
+      <p class="cfg-note">The grid-charge schedule the optimizer has programmed into the
+        CerboGX (Settings → ESS → Scheduled charging). 5 slots, mirrored here.</p>
+      <div id="victron-schedules" class="card"></div>
+    </section>
+
     <section id="tab-config" class="tab-panel">
       <div id="config"></div>
     </section>
@@ -79,7 +86,7 @@
 
   <footer class="foot">
     <span id="meta" class="muted"></span>
-    <button id="refresh" class="btn">Refresh</button>
+    <button id="replan" class="btn" title="Re-run the optimizer now on current data">Replan</button>
   </footer>
 
   <!-- Self-contained, dependency-free view modules. Loaded before app.js, which

@@ -237,6 +237,7 @@ def get_plan() -> dict:
         "stale": (age_s is not None and age_s > 1800),  # >30 min old
         "battery_soc": raw.get("battery_soc"),
         "pv_remaining_wh": raw.get("pv_remaining_wh"),
+        "pv_today_total_kwh": raw.get("pv_today_total_kwh"),
         "pv_tomorrow_wh": raw.get("pv_tomorrow_wh"),
         "price_points": raw.get("price_points"),
         "slot_duration_h": raw.get("slot_duration_h"),

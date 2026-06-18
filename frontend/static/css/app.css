@@ -25,8 +25,9 @@ body {
   padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line);
   position: sticky; top: 0; z-index: 5;
 }
-.brand { font-weight: 700; letter-spacing: .3px; }
+.brand { font-weight: 700; letter-spacing: .3px; display: flex; align-items: center; gap: 8px; }
 .brand span { color: var(--muted); font-weight: 400; }
+.brand-logo { height: 30px; width: auto; display: block; }
 .status-strip { display: flex; gap: 18px; flex-wrap: wrap; margin-left: auto; }
 
 /* Sticky-header clock + sunrise/sunset (top-right, globally useful) */
@@ -97,18 +98,17 @@ main { padding: 12px 16px 80px; max-width: 1100px; margin: 0 auto; }
 /* decision card */
 .decision h2 { margin: 0 0 8px; font-size: 16px; }
 .decision .reason { color: var(--text); margin: 4px 0; }
-.decision .row { display: flex; gap: 22px; flex-wrap: wrap; margin-top: 6px; }
-.decision .row .kv small { color: var(--muted); display: block; }
-.flow { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
+.decision .row { display: flex; gap: 26px; flex-wrap: wrap; margin-top: 8px; }
+.decision .row .kv b { font-size: 15px; }
+.decision .row .kv small { color: var(--muted); display: block; font-size: 13px; margin-top: 1px; }
+.flow { display: flex; gap: 20px; flex-wrap: wrap; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
 .flow .f { display: flex; flex-direction: column; }
 .flow .f b { font-size: 15px; font-weight: 600; }
-.flow .f small { color: var(--muted); font-size: 12px; }
+.flow .f small { color: var(--muted); font-size: 13px; margin-top: 1px; }
 .live-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-left: 6px; vertical-align: middle; }
 .live-on { background: var(--sell); }
 .live-off { background: var(--muted); }
 
-.day-sub { color: var(--muted); font-size: 13px; margin: 4px 0 2px 8px; }
-.day-sub b { color: var(--text); font-weight: 600; }
 
 /* hour table — Hour | Timeline | Avg | Grid | Prod | Cons | SoC | Net */
 .table-head, .hour-row, .slot-row {
@@ -149,11 +149,27 @@ main { padding: 12px 16px 80px; max-width: 1100px; margin: 0 auto; }
 .slot-detail .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px,1fr)); gap: 8px 18px; margin-top: 6px; }
 .slot-detail .grid div small { color: var(--muted); display: block; }
 
-/* day summary */
-.day-row { display: flex; gap: 18px; flex-wrap: wrap; padding: 4px 0; border-bottom: 1px dashed var(--line); }
-.day-row:last-child { border-bottom: none; }
-.day-row .lbl { min-width: 150px; font-weight: 600; }
-.day-row .sub { color: var(--muted); font-size: 12px; }
+/* day summary — four aligned columns: label | import | export | net */
+.day-row, .day-sub {
+  display: grid;
+  grid-template-columns: 176px 1fr 1fr 132px;
+  gap: 6px 20px; align-items: baseline;
+}
+.day-row { padding: 6px 2px; font-size: 14.5px; }
+.day-row .lbl { font-weight: 700; }
+.day-sub { padding: 3px 2px 3px 16px; font-size: 13.5px; }
+.day-sub .lbl { color: var(--muted); font-weight: 500; }
+.day-row .num, .day-sub .num { font-variant-numeric: tabular-nums; }
+.day-row .num .t, .day-sub .num .t { color: var(--muted); margin-right: 3px; }
+.day-row .num small, .day-sub .num small { color: var(--muted); margin-left: 3px; font-size: .92em; }
+.day-sub .num b, .day-row .num b { font-weight: 600; }
+.day-row .net, .day-sub .net { text-align: right; font-variant-numeric: tabular-nums; }
+.day-total { margin-top: 6px; padding-top: 9px; border-top: 1px solid var(--line); font-size: 15px; }
+.day-total .lbl { letter-spacing: .4px; }
+@media (max-width: 640px) {
+  .day-row, .day-sub { grid-template-columns: 1fr 1fr; }
+  .day-row .lbl, .day-sub .lbl { grid-column: 1 / -1; }
+}
 
 /* config */
 .cfg-group h3 { margin: 14px 0 6px; font-size: 14px; color: var(--accent); }
@@ -169,6 +185,14 @@ main { padding: 12px 16px 80px; max-width: 1100px; margin: 0 auto; }
 .cfg-edit .cancel { background: var(--line); color: var(--text); }
 .cfg-msg { font-size: 12px; margin-left: 8px; }
 .cfg-note { color: var(--muted); font-size: 12px; margin: 0 0 10px; }
+
+/* Victron tab — CerboGX-style schedule list */
+.vic-row { display: flex; align-items: center; padding: 15px 6px; border-bottom: 1px solid var(--line); }
+.vic-row:last-child { border-bottom: none; }
+.vic-name { font-weight: 600; font-size: 15px; }
+.vic-row > span:nth-child(2) { margin-left: auto; font-size: 15px; }
+.vic-on { color: var(--text); }
+.vic-chev { color: var(--muted); font-size: 22px; margin-left: 16px; line-height: 1; }
 
 .foot {
   position: fixed; bottom: 0; left: 0; right: 0; display: flex; align-items: center;

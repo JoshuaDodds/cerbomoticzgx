@@ -1,0 +1,28 @@
+<svg viewBox="0 0 640 132" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="CerbomoticzGX">
+  <defs>
+    <linearGradient id="cgx" x1="0" y1="0" x2="1" y2="0.4">
+      <stop offset="0%" stop-color="#22d3ee"/>
+      <stop offset="55%" stop-color="#2f7bf6"/>
+      <stop offset="100%" stop-color="#2563eb"/>
+    </linearGradient>
+  </defs>
+
+  <!-- wordmark: "Cerbomoticz" in white -->
+  <text x="4" y="94" font-family="'Segoe UI', system-ui, Roboto, Helvetica, Arial, sans-serif"
+        font-size="70" font-weight="600" letter-spacing="-2" fill="#ffffff">Cerbomoticz</text>
+
+  <!-- house outline wrapping the GX -->
+  <path d="M404,124 L404,66 Q404,62 408,60 L502,18 Q506,16 510,18 L604,60 Q608,62 608,66 L608,124"
+        fill="none" stroke="url(#cgx)" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- roof solar panel -->
+  <g stroke="url(#cgx)" stroke-width="2.5" fill="none" stroke-linejoin="round">
+    <path d="M430,58 L470,40 L486,49 L446,67 Z"/>
+    <line x1="438.5" y1="62" x2="478" y2="44"/>
+    <line x1="451" y1="52.5" x2="463" y2="58"/>
+  </g>
+
+  <!-- GX -->
+  <text x="430" y="112" font-family="'Segoe UI', system-ui, Roboto, Helvetica, Arial, sans-serif"
+        font-size="98" font-weight="800" letter-spacing="-2" fill="url(#cgx)">GX</text>
+</svg>

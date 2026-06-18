@@ -103,16 +103,19 @@ class of knob and will be written via `STATE.set()` instead of `.env`.
 `frontend/live.py` subscribes (read-only) to the same broker the main service uses
 (`MOSQUITTO_IP`) and caches the latest value for SoC, price, grid/PV/battery/load
 power, AC setpoint, and the published `ai_mode`/`ai_reason`/`feed_in_limit_state`.
-The UI polls `/api/live` every ~5s and overlays these live values on the slower
-plan snapshot, so the Overview (mode, SoC, price, grid flow, power-flow strip) is
-truly live. A green/grey dot on the "Now" card shows whether the live feed is
+The UI receives these via a **Server-Sent Events push** (`/api/live/stream`) — the
+server streams a fresh snapshot the instant a new MQTT value arrives, so the
+Overview and Live diagram update in real time with no polling lag. A slow 20s
+poll of `/api/live` remains as a fallback if the stream drops or is proxy-buffered.
+The values overlay the slower plan snapshot. A green/grey dot on the "Now" card shows whether the live feed is
 connected; if it's offline the UI falls back to plan values. No new config — it
 reuses `MOSQUITTO_IP` and `VRM_PORTAL_ID`.
 
 ## API
 
 - `GET /api/plan` — current decision, hour-grouped schedule, day summary, staleness.
-- `GET /api/live` — live MQTT values (SoC, price, grid/PV/battery/load W, mode, …).
+- `GET /api/live` — live MQTT values (SoC, price, grid/PV/battery/load/EV W, …).
+- `GET /api/live/stream` — Server-Sent Events; pushes a live snapshot on each MQTT update.
 - `GET /api/config` — settings schema with current values.
 - `POST /api/config` — `{ "key": ..., "value": ... }`, writes one allow-listed setting.
 - `GET /healthz` — liveness.

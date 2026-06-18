@@ -140,6 +140,13 @@ class OptimizationEngine:
         # grid (PV surplus feed-in is still allowed). 0.0 disables the floor.
         self.min_sell_price = _safe_float('ESS_MIN_SELL_PRICE', 0.0)
 
+        # Dynamic cost-basis sell floor (€/kWh AC): the optimizer will not actively
+        # discharge stored energy to the grid below this price, so it can't sell
+        # energy for less than it cost to put there. Set per-plan by the caller via
+        # ``set_cost_basis_floor`` from the persisted weighted purchase price; 0.0
+        # (default / empty battery / PV-filled) disables it.
+        self.cost_basis_sell_floor = 0.0
+
         # Battery wear cost charged per kWh discharged from the battery. Discourages
         # cycling for marginal arbitrage that round-trip losses would otherwise
         # eat. 0.0 disables (no wear cost). Applied on discharge so a full
@@ -223,6 +230,23 @@ class OptimizationEngine:
         if index < len(forecast):
             return forecast[index]
         return default
+
+    def set_cost_basis_floor(self, basis_eur_per_dc_kwh: float) -> None:
+        """Set the active-discharge sell floor from a DC cost basis (€/kWh).
+
+        Selling 1 kWh DC yields ``discharge_efficiency`` kWh AC, so the price
+        needed to recover the basis is ``basis / discharge_efficiency``.
+        """
+        try:
+            basis = max(0.0, float(basis_eur_per_dc_kwh))
+        except (TypeError, ValueError):
+            basis = 0.0
+        eff = self.discharge_efficiency if self.discharge_efficiency > EPS else 0.90
+        self.cost_basis_sell_floor = basis / eff if basis > 0 else 0.0
+
+    def _effective_sell_floor(self) -> float:
+        """Lowest price at which active battery discharge to grid is allowed."""
+        return max(self.min_sell_price, self.cost_basis_sell_floor)
 
     def _sell_price(self, buy_price: float) -> float:
         return buy_price * self.export_price_factor - self.export_fee
@@ -372,9 +396,11 @@ class OptimizationEngine:
                     export_kwh = -grid_energy if grid_energy < 0 else 0.0
 
                     # Never actively sell battery energy below the sell-price
-                    # floor. PV-surplus feed-in (battery not discharging) is
-                    # still allowed so we don't curtail free solar export.
-                    if export_kwh > EPS and dc_change_kwh < -EPS and sell < self.min_sell_price - EPS:
+                    # floor (the higher of the static ESS_MIN_SELL_PRICE and the
+                    # dynamic cost-basis floor — never sell stored energy for less
+                    # than it cost to store). PV-surplus feed-in (battery not
+                    # discharging) is still allowed so we don't curtail free solar.
+                    if export_kwh > EPS and dc_change_kwh < -EPS and sell < self._effective_sell_floor() - EPS:
                         continue
 
                     # (#3) Block grid-sourced charging when the price is above the
@@ -649,6 +675,13 @@ class OptimizationEngine:
 
 def optimize_schedule(current_soc, price_data, load_forecast=None, pv_forecast=None):
     engine = OptimizationEngine()
+    # Refuse to plan a sale of stored energy below what it cost to store it. The
+    # basis is persisted across re-plans/restarts (best-effort; never blocks).
+    try:
+        from lib import ess_cost_basis
+        engine.set_cost_basis_floor(ess_cost_basis.current_basis())
+    except Exception as e:  # pragma: no cover - defensive
+        logging.warning("AI_ESS: cost-basis floor unavailable (%s); planning without it.", e)
     return engine.optimize(current_soc, price_data, load_forecast, pv_forecast)
 
 

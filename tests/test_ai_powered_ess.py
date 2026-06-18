@@ -340,5 +340,38 @@ class TestAIPoweredESS(unittest.TestCase):
         self.assertTrue(all(s['price'] <= 0.15 + 1e-9 for s in buys),
                         "grid charging must not occur above the 0.15 ceiling")
 
+    def test_cost_basis_floor_math_and_precedence(self):
+        # basis €0.27/kWh DC at 90% discharge eff -> €0.30/kWh AC floor.
+        self.engine.discharge_efficiency = 0.90
+        self.engine.min_sell_price = 0.0
+        self.engine.set_cost_basis_floor(0.27)
+        self.assertAlmostEqual(self.engine.cost_basis_sell_floor, 0.27 / 0.90, places=4)
+        self.assertAlmostEqual(self.engine._effective_sell_floor(), 0.27 / 0.90, places=4)
+        # The higher of the static and dynamic floor wins.
+        self.engine.min_sell_price = 0.50
+        self.assertAlmostEqual(self.engine._effective_sell_floor(), 0.50, places=4)
+        # Zero basis (empty / PV-filled battery) disables the dynamic floor.
+        self.engine.min_sell_price = 0.0
+        self.engine.set_cost_basis_floor(0.0)
+        self.assertEqual(self.engine.cost_basis_sell_floor, 0.0)
+        self.assertEqual(self.engine._effective_sell_floor(), 0.0)
+
+    def test_cost_basis_floor_blocks_selling_below_cost(self):
+        # Energy bought at a high basis must not be dumped into a lower-priced
+        # "peak". Prices top out at 0.30; a 0.40/kWh DC basis (floor ~0.44 AC)
+        # means no slot clears the floor, so the battery is never actively sold.
+        base_time = datetime.now(tz.UTC).replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        prices = []
+        for i in range(24):
+            t = base_time + timedelta(hours=i)
+            prices.append({'start': t, 'total': 0.30 if i % 6 == 0 else 0.25, 'level': 'NORMAL'})
+
+        eng = self._arb_engine(min_sell_price=0.0)
+        eng.set_cost_basis_floor(0.40)          # floor ~0.421/kWh AC (>0.30)
+        result = eng.optimize(90.0, prices)
+        self.assertIsNotNone(result)
+        self.assertFalse(any(s['action'] == 'sell' for s in result['schedule']),
+                         "must not actively discharge below the cost-basis floor")
+
 if __name__ == '__main__':
     unittest.main()

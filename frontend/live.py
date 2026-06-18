@@ -33,6 +33,7 @@ class MqttLive:
         self._connected = False
         self._started = False
         self._key_by_topic = {}
+        self._cond = threading.Condition()   # notified on every new MQTT value (for SSE push)
 
     def _build_topics(self, sid):
         return {
@@ -96,6 +97,25 @@ class MqttLive:
             value = msg.payload.decode("utf-8", "ignore")
         with self._lock:
             self._values[key] = value
+        with self._cond:                      # wake any SSE streams waiting for a change
+            self._cond.notify_all()
+
+    def wait_for_change(self, timeout: float = 15.0) -> None:
+        """Block until the next MQTT value arrives (or ``timeout`` for keepalive)."""
+        with self._cond:
+            self._cond.wait(timeout=timeout)
+
+    def publish(self, topic: str, payload: str = "", retain: bool = False) -> bool:
+        """Publish a message on the shared broker (used by the dashboard's deliberate
+        actions, e.g. the Replan trigger). Best-effort; returns success."""
+        try:
+            client = getattr(self, "_client", None)
+            if client is not None:
+                client.publish(topic, payload=payload, retain=retain)
+                return True
+        except Exception:
+            pass
+        return False
 
     def snapshot(self) -> dict:
         with self._lock:
