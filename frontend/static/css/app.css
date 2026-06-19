@@ -25,9 +25,15 @@ body {
   padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line);
   position: sticky; top: 0; z-index: 5;
 }
-.brand { font-weight: 700; letter-spacing: .3px; display: flex; align-items: center; gap: 8px; }
-.brand span { color: var(--muted); font-weight: 400; }
+.brand { font-weight: 700; letter-spacing: .3px; display: flex; align-items: center; gap: 14px; }
 .brand-logo { height: 50px; width: auto; display: block; }
+.app-nav { display: flex; align-items: center; gap: 6px; height: 50px; }
+.app-nav-link {
+  color: var(--muted); text-decoration: none; font-size: 15px; font-weight: 600;
+  padding: 7px 10px; border-radius: 8px;
+}
+.app-nav-link:hover { color: var(--text); background: var(--panel-2); }
+.app-nav-link.active { color: var(--text); background: var(--panel-2); }
 .status-strip { display: flex; gap: 18px; flex-wrap: wrap; margin-left: auto; }
 
 /* Sticky-header clock + sunrise/sunset (top-right, globally useful) */
@@ -63,6 +69,14 @@ body {
 .tab.active { color: var(--text); background: var(--panel); border-color: var(--line); border-bottom: 2px solid var(--accent); }
 
 main { padding: 12px 16px 80px; max-width: 1100px; margin: 0 auto; }
+.app-view { display: none; }
+.app-view.active { display: block; }
+.battery-view { padding: 12px 16px 80px; }
+.battery-frame-card { padding: 0; overflow: hidden; margin: 0; }
+.battery-frame {
+  display: block; width: 100%; height: calc(100vh - 94px); min-height: 720px;
+  border: 0; background: #fff;
+}
 .tab-panel { display: none; }
 .tab-panel.active { display: block; }
 

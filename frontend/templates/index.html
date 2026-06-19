@@ -8,86 +8,100 @@
 </head>
 <body>
   <header class="topbar">
-    <div class="brand"><img src="{{ url_for('static', filename='img/logo_final.png') }}" alt="CerbomoticzGX" class="brand-logo"/><span> · ESS</span></div>
+    <div class="brand">
+      <img src="{{ url_for('static', filename='img/logo_final.png') }}" alt="CerbomoticzGX" class="brand-logo"/>
+      <nav class="app-nav" aria-label="Application sections">
+        <a href="#ess" class="app-nav-link active" data-app-view="ess">ESS</a>
+        <a href="#battery" class="app-nav-link" data-app-view="battery">Battery</a>
+      </nav>
+    </div>
     <div id="status-strip" class="status-strip">
       <span class="muted">loading…</span>
     </div>
     <div id="header-clock" class="header-clock"></div>
   </header>
 
-  <section class="overview">
-    <div id="metrics" class="metrics"></div>
-    <div class="overview-row">
-      <div id="solar" class="card solar"></div>
-      <div id="decision" class="card decision"></div>
-    </div>
-    <!-- Day cost summary lives here (above the tabs) so it's visible on every tab. -->
-    <div id="day-summary" class="card"></div>
-  </section>
-
-  <nav class="tabs">
-    <button class="tab" data-tab="live">Live</button>
-    <button class="tab" data-tab="trends">Trends</button>
-    <button class="tab active" data-tab="schedule">Schedule</button>
-    <button class="tab" data-tab="victron">Victron</button>
-    <button class="tab" data-tab="config">Configuration</button>
-  </nav>
-
-  <main>
-    <section id="tab-live" class="tab-panel">
-      <div class="card">
-        <h3 style="margin:2px 0 10px">Live power flow</h3>
-        <div id="powerflow" class="powerflow"><span class="muted">waiting for live feed…</span></div>
+  <div id="ess-view" class="app-view active">
+    <section class="overview">
+      <div id="metrics" class="metrics"></div>
+      <div class="overview-row">
+        <div id="solar" class="card solar"></div>
+        <div id="decision" class="card decision"></div>
       </div>
+      <!-- Day cost summary lives here (above the tabs) so it's visible on every tab. -->
+      <div id="day-summary" class="card"></div>
     </section>
 
-    <section id="tab-trends" class="tab-panel">
-      <div id="energy-metrics" class="metrics-grid"></div>
-      <div class="card">
-        <h3 style="margin:2px 0 10px">SoC &amp; price across the horizon</h3>
-        <div id="horizon-chart" class="chart"><span class="muted">no plan yet…</span></div>
-      </div>
-    </section>
+    <nav class="tabs">
+      <button class="tab" data-tab="live">Live</button>
+      <button class="tab" data-tab="trends">Trends</button>
+      <button class="tab active" data-tab="schedule">Schedule</button>
+      <button class="tab" data-tab="victron">Victron</button>
+      <button class="tab" data-tab="config">Configuration</button>
+    </nav>
 
-    <section id="tab-schedule" class="tab-panel active">
-      <div class="legend">
-        <span class="chip mode-idle">IDLE</span>
-        <span class="chip mode-retain">RETAIN</span>
-        <span class="chip mode-buy">BUY</span>
-        <span class="chip mode-sell">SELL</span>
-        <span class="muted">— click an hour to expand to 15-min, click a slot for the reason</span>
-      </div>
-
-      <div class="card">
-        <div class="table-head hour-row">
-          <span class="col-time">Hour</span>
-          <span class="col-bar">Timeline</span>
-          <span class="col-num">Avg €/kWh</span>
-          <span class="col-num">Grid</span>
-          <span class="col-num">Prod.</span>
-          <span class="col-num">Cons.</span>
-          <span class="col-num">SoC</span>
-          <span class="col-num">Net</span>
+    <main>
+      <section id="tab-live" class="tab-panel">
+        <div class="card">
+          <h3 style="margin:2px 0 10px">Live power flow</h3>
+          <div id="powerflow" class="powerflow"><span class="muted">waiting for live feed…</span></div>
         </div>
-        <div id="hours"></div>
-      </div>
-    </section>
+      </section>
 
-    <section id="tab-victron" class="tab-panel">
-      <p class="cfg-note">The grid-charge schedule the optimizer has programmed into the
-        CerboGX (Settings → ESS → Scheduled charging). 5 slots, mirrored here.</p>
-      <div id="victron-schedules" class="card"></div>
-    </section>
+      <section id="tab-trends" class="tab-panel">
+        <div id="energy-metrics" class="metrics-grid"></div>
+        <div class="card">
+          <h3 style="margin:2px 0 10px">SoC &amp; price across the horizon</h3>
+          <div id="horizon-chart" class="chart"><span class="muted">no plan yet…</span></div>
+        </div>
+      </section>
 
-    <section id="tab-config" class="tab-panel">
-      <div id="config"></div>
-    </section>
-  </main>
+      <section id="tab-schedule" class="tab-panel active">
+        <div class="legend">
+          <span class="chip mode-idle">IDLE</span>
+          <span class="chip mode-retain">RETAIN</span>
+          <span class="chip mode-buy">BUY</span>
+          <span class="chip mode-sell">SELL</span>
+          <span class="muted">— click an hour to expand to 15-min, click a slot for the reason</span>
+        </div>
 
-  <footer class="foot">
-    <span id="meta" class="muted"></span>
-    <button id="replan" class="btn" title="Re-run the optimizer now on current data">Replan</button>
-  </footer>
+        <div class="card">
+          <div class="table-head hour-row">
+            <span class="col-time">Hour</span>
+            <span class="col-bar">Timeline</span>
+            <span class="col-num">Avg €/kWh</span>
+            <span class="col-num">Grid</span>
+            <span class="col-num">Prod.</span>
+            <span class="col-num">Cons.</span>
+            <span class="col-num">SoC</span>
+            <span class="col-num">Net</span>
+          </div>
+          <div id="hours"></div>
+        </div>
+      </section>
+
+      <section id="tab-victron" class="tab-panel">
+        <p class="cfg-note">The grid-charge schedule the optimizer has programmed into the
+          CerboGX (Settings → ESS → Scheduled charging). 5 slots, mirrored here.</p>
+        <div id="victron-schedules" class="card"></div>
+      </section>
+
+      <section id="tab-config" class="tab-panel">
+        <div id="config"></div>
+      </section>
+    </main>
+
+    <footer class="foot">
+      <span id="meta" class="muted"></span>
+      <button id="replan" class="btn" title="Re-run the optimizer now on current data">Replan</button>
+    </footer>
+  </div>
+
+  <section id="battery-view" class="app-view battery-view" aria-label="Battery rack metrics">
+    <div class="card battery-frame-card">
+      <iframe class="battery-frame" src="https://batt.hs.mfis.net/" title="Battery rack metrics"></iframe>
+    </div>
+  </section>
 
   <!-- Self-contained, dependency-free view modules. Loaded before app.js, which
        calls them defensively (try/catch) so a failure here can't break the rest. -->

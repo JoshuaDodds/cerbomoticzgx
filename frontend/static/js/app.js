@@ -82,6 +82,27 @@ document.querySelectorAll(".tab").forEach((t) => {
 
 let firstRender = true;
 
+// ---- Top-level app views ----
+function setAppView(viewName) {
+  const view = viewName === "battery" ? "battery" : "ess";
+  document.querySelectorAll(".app-view").forEach((x) => x.classList.remove("active"));
+  document.querySelectorAll(".app-nav-link").forEach((x) => x.classList.remove("active"));
+  const panel = $(`#${view}-view`);
+  const link = document.querySelector(`.app-nav-link[data-app-view="${view}"]`);
+  if (panel) panel.classList.add("active");
+  if (link) link.classList.add("active");
+}
+
+function appViewFromHash() {
+  return window.location.hash === "#battery" ? "battery" : "ess";
+}
+
+document.querySelectorAll(".app-nav-link").forEach((link) => {
+  link.addEventListener("click", () => setAppView(link.dataset.appView));
+});
+window.addEventListener("hashchange", () => setAppView(appViewFromHash()));
+setAppView(appViewFromHash());
+
 function todayNet(plan) {
   plan = planWithLiveActuals(plan);
   if (!plan) return null;
@@ -192,7 +213,7 @@ function renderMetrics(plan) {
   box.appendChild(card("Battery SoC", (soc != null ? Number(soc).toFixed(1) : "—") + "<small> %</small>"));
   box.appendChild(card("Price now", "€" + Number(price || 0).toFixed(3) + "<small> /kWh</small>"));
   if (tNet != null) box.appendChild(card("Today net", netHtml(tNet)));
-  if (total) box.appendChild(card("Horizon net <small>(today+tomorrow)</small>", netHtml(total.net)));
+  if (total) box.appendChild(card("Horizon net (2 Day)", netHtml(total.net)));
   if (ns) box.appendChild(card("Next SELL", ns.time.slice(11, 16) + " <small>€" + Number(ns.price).toFixed(3) + "</small>"));
 }
 
