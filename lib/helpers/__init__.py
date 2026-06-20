@@ -15,6 +15,21 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S')
 
 
+def is_truthy(value, default: bool = False) -> bool:
+    """Parse a config/env value as a boolean.
+
+    Accepts real booleans and the usual string spellings ("1"/"true"/"yes"/"on").
+    Critically, a string such as ``"False"`` is treated as False — plain
+    ``bool("False")`` is True because any non-empty string is truthy, which is the
+    source of several "setting ignored" config bugs.
+    """
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
 def publish_message(topic, message=None, qos=0, retain=False, payload=None) -> None:
     """
     publishes a single message to a given topic on the MQtt broker

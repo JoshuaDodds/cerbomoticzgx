@@ -12,7 +12,7 @@ from lib.ev_charge_controller import EvCharger
 from lib.task_scheduler import TaskScheduler
 from lib.victron_integration import restore_default_battery_max_voltage
 from lib.tibber_api import live_measurements, publish_pricing_data
-from lib.helpers import publish_message, retrieve_message
+from lib.helpers import publish_message, retrieve_message, is_truthy
 from lib.global_state import GlobalStateDatabase, GlobalStateClient
 from lib.solar_forecasting import get_victron_solar_forecast
 from lib.energy_broker import (
@@ -25,7 +25,7 @@ GlobalStateDB = GlobalStateDatabase()
 STATE = GlobalStateClient()
 
 ACTIVE_MODULES = json.loads(retrieve_setting('ACTIVE_MODULES'))
-HOME_CONNECT_APPLIANCE_SCHEDULING = bool(retrieve_setting("HOME_CONNECT_APPLIANCE_SCHEDULING")) or False
+HOME_CONNECT_APPLIANCE_SCHEDULING = is_truthy(retrieve_setting("HOME_CONNECT_APPLIANCE_SCHEDULING"))
 
 def ev_charge_controller(): EvCharger().main()
 
@@ -78,6 +78,8 @@ def post_startup():
 
     if HOME_CONNECT_APPLIANCE_SCHEDULING:
         logging.info(f"HomeConnect Appliance Scheduling module is enabled.")
+    else:
+        logging.info(f"HomeConnect Appliance Scheduling module is disabled.")
 
     logging.info(f"post_startup() actions executing...")
 

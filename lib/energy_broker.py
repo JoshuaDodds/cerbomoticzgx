@@ -485,16 +485,21 @@ def run_daily_price_update_and_optimize():
     run_ai_optimizer()
 
 
-def _pv_shape_by_slot(days: int = 5) -> dict:
-    """Learned PV *shape*: mean realised PV power (kW) per quarter-hour-of-day
-    over the last ``days`` days, keyed by ``'HH:MM'``.
+PV_DAYLIGHT_START_H, PV_DAYLIGHT_END_H = 5, 22
 
-    Used only as relative weights to redistribute the VRM daily total — so the
-    magnitude still comes from VRM (which captures today's weather), while the
-    intraday SHAPE comes from your panels' actual curve (e.g. shaded/near-zero
-    early morning, peak midday). This is weather-robust precisely because it's a
-    normalised shape, not an average of absolute generation. Returns {} when no
-    usable history (caller falls back to an even spread).
+
+def _pv_shape_by_slot(days: int = 3) -> dict:
+    """Learned PV *shape*: mean realised PV power (kW) per quarter-hour-of-day
+    over the last ``days`` days (DAYLIGHT slots only), keyed by ``'HH:MM'``.
+
+    Used as relative weights to redistribute the day's PV total, and as the basis
+    for the intraday "elapsed fraction" used to self-correct the magnitude
+    (``_pv_intraday_remaining_kwh``). Only sun-up hours
+    (``PV_DAYLIGHT_START_H..PV_DAYLIGHT_END_H``) are included so night/evening
+    zeros don't dilute the curve or skew the cumulative-fraction maths. This is
+    weather-robust precisely because it's a normalised shape, not an average of
+    absolute generation. Returns {} when no usable history (caller falls back to
+    an even spread).
     """
     import os
     import json
@@ -525,6 +530,8 @@ def _pv_shape_by_slot(days: int = 5) -> dict:
                         continue
                     try:
                         when = _dt.fromisoformat(ts)
+                        if not (PV_DAYLIGHT_START_H <= when.hour < PV_DAYLIGHT_END_H):
+                            continue   # daylight only — exclude night/evening
                         key = f"{when.hour:02d}:{(when.minute // 15) * 15:02d}"
                         buckets.setdefault(key, []).append(max(0.0, float(pv)) / 1000.0)
                     except (TypeError, ValueError):
@@ -535,14 +542,83 @@ def _pv_shape_by_slot(days: int = 5) -> dict:
         return {}
 
 
+def _pv_intraday_remaining_kwh(shape: dict, remaining_vrm_kwh: float, now=None) -> float:
+    """Self-correct the remaining-PV magnitude from today's realised outperformance.
+
+    VRM anchors the forecast to a fixed daily total, so on a better-than-forecast
+    day ``pv_projected_remaining`` (= VRM_total - actual) collapses toward 0 while
+    the panels are still producing strongly — starving the rest-of-day forecast.
+    Here we project today's total from the PV produced SO FAR and the share of the
+    day's solar curve that should be complete by now (from the learned DAYLIGHT
+    shape), then scale the remaining UP toward that projection — damped and capped,
+    and only ever upward from VRM. On a normal day the projection ≈ VRM so nothing
+    changes. Returns the (possibly increased) remaining-PV kWh for today.
+
+    Tunables: ``ESS_PV_INTRADAY_CORRECTION`` (damp 0..1, 0 disables),
+    ``ESS_PV_INTRADAY_MAX_RATIO`` (cap projected day total vs VRM),
+    ``ESS_PV_INTRADAY_MIN_ELAPSED`` (min daylight fraction before extrapolating).
+    """
+    try:
+        damp = _get_float_setting('ESS_PV_INTRADAY_CORRECTION', 0.6)
+        if damp <= 0 or not shape:
+            return remaining_vrm_kwh
+        max_ratio = _get_float_setting('ESS_PV_INTRADAY_MAX_RATIO', 1.6)
+        min_elapsed = _get_float_setting('ESS_PV_INTRADAY_MIN_ELAPSED', 0.10)
+
+        from datetime import datetime as _dt
+        now = now or _dt.now().astimezone()
+        if not (PV_DAYLIGHT_START_H <= now.hour < PV_DAYLIGHT_END_H):
+            return remaining_vrm_kwh   # outside daylight — nothing to extrapolate
+
+        def _f(v):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return 0.0
+
+        actual = _f(STATE.get('c1_daily_yield')) + _f(STATE.get('c2_daily_yield'))
+        if actual <= 0:
+            return remaining_vrm_kwh
+
+        def _slot_min(k):
+            try:
+                h, m = k.split(':')
+                return int(h) * 60 + int(m)
+            except (ValueError, AttributeError):
+                return 0
+
+        now_min = now.hour * 60 + now.minute
+        total_w = sum(shape.values())
+        if total_w <= 0:
+            return remaining_vrm_kwh
+        elapsed_w = sum(v for k, v in shape.items() if _slot_min(k) <= now_min)
+        frac = elapsed_w / total_w
+        if frac < max(1e-3, min_elapsed):
+            return remaining_vrm_kwh   # too early in the day to extrapolate reliably
+
+        vrm_remaining = max(0.0, remaining_vrm_kwh)
+        vrm_total = actual + vrm_remaining
+        projected_total = actual / frac
+        if vrm_total > 0:
+            projected_total = min(projected_total, max_ratio * vrm_total)  # cap runaway
+        projected_remaining = max(0.0, projected_total - actual)
+
+        # Only ever scale UP from VRM's remaining, damped toward the projection.
+        return vrm_remaining + damp * max(0.0, projected_remaining - vrm_remaining)
+    except Exception as e:
+        logging.debug(f"EnergyBroker: PV intraday correction failed: {e}")
+        return remaining_vrm_kwh
+
+
 def _build_pv_forecast_by_slot(price_slots: list, slot_duration_h: float) -> dict:
     """Build a per-slot PV generation forecast (kWh) keyed by slot start time.
 
     Keeps the VRM daily magnitude (today's remaining + tomorrow's full day, which
-    reflect today's weather) but distributes it across the day using the LEARNED
-    per-slot shape from history (`_pv_shape_by_slot`) so e.g. shaded early-morning
-    slots get ~0 instead of an even share. Falls back to an even daylight spread
-    when there's no usable history.
+    reflect today's weather), self-corrects today's remaining UP when we're
+    out-producing the VRM forecast (`_pv_intraday_remaining_kwh`), then distributes
+    it across the day using the LEARNED per-slot shape from history
+    (`_pv_shape_by_slot`) so e.g. shaded early-morning slots get ~0 instead of an
+    even share. Falls back to an even daylight spread when there's no usable history.
     """
     from datetime import date as _date, timedelta as _td
 
@@ -555,9 +631,18 @@ def _build_pv_forecast_by_slot(price_slots: list, slot_duration_h: float) -> dic
     today_kwh = _kwh('pv_projected_remaining')
     tomorrow_kwh = _kwh('pv_projected_tomorrow')
 
+    # Learned daylight shape (trailing N days), used both to redistribute the day's
+    # total AND to gauge how far through the solar curve we are for the intraday
+    # magnitude correction below.
+    shape = _pv_shape_by_slot(int(_get_float_setting('ESS_PV_SHAPE_DAYS', 3)))
+
+    # Self-correct today's remaining UP when we're out-producing the VRM forecast
+    # (tomorrow stays on VRM — no actuals yet).
+    today_kwh = _pv_intraday_remaining_kwh(shape, today_kwh)
+
     today = _date.today()
     tomorrow = today + _td(days=1)
-    daylight_start_h, daylight_end_h = 5, 22
+    daylight_start_h, daylight_end_h = PV_DAYLIGHT_START_H, PV_DAYLIGHT_END_H
 
     today_slots, tomorrow_slots = [], []
     for slot in price_slots:
@@ -569,8 +654,6 @@ def _build_pv_forecast_by_slot(price_slots: list, slot_duration_h: float) -> dic
             today_slots.append(start)
         elif d == tomorrow:
             tomorrow_slots.append(start)
-
-    shape = _pv_shape_by_slot(5)
 
     def _distribute(total, slots):
         if total <= 0 or not slots:

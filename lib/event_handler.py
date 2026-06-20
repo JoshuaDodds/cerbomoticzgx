@@ -2,7 +2,7 @@ import os
 import math
 import signal
 
-from lib.helpers import get_topic_key, publish_message
+from lib.helpers import get_topic_key, publish_message, is_truthy
 from lib.constants import logging
 from lib.config_retrieval import retrieve_setting
 from lib.victron_integration import regulate_battery_max_voltage, ac_power_setpoint
@@ -21,7 +21,7 @@ from lib.energy_broker import (
 LOAD_RESERVATION = int(retrieve_setting("LOAD_RESERVATION")) or 0
 LOAD_RESERVATION_REDUCTION_FACTOR = float(retrieve_setting("LOAD_REDUCTION_FACTOR")) or 1
 MINIMUM_ESS_SOC = int(retrieve_setting("MINIMUM_ESS_SOC")) or 100
-HOME_CONNECT_APPLIANCE_SCHEDULING = bool(retrieve_setting("HOME_CONNECT_APPLIANCE_SCHEDULING")) or False
+HOME_CONNECT_APPLIANCE_SCHEDULING = is_truthy(retrieve_setting("HOME_CONNECT_APPLIANCE_SCHEDULING"))
 
 class Event:
 

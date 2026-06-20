@@ -86,6 +86,60 @@ def test_pv_forecast_uses_learned_shape(monkeypatch):
     assert fc.get(slots[0]["start"], 0.0) < 1e-6
 
 
+def test_pv_intraday_correction_scales_up_on_outperformance(monkeypatch):
+    from datetime import datetime
+    monkeypatch.setattr(energy_broker, "retrieve_setting", lambda name: None)  # defaults
+    monkeypatch.setattr(energy_broker, "STATE",
+                        DummyState({"c1_daily_yield": 20.0, "c2_daily_yield": 0.0}))
+    shape = {"06:00": 1.0, "12:00": 1.0, "18:00": 1.0}     # 3 equal daylight slots
+    now = datetime(2026, 6, 18, 12, 30)                    # 2/3 of the curve elapsed
+    # projected_total = 20 / (2/3) = 30; projected_remaining = 10;
+    # corrected = 2 + 0.6*(10-2) = 6.8  (scaled UP from VRM's 2 kWh)
+    out = energy_broker._pv_intraday_remaining_kwh(shape, 2.0, now=now)
+    assert abs(out - 6.8) < 1e-6
+
+
+def test_pv_intraday_correction_noop_when_on_track(monkeypatch):
+    from datetime import datetime
+    monkeypatch.setattr(energy_broker, "retrieve_setting", lambda name: None)
+    monkeypatch.setattr(energy_broker, "STATE",
+                        DummyState({"c1_daily_yield": 20.0, "c2_daily_yield": 0.0}))
+    shape = {"06:00": 1.0, "12:00": 1.0, "18:00": 1.0}
+    now = datetime(2026, 6, 18, 12, 30)                    # projected_total 30 == VRM total
+    out = energy_broker._pv_intraday_remaining_kwh(shape, 10.0, now=now)
+    assert abs(out - 10.0) < 1e-6                          # already on track -> unchanged
+
+
+def test_pv_intraday_correction_too_early_in_day(monkeypatch):
+    from datetime import datetime
+    monkeypatch.setattr(energy_broker, "retrieve_setting", lambda name: None)
+    monkeypatch.setattr(energy_broker, "STATE",
+                        DummyState({"c1_daily_yield": 0.5, "c2_daily_yield": 0.0}))
+    shape = {"05:00": 0.05, "12:00": 5.0, "18:00": 1.0}    # ~0.8% elapsed by 05:30
+    now = datetime(2026, 6, 18, 5, 30)
+    assert energy_broker._pv_intraday_remaining_kwh(shape, 8.0, now=now) == 8.0
+
+
+def test_pv_intraday_correction_skips_outside_daylight(monkeypatch):
+    from datetime import datetime
+    monkeypatch.setattr(energy_broker, "retrieve_setting", lambda name: None)
+    monkeypatch.setattr(energy_broker, "STATE",
+                        DummyState({"c1_daily_yield": 20.0, "c2_daily_yield": 0.0}))
+    now = datetime(2026, 6, 18, 23, 0)
+    assert energy_broker._pv_intraday_remaining_kwh({"12:00": 1.0}, 5.0, now=now) == 5.0
+
+
+def test_pv_intraday_correction_disabled_by_setting(monkeypatch):
+    from datetime import datetime
+    monkeypatch.setattr(energy_broker, "retrieve_setting",
+                        lambda name: "0" if name == "ESS_PV_INTRADAY_CORRECTION" else None)
+    monkeypatch.setattr(energy_broker, "STATE",
+                        DummyState({"c1_daily_yield": 20.0, "c2_daily_yield": 0.0}))
+    shape = {"06:00": 1.0, "12:00": 1.0, "18:00": 1.0}
+    now = datetime(2026, 6, 18, 12, 30)
+    assert energy_broker._pv_intraday_remaining_kwh(shape, 2.0, now=now) == 2.0
+
+
 def test_load_forecast_prefers_historical_average(monkeypatch):
     from datetime import datetime
     # Realised 0.8 kW for the 06:00 quarter-hours over the last few days.
@@ -248,6 +302,22 @@ def test_nightly_schedule_runs_when_skip_disabled(monkeypatch):
 
 
 # --- Manual grid-charge override -------------------------------------------
+
+def test_is_truthy_parses_false_string():
+    # Regression: bool("False") is True, which made HOME_CONNECT_APPLIANCE_SCHEDULING
+    # (and similar flags) ignore a "False" setting.
+    from lib.helpers import is_truthy
+    assert is_truthy("True") is True
+    assert is_truthy("1") is True
+    assert is_truthy("on") is True
+    assert is_truthy("False") is False
+    assert is_truthy("false") is False
+    assert is_truthy("0") is False
+    assert is_truthy("") is False
+    assert is_truthy(None) is False
+    assert is_truthy(True) is True
+    assert is_truthy(None, default=True) is True
+
 
 def test_manual_grid_charge_on_reads_toggle(monkeypatch):
     monkeypatch.setattr(energy_broker, "STATE", DummyState({"grid_charging_enabled": "True"}))
