@@ -71,11 +71,67 @@
         <path d="${socArea}" fill="url(#socFill)" stroke="none"/>
         <path d="${priceLine}" fill="none" stroke="var(--buy)" stroke-width="1.8" opacity="0.9"/>
         <path d="${socLine}" fill="none" stroke="var(--sell)" stroke-width="2.6"/>
+        <g id="hc-hover" style="display:none; pointer-events:none">
+          <line id="hc-hline" x1="0" x2="0" y1="${M.t}" y2="${(M.t + PH).toFixed(1)}" stroke="var(--buy)" stroke-width="1" stroke-dasharray="3 3" opacity="0.7"/>
+          <circle id="hc-hdot" r="4.5" fill="var(--buy)" stroke="#0b0f14" stroke-width="1.5"/>
+        </g>
+        <rect x="${M.l}" y="${M.t}" width="${PW}" height="${PH}" fill="transparent" id="hc-hit"/>
       </svg>
       <div class="chart-legend muted">
         <span><span class="swatch" style="background:var(--sell)"></span> Battery SoC (%)</span>
         <span><span class="swatch" style="background:var(--buy)"></span> Buy price (€/kWh)</span>
       </div>`;
+
+    // ---- hover tooltip: nearest slot's buy price (+ SoC) ----
+    const svg = box.querySelector("svg");
+    if (!svg) return;
+    box.style.position = "relative";
+    const tip = document.createElement("div");
+    tip.className = "chart-tip";
+    tip.style.display = "none";
+    box.appendChild(tip);
+    const hover = svg.querySelector("#hc-hover");
+    const hline = svg.querySelector("#hc-hline");
+    const hdot = svg.querySelector("#hc-hdot");
+
+    const dayLabel = (iso) => {
+      const d = new Date(iso), now = new Date();
+      const key = (x) => `${x.getFullYear()}-${x.getMonth()}-${x.getDate()}`;
+      const tmr = new Date(now); tmr.setDate(now.getDate() + 1);
+      if (key(d) === key(now)) return "Today";
+      if (key(d) === key(tmr)) return "Tomorrow";
+      return isNaN(d) ? "" : d.toLocaleDateString(undefined, { weekday: "short" });
+    };
+    const idxFromEvent = (e) => {
+      const ctm = svg.getScreenCTM();
+      if (!ctm) return -1;
+      const sp = svg.createSVGPoint();
+      sp.x = e.clientX; sp.y = e.clientY;
+      const u = sp.matrixTransform(ctm.inverse());
+      if (u.x < M.l - 6 || u.x > M.l + PW + 6) return -1;
+      const i = Math.round((u.x - M.l) / (PW / (n - 1)));
+      return Math.max(0, Math.min(n - 1, i));
+    };
+    const onMove = (e) => {
+      const i = idxFromEvent(e);
+      if (i < 0) { hover.style.display = "none"; tip.style.display = "none"; return; }
+      const p = pts[i], x = X(i, n), yPrice = Yp(p.price);
+      hline.setAttribute("x1", x.toFixed(1)); hline.setAttribute("x2", x.toFixed(1));
+      hdot.setAttribute("cx", x.toFixed(1)); hdot.setAttribute("cy", yPrice.toFixed(1));
+      hover.style.display = "";
+      tip.innerHTML = `<b>${dayLabel(p.t)} ${p.t.slice(11, 16)}</b>`
+        + `<span>€${p.price.toFixed(3)} /kWh · ${Math.round(p.soc)}% SoC</span>`;
+      tip.style.display = "block";
+      const br = box.getBoundingClientRect();
+      const tw = tip.offsetWidth, th = tip.offsetHeight;
+      let tx = e.clientX - br.left + 14, ty = e.clientY - br.top - th - 10;
+      if (tx + tw > br.width) tx = e.clientX - br.left - tw - 14;
+      if (ty < 0) ty = e.clientY - br.top + 16;
+      tip.style.left = `${Math.max(0, tx)}px`;
+      tip.style.top = `${ty}px`;
+    };
+    svg.addEventListener("mousemove", onMove);
+    svg.addEventListener("mouseleave", () => { hover.style.display = "none"; tip.style.display = "none"; });
   };
 
   // ---------- HA-style energy metrics ----------

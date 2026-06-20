@@ -55,6 +55,17 @@ class MqttLive:
             "day_import_cost": "Tibber/home/energy/day/cost",
             "day_export_kwh": "Tibber/home/energy/day/exported",
             "day_export_reward": "Tibber/home/energy/day/reward",
+            # Today / tomorrow lowest & highest buy price (cost €/kWh + the hour it
+            # occurs) — already published retained by the Tibber module. Tomorrow's
+            # values read "not_yet_published" until Tibber releases them (~13:00).
+            "price_today_low": "Tibber/home/price_info/today/lowest/0/cost",
+            "price_today_low_at": "Tibber/home/price_info/today/lowest/0/hour",
+            "price_today_high": "Tibber/home/price_info/today/highest/0/cost",
+            "price_today_high_at": "Tibber/home/price_info/today/highest/0/hour",
+            "price_tom_low": "Tibber/home/price_info/tomorrow/lowest/0/cost",
+            "price_tom_low_at": "Tibber/home/price_info/tomorrow/lowest/0/hour",
+            "price_tom_high": "Tibber/home/price_info/tomorrow/highest/0/cost",
+            "price_tom_high_at": "Tibber/home/price_info/tomorrow/highest/0/hour",
         }
 
     def start(self):
@@ -148,6 +159,15 @@ class MqttLive:
         out["day_import_cost"] = _num("day_import_cost")
         out["day_export_kwh"] = _num("day_export_kwh")
         out["day_export_reward"] = _num("day_export_reward")
+        # Today / tomorrow price extremes (cost is None when not yet published).
+        out["price_today_low"] = _num("price_today_low")
+        out["price_today_high"] = _num("price_today_high")
+        out["price_tom_low"] = _num("price_tom_low")
+        out["price_tom_high"] = _num("price_tom_high")
+        out["price_today_low_at"] = vals.get("price_today_low_at")
+        out["price_today_high_at"] = vals.get("price_today_high_at")
+        out["price_tom_low_at"] = vals.get("price_tom_low_at")
+        out["price_tom_high_at"] = vals.get("price_tom_high_at")
         return out
 
 

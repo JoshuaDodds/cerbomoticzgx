@@ -584,17 +584,65 @@ class OptimizationEngine:
         return ('STORED_CHEAPER_THAN_GRID',
                 f"Using stored energy — cheaper than buying from the grid at €{price:.3f}/kWh")
 
-    def _post_process(self, schedule, slot_seconds):
-        # Attach a per-slot reason + canonical control action so every surface
-        # (console, web UI, plan JSON, history) shows the same label.
-        for i, step in enumerate(schedule):
-            code, text = self._explain_action(schedule, i)
-            step['reason_code'] = code
-            step['reason'] = text
-            step['control_action'] = control_action_for(
-                step['action'], step['soc_start'], step['soc_end'], step['grid_energy'])
+    def _frontload_charging(self, schedule, slot_h):
+        """Re-time each contiguous charging run to full-power-to-target.
 
-        # Group consecutive grid-charge (buy) slots into Victron charge windows.
+        The DP is indifferent about HOW it spreads a charge across flat-price slots
+        and tie-breaks to a gentle trickle, but the Victron BatteryLife schedule
+        charges at FULL power until the target SoC is reached, then holds. That
+        mismatch made BUY settlement predictions read 2-20x low. Here we re-simulate
+        each rising-SoC run charging at the max feasible rate (battery power + grid
+        import limits — the same constraints the DP used), so the REPORTED per-slot
+        trajectory, economics and settlement predictions match reality.
+
+        Preserves each run's start slot, membership window and END SoC, so the
+        separately-derived Victron charge windows (control) are unaffected — only
+        per-slot soc/grid_energy/action change. Mutates ``schedule`` in place.
+        """
+        cap = self.battery_capacity
+        if cap <= 0:
+            return
+        n = len(schedule)
+        i = 0
+        while i < n:
+            if schedule[i]['soc_end'] <= schedule[i]['soc_start'] + EPS:
+                i += 1
+                continue
+            # Maximal run of consecutive charging (rising-SoC) slots.
+            j = i
+            while j + 1 < n and schedule[j + 1]['soc_end'] > schedule[j + 1]['soc_start'] + EPS:
+                j += 1
+            target = schedule[j]['soc_end']        # preserve the run's end SoC
+            soc = schedule[i]['soc_start']
+            for k in range(i, j + 1):
+                step = schedule[k]
+                net_load = step['load'] - step['pv']
+                room_dc = max(0.0, (target - soc) / 100.0 * cap)
+                max_dc_power = self.max_charge_power * slot_h
+                # grid_energy = net_load + dc/eff must stay within the import limit.
+                max_dc_grid = (self.max_power_import * slot_h - net_load) * self.charge_efficiency
+                dc = min(room_dc, max_dc_power, max(0.0, max_dc_grid))
+                # Always at least absorb free PV surplus (charges with no import).
+                dc = max(dc, min(room_dc, max(0.0, -net_load) * self.charge_efficiency))
+                ac_for_batt = dc / self.charge_efficiency if dc > EPS else 0.0
+                new_end = soc + (dc / cap * 100.0)
+                step['soc_start'] = round(soc, 4)
+                step['soc_end'] = round(new_end, 4)
+                step['grid_energy'] = round(net_load + ac_for_batt, 4)
+                step['action'] = self._classify_action(soc, new_end, step['grid_energy'])
+                soc = new_end
+            # Safety: guarantee the run still ends exactly on the original target so
+            # the downstream SoC trajectory (and Victron target) is untouched.
+            schedule[j]['soc_end'] = round(target, 4)
+            i = j + 1
+
+    def _post_process(self, schedule, slot_seconds):
+        slot_h = slot_seconds / 3600.0
+
+        # Group consecutive grid-charge (buy) slots into Victron charge windows from
+        # the ORIGINAL DP trajectory. The Victron charges full-power to the window's
+        # target_soc, so this (start/duration/target) is the real control surface —
+        # derived BEFORE the reporting re-time below so control is never affected.
         victron_slots = []
         current_slot = None
         for i, step in enumerate(schedule):
@@ -628,11 +676,28 @@ class OptimizationEngine:
             'target_soc': s['target_soc'],
         } for s in victron_slots]
 
+        # Re-time charging to full-power-to-target so the reported trajectory +
+        # settlement predictions match the Victron's actual behaviour. Control
+        # (victron_slots above; BUY setpoint = 0 below) is unchanged. Best-effort.
+        if _safe_float('ESS_MODEL_CHARGE_RATE', 1.0) != 0:
+            try:
+                self._frontload_charging(schedule, slot_h)
+            except Exception as e:  # pragma: no cover - defensive
+                logging.warning("AI_ESS: charge-rate re-time skipped: %s", e)
+
+        # Attach a per-slot reason + canonical control action on the final trajectory
+        # so every surface (console, web UI, plan JSON, history) shows the same label.
+        for i, step in enumerate(schedule):
+            code, text = self._explain_action(schedule, i)
+            step['reason_code'] = code
+            step['reason'] = text
+            step['control_action'] = control_action_for(
+                step['action'], step['soc_start'], step['soc_end'], step['grid_energy'])
+
         # Immediate control for the current slot.
         first = schedule[0]
         mode = first['action']
         export_setpoint = _safe_float('ESS_EXPORT_AC_SETPOINT', -10000.0)
-        slot_h = slot_seconds / 3600.0
         # PV surplus = exporting while the battery is NOT discharging (SoC flat or
         # rising). This is solar feed-in, not a stored-energy sell.
         pv_surplus = mode == 'sell' and first['soc_end'] >= first['soc_start'] - EPS

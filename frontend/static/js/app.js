@@ -226,9 +226,25 @@ function renderSolar(plan) {
   const totalToday = plan.pv_today_total_kwh != null ? Number(plan.pv_today_total_kwh).toFixed(1) : null;
   const tom = plan.pv_tomorrow_wh != null ? (plan.pv_tomorrow_wh / 1000).toFixed(1) : "—";
   const pvnow = (liveOn() && lastLive.pv_w != null) ? fmtPower(lastLive.pv_w) : null;
+
+  // Today / tomorrow lowest & highest buy price, from the retained Tibber MQTT
+  // topics via the live feed. Tomorrow appears once Tibber publishes it (~13:00);
+  // until then its cost reads non-numeric and the row is hidden.
+  const L = lastLive || {};
+  const eur3 = (v) => "€" + Number(v).toFixed(3);
+  const hhmm = (s) => (typeof s === "string" && s.length >= 5) ? s.slice(0, 5) : "";
+  const priceRow = (label, lo, loAt, hi, hiAt) => (lo != null && hi != null)
+    ? `<div class="pl-row"><span class="pl">${label}</span> low <b>${eur3(lo)}</b>`
+      + `${loAt ? ` <span class="plt">${hhmm(loAt)}</span>` : ""} &nbsp;·&nbsp; high <b>${eur3(hi)}</b>`
+      + `${hiAt ? ` <span class="plt">${hhmm(hiAt)}</span>` : ""}</div>`
+    : "";
+  let pricesHtml = priceRow("Today", L.price_today_low, L.price_today_low_at, L.price_today_high, L.price_today_high_at)
+    + priceRow("Tomorrow", L.price_tom_low, L.price_tom_low_at, L.price_tom_high, L.price_tom_high_at);
+
   box.innerHTML = `<div class="label">Solar forecast</div>
-    <div class="big">${today}<small style="font-size:13px;color:var(--muted)"> kWh${totalToday ? ` (of ${totalToday})` : ""} remaining today</small></div>
-    <div class="sub">${tom} kWh forecast tomorrow${pvnow ? ` &nbsp;·&nbsp; producing ${pvnow} now` : ""}</div>`;
+    <div class="big">${today}<small style="font-size:13px;color:var(--muted)"> kWh${totalToday ? ` (of ${totalToday})` : ""} remaining.</small></div>
+    <div class="sub">${tom} kWh forecast tomorrow${pvnow ? ` &nbsp;·&nbsp; producing ${pvnow} now` : ""}</div>
+    ${pricesHtml ? `<div class="solar-prices">${pricesHtml}</div>` : ""}`;
 }
 
 function renderDecision(plan) {
@@ -275,11 +291,11 @@ function renderDecision(plan) {
   const item = (lbl, val) => `<div class="kv"><b>${val}</b><small>${lbl}</small></div>`;
   const row = el("div", "row");
   row.innerHTML =
-    item("price", "€" + Number(price || 0).toFixed(4)) +
-    item("battery", batteryState) +
-    item("control", control) +
-    item("feed-in cap", feedIn) +
-    item("victron setpoint (live)", liveSetpoint);
+    item("Price", "€" + Number(price || 0).toFixed(4)) +
+    item("Battery", batteryState) +
+    item("Scheduled Charging", control) +
+    item("PV Cap", feedIn) +
+    item("Grid Setpoint", liveSetpoint);
   box.appendChild(row);
 
   // Live power flow — signed values: grid −=export/+=import, battery −=discharge/+=charge.
@@ -287,10 +303,10 @@ function renderDecision(plan) {
     const f = (lbl, val) => `<div class="f"><b>${val}</b><small>${lbl}</small></div>`;
     const flow = el("div", "flow");
     flow.innerHTML =
-      f("grid", fmtPower(lastLive.grid_w)) +
-      f("solar", fmtPower(lastLive.pv_w)) +
-      f("battery", fmtPower(lastLive.batt_w)) +
-      f("house load", fmtPower(lastLive.load_w));
+      f("Grid Use", fmtPower(lastLive.grid_w)) +
+      f("PV Generation", fmtPower(lastLive.pv_w)) +
+      f("Battery use", fmtPower(lastLive.batt_w)) +
+      f("AC Loads", fmtPower(lastLive.load_w));
     box.appendChild(flow);
   }
 }

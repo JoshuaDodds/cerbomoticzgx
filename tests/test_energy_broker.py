@@ -303,6 +303,16 @@ def test_nightly_schedule_runs_when_skip_disabled(monkeypatch):
 
 # --- Manual grid-charge override -------------------------------------------
 
+def test_realized_action_from_live_flow():
+    # + = import/charge, - = export/discharge (W).
+    assert energy_broker._realized_action(-8000, -10000) == "SELL"    # exporting + discharging
+    assert energy_broker._realized_action(11000, 14000) == "BUY"      # importing + charging
+    assert energy_broker._realized_action(1000, -50) == "RETAIN"      # grid covers load, batt held
+    assert energy_broker._realized_action(-50, 2000) == "IDLE"        # PV charging, grid ~0
+    assert energy_broker._realized_action(0, 0) == "IDLE"
+    assert energy_broker._realized_action(None, None) == "IDLE"
+
+
 def test_is_truthy_parses_false_string():
     # Regression: bool("False") is True, which made HOME_CONNECT_APPLIANCE_SCHEDULING
     # (and similar flags) ignore a "False" setting.

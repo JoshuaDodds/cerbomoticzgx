@@ -73,6 +73,7 @@ Note: The name of this project is a nod to both Victron Energy & the Domoticz pr
   - `OPTIMIZER_SOC_STEP_PCT`: DP SoC discretization step in percentage points (default 5.0; smaller = finer control, more compute).
   - `ESS_MAX_GRID_IMPORT_KW` / `ESS_MAX_GRID_EXPORT_KW`: Grid power limits (kW) for the optimizer's feasibility checks.
   - `ESS_MAX_CHARGE_KW` / `ESS_MAX_DISCHARGE_KW`: Optional battery power caps (default to the grid limits).
+  - `ESS_MODEL_CHARGE_RATE`: Report charging as full-power-to-target (how the Victron BatteryLife schedule actually executes) so BUY settlement predictions/economics match reality. Reporting only — control is unchanged. 1 = on (default), 0 = report the raw DP trajectory.
   - `ESS_EXPORT_PRICE_FACTOR` / `ESS_EXPORT_FEE`: Export price model — `sell = buy * factor - fee` (defaults 1.0 / 0.0).
   - `ESS_TERMINAL_VALUE_FACTOR`: Value of end-of-horizon stored energy as a multiple of the horizon mean buy price (default 1.0; 0.0 disables).
   - `ESS_EXPECTED_PEAK_PRICE`: Expected peak buy price (currency/kWh). When set, end-of-horizon stored energy is valued at the higher of the horizon mean and this peak, so charge is held for the typical morning/evening peaks (0 disables).

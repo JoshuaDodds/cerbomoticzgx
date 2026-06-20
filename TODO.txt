@@ -1,1 +1,0 @@
-- Clean up stale .md file in root after this PR is finished

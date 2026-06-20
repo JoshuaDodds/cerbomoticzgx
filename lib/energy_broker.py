@@ -1080,6 +1080,34 @@ def _publish_plan_json(result, *, batt_soc, price_points, pv_remaining,
         logging.warning(f"AI_ESS: Failed to publish plan JSON for frontend: {e}")
 
 
+def _realized_action(grid_w, batt_w, deadband_w: int = 200) -> str:
+    """Canonical action describing what the system is ACTUALLY doing right now, from
+    the live power flow (W; + = import/charge, − = export/discharge).
+
+    The history record pairs THIS cycle's decision (``control_action``) with the
+    power measured at cycle start — i.e. the steady-state outcome of the PRIOR
+    decision. At a transition those legitimately differ (e.g. a new RETAIN decision
+    logged while the previous SELL's export is still ramping down, or an IDLE
+    re-evaluation while the Victron charge schedule is still topping up). Recording
+    the realized action alongside the decision makes that explicit instead of
+    looking like a mislabel.
+    """
+    try:
+        g = float(grid_w) if grid_w is not None else 0.0
+        b = float(batt_w) if batt_w is not None else 0.0
+    except (TypeError, ValueError):
+        return "IDLE"
+    charging, discharging = b > deadband_w, b < -deadband_w
+    importing, exporting = g > deadband_w, g < -deadband_w
+    if discharging and exporting:
+        return "SELL"
+    if charging and importing:
+        return "BUY"
+    if importing:
+        return "RETAIN"          # grid covering load; battery held
+    return "IDLE"                # PV-driven / neutral
+
+
 def _append_history(result, *, batt_soc, applied_setpoint, today_actuals, realized_power=None) -> None:
     """Append one analytics-ready record per optimizer cycle to a per-day NDJSON
     file (one JSON object per line) under HISTORY_DIR.
@@ -1139,12 +1167,31 @@ def _append_history(result, *, batt_soc, applied_setpoint, today_actuals, realiz
         # Actual PV produced so far today (kWh) from the two MPPT daily yields.
         pv_actual_today_kwh = round((_num(STATE.get('c1_daily_yield')) or 0.0)
                                     + (_num(STATE.get('c2_daily_yield')) or 0.0), 3)
+        load_actual_today_wh = _num(STATE.get('consumption_total_cumulative'))
+
+        # Midnight rollover guard. The Tibber daily counters reset promptly at 00:00,
+        # but the Victron MPPT daily-yield and consumption counters can lag a cycle,
+        # carrying yesterday's full-day totals into the first record of the new day.
+        # Two deterministic corrections (no effect on control — logging only):
+        #   * PV cannot be produced before dawn, so any pre-dawn yield is a stale
+        #     counter -> 0.
+        #   * If the day's grid import has just reset (~0) while the consumption
+        #     counter still shows a full day's accumulation, it's stale -> 0.
+        fresh_day = (_num(act.get('imp_kwh')) or 0.0) < 0.1
+        if now.hour < PV_DAYLIGHT_START_H and pv_actual_today_kwh > 0.5:
+            pv_actual_today_kwh = 0.0
+        if fresh_day and (load_actual_today_wh or 0.0) > 2000.0:
+            load_actual_today_wh = 0.0
 
         record = {
             "ts": now.isoformat(),
             "kind": "cycle",
             "soc": batt_soc,
             "control_action": result.get('control_action'),
+            # What the system was actually doing (from live flow) when this record
+            # was written — equals control_action in steady state, differs across a
+            # transition while the prior decision's power is still settling.
+            "realized_action": _realized_action(rp.get('grid_w'), rp.get('batt_w')),
             "mode": result.get('mode'),
             "reason_code": result.get('reason_code'),
             "price_buy": result.get('current_price'),
@@ -1164,7 +1211,7 @@ def _append_history(result, *, batt_soc, applied_setpoint, today_actuals, realiz
             "pv_forecast_today_kwh": _num(STATE.get('pv_projected_today')),
             "pv_actual_today_kwh": pv_actual_today_kwh,
             "load_forecast_today_wh": _num(STATE.get('consumption_total_projected')),
-            "load_actual_today_wh": _num(STATE.get('consumption_total_cumulative')),
+            "load_actual_today_wh": load_actual_today_wh,
             "plan_horizon_net_eur": plan_horizon_net_eur,
             "realized_net_eur": realized_net_eur,
             # Running daily actuals (reset by Tibber at midnight).

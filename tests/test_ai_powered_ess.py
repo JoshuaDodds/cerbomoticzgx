@@ -373,5 +373,51 @@ class TestAIPoweredESS(unittest.TestCase):
         self.assertFalse(any(s['action'] == 'sell' for s in result['schedule']),
                          "must not actively discharge below the cost-basis floor")
 
+    def test_frontload_charging_matches_full_power(self):
+        # The DP may plan a gentle trickle on flat-price slots; re-timing should
+        # charge at full power to the same target, then hold.
+        self.engine.battery_capacity = 40.0
+        self.engine.charge_efficiency = 1.0
+        self.engine.max_charge_power = 10.0
+        self.engine.max_power_import = 10.0
+        slot_h = 0.25                       # full power = 10 kW * 0.25 h = 2.5 kWh = 6.25%
+
+        def s(a, b):
+            return {'time': datetime.now(tz.UTC), 'action': 'buy', 'soc_start': a,
+                    'soc_end': b, 'grid_energy': (b - a) / 100.0 * 40.0,
+                    'load': 0.0, 'pv': 0.0, 'price': 0.10, 'sell': 0.10}
+
+        sched = [s(0, 2.5), s(2.5, 5), s(5, 7.5), s(7.5, 10)]   # gentle: +2.5%/slot
+        self.engine._frontload_charging(sched, slot_h)
+
+        # Slot 0 now charges at full power (6.25%), not the gentle 2.5%.
+        self.assertAlmostEqual(sched[0]['soc_end'], 6.25, places=2)
+        self.assertAlmostEqual(sched[0]['grid_energy'], 2.5, places=2)
+        # The run still ends exactly on the original target (downstream untouched).
+        self.assertAlmostEqual(sched[-1]['soc_end'], 10.0, places=2)
+        # Once the target is reached, later slots hold (no extra charge).
+        self.assertAlmostEqual(sched[-1]['soc_start'], 10.0, places=2)
+        self.assertAlmostEqual(sched[-1]['grid_energy'], 0.0, places=2)
+
+    def test_frontload_charging_respects_import_limit(self):
+        # With a tight import limit, the per-slot charge can't exceed it.
+        self.engine.battery_capacity = 40.0
+        self.engine.charge_efficiency = 1.0
+        self.engine.max_charge_power = 100.0      # effectively unlimited battery power
+        self.engine.max_power_import = 4.0        # 4 kW * 0.25 h = 1.0 kWh/slot cap
+        slot_h = 0.25
+
+        def s(a, b):
+            return {'time': datetime.now(tz.UTC), 'action': 'buy', 'soc_start': a,
+                    'soc_end': b, 'grid_energy': (b - a) / 100.0 * 40.0,
+                    'load': 0.0, 'pv': 0.0, 'price': 0.10, 'sell': 0.10}
+
+        sched = [s(0, 2), s(2, 4), s(4, 6), s(6, 8), s(8, 10)]   # gentle +2%/slot
+        self.engine._frontload_charging(sched, slot_h)
+        # Front-loaded up to the 1.0 kWh/slot import cap (more than the gentle
+        # 0.8 kWh, but never above the grid limit).
+        self.assertAlmostEqual(sched[0]['grid_energy'], 1.0, places=2)
+        self.assertAlmostEqual(sched[-1]['soc_end'], 10.0, places=2)
+
 if __name__ == '__main__':
     unittest.main()

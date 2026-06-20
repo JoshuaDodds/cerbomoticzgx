@@ -152,7 +152,7 @@
       "pf-grid-l0": gImp != null ? `⇢ ${Number(gImp).toFixed(2)} kWh` : "",
       "pf-grid-l1": gExp != null ? `⇠ ${Number(gExp).toFixed(2)} kWh` : "",
       "pf-house-big": fmtW(load), "pf-house-l0": kwh(today.consumption_kwh),
-      "pf-batt-big": (soc != null ? Number(soc).toFixed(0) + "%" : "—"), "pf-batt-l0": fmtW(batt),
+      "pf-batt-big": fmtW(batt), "pf-batt-l0": (soc != null ? Number(soc).toFixed(0) + "% SoC" : "—"),
     };
     if (ev != null) { labels["pf-ev-big"] = fmtW(ev); labels["pf-ev-l0"] = kwh(today.ev_kwh); }
     if (gasM3 != null) labels["pf-gas-big"] = `${Number(gasM3).toFixed(2)} m³`;
