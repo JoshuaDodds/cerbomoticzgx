@@ -32,6 +32,60 @@ def history_dir() -> str:
     return _env().get("HISTORY_DIR") or "data/history"
 
 
+def _f(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _last_daily_record(path: str):
+    """Last cycle record of a day's NDJSON (carries the cumulative daily counters)."""
+    last = None
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if r.get("kind") in (None, "cycle") and r.get("day_import_cost") is not None:
+                    last = r
+    except (FileNotFoundError, OSError):
+        return None
+    return last
+
+
+def monthly_history() -> list:
+    """Per-day net totals for the current calendar month (Trends monthly chart).
+    net_eur = export_reward - import_cost (profit positive). Days with no data are
+    skipped."""
+    from datetime import timedelta
+    today = datetime.now().date()
+    d = today.replace(day=1)
+    out = []
+    while d <= today:
+        rec = _last_daily_record(os.path.join(history_dir(), f"ess-{d.strftime('%Y-%m-%d')}.ndjson"))
+        if rec is not None:
+            imp_cost, exp_rev = _f(rec.get("day_import_cost")), _f(rec.get("day_export_reward"))
+            net = (exp_rev - imp_cost) if (imp_cost is not None and exp_rev is not None) else None
+            out.append({
+                "date": d.strftime("%Y-%m-%d"),
+                "day": d.day,
+                "net_eur": round(net, 2) if net is not None else None,
+                "import_cost": round(imp_cost, 2) if imp_cost is not None else None,
+                "export_reward": round(exp_rev, 2) if exp_rev is not None else None,
+                "import_kwh": _f(rec.get("day_import_kwh")),
+                "export_kwh": _f(rec.get("day_export_kwh")),
+                "is_today": d == today,
+            })
+        d += timedelta(days=1)
+    return out
+
+
 def _parse_time(s):
     try:
         return datetime.fromisoformat(s)

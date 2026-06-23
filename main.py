@@ -94,30 +94,10 @@ def post_startup():
     restore_and_publish('grid_charging_enabled_by_price', default=False)
     restore_and_publish('tesla_charge_requested', default=False)
 
-    # clear the energy sale scheduling status message
-    logging.info(f"post_startup(): Retrieving latest pricing data...")
-    get_todays_n_highest_prices(0, 100)
-
-    # update tibber pricing info and solar forecast
-    logging.info(f"post_startup(): Publishing latest pricing and solar forecast data to data bus...")
-    publish_pricing_data(__name__)
-    get_victron_solar_forecast()
-    retrieve_latest_tibber_pricing()
-
-    # Make sure we apply energy broker logic post startup to recover if the service restarts while in a
-    # managed state.
-    apply_energy_broker_logic()
-
-    # Start service scheduled tasks
-    TaskScheduler()
-
-    # Start the .env file config watcher / change handler
-    config_watcher = ConfigWatcher(handler=handle_env_change)
-    config_watcher.start()
-
-    # Optionally run the read-only dashboard in-process (daemon thread). Guarded
-    # so a frontend failure can NEVER crash the controller; default off (the
-    # dashboard normally runs as its own process / container sidecar).
+    # Start the read-only dashboard EARLY (if enabled), BEFORE any network-bound
+    # pricing/forecast work, so the web server is available immediately and can
+    # never be delayed by a slow/unreachable Tibber or VRM. Guarded — a frontend
+    # failure can never crash the controller.
     if str(retrieve_setting('FRONTEND_ENABLED') or '').strip().lower() in ('1', 'true', 'yes', 'on'):
         try:
             from frontend.server import run_in_thread
@@ -125,6 +105,34 @@ def post_startup():
             logging.info("Frontend dashboard started in-process (FRONTEND_ENABLED).")
         except Exception as FrontendError:
             logging.warning(f"Frontend dashboard failed to start; continuing without it: {FrontendError}")
+
+    # Pricing/forecast warm-up hits Tibber + VRM and can block for tens of seconds
+    # (or fail) during a third-party outage. Run it in a background daemon thread so
+    # it can NEVER block startup, the scheduler, or the web server. Each step is
+    # isolated so one failure doesn't skip the rest; the scheduler refreshes all of
+    # this periodically, so a failed warm-up self-heals on the next cycle.
+    def _startup_warm_up():
+        logging.info("post_startup(): warming up pricing + solar forecast (background)…")
+        for label, fn in (
+            ("today's highest prices", lambda: get_todays_n_highest_prices(0, 100)),
+            ("publish pricing", lambda: publish_pricing_data(__name__)),
+            ("solar forecast", get_victron_solar_forecast),
+            ("latest pricing", retrieve_latest_tibber_pricing),
+            ("energy-broker recovery", apply_energy_broker_logic),
+        ):
+            try:
+                fn()
+            except Exception as e:
+                logging.warning("post_startup warm-up '%s' failed (recovers on schedule): %s", label, e)
+        logging.info("post_startup(): warm-up complete.")
+
+    threading.Thread(target=_startup_warm_up, name="startup-warmup", daemon=True).start()
+
+    # Start service scheduled tasks + the .env config watcher (independent of the
+    # warm-up above, so they come up immediately).
+    TaskScheduler()
+    config_watcher = ConfigWatcher(handler=handle_env_change)
+    config_watcher.start()
 
     logging.info(f"post_startup() actions complete. v{retrieve_setting('VERSION')} Initialization complete.")
 

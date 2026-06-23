@@ -1,0 +1,952 @@
+"""Read-only AI advisor for the ESS dashboard (Phase 1).
+
+A manually-triggered analyst: it gathers recent performance history, the current
+plan, and the **tunable** configuration (never secrets), sends them to Claude, and
+returns a markdown report. Two modes:
+
+  * default daily review — "how is the optimizer doing, anything to improve?"
+  * an open question — e.g. "Why did we sell at 15:00 yesterday?"
+
+SAFETY: this module is strictly read-only. It never writes config, never touches
+control, and never sends secrets to the API — only the allow-listed tunables from
+``CONFIG_SCHEMA`` (plus performance data) are shared. It lives in the frontend
+package so it is fully isolated from the control runtime.
+"""
+import os
+import re
+import glob
+import json
+import time
+import threading
+from datetime import datetime, timedelta
+
+from dotenv import dotenv_values
+
+from frontend.config_schema import CONFIG_SCHEMA
+from frontend import data as _data
+
+# Current Claude models (override via ADVISOR_MODEL). Sonnet is the sensible
+# default for this analysis; Haiku is cheaper/faster for lighter use.
+DEFAULT_MODEL = "claude-sonnet-4-6"
+DEFAULT_HISTORY_DAYS = 4
+MAX_OUTPUT_TOKENS = 1800
+ADVISOR_TIMEOUT_S = 300
+# Token-budget guards so a review costs a few K tokens, not ~100K. Extended thinking
+# is the big sink (it ran away on the first call), so it's disabled by default; the
+# input prompt is also hard-capped (history detail auto-trims to fit).
+DEFAULT_MAX_INPUT_CHARS = 16000          # ~4K tokens of data
+DEFAULT_MAX_THINKING_TOKENS = 0          # 0 = no extended thinking on the CLI
+# On-demand history retrieval (question path only): when the model decides it needs
+# day(s) beyond the inline window it emits a NEED_HISTORY directive and we pull those
+# specific day files from data/history/. Bounded so a deep question can't blow up.
+DEFAULT_RETRIEVAL_MAX_DAYS = 14
+DEFAULT_RETRIEVAL_MAX_CHARS = 120000     # ~30K tokens; one full day of slots is ~45K chars
+# Claude Code CLI streaming flags (overridable via ADVISOR_CLI_STREAM_ARGS in case a
+# CLI version differs). stream-json + partial messages gives token-by-token output.
+DEFAULT_STREAM_ARGS = "--output-format stream-json --verbose --include-partial-messages"
+
+_run_lock = threading.Lock()
+
+
+# --------------------------------------------------------------------------- #
+# Config / secrets
+# --------------------------------------------------------------------------- #
+def _conf() -> dict:
+    """Merge .secrets + .env (secrets first so .env can't shadow a key name)."""
+    cfg = {}
+    try:
+        cfg.update(dotenv_values(".secrets") or {})
+    except Exception:
+        pass
+    try:
+        cfg.update(dotenv_values(".env") or {})
+    except Exception:
+        pass
+    return cfg
+
+
+def _api_key(conf) -> str | None:
+    return (conf.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_API_KEY") or "").strip() or None
+
+
+def _oauth_token(conf) -> str | None:
+    return (conf.get("CLAUDE_CODE_OAUTH_TOKEN") or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or "").strip() or None
+
+
+def _auth_mode(conf) -> str | None:
+    """Pick the backend:
+      'custom' — any subscription-login CLI set via ADVISOR_CLI_CMD (e.g. the Gemini
+                 or OpenAI Codex CLI). Usage is drawn from that plan; no API key.
+      'cli'    — Claude Code, authenticated by a Claude Pro/Max OAuth token (or the
+                 host's existing `claude` login). No API key.
+      'api'    — Anthropic API key, pay-as-you-go.
+    Honors ADVISOR_AUTH=cli|api|auto (default auto). A configured ADVISOR_CLI_CMD
+    wins unless ADVISOR_AUTH=api is set explicitly."""
+    pref = (conf.get("ADVISOR_AUTH") or "auto").strip().lower()
+    if pref == "api":
+        return "api" if _api_key(conf) else None
+    if (conf.get("ADVISOR_CLI_CMD") or "").strip():
+        return "custom"             # gemini / codex / any subscription-login CLI
+    if pref == "cli":
+        # Use an explicit token if provided, else the host's existing `claude` login.
+        return "cli"
+    if _oauth_token(conf):          # auto: prefer an explicit subscription token
+        return "cli"
+    if _api_key(conf):
+        return "api"
+    return None
+
+
+def _model(conf, backend: str) -> str:
+    """Model id. The CLI accepts short aliases (sonnet/opus/haiku); the API needs a
+    full model string."""
+    m = (conf.get("ADVISOR_MODEL") or "").strip()
+    if m:
+        return m
+    return "sonnet" if backend == "cli" else DEFAULT_MODEL
+
+
+def _tunables(conf) -> list[dict]:
+    """The allow-listed tunables (key, value, type, description) — SECRET-SAFE.
+
+    Only keys present in CONFIG_SCHEMA are ever included, so secrets (tokens, PATs,
+    passwords, broker IPs, portal IDs) in .env are never sent to the API.
+    """
+    out = []
+    for group in CONFIG_SCHEMA:
+        for s in group.get("settings", []):
+            k = s["key"]
+            out.append({
+                "key": k,
+                "value": conf.get(k),
+                "type": s.get("type"),
+                "group": group.get("group"),
+                "desc": s.get("desc", ""),
+            })
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# History gathering
+# --------------------------------------------------------------------------- #
+# Compact field sets so a few days of data fit comfortably in one request.
+# pv_w = instantaneous PV power; pv_actual_today_kwh = cumulative realized PV (kWh).
+# Cumulative day_* totals and net live in the day summary, not per slot.
+_CYCLE_FIELDS = ("ts", "control_action", "realized_action", "reason_code", "soc",
+                 "price_buy", "price_sell", "applied_setpoint_w", "grid_w", "pv_w",
+                 "batt_w", "load_w", "pv_actual_today_kwh")
+# actual_pv_kwh = per-slot realized PV; predicted_grid_kwh = predicted import/export.
+_SETTLE_FIELDS = ("ts", "predicted_control_action", "predicted_grid_kwh",
+                  "predicted_net_eur", "actual_net_eur", "actual_import_kwh",
+                  "actual_export_kwh", "actual_pv_kwh", "soc_start", "soc_end",
+                  "price_buy", "cost_basis_eur_per_kwh")
+
+
+def _read_day(day) -> list[dict]:
+    path = os.path.join(_data.history_dir(), f"ess-{day.strftime('%Y-%m-%d')}.ndjson")
+    recs = []
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    try:
+                        recs.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+    except (FileNotFoundError, OSError):
+        pass
+    return recs
+
+
+def _hm(ts):
+    try:
+        return datetime.fromisoformat(ts).strftime("%H:%M")
+    except (TypeError, ValueError):
+        return ts
+
+
+def _trim(rec, fields):
+    return {k: rec.get(k) for k in fields if rec.get(k) is not None}
+
+
+def _day_summary(recs) -> dict:
+    """Per-day rollup: P&L, action mix, settlement accuracy."""
+    cycles = [r for r in recs if r.get("kind") == "cycle"]
+    settles = [r for r in recs if r.get("kind") == "settlement"]
+    actions = {}
+    for c in cycles:
+        a = c.get("control_action") or "?"
+        actions[a] = actions.get(a, 0) + 1
+    last = cycles[-1] if cycles else {}
+    # Settlement net error (predicted vs actual), mean absolute.
+    errs = [abs((s.get("predicted_net_eur") or 0) - (s.get("actual_net_eur") or 0))
+            for s in settles if s.get("actual_net_eur") is not None]
+
+    def _kwh(v, div=1.0):
+        try:
+            return round(float(v) / div, 2)
+        except (TypeError, ValueError):
+            return None
+
+    # PV / load forecast-vs-actual for the day, normalised to kWh. NB the source field
+    # `pv_forecast_today_kwh` is actually stored in Wh (a known mislabel), as are the
+    # load_*_wh fields, so they are /1000 here; pv_actual_today_kwh is already kWh.
+    pv_fc = _kwh(last.get("pv_forecast_today_kwh"), 1000.0)
+    pv_act = _kwh(last.get("pv_actual_today_kwh"))
+    ld_fc = _kwh(last.get("load_forecast_today_wh"), 1000.0)
+    ld_act = _kwh(last.get("load_actual_today_wh"), 1000.0)
+    return {
+        "cycles": len(cycles),
+        "actions": actions,
+        "day_import_kwh": last.get("day_import_kwh"),
+        "day_import_cost": last.get("day_import_cost"),
+        "day_export_kwh": last.get("day_export_kwh"),
+        "day_export_reward": last.get("day_export_reward"),
+        "realized_net_eur": last.get("realized_net_eur"),
+        "settlement_mean_abs_net_err_eur": round(sum(errs) / len(errs), 4) if errs else None,
+        "pv_forecast_kwh": pv_fc,        # day forecast (normalised to kWh)
+        "pv_actual_kwh": pv_act,         # day realized PV (kWh)
+        "pv_forecast_err_kwh": (round(pv_act - pv_fc, 2)
+                                if pv_fc is not None and pv_act is not None else None),
+        "load_forecast_kwh": ld_fc,
+        "load_actual_kwh": ld_act,
+    }
+
+
+def _gather(days: int, detail_days: int = 2) -> dict:
+    """Build the performance payload: per-day summaries for `days`, plus trimmed
+    per-slot records for the most recent `detail_days` (so specific questions like
+    'why did we sell at 15:00 yesterday' can be answered from the actual records)."""
+    today = datetime.now().date()
+    summaries, detail = {}, {}
+    for i in range(days):
+        d = today - timedelta(days=i)
+        recs = _read_day(d)
+        if not recs:
+            continue
+        key = d.strftime("%Y-%m-%d")
+        summaries[key] = _day_summary(recs)
+        if i < detail_days:
+            detail[key] = {
+                "cycles": [{**_trim(r, _CYCLE_FIELDS), "ts": _hm(r.get("ts"))}
+                           for r in recs if r.get("kind") == "cycle"],
+                "settlements": [{**_trim(r, _SETTLE_FIELDS), "ts": _hm(r.get("ts"))}
+                                for r in recs if r.get("kind") == "settlement"],
+            }
+    return {"daily_summaries": summaries, "recent_detail": detail}
+
+
+# --------------------------------------------------------------------------- #
+# On-demand history retrieval (question path): the model can ask for more days.
+# --------------------------------------------------------------------------- #
+_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}$")
+_NEED_RE = re.compile(r"NEED_HISTORY\s*:\s*(.+)", re.IGNORECASE | re.DOTALL)
+
+
+def _history_manifest() -> dict:
+    """List every day available in data/history/ plus the record schema, so the model
+    knows exactly what it can ask for (it only ever sees the recent few days inline)."""
+    days = []
+    try:
+        for p in glob.glob(os.path.join(_data.history_dir(), "ess-*.ndjson")):
+            m = re.search(r"ess-(\d{4}-\d{2}-\d{2})\.ndjson$", os.path.basename(p))
+            if m:
+                days.append(m.group(1))
+    except OSError:
+        pass
+    days.sort()
+    return {
+        "dir": "data/history",
+        "available_days": days,
+        "earliest": days[0] if days else None,
+        "latest": days[-1] if days else None,
+        "count": len(days),
+        "record_schema": {
+            "cycle_fields": list(_CYCLE_FIELDS),
+            "settlement_fields": list(_SETTLE_FIELDS),
+            "note": "one JSON object per line; kind=cycle (a 15-min decision) or "
+                    "kind=settlement (predicted vs actual for the slot that closed).",
+        },
+    }
+
+
+def _parse_need_history(text: str, available_days: list[str], max_days: int) -> list[str]:
+    """If the model's reply is a NEED_HISTORY directive, return the validated days it
+    asked for (only days that actually exist; supports commas and A..B ranges). Returns
+    [] when the reply is a normal answer, so a stray mention can't trigger retrieval."""
+    if not text:
+        return []
+    stripped = text.strip()
+    if not stripped.upper().startswith("NEED_HISTORY"):
+        return []                     # the protocol requires the directive to stand alone
+    m = _NEED_RE.search(stripped)
+    if not m:
+        return []
+    avail = set(available_days or [])
+    want = set()
+    for tok in re.split(r"[,\s;]+", m.group(1).strip()):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if ".." in tok:               # inclusive date range A..B
+            a, _, b = tok.partition("..")
+            a, b = a.strip(), b.strip()
+            if _DATE_RE.match(a) and _DATE_RE.match(b):
+                lo, hi = sorted((a, b))
+                want |= {d for d in avail if lo <= d <= hi}
+        elif _DATE_RE.match(tok) and tok in avail:
+            want.add(tok)
+    return sorted(want)[:max_days]
+
+
+def _load_days(date_strs: list[str], conf) -> dict:
+    """Pull the requested day files as compact, budget-bounded detail (same trimmed
+    shape as _gather's recent_detail). Stops adding heavy detail once the char budget
+    is hit, keeping at least each day's summary."""
+    budget = _conf_int(conf, "ADVISOR_RETRIEVAL_MAX_CHARS", DEFAULT_RETRIEVAL_MAX_CHARS)
+    out, used = {}, 0
+    for ds in date_strs:
+        try:
+            d = datetime.strptime(ds, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        recs = _read_day(d)
+        if not recs:
+            continue
+        block = {
+            "summary": _day_summary(recs),
+            "cycles": [{**_trim(r, _CYCLE_FIELDS), "ts": _hm(r.get("ts"))}
+                       for r in recs if r.get("kind") == "cycle"],
+            "settlements": [{**_trim(r, _SETTLE_FIELDS), "ts": _hm(r.get("ts"))}
+                            for r in recs if r.get("kind") == "settlement"],
+        }
+        chunk = len(json.dumps(block, default=str))
+        if used + chunk > budget:
+            out[ds] = {"summary": block["summary"],
+                       "note": "per-slot detail omitted (retrieval budget reached)"}
+            break
+        out[ds] = block
+        used += chunk
+    return out
+
+
+def _plan_excerpt() -> dict:
+    raw = _data.load_raw_plan() or {}
+    return {
+        "generated_at": raw.get("generated_at"),
+        "battery_soc": raw.get("battery_soc"),
+        "current": raw.get("current"),
+        "today": raw.get("today"),
+        "next_slots": (raw.get("schedule") or [])[:12],
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Prompt
+# --------------------------------------------------------------------------- #
+_PRIMER = """\
+You are a senior energy-systems engineer reviewing a home battery ESS optimizer.
+
+System: 16 kW 3-phase Victron ESS, ~42 kWh LFP battery, rooftop PV, in the
+Netherlands on Tibber dynamic pricing (currently net-metering / "saldering", so
+the buy and sell price are equal until it ends Jan 2027). A dynamic-program
+optimizer re-plans every 15 minutes over the Tibber price horizon using PV and
+load forecasts. Actions are executed by commanding Victron setpoints over MQTT: the
+ESS runs in "Optimized WITHOUT BatteryLife" with DVCC managing the LFP charge/
+discharge limits, and the inverters typically report "External control" while this
+controller is driving them. There is NO BatteryLife scheduled charging in play — do
+NOT attribute any behaviour to BatteryLife. One of four actions per slot, labelled
+by the commanded setpoint:
+  - IDLE   : neutral setpoint — the inverter self-consumes PV and decides charge vs
+             export within DVCC limits.
+  - RETAIN : grid covers the house load, battery held (no forced charge/discharge).
+  - BUY    : commanded full-power grid charge, held until the planned target SoC.
+  - SELL   : commanded grid export at a metered setpoint (forced discharge).
+If the battery is NOT charging from PV surplus, the cause is the commanded setpoint,
+an active feed-in / export limit, or a DVCC current limit — never BatteryLife.
+History records are 15-min "cycle" rows (the decision + realized power) paired with
+"settlement" rows (predicted vs actual for the slot that just closed). A persistent
+cost-basis tracks what stored energy cost; a min-sell-price floor and an arbitrage
+margin prune marginal cycles; SELL hysteresis damps churn.
+
+You are an ADVISOR only. You cannot change anything. Recommend, explain, and
+prioritise — the human applies changes separately and safely."""
+
+_REVIEW_TASK = """\
+TASK: Produce a SHORT morning review — something the user can scan in ~15 seconds.
+
+LENGTH (obey strictly):
+  - Total UNDER 250 words. No preamble, no sign-off, no "watch list", no recap of
+    the data.
+  - Use exactly these sections; omit a section entirely if there is nothing real to
+    say:
+      **P/L** — one line: made or lost money so far + the single main reason.
+      **Good** — one or two lines: what is going right.
+      **Issues** — up to 3 bullets, real economic problems only; one short clause of
+                   explanation each is fine.
+      **Do** — up to 3 bullets, each = tunable name + value + short why (or "code:"
+               for a code change). Omit this section entirely if nothing is worth
+               changing (see "FINDING NOTHING" below).
+  - Cite a time/number where it supports the point. No confidence/risk labels,
+    no nested sub-bullets.
+
+DO NOT FLAG ANY OF THESE — they are intended and pre-approved, not problems:
+  - Low, very low, or 0% battery SOC; an empty/drained battery; running the house
+    off solar or cheap grid while SOC is low. "0%" is really ~5% (the BMS floor);
+    draining to that level to arbitrage or self-consume is desired behaviour. Never
+    call it an issue, a risk, or a "missed opportunity to store PV".
+  - RETAIN or IDLE while SOC is low.
+Only surface genuine money mistakes: churn, selling below cost basis, mis-timed
+charge/sell, or forecast/settlement errors that actually cost euros.
+
+BEFORE putting any tunable in **Do**, verify all three against the DATA; drop it if
+it fails any:
+  1. The tunable NAME appears in the provided `tunables` list — never invent one.
+  2. Your value actually DIFFERS from the current value (no no-op suggestions).
+  3. It really does what you claim, checked against the prices/SoC in `current_plan`.
+     E.g. a max-charge-PRICE cap must sit ABOVE the slots you want to allow (a lower
+     cap blocks them); charging earlier only helps if a later slot is pricier or
+     time/capacity runs out.
+
+FINDING NOTHING IS A VALID, GOOD RESULT. If the recent schedule and yesterday look
+correct and well executed, say so plainly — e.g. "No changes recommended: yesterday
+executed as intended and today's plan looks sound" — and stop. Do NOT manufacture
+issues or tweaks just to fill **Issues** or **Do**; omit those sections when empty."""
+
+_QUESTION_TASK = """\
+TASK: Answer the user's question below using the data provided. Be specific and
+cite the relevant records (times, prices, SoC, actions, reason codes). If the
+question implies a possible improvement, note whether it would be an existing
+tunable, a new tunable, or a code change.
+
+Be brief. Low/0% SOC (really ~5%, the BMS floor) and draining the battery to run off
+solar or cheap grid are intended and pre-approved — never flag them as problems.
+
+DEEPER HISTORY: `history_manifest` lists EVERY day available in data/history/ plus
+the record schema. The inline `performance` data only covers the most recent few days
+in detail. If — and ONLY if — answering needs day(s) outside that inline detail, do
+not guess and do not say you lack data: instead make your ENTIRE reply exactly one
+line and nothing else —
+  NEED_HISTORY: <comma-separated YYYY-MM-DD, and/or A..B ranges>
+naming only days present in history_manifest (max {max_days}). You will be re-asked
+with those days attached, and then you answer. If the inline data already suffices,
+just answer — never request history you don't need.
+
+USER QUESTION: {question}"""
+
+
+def _build_messages(question: str | None, conf) -> tuple[str, str]:
+    """Build (system, user). Keeps the prompt under ADVISOR_MAX_INPUT_CHARS by
+    progressively reducing how many days of per-slot DETAIL are included (daily
+    summaries are always kept), then hard-truncating as a last resort. This bounds
+    the input token cost of a review."""
+    max_chars = _conf_int(conf, "ADVISOR_MAX_INPUT_CHARS", DEFAULT_MAX_INPUT_CHARS)
+    days = _conf_int(conf, "ADVISOR_HISTORY_DAYS", DEFAULT_HISTORY_DAYS)
+    base = {"tunables": _tunables(conf), "current_plan": _plan_excerpt(),
+            "now": datetime.now().astimezone().isoformat()}
+    if question:
+        max_days = _conf_int(conf, "ADVISOR_RETRIEVAL_MAX_DAYS", DEFAULT_RETRIEVAL_MAX_DAYS)
+        task = _QUESTION_TASK.format(question=question.strip(), max_days=max_days)
+        base["history_manifest"] = _history_manifest()   # so it knows what it can pull
+    else:
+        task = _REVIEW_TASK
+
+    user = ""
+    for detail_days in (2, 1, 0):        # shrink detail until it fits the budget
+        payload = {**base, "performance": _gather(days, detail_days=detail_days)}
+        user = (f"{task}\n\n=== DATA (JSON) ===\n"
+                f"{json.dumps(payload, default=str)}\n=== END DATA ===")
+        if len(user) <= max_chars:
+            break
+    if len(user) > max_chars:            # last resort: hard cap
+        user = user[:max_chars] + "\n…(data truncated to fit the input budget)…\n=== END DATA ==="
+    return _PRIMER, user
+
+
+def _conf_int(conf, key, default):
+    try:
+        return int(float(conf.get(key)))
+    except (TypeError, ValueError):
+        return default
+
+
+# --------------------------------------------------------------------------- #
+# Claude call
+# --------------------------------------------------------------------------- #
+def _call_claude_cli(system: str, user: str, model: str, token: str | None, conf) -> dict:
+    """Run the analysis through the Claude Code CLI on the host's Pro/Max
+    subscription (no API key). Uses an explicit OAuth token if given, otherwise the
+    host's existing `claude` login. Read-only: the whole prompt + data is fed on
+    stdin, it runs in a neutral temp dir (nothing local to touch), plain text back."""
+    import subprocess
+    import tempfile
+
+    cli = (conf.get("CLAUDE_CLI_PATH") or "claude").strip()
+    prompt = f"{system}\n\n{user}"
+    cmd = [cli, "--print"]
+    if model:
+        cmd += ["--model", model]
+
+    env = dict(os.environ)
+    if token:
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = token
+    env.pop("ANTHROPIC_API_KEY", None)   # prefer the subscription login over API credits
+    env["MAX_THINKING_TOKENS"] = str(_conf_int(conf, "ADVISOR_MAX_THINKING_TOKENS",
+                                               DEFAULT_MAX_THINKING_TOKENS))
+    cfgdir = (conf.get("CLAUDE_CONFIG_DIR") or "").strip()
+    if cfgdir:
+        env["CLAUDE_CONFIG_DIR"] = cfgdir   # isolate from a possibly-stale ~/.claude cache
+    try:
+        proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
+                              timeout=180, env=env, cwd=tempfile.gettempdir())
+    except FileNotFoundError:
+        return {"ok": False, "error": f"Claude Code CLI '{cli}' not found on this host. "
+                "Install it (npm i -g @anthropic-ai/claude-code) and run `claude setup-token`, "
+                "or set CLAUDE_CLI_PATH to its location."}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "Claude Code timed out (>180s)."}
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip()[:600]
+        return {"ok": False, "error": f"Claude Code error: {err or 'non-zero exit'}"}
+    text = (proc.stdout or "").strip()
+    return {"ok": True, "report": text or "_(no content returned)_", "usage": None}
+
+
+def _call_claude_api(system: str, user: str, model: str, api_key: str) -> dict:
+    try:
+        import anthropic
+    except ImportError:
+        return {"ok": False, "error": "The 'anthropic' SDK is not installed. "
+                                      "Run: pip install anthropic"}
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        resp = client.messages.create(
+            model=model,
+            max_tokens=MAX_OUTPUT_TOKENS,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+        text = "".join(getattr(b, "text", "") for b in resp.content).strip()
+        usage = getattr(resp, "usage", None)
+        return {
+            "ok": True,
+            "report": text or "_(no content returned)_",
+            "usage": {"input_tokens": getattr(usage, "input_tokens", None),
+                      "output_tokens": getattr(usage, "output_tokens", None)} if usage else None,
+        }
+    except Exception as e:  # anthropic.APIError and friends
+        return {"ok": False, "error": f"Claude API error: {e}"}
+
+
+# --------------------------------------------------------------------------- #
+# Streaming (Server-Sent Events) — transparent progress + token output
+# --------------------------------------------------------------------------- #
+def _extract_delta(ev: dict):
+    """Pull assistant text out of a Claude Code stream-json event, tolerant of the
+    several shapes the CLI emits across versions. Returns a list of text fragments."""
+    out = []
+    t = ev.get("type")
+    # token-level deltas: top-level, or nested under a stream_event "event" wrapper.
+    for d in (ev.get("delta"), (ev.get("event") or {}).get("delta")):
+        if isinstance(d, dict) and d.get("text"):
+            out.append(d["text"])
+    # a full assistant message (fallback when partials aren't emitted)
+    msg = ev.get("message") if t in ("assistant", None) else None
+    if isinstance(msg, dict):
+        for blk in (msg.get("content") or []):
+            if isinstance(blk, dict) and blk.get("type") in (None, "text") and blk.get("text"):
+                out.append(blk["text"])
+    return out
+
+
+def _stream_cli(system, user, model, token, conf):
+    """Stream the Claude Code CLI: progress 'log' events + 'delta' text as it arrives.
+    Kills the subprocess if the consumer (SSE client) goes away."""
+    import subprocess
+    import tempfile
+    import shlex
+
+    cli = (conf.get("CLAUDE_CLI_PATH") or "claude").strip()
+    stream_args = shlex.split((conf.get("ADVISOR_CLI_STREAM_ARGS") or DEFAULT_STREAM_ARGS))
+    prompt = f"{system}\n\n{user}"
+    cmd = [cli, "--print", *stream_args]
+    if model:
+        cmd += ["--model", model]
+
+    env = dict(os.environ)
+    if token:
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = token
+    env.pop("ANTHROPIC_API_KEY", None)
+    # Cap (default disable) extended thinking — it was the runaway token sink.
+    env["MAX_THINKING_TOKENS"] = str(_conf_int(conf, "ADVISOR_MAX_THINKING_TOKENS",
+                                               DEFAULT_MAX_THINKING_TOKENS))
+    cfgdir = (conf.get("CLAUDE_CONFIG_DIR") or "").strip()
+    if cfgdir:
+        env["CLAUDE_CONFIG_DIR"] = cfgdir   # isolate from a possibly-stale ~/.claude cache
+
+    try:
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                env=env, cwd=tempfile.gettempdir())
+    except FileNotFoundError:
+        yield {"type": "error", "error": f"Claude Code CLI '{cli}' not found on this host. "
+               "Install it (npm i -g @anthropic-ai/claude-code) and log in / set "
+               "CLAUDE_CODE_OAUTH_TOKEN, or set CLAUDE_CLI_PATH."}
+        return
+
+    emitted = False
+    thinking = 0
+    thinking_last = 0.0
+    auth_fail = False
+    start = time.time()
+    # Feed the (large) prompt on a background thread so a full pipe buffer can't
+    # deadlock against us reading stdout.
+    def _feed():
+        try:
+            proc.stdin.write(prompt)
+            proc.stdin.close()
+        except Exception:
+            pass
+    threading.Thread(target=_feed, daemon=True).start()
+    try:
+        for line in proc.stdout:
+            if time.time() - start > ADVISOR_TIMEOUT_S:
+                yield {"type": "error", "error": f"Timed out after {ADVISOR_TIMEOUT_S}s."}
+                break
+            line = line.rstrip("\n")
+            if not line.strip():
+                continue
+            # Auth failures can arrive as stderr OR inside a JSON result event.
+            low = line.lower()
+            if any(k in low for k in ("401", "invalid authentication", "unauthor", "invalid_grant")):
+                auth_fail = True
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                yield {"type": "log", "msg": line[:600]}   # non-JSON (e.g. stderr) -> log
+                continue
+            t = ev.get("type")
+            deltas = _extract_delta(ev)
+            if deltas and not (emitted and t in ("assistant",)):
+                # token deltas always flow; a full 'assistant' message is skipped if
+                # we already streamed partials (avoids duplicating the text).
+                for frag in deltas:
+                    emitted = True
+                    yield {"type": "delta", "text": frag}
+            elif t == "result":
+                if not emitted and ev.get("result"):
+                    emitted = True
+                    yield {"type": "delta", "text": ev["result"]}
+                u = ev.get("usage") or {}
+                cost = ev.get("total_cost_usd")
+                yield {"type": "log", "msg": "result "
+                       f"in:{u.get('input_tokens', '?')} out:{u.get('output_tokens', '?')}"
+                       + (f" ${cost}" if cost else "")}
+            elif t in ("system", "user"):
+                sub = ev.get("subtype") or "event"
+                if sub == "thinking_tokens":
+                    # Coalesce the high-frequency thinking stream into one throttled,
+                    # in-place "thinking…" indicator instead of spamming the log.
+                    thinking += 1
+                    nowt = time.time()
+                    if nowt - thinking_last > 0.5:
+                        thinking_last = nowt
+                        yield {"type": "thinking", "count": thinking}
+                elif sub == "init":
+                    yield {"type": "log", "msg": "session started — Claude is working…"}
+                # other system/status events are noise — ignore
+        rc = proc.wait()
+        if auth_fail and not emitted:
+            yield {"type": "error", "error": (
+                "Claude authentication failed (401). This is a known Claude Code issue: "
+                "the cached credential state at ~/.claude/.credentials.json goes stale and "
+                "rejects even a valid token. Recovery: delete that file (or `claude logout`), "
+                "re-run `claude setup-token`, update CLAUDE_CODE_OAUTH_TOKEN in .secrets, and "
+                "restart the frontend. To make it more durable, set CLAUDE_CONFIG_DIR to a "
+                "dedicated dir so the advisor uses only the token and isn't poisoned by the "
+                "interactive login's cache.")}
+        elif rc not in (0, None) and not emitted:
+            yield {"type": "error", "error": f"Claude Code exited with code {rc}."}
+    finally:
+        if proc.poll() is None:        # consumer gone or we're done — never leave a zombie
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
+def _stream_generic_cli(system, user, conf):
+    """Provider-agnostic CLI path. Runs ADVISOR_CLI_CMD (e.g. the Gemini or OpenAI
+    Codex CLI, authenticated by your own subscription login), feeds the prompt on
+    stdin, and streams stdout back as the report. Lets the advisor use ANY
+    subscription-login CLI, not just Claude Code — no API key, no per-call charge.
+    The prompt is delivered two ways depending on the CLI:
+      * if ADVISOR_CLI_CMD contains the literal token {prompt}, it's substituted as
+        a single argument (for CLIs that want the prompt as a flag value);
+      * otherwise the prompt is piped on stdin.
+    Examples (set in .env):
+        ADVISOR_CLI_CMD=gemini -p {prompt}   # Gemini CLI (after `gemini login`)
+        ADVISOR_CLI_CMD=codex exec {prompt}  # OpenAI Codex CLI (after signing in)
+        ADVISOR_CLI_CMD=claude --print       # any CLI that reads the prompt on stdin
+    """
+    import subprocess
+    import tempfile
+    import shlex
+
+    raw = (conf.get("ADVISOR_CLI_CMD") or "").strip()
+    tokens = shlex.split(raw)
+    if not tokens:
+        yield {"type": "error", "error": "ADVISOR_CLI_CMD is not set."}
+        return
+    prompt = f"{system}\n\n{user}"
+    use_stdin = "{prompt}" not in raw
+    cmd = [prompt if t == "{prompt}" else t for t in tokens]
+    env = dict(os.environ)
+    env.pop("ANTHROPIC_API_KEY", None)
+    try:
+        proc = subprocess.Popen(cmd,
+                                stdin=(subprocess.PIPE if use_stdin else subprocess.DEVNULL),
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, bufsize=1, env=env, cwd=tempfile.gettempdir())
+    except FileNotFoundError:
+        yield {"type": "error", "error": f"Command not found: {tokens[0]!r}. Install the CLI "
+               "(e.g. `gemini login` / `codex`) or fix ADVISOR_CLI_CMD."}
+        return
+
+    if use_stdin:
+        def _feed():
+            try:
+                proc.stdin.write(prompt)
+                proc.stdin.close()
+            except Exception:
+                pass
+        threading.Thread(target=_feed, daemon=True).start()
+
+    emitted = False
+    start = time.time()
+    try:
+        for line in proc.stdout:
+            if time.time() - start > ADVISOR_TIMEOUT_S:
+                yield {"type": "error", "error": f"Timed out after {ADVISOR_TIMEOUT_S}s."}
+                break
+            emitted = True
+            yield {"type": "delta", "text": line}   # raw text/markdown from the CLI
+        rc = proc.wait()
+        if rc not in (0, None) and not emitted:
+            yield {"type": "error", "error": f"CLI exited with code {rc}."}
+    finally:
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
+def _call_generic_cli(system, user, conf) -> dict:
+    """Non-streaming wrapper around _stream_generic_cli for the plain POST path."""
+    parts, err = [], None
+    for ev in _stream_generic_cli(system, user, conf):
+        if ev.get("type") == "delta":
+            parts.append(ev.get("text", ""))
+        elif ev.get("type") == "error":
+            err = ev.get("error")
+    text = "".join(parts).strip()
+    if not text:
+        return {"ok": False, "report": "", "error": err or "No output from ADVISOR_CLI_CMD."}
+    return {"ok": True, "report": text, "error": None}
+
+
+def _stream_api(system, user, model, api_key):
+    try:
+        import anthropic
+    except ImportError:
+        yield {"type": "error", "error": "The 'anthropic' SDK is not installed (pip install anthropic)."}
+        return
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        with client.messages.stream(model=model, max_tokens=MAX_OUTPUT_TOKENS,
+                                     system=system,
+                                     messages=[{"role": "user", "content": user}]) as stream:
+            for text in stream.text_stream:
+                yield {"type": "delta", "text": text}
+    except Exception as e:
+        yield {"type": "error", "error": f"Claude API error: {e}"}
+
+
+def _auth_log_event(mode, conf) -> dict:
+    """Non-secret diagnostic line about which backend/credential is in use."""
+    if mode == "custom":
+        cmd0 = (conf.get("ADVISOR_CLI_CMD") or "").split()
+        return {"type": "log", "msg": "auth=custom · cmd=" + (cmd0[0] if cmd0 else "?")}
+    if mode == "cli":
+        tok = _oauth_token(conf)
+        return {"type": "log", "msg": "auth=cli · token=" +
+                (f"present ({len(tok)} chars)" if tok else "absent → using host `claude` login")
+                + ((" · CLAUDE_CONFIG_DIR=" + conf.get("CLAUDE_CONFIG_DIR"))
+                   if conf.get("CLAUDE_CONFIG_DIR") else "")}
+    return {"type": "log", "msg": "auth=api"}
+
+
+def _stream_for(mode, system, user, model, conf):
+    """Dispatch one streamed model call to the active backend (yields event dicts)."""
+    if mode == "custom":
+        yield from _stream_generic_cli(system, user, conf)
+    elif mode == "cli":
+        yield from _stream_cli(system, user, model, _oauth_token(conf), conf)
+    else:
+        yield from _stream_api(system, user, model, _api_key(conf))
+
+
+def _answer_with_retrieval(question, conf, mode, model):
+    """Question path with on-demand history. Streams the answer live, but sniffs the
+    first line: if the model replies with a NEED_HISTORY directive instead of an
+    answer, pull those day files from data/history/ and re-ask (pass 2), now streaming
+    the real answer. The daily review never comes through here, so it stays cheap."""
+    manifest = _history_manifest()
+    system, user = _build_messages(question, conf)
+    yield {"type": "stage", "msg": f"Prompt ~{len(system) + len(user):,} chars. Asking {model}…"}
+
+    # --- Pass 1: stream, but hold back the first line to detect a directive. ---
+    buf, decided, is_request, captured, err_ev = "", False, False, [], None
+    for ev in _stream_for(mode, system, user, model, conf):
+        t = ev.get("type")
+        if t == "delta":
+            txt = ev.get("text", "")
+            captured.append(txt)
+            if decided:
+                yield ev
+                continue
+            buf += txt
+            if "\n" in buf or len(buf) >= 16:          # enough to judge the first line
+                if buf.lstrip().upper().startswith("NEED_HISTORY"):
+                    is_request, decided = True, True    # suppress; consume rest quietly
+                else:
+                    decided = True
+                    yield {"type": "delta", "text": buf}   # flush, then stream live
+        elif t == "error":
+            err_ev = ev
+            break
+        elif t in ("thinking", "stage", "log"):
+            yield ev
+
+    # Resolve a very short pass-1 reply that never crossed the decision threshold.
+    if not decided:
+        if buf.lstrip().upper().startswith("NEED_HISTORY"):
+            is_request = True
+        elif buf:
+            yield {"type": "delta", "text": buf}
+    if err_ev is not None:
+        yield err_ev
+        return
+    if not is_request:
+        return                                   # a normal answer was already streamed
+
+    # --- Retrieval: resolve the requested days and re-ask. ---
+    max_days = _conf_int(conf, "ADVISOR_RETRIEVAL_MAX_DAYS", DEFAULT_RETRIEVAL_MAX_DAYS)
+    want = _parse_need_history("".join(captured), manifest.get("available_days") or [], max_days)
+    if not want:
+        yield {"type": "stage", "msg": "Model asked for history, but no matching days "
+               "exist — answering from inline data."}
+        user2 = user + ("\n\n(You requested more history but no matching days exist. "
+                        "Answer with the data already provided; do not request more.)")
+    else:
+        loaded = _load_days(want, conf)
+        yield {"type": "stage", "msg": f"Pulled {len(loaded)} day(s): "
+               f"{', '.join(sorted(loaded))}. Re-asking…"}
+        extra = json.dumps({"requested_history": loaded}, default=str)
+        user2 = (user + "\n\n=== ADDITIONAL HISTORY (you requested this) ===\n"
+                 + extra + "\n=== END ADDITIONAL HISTORY ===\n\n"
+                 "Now answer the question using ALL data above. Do NOT request more history.")
+    yield from _stream_for(mode, system, user2, model, conf)
+
+
+def run_stream(question: str | None = None):
+    """Generator of SSE event dicts (stage/log/delta/done/error) for live progress.
+    Read-only. The lock is released — and any CLI subprocess killed — when the
+    generator closes, including when the browser disconnects, so a wedged run can
+    never leave the advisor stuck on 'already running'."""
+    conf = _conf()
+    mode = _auth_mode(conf)
+    if not mode:
+        yield {"type": "error", "error": (
+            "No Claude credentials configured. If `claude` is already logged in on "
+            "this host, set ADVISOR_AUTH=cli. Otherwise set CLAUDE_CODE_OAUTH_TOKEN "
+            "in .secrets, or ANTHROPIC_API_KEY for API use.")}
+        return
+    model = _model(conf, mode)
+    if not _run_lock.acquire(blocking=False):
+        yield {"type": "error", "error": "An advisor review is already running — please wait."}
+        return
+    t0 = time.time()
+    try:
+        yield {"type": "stage", "msg": f"Gathering history + tunables ({mode})…"}
+        yield _auth_log_event(mode, conf)
+        if question:
+            # Question path: may pull deeper history from data/history/ on demand.
+            yield from _answer_with_retrieval(question, conf, mode, model)
+        else:
+            system, user = _build_messages(None, conf)
+            yield {"type": "stage", "msg": f"Prompt ~{len(system) + len(user):,} chars. "
+                   f"Calling {model}…"}
+            yield from _stream_for(mode, system, user, model, conf)
+        yield {"type": "done", "model": model, "auth": mode,
+               "mode": "question" if question else "review",
+               "elapsed_s": round(time.time() - t0, 1),
+               "generated_at": datetime.now().astimezone().isoformat()}
+    except Exception as e:
+        yield {"type": "error", "error": f"Advisor failed: {e}"}
+    finally:
+        _run_lock.release()
+
+
+# --------------------------------------------------------------------------- #
+# Public entry point
+# --------------------------------------------------------------------------- #
+def run(question: str | None = None) -> dict:
+    """Run the advisor (default review, or answer `question`). Returns a dict with
+    ok / report / model / auth / generated_at / error. Read-only and best-effort."""
+    conf = _conf()
+    mode = _auth_mode(conf)
+    if not mode:
+        return {"ok": False, "model": None, "error": (
+            "No Claude credentials configured. If `claude` is already installed and "
+            "logged in on this host, set ADVISOR_AUTH=cli in .env to use that login. "
+            "Otherwise put a CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`) in "
+            ".secrets, or set ANTHROPIC_API_KEY for pay-as-you-go API use.")}
+
+    model = _model(conf, mode)
+    if not _run_lock.acquire(blocking=False):
+        return {"ok": False, "model": model,
+                "error": "An advisor review is already running — please wait."}
+    try:
+        if question:
+            # Question path: reuse the streaming retrieval orchestrator, collected.
+            parts, err = [], None
+            for ev in _answer_with_retrieval(question, conf, mode, model):
+                t = ev.get("type")
+                if t == "delta":
+                    parts.append(ev.get("text", ""))
+                elif t == "error":
+                    err = ev.get("error")
+            text = "".join(parts).strip()
+            result = ({"ok": True, "report": text, "error": None} if text
+                      else {"ok": False, "report": "", "error": err or "No answer produced."})
+        else:
+            system, user = _build_messages(None, conf)
+            if mode == "custom":
+                result = _call_generic_cli(system, user, conf)
+            elif mode == "cli":
+                result = _call_claude_cli(system, user, model, _oauth_token(conf), conf)
+            else:
+                result = _call_claude_api(system, user, model, _api_key(conf))
+        result["model"] = model
+        result["auth"] = mode
+        result["generated_at"] = datetime.now().astimezone().isoformat()
+        result["mode"] = "question" if question else "review"
+        return result
+    except Exception as e:
+        return {"ok": False, "model": model, "error": f"Advisor failed: {e}",
+                "generated_at": datetime.now().astimezone().isoformat()}
+    finally:
+        _run_lock.release()

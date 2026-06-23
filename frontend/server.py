@@ -39,6 +39,12 @@ def api_config():
     return jsonify({"groups": data.get_config()})
 
 
+@app.route("/api/history/month")
+def api_history_month():
+    """Per-day net totals for the current month (Trends monthly chart)."""
+    return jsonify({"days": data.monthly_history()})
+
+
 @app.route("/api/config", methods=["POST"])
 def api_config_set():
     """Persist a single allow-listed setting to .env (applies on next cycle)."""
@@ -88,6 +94,45 @@ def api_replan():
     except Exception as e:
         logging.warning("Replan failed: %s", e)
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/advisor", methods=["POST"])
+def api_advisor():
+    """Run the read-only AI advisor — a default daily review, or answer an open
+    question (e.g. "Why did we sell at 15:00 yesterday?"). Never writes config or
+    control; only allow-listed tunables + performance data are sent to the API.
+    Blocking (the model call takes a few seconds); threaded=True keeps the UI free."""
+    body = request.get_json(silent=True) or {}
+    question = (body.get("question") or "").strip() or None
+    try:
+        from frontend import advisor
+        return jsonify(advisor.run(question))
+    except Exception as e:
+        logging.warning("Advisor failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/advisor/stream")
+def api_advisor_stream():
+    """Server-Sent Events stream of the advisor run — progress stages, live CLI log
+    lines, and the model's output as it arrives — so the UI is transparent instead
+    of hanging silently. The lock + any subprocess are released when the client
+    disconnects (the generator is closed)."""
+    question = (request.args.get("question") or "").strip() or None
+
+    def gen():
+        from frontend import advisor
+        try:
+            for ev in advisor.run_stream(question):
+                yield f"data: {json.dumps(ev)}\n\n"
+        except GeneratorExit:                    # client disconnected
+            raise
+        except Exception as e:                   # never break the stream silently
+            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+
+    return Response(gen(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                             "Connection": "keep-alive"})
 
 
 @app.route("/healthz")

@@ -702,7 +702,136 @@ async function replan() {
 const _replanBtn = $("#replan");
 if (_replanBtn) _replanBtn.addEventListener("click", replan);
 
+// ---- Advisor (read-only AI review) ----
+const _esc = (t) => String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+function _mdInline(s) {
+  return s
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[^*])\*([^*\s][^*]*)\*/g, "$1<em>$2</em>");
+}
+function mdToHtml(md) {
+  const lines = _esc(md || "").split(/\r?\n/);
+  let html = "", list = null;
+  const closeList = () => { if (list) { html += `</${list}>`; list = null; } };
+  for (const raw of lines) {
+    const line = raw.replace(/\s+$/, "");
+    let m;
+    if (!line.trim()) { closeList(); continue; }
+    if ((m = line.match(/^(#{1,4})\s+(.*)$/))) {
+      closeList(); const lvl = Math.min(6, m[1].length + 2);
+      html += `<h${lvl}>${_mdInline(m[2])}</h${lvl}>`; continue;
+    }
+    if ((m = line.match(/^\s*[-*]\s+(.*)$/))) {
+      if (list !== "ul") { closeList(); html += "<ul>"; list = "ul"; }
+      html += `<li>${_mdInline(m[1])}</li>`; continue;
+    }
+    if ((m = line.match(/^\s*\d+\.\s+(.*)$/))) {
+      if (list !== "ol") { closeList(); html += "<ol>"; list = "ol"; }
+      html += `<li>${_mdInline(m[1])}</li>`; continue;
+    }
+    closeList();
+    html += `<p>${_mdInline(line.trim())}</p>`;
+  }
+  closeList();
+  return html;
+}
+
+let _advisorBusy = false;
+let _advisorES = null;
+// Streams the advisor run over SSE so the user sees live progress (stages, CLI log
+// lines, and the model's output as it arrives) instead of a silent hang.
+function runAdvisor(question) {
+  if (_advisorBusy) return;
+  const report = $("#advisor-report"), meta = $("#advisor-meta"), rBtn = $("#advisor-review");
+  _advisorBusy = true;
+  if (rBtn) rBtn.disabled = true;
+  meta.textContent = "";
+  report.innerHTML = '<div class="advisor-log" id="advisor-log"></div><div class="advisor-out" id="advisor-out"></div>';
+  const logEl = $("#advisor-log"), outEl = $("#advisor-out");
+  let acc = "", done = false;
+  const addLog = (cls, msg) => {
+    const d = document.createElement("div");
+    d.className = "alog " + cls;
+    d.textContent = msg;
+    logEl.appendChild(d);
+    logEl.scrollTop = logEl.scrollHeight;
+  };
+  addLog("alog-stage", question ? `Asking: ${question}` : "Starting daily review…");
+
+  const finish = (metaTxt) => {
+    if (done) return;
+    done = true;
+    if (_advisorES) { _advisorES.close(); _advisorES = null; }   // stop auto-reconnect
+    _advisorBusy = false;
+    if (rBtn) rBtn.disabled = false;
+    if (metaTxt) meta.textContent = metaTxt;
+  };
+
+  let es;
+  try {
+    es = new EventSource("/api/advisor/stream?question=" + encodeURIComponent(question || ""));
+  } catch (e) {
+    addLog("alog-err", "✗ could not open the advisor stream.");
+    outEl.innerHTML = '<div class="banner">Could not start the advisor.</div>';
+    finish();
+    return;
+  }
+  _advisorES = es;
+  es.onmessage = (e) => {
+    let ev;
+    try { ev = JSON.parse(e.data); } catch (_) { return; }
+    if (ev.type === "stage") addLog("alog-stage", "• " + ev.msg);
+    else if (ev.type === "log") addLog("alog-line", ev.msg);
+    else if (ev.type === "thinking") {
+      let th = document.getElementById("alog-think");
+      if (!th) { th = document.createElement("div"); th.id = "alog-think"; th.className = "alog alog-think"; logEl.appendChild(th); }
+      th.textContent = `🧠 Claude is thinking… (${ev.count})`;
+      logEl.scrollTop = logEl.scrollHeight;
+    } else if (ev.type === "delta") {
+      const th = document.getElementById("alog-think");
+      if (th && !th.dataset.done) { th.dataset.done = "1"; th.textContent = "🧠 thinking complete — writing the report…"; }
+      acc += ev.text;
+      outEl.innerHTML = mdToHtml(acc);
+    }
+    else if (ev.type === "error") {
+      addLog("alog-err", "✗ " + ev.error);
+      if (!acc) outEl.innerHTML = `<div class="banner">${_esc(ev.error)}</div>`;
+      finish("error");
+    } else if (ev.type === "done") {
+      outEl.innerHTML = mdToHtml(acc);
+      const when = ev.generated_at ? new Date(ev.generated_at).toLocaleTimeString([], { hour12: false }) : "";
+      finish([ev.mode === "question" ? "Answer" : "Daily review", ev.model, ev.auth,
+              ev.elapsed_s != null ? ev.elapsed_s + "s" : null, when].filter(Boolean).join(" · "));
+    }
+  };
+  es.onerror = () => {
+    if (!done) {
+      addLog("alog-err", "✗ stream closed (connection lost or service restarting).");
+      if (!acc) outEl.innerHTML = '<div class="banner">Advisor stream closed — is the service running?</div>';
+    }
+    finish();
+  };
+}
+const _advReview = $("#advisor-review");
+if (_advReview) _advReview.addEventListener("click", () => runAdvisor(null));
+const _advForm = $("#advisor-ask");
+if (_advForm) _advForm.addEventListener("submit", (e) => {
+  e.preventDefault();
+  const q = ($("#advisor-q").value || "").trim();
+  if (q) runAdvisor(q);
+});
+
+// Month-so-far daily net chart (Trends). Cheap; refreshed slowly.
+async function refreshMonthly() {
+  try {
+    const r = await fetch("/api/history/month").then((x) => x.json());
+    if (window.renderMonthlyChart) renderMonthlyChart("monthly-chart", (r && r.days) || []);
+  } catch (e) { /* leave the placeholder */ }
+}
+
 load();
+refreshMonthly();
 renderHeaderClock();
 startLiveStream();              // instant live updates via SSE
 // Plan refreshes slowly (changes only when the optimizer runs). Live values now
@@ -710,3 +839,4 @@ startLiveStream();              // instant live updates via SSE
 setInterval(refreshPlan, 30000);
 setInterval(pollLive, 20000);
 setInterval(renderHeaderClock, 1000);
+setInterval(refreshMonthly, 120000);   // month chart changes slowly

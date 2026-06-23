@@ -134,6 +134,77 @@
     svg.addEventListener("mouseleave", () => { hover.style.display = "none"; tip.style.display = "none"; });
   };
 
+  // ---------- monthly daily-net chart ----------
+  window.renderMonthlyChart = function (containerId, days) {
+    const box = document.getElementById(containerId);
+    if (!box) return;
+    const pts = (days || []).filter((d) => d.net_eur != null);
+    if (!pts.length) { box.innerHTML = '<span class="muted">no history this month yet…</span>'; return; }
+    const W = 940, H = 280, m = { l: 50, r: 20, t: 16, b: 28 };
+    const pw = W - m.l - m.r, ph = H - m.t - m.b;
+    const nets = pts.map((p) => p.net_eur);
+    let lo = Math.min(0, ...nets), hi = Math.max(0, ...nets);
+    if (lo === hi) hi = lo + 1;
+    const span = (hi - lo) || 1, n = pts.length;
+    const X = (i) => m.l + (n <= 1 ? pw / 2 : (pw * i) / (n - 1));
+    const Y = (v) => m.t + ph - (ph * (v - lo)) / span;
+
+    let grid = "";
+    for (let k = 0; k <= 4; k++) {
+      const v = lo + (span * k) / 4, yy = Y(v).toFixed(1);
+      grid += `<line x1="${m.l}" y1="${yy}" x2="${m.l + pw}" y2="${yy}" stroke="var(--line)" stroke-width="1"/>`;
+      grid += `<text x="${m.l - 7}" y="${(Y(v) + 3).toFixed(1)}" text-anchor="end" font-size="11" fill="var(--muted)">€${v.toFixed(1)}</text>`;
+    }
+    grid += `<line x1="${m.l}" y1="${Y(0).toFixed(1)}" x2="${m.l + pw}" y2="${Y(0).toFixed(1)}" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="2 2"/>`;
+    let xt = "", step = Math.max(1, Math.ceil(n / 12));
+    pts.forEach((p, i) => {
+      if (i % step === 0 || i === n - 1) xt += `<text x="${X(i).toFixed(1)}" y="${m.t + ph + 16}" text-anchor="middle" font-size="11" fill="var(--muted)">${p.day}</text>`;
+    });
+    const line = pts.map((p, i) => `${i ? "L" : "M"}${X(i).toFixed(1)},${Y(p.net_eur).toFixed(1)}`).join(" ");
+    let dots = "";
+    pts.forEach((p, i) => {
+      const col = p.net_eur >= 0 ? "var(--sell)" : "#f87171";
+      dots += `<circle cx="${X(i).toFixed(1)}" cy="${Y(p.net_eur).toFixed(1)}" r="${p.is_today ? 5 : 4}" fill="${col}" stroke="#0b0f14" stroke-width="1"/>`;
+    });
+    box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" width="100%" preserveAspectRatio="xMidYMid meet" role="img" aria-label="daily net, month so far">
+        ${grid}${xt}
+        <path d="${line}" fill="none" stroke="var(--accent)" stroke-width="1.6" opacity="0.45"/>
+        ${dots}
+        <rect x="${m.l}" y="${m.t}" width="${pw}" height="${ph}" fill="transparent"/>
+      </svg>
+      <div class="chart-legend muted"><span>↑ profit · ↓ net cost — hover a day for detail</span></div>`;
+
+    const svg = box.querySelector("svg");
+    if (!svg) return;
+    box.style.position = "relative";
+    const tip = document.createElement("div");
+    tip.className = "chart-tip"; tip.style.display = "none";
+    box.appendChild(tip);
+    const dname = (iso) => { const d = new Date(iso); return isNaN(d) ? "" : d.toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" }); };
+    const idxFromEvent = (e) => {
+      const ctm = svg.getScreenCTM(); if (!ctm) return -1;
+      const sp = svg.createSVGPoint(); sp.x = e.clientX; sp.y = e.clientY;
+      const u = sp.matrixTransform(ctm.inverse());
+      if (u.x < m.l - 8 || u.x > m.l + pw + 8) return -1;
+      return Math.max(0, Math.min(n - 1, Math.round((u.x - m.l) / (pw / Math.max(1, n - 1)))));
+    };
+    svg.addEventListener("mousemove", (e) => {
+      const i = idxFromEvent(e);
+      if (i < 0) { tip.style.display = "none"; return; }
+      const p = pts[i], profit = p.net_eur >= 0;
+      tip.innerHTML = `<b>${dname(p.date)}${p.is_today ? " (today)" : ""}</b>`
+        + `<span>${profit ? "€" + p.net_eur.toFixed(2) + " profit" : "€" + Math.abs(p.net_eur).toFixed(2) + " cost"}`
+        + ` · in ${p.import_kwh != null ? p.import_kwh.toFixed(1) : "?"} / out ${p.export_kwh != null ? p.export_kwh.toFixed(1) : "?"} kWh</span>`;
+      tip.style.display = "block";
+      const br = box.getBoundingClientRect(), tw = tip.offsetWidth, th = tip.offsetHeight;
+      let tx = e.clientX - br.left + 14, ty = e.clientY - br.top - th - 10;
+      if (tx + tw > br.width) tx = e.clientX - br.left - tw - 14;
+      if (ty < 0) ty = e.clientY - br.top + 16;
+      tip.style.left = `${Math.max(0, tx)}px`; tip.style.top = `${ty}px`;
+    });
+    svg.addEventListener("mouseleave", () => { tip.style.display = "none"; });
+  };
+
   // ---------- HA-style energy metrics ----------
   function gauge(pct, color) {
     const r = 52, cx = 64, cy = 64;

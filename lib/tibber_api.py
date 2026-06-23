@@ -3,6 +3,7 @@ import time
 import requests
 import json
 import os
+import threading
 
 from datetime import datetime, timezone, timedelta
 from dateutil import parser, tz
@@ -21,15 +22,49 @@ from websockets.exceptions import ConnectionClosedError
 logging.getLogger("gql.transport").setLevel(logging.ERROR)
 
 tzinfos = {"UTC": tz.gettz(retrieve_setting('TIMEZONE'))}
-account = tibber.Account(retrieve_setting('TIBBER_ACCESS_TOKEN'))
-_home = account.homes[0]
+
+
+# The tibber library fetches the GraphQL schema over the network IN the Account()
+# constructor, so initialising it inline would block import (and thus the whole
+# service start) — and crash outright if Tibber is down. Start with no account and
+# populate it from a background daemon thread that retries with backoff, so a slow
+# or unreachable Tibber can never block or crash startup. The single consumer
+# (``live_measurements``) reads ``_home`` at call time and skips if not ready yet.
+account = None
+_home = None
+
+
+def _account_init_worker(delay: float = 5.0):
+    global account, _home
+    token = retrieve_setting('TIBBER_ACCESS_TOKEN')
+    while True:
+        try:
+            acct = tibber.Account(token)
+            account, _home = acct, (acct.homes[0] if acct.homes else None)
+            logging.info("Tibber: account initialised.")
+            return
+        except Exception as e:                      # network/timeout/transport errors
+            logging.warning("Tibber: account init failed (retry in %ss): %s", int(delay), e)
+            time.sleep(delay)
+            delay = min(delay * 2, 60.0)            # exponential backoff, capped at 60s
+
+
+threading.Thread(target=_account_init_worker, name="tibber-account-init", daemon=True).start()
 
 client = VictronClient().get_client()
 
 _PRICE_CACHE = {}
 DEFAULT_PRICE_CACHE_PATH = "/dev/shm/cerbo_tibber_price_cache.json"
 
-def live_measurements(home=_home or None):
+def live_measurements(home=None):
+    # Resolve the account-backed home at CALL time (it's initialised in the
+    # background), and skip gracefully if Tibber isn't ready yet — the caller/
+    # scheduler will retry.
+    home = home if home is not None else _home
+    if home is None:
+        logging.warning("Tibber: live_measurements skipped — account not ready yet.")
+        return
+
     @home.event("live_measurement")
     async def log_accumulated(data):
         try:

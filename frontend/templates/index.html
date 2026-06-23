@@ -37,6 +37,7 @@
       <button class="tab" data-tab="trends">Trends</button>
       <button class="tab active" data-tab="schedule">Schedule</button>
       <button class="tab" data-tab="victron">Victron</button>
+      <button class="tab" data-tab="advisor">Advisor</button>
       <button class="tab" data-tab="config">Configuration</button>
     </nav>
 
@@ -53,6 +54,10 @@
         <div class="card">
           <h3 style="margin:2px 0 10px">SoC &amp; price across the horizon</h3>
           <div id="horizon-chart" class="chart"><span class="muted">no plan yet…</span></div>
+        </div>
+        <div class="card">
+          <h3 style="margin:2px 0 10px">Daily net — month so far</h3>
+          <div id="monthly-chart" class="chart"><span class="muted">loading…</span></div>
         </div>
       </section>
 
@@ -84,6 +89,26 @@
         <p class="cfg-note">The grid-charge schedule the optimizer has programmed into the
           CerboGX (Settings → ESS → Scheduled charging). 5 slots, mirrored here.</p>
         <div id="victron-schedules" class="card"></div>
+      </section>
+
+      <section id="tab-advisor" class="tab-panel">
+        <div class="card advisor">
+          <p class="cfg-note">A read-only AI review of recent optimizer behaviour. Run the daily
+            review, or ask a specific question — it analyses history + tunables and never changes
+            config or control.</p>
+          <div class="advisor-controls">
+            <button id="advisor-review" class="btn-secondary">Run daily review</button>
+            <form id="advisor-ask" class="advisor-ask">
+              <input id="advisor-q" type="text" autocomplete="off"
+                     placeholder="Ask a question, e.g. Why did we sell at 15:00 yesterday?"/>
+              <button type="submit" class="btn-secondary">Ask</button>
+            </form>
+          </div>
+          <div id="advisor-meta" class="advisor-meta muted"></div>
+          <div id="advisor-report" class="advisor-report">
+            <span class="muted">No review yet — run the daily review or ask a question.</span>
+          </div>
+        </div>
       </section>
 
       <section id="tab-config" class="tab-panel">

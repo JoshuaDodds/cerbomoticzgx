@@ -1488,6 +1488,26 @@ def run_ai_optimizer():
         # Make the published result reflect what we ACTUALLY applied this cycle.
         result['control_action'] = applied_control_action
 
+        # Keep the published schedule's CURRENT slot consistent with what we actually
+        # applied. When a planned SELL is suppressed by hysteresis, or a manual
+        # override forces RETAIN, the top-level action changes but schedule[0] still
+        # held the original DP action — so the Schedule tab showed an action (and a
+        # phantom profit) we never took. Sync slot 0 to reality (future slots are
+        # projections that re-plan next cycle).
+        sched = result.get('schedule') or []
+        if sched and sched[0].get('control_action') != applied_control_action:
+            s0 = sched[0]
+            slot_h = result.get('slot_duration_h') or 0.25
+            s0['control_action'] = applied_control_action
+            s0['reason_code'] = result.get('reason_code')
+            s0['reason'] = result.get('reason')
+            s0['mode'] = result.get('mode')
+            if applied_control_action in ('RETAIN', 'IDLE'):
+                # Battery held — no discharge. Reflect the applied grid setpoint
+                # (import to cover load, or ~0 when PV covers it) and a flat SoC.
+                s0['soc_end'] = s0.get('soc_start')
+                s0['grid_energy'] = round((applied_setpoint or 0) / 1000.0 * slot_h, 4)
+
         # Publish the current action/reason for dashboards and automation.
         STATE.set('ai_control_action', applied_control_action)
         STATE.set('ai_mode', result.get('mode'))
