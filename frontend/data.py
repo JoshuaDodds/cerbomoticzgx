@@ -10,7 +10,7 @@ templates/JS stay thin and this stays unit-testable.
 import os
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from dotenv import dotenv_values
 
@@ -118,18 +118,25 @@ def _today_history_path() -> str:
     return os.path.join(history_dir(), f"ess-{today}.ndjson")
 
 
-def settled_slots_for_today(forecast_start: str | None = None) -> list:
-    """Read today's settled slots from history as schedule-shaped rows.
+def _settled_slots_for_day(day, cutoff=None) -> list:
+    """Read one day's settled slots from history as schedule-shaped rows.
 
     Settlement records are actuals for a slot that has closed. We expose them in
     the same hour tree as the forward plan, using ``time`` as the original slot
-    start so the schedule can begin at midnight and flow naturally into "now".
+    start. ``cutoff`` (a datetime) drops rows at/after it — used for today so the
+    live forward plan owns the active and future slots.
     """
-    today = datetime.now().date()
-    cutoff = _parse_time(forecast_start)
+    path = os.path.join(history_dir(), f"ess-{day.isoformat()}.ndjson")
     slots = []
+
+    def _num(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
     try:
-        with open(_today_history_path()) as fh:
+        with open(path) as fh:
             for line in fh:
                 line = line.strip()
                 if not line:
@@ -141,26 +148,13 @@ def settled_slots_for_today(forecast_start: str | None = None) -> list:
                 if rec.get("kind") != "settlement":
                     continue
                 start = _parse_time(rec.get("slot_start"))
-                if start is None or start.date() != today:
+                if start is None or start.date() != day:
                     continue
-                # Once the forward plan starts, let the plan own the active and
-                # future slots. History rows before that are closed/actual.
                 if cutoff is not None and start >= cutoff:
                     continue
 
-                imp = rec.get("actual_import_kwh")
-                exp = rec.get("actual_export_kwh")
-                actual_cost = rec.get("actual_cost")
-                actual_reward = rec.get("actual_reward")
-
-                def _num(v):
-                    try:
-                        return float(v)
-                    except (TypeError, ValueError):
-                        return None
-
-                imp_f = _num(imp)
-                exp_f = _num(exp)
+                imp_f = _num(rec.get("actual_import_kwh"))
+                exp_f = _num(rec.get("actual_export_kwh"))
                 grid = None
                 if imp_f is not None or exp_f is not None:
                     grid = (imp_f or 0.0) - (exp_f or 0.0)
@@ -181,8 +175,8 @@ def settled_slots_for_today(forecast_start: str | None = None) -> list:
                     "soc_end": _num(rec.get("soc_end")),
                     "actual_import_kwh": imp_f,
                     "actual_export_kwh": exp_f,
-                    "actual_cost": _num(actual_cost),
-                    "actual_reward": _num(actual_reward),
+                    "actual_cost": _num(rec.get("actual_cost")),
+                    "actual_reward": _num(rec.get("actual_reward")),
                     "actual_net_eur": _num(rec.get("actual_net_eur")),
                     "incomplete": bool(rec.get("incomplete")),
                 })
@@ -191,6 +185,35 @@ def settled_slots_for_today(forecast_start: str | None = None) -> list:
 
     slots.sort(key=lambda s: s["time"])
     return slots
+
+
+def settled_slots_for_today(forecast_start: str | None = None) -> list:
+    """Today's settled slots (history rows before the live plan takes over)."""
+    return _settled_slots_for_day(datetime.now().date(),
+                                  cutoff=_parse_time(forecast_start))
+
+
+def previous_day_schedule(days_back: int = 1) -> dict:
+    """Build a settled hour-tree for a prior day (default yesterday) so the UI can
+    show it collapsed beneath today's schedule, giving a continuous 2-3 day view."""
+    day = datetime.now().date() - timedelta(days=days_back)
+    slots = _settled_slots_for_day(day)
+    hours = group_by_hour(slots) if slots else []
+    imp_cost = sum((s.get("actual_cost") or 0.0) for s in slots)
+    exp_rev = sum((s.get("actual_reward") or 0.0) for s in slots)
+    imp_kwh = sum((s.get("actual_import_kwh") or 0.0) for s in slots)
+    exp_kwh = sum((s.get("actual_export_kwh") or 0.0) for s in slots)
+    return {
+        "date": day.isoformat(),
+        "label": day.strftime("%a %d %b"),
+        "available": bool(slots),
+        "hours": hours,
+        "summary": {
+            "import_kwh": round(imp_kwh, 2), "import_cost": round(imp_cost, 3),
+            "export_kwh": round(exp_kwh, 2), "export_rev": round(exp_rev, 3),
+            "net": round(imp_cost - exp_rev, 2), "slots": len(slots),
+        },
+    }
 
 
 def group_by_hour(schedule: list) -> list:

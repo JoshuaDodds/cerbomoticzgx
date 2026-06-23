@@ -160,6 +160,15 @@ main { padding: 12px 16px 80px; max-width: 1100px; margin: 0 auto; }
 .hour-row .col-time { font-weight: 600; }
 .hour-row .col-time .caret { color: var(--muted); margin-right: 6px; display: inline-block; width: 10px; }
 
+/* previous-day settled schedule (collapsed above today's tree) */
+.prev-day { margin-bottom: 6px; border-bottom: 1px dashed var(--line); padding-bottom: 6px; }
+.prev-day-head { color: var(--muted); }
+.prev-day-head .col-time { font-weight: 600; }
+.prev-day-head .col-bar { font-size: 12px; }
+.prev-day-body { margin-top: 2px; }
+.prev-day-cap { padding: 6px 8px 8px; font-size: 13px; }
+.prev-day-msg { padding: 10px 8px; font-size: 13px; }
+
 .bar { display: flex; height: 14px; border-radius: 4px; overflow: hidden; background: var(--line); }
 .bar span { display: block; height: 100%; }
 

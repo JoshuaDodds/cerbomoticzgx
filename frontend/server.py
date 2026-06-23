@@ -45,6 +45,17 @@ def api_history_month():
     return jsonify({"days": data.monthly_history()})
 
 
+@app.route("/api/history/day")
+def api_history_day():
+    """Settled hour-tree for a prior day (default yesterday), lazy-loaded when the
+    user expands the previous-day row beneath the schedule."""
+    try:
+        days_back = max(1, int(request.args.get("days_back", 1)))
+    except (TypeError, ValueError):
+        days_back = 1
+    return jsonify(data.previous_day_schedule(days_back))
+
+
 @app.route("/api/config", methods=["POST"])
 def api_config_set():
     """Persist a single allow-listed setting to .env (applies on next cycle)."""

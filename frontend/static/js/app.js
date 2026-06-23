@@ -380,6 +380,52 @@ function slotDetail(s) {
   return d;
 }
 
+// Reusable builders shared by today's tree and the previous-day tree.
+function hourRowInner(h) {
+  const nowTag = h.is_current ? '<span class="now-tag">NOW</span>' : "";
+  return (
+    `<span class="col-time"><span class="caret">▸</span>${h.label}${nowTag}</span>` +
+    `<span class="col-bar"></span>` +
+    `<span class="col-num">€${h.avg_price.toFixed(3)}</span>` +
+    `<span class="col-num">${fmtGrid(h.grid_kwh)}</span>` +
+    `<span class="col-num">${prodCell(h.production_kwh)}</span>` +
+    `<span class="col-num">${consCell(h.consumption_kwh)}</span>` +
+    `<span class="col-num">${socPair(h.soc_start, h.soc_end)}</span>` +
+    `<span class="col-num">${netHtml(h.net_cost)}</span>`
+  );
+}
+
+function makeSlotRow(s) {
+  const sr = el("div", "slot-row" + (s.is_current ? " current" : ""));
+  const g = Number(s.grid_energy);
+  const sell = Number(s.sell != null ? s.sell : s.price);
+  const imp = g > 0 ? g : 0;
+  const exp = g < 0 ? -g : 0;
+  const idle = isIdle(s);          // IDLE flow is projected, not committed
+  const settled = !!s.settled;
+  const slotNet = settled
+    ? Number(s.actual_cost || 0) - Number(s.actual_reward || 0)
+    : imp * Number(s.price) - exp * sell;
+  const muted = (v) => `<span class='muted'>${v}</span>`;
+  const gridStr = fmtGrid(g);
+  sr.innerHTML =
+    `<span><span class="slot-dot" style="background:var(--${slotColorVar(s)})"></span>${s.time.slice(11, 16)}</span>` +
+    `<span>${caOf(s)}</span>` +
+    `<span class="col-num">€${Number(s.price || 0).toFixed(3)}</span>` +
+    `<span class="col-num">${idle && !settled ? muted(gridStr) : gridStr}</span>` +
+    `<span class="col-num">${prodCell(s.pv)}</span>` +
+    `<span class="col-num">${consCell(s.load)}</span>` +
+    `<span class="col-num">${socPair(s.soc_start, s.soc_end)}</span>` +
+    `<span class="col-num">${idle && !settled ? muted("projected") : netHtml(slotNet)}</span>`;
+  const detail = slotDetail(s);
+  detail.style.display = "none";
+  sr.addEventListener("click", (e) => {
+    e.stopPropagation();
+    detail.style.display = detail.style.display === "none" ? "block" : "none";
+  });
+  return [sr, detail];
+}
+
 function renderHours(plan) {
   const box = $("#hours");
   box.innerHTML = "";
@@ -395,48 +441,13 @@ function renderHours(plan) {
   plan.hours.forEach((h) => {
     const row = el("div", "hour-row" + (h.is_current ? " current" : ""));
     if (h.is_current) currentRow = row;
-    const nowTag = h.is_current ? '<span class="now-tag">NOW</span>' : "";
-    row.innerHTML =
-      `<span class="col-time"><span class="caret">▸</span>${h.label}${nowTag}</span>` +
-      `<span class="col-bar"></span>` +
-      `<span class="col-num">€${h.avg_price.toFixed(3)}</span>` +
-      `<span class="col-num">${fmtGrid(h.grid_kwh)}</span>` +
-      `<span class="col-num">${prodCell(h.production_kwh)}</span>` +
-      `<span class="col-num">${consCell(h.consumption_kwh)}</span>` +
-      `<span class="col-num">${socPair(h.soc_start, h.soc_end)}</span>` +
-      `<span class="col-num">${netHtml(h.net_cost)}</span>`;
+    row.innerHTML = hourRowInner(h);
     row.querySelector(".col-bar").appendChild(timelineBar(h));
 
     const slotsWrap = el("div", "slots");
     slotsWrap.style.display = "none";
     h.slots.forEach((s) => {
-      const sr = el("div", "slot-row" + (s.is_current ? " current" : ""));
-      const g = Number(s.grid_energy);
-      const sell = Number(s.sell != null ? s.sell : s.price);
-      const imp = g > 0 ? g : 0;
-      const exp = g < 0 ? -g : 0;
-      const idle = isIdle(s);   // IDLE flow is projected, not committed
-      const settled = !!s.settled;
-      const slotNet = settled
-        ? Number(s.actual_cost || 0) - Number(s.actual_reward || 0)
-        : imp * Number(s.price) - exp * sell;
-      const muted = (v) => `<span class='muted'>${v}</span>`;
-      const gridStr = fmtGrid(g);
-      sr.innerHTML =
-        `<span><span class="slot-dot" style="background:var(--${slotColorVar(s)})"></span>${s.time.slice(11, 16)}</span>` +
-        `<span>${caOf(s)}</span>` +
-        `<span class="col-num">€${Number(s.price || 0).toFixed(3)}</span>` +
-        `<span class="col-num">${idle && !settled ? muted(gridStr) : gridStr}</span>` +
-        `<span class="col-num">${prodCell(s.pv)}</span>` +
-        `<span class="col-num">${consCell(s.load)}</span>` +
-        `<span class="col-num">${socPair(s.soc_start, s.soc_end)}</span>` +
-        `<span class="col-num">${idle && !settled ? muted("projected") : netHtml(slotNet)}</span>`;
-      const detail = slotDetail(s);
-      detail.style.display = "none";
-      sr.addEventListener("click", (e) => {
-        e.stopPropagation();
-        detail.style.display = detail.style.display === "none" ? "block" : "none";
-      });
+      const [sr, detail] = makeSlotRow(s);
       slotsWrap.appendChild(sr);
       slotsWrap.appendChild(detail);
     });
@@ -468,6 +479,81 @@ function renderHours(plan) {
     setTimeout(() => currentRow.scrollIntoView({ block: "center", behavior: "smooth" }), 80);
   }
   firstRender = false;
+}
+
+// ---- Render: previous-day settled schedule (collapsed, lazy-loaded) ----
+let _prevDayLoaded = false;
+function renderPrevDay() {
+  const box = $("#prev-day");
+  if (!box || box.dataset.ready) return;     // build the collapsed header once
+  box.dataset.ready = "1";
+  box.innerHTML = "";
+
+  const head = el("div", "hour-row prev-day-head");
+  head.innerHTML =
+    `<span class="col-time"><span class="caret">▸</span>Previous day</span>` +
+    `<span class="col-bar"><span class="muted">settled actuals — click to expand</span></span>` +
+    `<span class="col-num"></span><span class="col-num"></span><span class="col-num"></span>` +
+    `<span class="col-num"></span><span class="col-num"></span><span class="col-num"></span>`;
+  const body = el("div", "prev-day-body");
+  body.style.display = "none";
+
+  head.addEventListener("click", async () => {
+    const open = body.style.display !== "none";
+    body.style.display = open ? "none" : "block";
+    head.classList.toggle("open", !open);
+    head.querySelector(".caret").textContent = open ? "▸" : "▾";
+    if (!_prevDayLoaded) {
+      _prevDayLoaded = true;
+      body.innerHTML = `<div class="muted prev-day-msg">Loading…</div>`;
+      try {
+        const d = await fetch("/api/history/day").then((r) => r.json());
+        renderSettledDay(body, d);
+      } catch (e) {
+        _prevDayLoaded = false;               // allow a retry on next expand
+        body.innerHTML = `<div class="muted prev-day-msg">Couldn't load the previous day.</div>`;
+      }
+    }
+  });
+
+  box.appendChild(head);
+  box.appendChild(body);
+}
+
+function renderSettledDay(box, d) {
+  box.innerHTML = "";
+  if (!d || !d.available || !(d.hours || []).length) {
+    box.innerHTML = `<div class="muted prev-day-msg">No settled history for ${(d && d.label) || "the previous day"}.</div>`;
+    return;
+  }
+  const sum = d.summary || {};
+  const cap = el("div", "prev-day-cap");
+  cap.innerHTML =
+    `<b>${d.label}</b> &nbsp; net ${netHtml(sum.net)} ` +
+    `<span class="muted">· imported ${kwh(sum.import_kwh)} @ ${eur(sum.import_cost)} · ` +
+    `exported ${kwh(sum.export_kwh)} @ ${eur(sum.export_rev)}</span>`;
+  box.appendChild(cap);
+
+  d.hours.forEach((h) => {
+    const row = el("div", "hour-row");
+    row.innerHTML = hourRowInner(h);
+    row.querySelector(".col-bar").appendChild(timelineBar(h));
+    const slotsWrap = el("div", "slots");
+    slotsWrap.style.display = "none";
+    h.slots.forEach((s) => {
+      const [sr, detail] = makeSlotRow(s);
+      slotsWrap.appendChild(sr);
+      slotsWrap.appendChild(detail);
+    });
+    row.addEventListener("click", () => {
+      const isOpen = slotsWrap.style.display !== "none";
+      slotsWrap.style.display = isOpen ? "none" : "block";
+      row.classList.toggle("open", !isOpen);
+      row.querySelector(".caret").textContent = isOpen ? "▸" : "▾";
+    });
+    box.appendChild(row);
+    box.appendChild(slotsWrap);
+  });
 }
 
 // ---- Render: config (editable) ----
@@ -678,6 +764,7 @@ function renderHeaderClock() {
 
 async function load() {
   await refreshPlan();
+  renderPrevDay();           // set up the collapsed previous-day row (lazy-loads on expand)
   await loadConfig();
   await pollLive();
 }
