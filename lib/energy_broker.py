@@ -1263,6 +1263,11 @@ def _settle_prior_slot(result, *, batt_soc, today_actuals) -> None:
             'day_export_reward': _f(act.get('exp_rev')),
             'soc': _f(batt_soc),
             'pv_kwh': (_f(STATE.get('c1_daily_yield')) or 0.0) + (_f(STATE.get('c2_daily_yield')) or 0.0),
+            # Cumulative actual house consumption (Wh) so the settlement can diff it
+            # into a clean per-slot actual load (forecast-vs-actual analysis / charts).
+            # Read from STATE here (this function has no cycle-record locals); _diff
+            # turns a midnight counter reset into None, same as the other counters.
+            'load_actual_wh': _f(STATE.get('consumption_total_cumulative')),
         }
         sched0 = (result.get('schedule') or [{}])[0]
         cur['prediction'] = {
@@ -1270,6 +1275,10 @@ def _settle_prior_slot(result, *, batt_soc, today_actuals) -> None:
             'predicted_grid_kwh': _f(sched0.get('grid_energy')),
             'price_buy': _f(sched0.get('price')),
             'price_sell': _f(sched0.get('sell')),
+            # Per-slot PV and load the optimizer forecast for this slot, so each
+            # settlement pairs prediction vs actual for PV and consumption too.
+            'predicted_pv_kwh': _f(sched0.get('pv')),
+            'predicted_load_kwh': _f(sched0.get('load')),
         }
 
         prev = None
@@ -1297,6 +1306,7 @@ def _settle_prior_slot(result, *, batt_soc, today_actuals) -> None:
             imp_kwh, exp_kwh = _diff('day_import_kwh'), _diff('day_export_kwh')
             imp_cost, exp_rev = _diff('day_import_cost'), _diff('day_export_reward')
             pv_kwh = _diff('pv_kwh')
+            load_act_wh = _diff('load_actual_wh')   # cumulative Wh delta -> per-slot load
             soc_start, soc_end = prev.get('soc'), cur.get('soc')
             soc_delta = (soc_end - soc_start) if (soc_start is not None and soc_end is not None) else None
             actual_net = (exp_rev - imp_cost) if (exp_rev is not None and imp_cost is not None) else None
@@ -1346,6 +1356,9 @@ def _settle_prior_slot(result, *, batt_soc, today_actuals) -> None:
                 'actual_reward': round(exp_rev, 4) if exp_rev is not None else None,
                 'actual_net_eur': round(actual_net, 4) if actual_net is not None else None,
                 'actual_pv_kwh': round(pv_kwh, 3) if pv_kwh is not None else None,
+                'actual_load_kwh': round(load_act_wh / 1000.0, 3) if load_act_wh is not None else None,
+                'predicted_pv_kwh': pred.get('predicted_pv_kwh'),
+                'predicted_load_kwh': pred.get('predicted_load_kwh'),
                 'soc_start': soc_start,
                 'soc_end': soc_end,
                 'soc_delta': round(soc_delta, 2) if soc_delta is not None else None,

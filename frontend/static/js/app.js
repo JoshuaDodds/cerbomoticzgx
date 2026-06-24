@@ -30,6 +30,14 @@ const netHtml = (net) => {
   const profit = net < 0;
   return `<span class="${profit ? "profit" : "cost"}">${eur(Math.abs(net))} ${profit ? "profit" : "cost"}</span>`;
 };
+// Signed € for the header chips: a +/green profit or −/red loss, no "profit"/"cost"
+// word (the colour and sign carry it). `profit` is profit-positive.
+const netSigned = (profit) => {
+  if (profit == null) return "—";
+  const v = Number(profit);
+  const cls = v >= 0 ? "profit" : "cost";
+  return `<span class="${cls}">${v >= 0 ? "+" : "−"}€${Math.abs(v).toFixed(2)}</span>`;
+};
 // Signed grid flow (+ import / − export), plain. Production/consumption are
 // always positive; show "—" (muted) when ~0.
 const fmtGrid = (v) => {
@@ -194,7 +202,17 @@ function renderStatus(plan) {
   strip.appendChild(kv(chipFor(currentCA(c)), "action"));
   strip.appendChild(kv((soc != null ? Number(soc).toFixed(1) : "—") + "%", "battery SoC"));
   strip.appendChild(kv("€" + Number(price || 0).toFixed(3), "price /kWh"));
-  if (tNet != null) strip.appendChild(kv(netHtml(tNet), "Today"));
+  // Today + Month header chips: signed €, green (+) profit / red (−) loss, no word.
+  if (tNet != null) strip.appendChild(kv(netSigned(-tNet), "Today"));   // tNet is cost-positive
+  const mtd = plan.mtd_net;
+  if (mtd && mtd.net != null) {
+    const chip = kv(netSigned(mtd.net), "Month");
+    if (mtd.export_reward != null && mtd.import_cost != null) {
+      chip.title = `Month-to-date · export €${Number(mtd.export_reward).toFixed(2)} − ` +
+        `import €${Number(mtd.import_cost).toFixed(2)} = €${Number(mtd.net).toFixed(2)} over ${mtd.days} days`;
+    }
+    strip.appendChild(chip);
+  }
 }
 
 function renderMetrics(plan) {

@@ -39,9 +39,20 @@ def _f(v):
         return None
 
 
-def _last_daily_record(path: str):
-    """Last cycle record of a day's NDJSON (carries the cumulative daily counters)."""
-    last = None
+def _day_totals(path: str):
+    """A day's cumulative grid cost/reward/kWh as the MAX of each counter across the
+    day's cycle records. The daily counters only increase within a day, so the max is
+    the end-of-day total — and unlike reading just the final record, this is robust to
+    a malformed or partial last record (one written with e.g. day_export_reward=null
+    previously dropped the WHOLE day out of the month total)."""
+    imp_cost = exp_rev = imp_kwh = exp_kwh = None
+
+    def _mx(cur, v):
+        v = _f(v)
+        if v is None:
+            return cur
+        return v if (cur is None or v > cur) else cur
+
     try:
         with open(path) as fh:
             for line in fh:
@@ -52,38 +63,62 @@ def _last_daily_record(path: str):
                     r = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if r.get("kind") in (None, "cycle") and r.get("day_import_cost") is not None:
-                    last = r
+                if r.get("kind") not in (None, "cycle"):
+                    continue
+                imp_cost = _mx(imp_cost, r.get("day_import_cost"))
+                exp_rev = _mx(exp_rev, r.get("day_export_reward"))
+                imp_kwh = _mx(imp_kwh, r.get("day_import_kwh"))
+                exp_kwh = _mx(exp_kwh, r.get("day_export_kwh"))
     except (FileNotFoundError, OSError):
         return None
-    return last
+    if imp_cost is None and exp_rev is None:
+        return None
+    return {"import_cost": imp_cost, "export_reward": exp_rev,
+            "import_kwh": imp_kwh, "export_kwh": exp_kwh}
 
 
 def monthly_history() -> list:
     """Per-day net totals for the current calendar month (Trends monthly chart).
     net_eur = export_reward - import_cost (profit positive). Days with no data are
     skipped."""
-    from datetime import timedelta
     today = datetime.now().date()
     d = today.replace(day=1)
     out = []
     while d <= today:
-        rec = _last_daily_record(os.path.join(history_dir(), f"ess-{d.strftime('%Y-%m-%d')}.ndjson"))
-        if rec is not None:
-            imp_cost, exp_rev = _f(rec.get("day_import_cost")), _f(rec.get("day_export_reward"))
-            net = (exp_rev - imp_cost) if (imp_cost is not None and exp_rev is not None) else None
+        t = _day_totals(os.path.join(history_dir(), f"ess-{d.strftime('%Y-%m-%d')}.ndjson"))
+        if t is not None:
+            imp_cost = t["import_cost"] or 0.0
+            exp_rev = t["export_reward"] or 0.0
             out.append({
                 "date": d.strftime("%Y-%m-%d"),
                 "day": d.day,
-                "net_eur": round(net, 2) if net is not None else None,
-                "import_cost": round(imp_cost, 2) if imp_cost is not None else None,
-                "export_reward": round(exp_rev, 2) if exp_rev is not None else None,
-                "import_kwh": _f(rec.get("day_import_kwh")),
-                "export_kwh": _f(rec.get("day_export_kwh")),
+                "net_eur": round(exp_rev - imp_cost, 2),   # profit positive
+                "import_cost": round(imp_cost, 2),
+                "export_reward": round(exp_rev, 2),
+                "import_kwh": t["import_kwh"],
+                "export_kwh": t["export_kwh"],
                 "is_today": d == today,
             })
         d += timedelta(days=1)
     return out
+
+
+def mtd_net_eur() -> dict:
+    """Month-to-date result for the header chip: the sum of our settled daily totals
+    for the current calendar month (profit positive = Σexport_reward − Σimport_cost),
+    including today's running total. Sourced from our own history — deterministic and
+    always available (we tried Tibber's monthly GraphQL but it only exposes completed
+    months and didn't reflect mid-month bonuses, so it was dropped)."""
+    days = monthly_history()
+    imp = sum(d["import_cost"] for d in days)
+    exp = sum(d["export_reward"] for d in days)
+    return {
+        "net": round(exp - imp, 2),
+        "import_cost": round(imp, 2),
+        "export_reward": round(exp, 2),
+        "days": len(days),
+        "month": datetime.now().strftime("%b"),
+    }
 
 
 def _parse_time(s):
@@ -118,6 +153,47 @@ def _today_history_path() -> str:
     return os.path.join(history_dir(), f"ess-{today}.ndjson")
 
 
+def _slot_key(dt) -> str:
+    """A slot's 'HH:MM' start, rounded down to the 15-minute boundary."""
+    return f"{dt.hour:02d}:{(dt.minute // 15) * 15:02d}"
+
+
+def _actual_load_by_slot(day) -> dict:
+    """Per-slot actual house consumption (kWh) for a day, derived from the cumulative
+    load_actual_today_wh counter in the CYCLE records. This is available for ALL days —
+    the counter predates the per-slot actual_load_kwh settlement field — so previous
+    days can show real consumption too. Keyed by the slot's start 'HH:MM'."""
+    path = os.path.join(history_dir(), f"ess-{day.isoformat()}.ndjson")
+    cycles = []
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if r.get("kind") not in (None, "cycle"):
+                    continue
+                ts = _parse_time(r.get("ts"))
+                lw = _f(r.get("load_actual_today_wh"))
+                if ts is not None and lw is not None:
+                    cycles.append((ts, lw))
+    except (FileNotFoundError, OSError):
+        return {}
+    cycles.sort(key=lambda x: x[0])
+    out = {}
+    for i in range(1, len(cycles)):
+        prev_ts, prev_lw = cycles[i - 1]
+        delta = cycles[i][1] - prev_lw
+        if delta < -1e-6:          # midnight reset / counter restart -> skip this gap
+            continue
+        out[_slot_key(prev_ts)] = round(delta / 1000.0, 3)   # load for the slot starting then
+    return out
+
+
 def _settled_slots_for_day(day, cutoff=None) -> list:
     """Read one day's settled slots from history as schedule-shaped rows.
 
@@ -128,6 +204,7 @@ def _settled_slots_for_day(day, cutoff=None) -> list:
     """
     path = os.path.join(history_dir(), f"ess-{day.isoformat()}.ndjson")
     slots = []
+    load_map = _actual_load_by_slot(day)   # per-slot consumption (works for old days too)
 
     def _num(v):
         try:
@@ -159,6 +236,10 @@ def _settled_slots_for_day(day, cutoff=None) -> list:
                 if imp_f is not None or exp_f is not None:
                     grid = (imp_f or 0.0) - (exp_f or 0.0)
 
+                load_val = _num(rec.get("actual_load_kwh"))     # stored from today on
+                if load_val is None:
+                    load_val = load_map.get(_slot_key(start))   # derived for older days
+
                 slots.append({
                     "time": start.isoformat(),
                     "settled": True,
@@ -170,7 +251,7 @@ def _settled_slots_for_day(day, cutoff=None) -> list:
                     "price": _num(rec.get("price_buy")) or 0.0,
                     "sell": _num(rec.get("price_sell")) or _num(rec.get("price_buy")) or 0.0,
                     "pv": _num(rec.get("actual_pv_kwh")),
-                    "load": None,
+                    "load": load_val,
                     "soc_start": _num(rec.get("soc_start")),
                     "soc_end": _num(rec.get("soc_end")),
                     "actual_import_kwh": imp_f,
@@ -423,6 +504,7 @@ def get_plan() -> dict:
         "victron_slots": raw.get("victron_slots", []),
         "hours": group_by_hour(timeline_schedule),
         "day_summary": day_summary(schedule, raw.get("today_actuals")),
+        "mtd_net": mtd_net_eur(),
     }
 
 

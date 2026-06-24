@@ -170,8 +170,14 @@ def _trim(rec, fields):
     return {k: rec.get(k) for k in fields if rec.get(k) is not None}
 
 
-def _day_summary(recs) -> dict:
-    """Per-day rollup: P&L, action mix, settlement accuracy."""
+def _day_summary(recs, is_today: bool = False) -> dict:
+    """Per-day rollup: P&L, action mix, settlement accuracy.
+
+    For an IN-PROGRESS day (`is_today`), the *_actual_kwh and net figures are
+    cumulative-so-far, NOT full-day totals — so we expose `pv_expected_so_far_kwh`
+    (forecast that should already be realised, from the forecast minus the still-
+    remaining forecast) for a like-for-like comparison, and we do NOT emit a full-day
+    `pv_forecast_err_kwh` (which would otherwise read as a huge "miss" at dawn)."""
     cycles = [r for r in recs if r.get("kind") == "cycle"]
     settles = [r for r in recs if r.get("kind") == "settlement"]
     actions = {}
@@ -189,14 +195,15 @@ def _day_summary(recs) -> dict:
         except (TypeError, ValueError):
             return None
 
-    # PV / load forecast-vs-actual for the day, normalised to kWh. NB the source field
+    # PV / load forecast-vs-actual, normalised to kWh. NB the source field
     # `pv_forecast_today_kwh` is actually stored in Wh (a known mislabel), as are the
     # load_*_wh fields, so they are /1000 here; pv_actual_today_kwh is already kWh.
-    pv_fc = _kwh(last.get("pv_forecast_today_kwh"), 1000.0)
-    pv_act = _kwh(last.get("pv_actual_today_kwh"))
+    pv_fc = _kwh(last.get("pv_forecast_today_kwh"), 1000.0)   # whole-day forecast
+    pv_act = _kwh(last.get("pv_actual_today_kwh"))            # cumulative actual so far
+    pv_remaining = _kwh(last.get("pv_remaining_wh"), 1000.0)  # forecast still to come
     ld_fc = _kwh(last.get("load_forecast_today_wh"), 1000.0)
     ld_act = _kwh(last.get("load_actual_today_wh"), 1000.0)
-    return {
+    out = {
         "cycles": len(cycles),
         "actions": actions,
         "day_import_kwh": last.get("day_import_kwh"),
@@ -205,13 +212,24 @@ def _day_summary(recs) -> dict:
         "day_export_reward": last.get("day_export_reward"),
         "realized_net_eur": last.get("realized_net_eur"),
         "settlement_mean_abs_net_err_eur": round(sum(errs) / len(errs), 4) if errs else None,
-        "pv_forecast_kwh": pv_fc,        # day forecast (normalised to kWh)
-        "pv_actual_kwh": pv_act,         # day realized PV (kWh)
-        "pv_forecast_err_kwh": (round(pv_act - pv_fc, 2)
-                                if pv_fc is not None and pv_act is not None else None),
+        "pv_forecast_kwh": pv_fc,        # whole-day forecast
+        "pv_actual_kwh": pv_act,         # realized PV so far
         "load_forecast_kwh": ld_fc,
         "load_actual_kwh": ld_act,
     }
+    if is_today:
+        # Cumulative-so-far day: give the fair "expected by now" baseline and a flag.
+        exp_so_far = (round(pv_fc - pv_remaining, 2)
+                      if (pv_fc is not None and pv_remaining is not None) else None)
+        out["in_progress"] = True
+        out["as_of"] = _hm(last.get("ts"))
+        out["pv_forecast_remaining_kwh"] = pv_remaining
+        out["pv_expected_so_far_kwh"] = exp_so_far   # compare pv_actual_kwh to THIS, not pv_forecast_kwh
+    else:
+        # Completed day: a real whole-day forecast error is meaningful.
+        out["pv_forecast_err_kwh"] = (round(pv_act - pv_fc, 2)
+                                      if pv_fc is not None and pv_act is not None else None)
+    return out
 
 
 def _gather(days: int, detail_days: int = 2) -> dict:
@@ -226,7 +244,7 @@ def _gather(days: int, detail_days: int = 2) -> dict:
         if not recs:
             continue
         key = d.strftime("%Y-%m-%d")
-        summaries[key] = _day_summary(recs)
+        summaries[key] = _day_summary(recs, is_today=(d == today))
         if i < detail_days:
             detail[key] = {
                 "cycles": [{**_trim(r, _CYCLE_FIELDS), "ts": _hm(r.get("ts"))}
@@ -369,6 +387,17 @@ History records are 15-min "cycle" rows (the decision + realized power) paired w
 "settlement" rows (predicted vs actual for the slot that just closed). A persistent
 cost-basis tracks what stored energy cost; a min-sell-price floor and an arbitrage
 margin prune marginal cycles; SELL hysteresis damps churn.
+
+TIME / PARTIAL DAYS — read this carefully. `now` is the current time. The most recent
+day is normally IN PROGRESS (its summary has `in_progress: true` and an `as_of` time);
+its `*_actual_kwh`, net, and counts are cumulative SO FAR, not full-day totals. PV is
+produced only during daylight, so before mid-morning the day's actual PV is naturally
+near zero — that is NOT a forecast miss. NEVER compare a whole-day forecast
+(`pv_forecast_kwh`) to a partial-day actual. For an in-progress day, compare
+`pv_actual_kwh` only against `pv_expected_so_far_kwh` (what the forecast says should
+already have been produced by `as_of`); if they're close, the forecast is on track.
+Assess true full-day forecast accuracy only on COMPLETED days (which carry
+`pv_forecast_err_kwh`). The same partial-day caveat applies to load and net.
 
 You are an ADVISOR only. You cannot change anything. Recommend, explain, and
 prioritise — the human applies changes separately and safely."""
