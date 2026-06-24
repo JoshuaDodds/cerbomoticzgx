@@ -360,6 +360,46 @@ def _plan_excerpt() -> dict:
     }
 
 
+def _live_excerpt():
+    """Real-time power flow as of NOW, from the dashboard's MQTT feed. This is GROUND
+    TRUTH for what the system is actually doing this instant — which can differ from
+    the plan's forecast label for the current slot (e.g. at low SoC, PV surplus charges
+    the battery even on an IDLE/PV_SURPLUS slot rather than exporting). Best-effort:
+    returns None if the live feed isn't available."""
+    try:
+        from frontend.live import live
+        s = live.snapshot() or {}
+    except Exception:
+        return None
+
+    def _n(k):
+        v = s.get(k)
+        try:
+            return round(float(v), 0) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    g, b, pv, load = _n("grid_w"), _n("batt_w"), _n("pv_w"), _n("load_w")
+    parts = []
+    if g is not None:
+        parts.append(f"grid {'importing' if g > 15 else 'exporting' if g < -15 else 'idle'} {abs(g):.0f}W")
+    if b is not None:
+        parts.append(f"battery {'charging' if b > 15 else 'discharging' if b < -15 else 'idle'} {abs(b):.0f}W")
+    if pv is not None:
+        parts.append(f"PV {pv:.0f}W")
+    if load is not None:
+        parts.append(f"house {load:.0f}W")
+    return {
+        "connected": s.get("connected"),
+        "soc_pct": _n("soc"),
+        "pv_w": pv, "load_w": load,
+        "grid_w": g,            # + import / − export
+        "batt_w": b,            # + charging / − discharging
+        "ev_w": _n("ev_w"),
+        "summary": "; ".join(parts) if parts else None,
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Prompt
 # --------------------------------------------------------------------------- #
@@ -398,6 +438,23 @@ near zero — that is NOT a forecast miss. NEVER compare a whole-day forecast
 already have been produced by `as_of`); if they're close, the forecast is on track.
 Assess true full-day forecast accuracy only on COMPLETED days (which carry
 `pv_forecast_err_kwh`). The same partial-day caveat applies to load and net.
+
+LIVE STATE — this is GROUND TRUTH for "right now". `live_now` is the real-time power
+flow as of `now` (signs: `grid_w` + import / − export; `batt_w` + charging /
+− discharging; `pv_w` production; `load_w` house). When describing what the system is
+doing this instant, trust `live_now`, NOT the plan's label for the current slot (the
+plan is a forecast and can lag reality). Critically: when SoC is low and PV exceeds the
+house load, the battery is CHARGING from the PV surplus (`batt_w` > 0) — it is NOT
+exporting — even on a slot the plan calls IDLE / PV_SURPLUS. Only say surplus is
+"exporting to grid" when `grid_w` is actually negative. "Excess PV that can't be stored"
+exists only when the battery is full (or DVCC is capping charge); at low SoC there is
+no such excess — the PV is filling the battery.
+
+EV Charging — the system can charge an EV from the grid, PV, or the battery. The 
+EV is treated as a house load and is a 3 phase charger cabable of up to 17kw and
+is controlled by a Maxem.io charge controller to prevent overloading a phase if 
+the house load is high (it reduces the charge rate temporarily until the load 
+decreases).
 
 You are an ADVISOR only. You cannot change anything. Recommend, explain, and
 prioritise — the human applies changes separately and safely."""
@@ -473,6 +530,7 @@ def _build_messages(question: str | None, conf) -> tuple[str, str]:
     max_chars = _conf_int(conf, "ADVISOR_MAX_INPUT_CHARS", DEFAULT_MAX_INPUT_CHARS)
     days = _conf_int(conf, "ADVISOR_HISTORY_DAYS", DEFAULT_HISTORY_DAYS)
     base = {"tunables": _tunables(conf), "current_plan": _plan_excerpt(),
+            "live_now": _live_excerpt(),   # ground-truth real-time power flow
             "now": datetime.now().astimezone().isoformat()}
     if question:
         max_days = _conf_int(conf, "ADVISOR_RETRIEVAL_MAX_DAYS", DEFAULT_RETRIEVAL_MAX_DAYS)
