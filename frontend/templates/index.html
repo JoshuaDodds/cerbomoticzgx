@@ -13,6 +13,7 @@
       <nav class="app-nav" aria-label="Application sections">
         <a href="#ess" class="app-nav-link active" data-app-view="ess">ESS</a>
         <a href="#battery" class="app-nav-link" data-app-view="battery">Battery</a>
+        <a href="#live" class="app-nav-link" data-app-view="live">Live</a>
       </nav>
     </div>
     <div id="status-strip" class="status-strip">
@@ -126,6 +127,12 @@
   <section id="battery-view" class="app-view battery-view" aria-label="Battery rack metrics">
     <div class="card battery-frame-card">
       <iframe class="battery-frame" src="https://batt.hs.mfis.net/" title="Battery rack metrics"></iframe>
+    </div>
+  </section>
+
+  <section id="live-view" class="app-view live-view" aria-label="Live system view">
+    <div class="card live-frame-card">
+      <iframe class="live-frame" src="http://192.168.1.163/app/" title="Live system view"></iframe>
     </div>
   </section>
 

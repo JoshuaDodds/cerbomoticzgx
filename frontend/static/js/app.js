@@ -91,8 +91,9 @@ document.querySelectorAll(".tab").forEach((t) => {
 let firstRender = true;
 
 // ---- Top-level app views ----
+const APP_VIEWS = ["ess", "battery", "live"];
 function setAppView(viewName) {
-  const view = viewName === "battery" ? "battery" : "ess";
+  const view = APP_VIEWS.includes(viewName) ? viewName : "ess";
   document.querySelectorAll(".app-view").forEach((x) => x.classList.remove("active"));
   document.querySelectorAll(".app-nav-link").forEach((x) => x.classList.remove("active"));
   const panel = $(`#${view}-view`);
@@ -102,7 +103,8 @@ function setAppView(viewName) {
 }
 
 function appViewFromHash() {
-  return window.location.hash === "#battery" ? "battery" : "ess";
+  const v = (window.location.hash || "").replace("#", "");
+  return APP_VIEWS.includes(v) ? v : "ess";
 }
 
 document.querySelectorAll(".app-nav-link").forEach((link) => {
