@@ -5,7 +5,7 @@ from paho.mqtt import publish
 from lib.config_retrieval import retrieve_setting
 from lib.constants import cerboGxEndpoint, systemId0
 from lib.constants import logging, PythonToVictronWeekdayNumberConversion
-from lib.helpers import get_seasonally_adjusted_max_charge_slots, calculate_max_discharge_slots_needed, publish_message, round_up_to_nearest_10, remove_message, current_min_soc_reserve
+from lib.helpers import get_seasonally_adjusted_max_charge_slots, calculate_max_discharge_slots_needed, publish_message, round_up_to_nearest_10, remove_message, current_min_soc_reserve, clear_victron_schedules as _clear_victron_schedules_helper
 from lib.tibber_api import lowest_48h_prices, lowest_24h_prices
 from lib.notifications import pushover_notification
 from lib.tibber_api import publish_pricing_data, get_all_price_points
@@ -464,10 +464,7 @@ def schedule_victron_ess_charging(hour, schedule=0, duration=3600, day=0):
     logging.info(f"EnergyBroker: Adding schedule entry for day:{weekday}, duration:{duration}, start: {start}")
 
 def clear_victron_schedules():
-    for i in range(0, 5):
-        day = -1
-        topic_stub = f"W/{systemId0}/settings/0/Settings/CGwacs/BatteryLife/Schedule/Charge/{i}/"
-        publish_message(f"{topic_stub}Day", payload=f"{{\"value\": {day}}}", retain=False)
+    _clear_victron_schedules_helper()
 
 def push_notification(hour, day, price):
     topic = f"Energy Broker Alert"

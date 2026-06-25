@@ -1,13 +1,16 @@
 # cerbomoticzGx Dashboard (`frontend/`)
 
-A self-contained, **read-only** web dashboard for visibility into the ESS service.
+A self-contained web dashboard for visibility into the ESS service, with a small
+set of explicit operator actions.
 It shows the current decision, the full optimizer schedule (expandable hour → 15-min
 → reasoning tree, including a collapsed **previous-day settled** view), a live
 power-flow diagram, day/month cost summaries, a Tibber-sourced **month-to-date
 profit** chip, a **Trends** view (SoC/price + monthly net), an **AI Advisor** that
 reviews recent performance on demand, and allow-listed `.env` config editing.
-Nothing here writes to the Victron control path — config edits go to `.env`, and the
-advisor only reads history and shells out to a local subscription CLI.
+The only direct Victron control action exposed here is the guarded **Import
+Schedule** clear button, which disables the five scheduled-charge slots; config
+edits go to `.env`, and the advisor only reads history and shells out to a local
+subscription CLI.
 
 ## Architecture / separation of concerns
 
@@ -21,6 +24,7 @@ frontend/
   config_schema.py   # declarative settings schema (drives the config view + advisor's allow-listed tunables)
   templates/index.html
   static/css/app.css
+  static/css/app.mobile.css  # phone-only overrides at <=680px; desktop rules stay untouched
   static/js/app.js         # core render + polling; calls the view modules defensively
   static/js/powerflow.js   # self-contained Live power-flow SVG (window.renderPowerFlow) — direct source-coloured flows, no hub
   static/js/charts.js      # self-contained SoC+price horizon SVG + monthly net chart
@@ -31,8 +35,8 @@ failure in either is isolated and cannot break the core dashboard.
 
 - The **main service** publishes its plan as JSON (atomic write) to
   `AI_PLAN_EXPORT_PATH` (default `/dev/shm/cerbo_ai_plan.json`) on every optimizer
-  run. The dashboard only *reads* that file plus `.env` — it never imports the
-  control path or touches MQTT, so it cannot interfere with the optimizer.
+  run. Plan/history/live views only read that file plus `.env`; explicit operator
+  POST routes import control helpers inside the request handler.
 - Control-action colors: IDLE (grey), RETAIN (amber), BUY (blue), SELL (green).
 
 ## Running
@@ -74,6 +78,10 @@ sharing the host's `/dev/shm` (so it can read the published plan). Expose
   net) + clock. **Today** and **Month** are signed € chips — green `+` for profit,
   red `−` for loss, no "profit"/"cost" word. **Month** is the sum of this month's
   settled daily totals (`Σ export_reward − Σ import_cost` from the history).
+  On phones, `app.mobile.css` compacts the header into logo + action/SoC pill + clock
+  with the full status strip as a horizontal swipe row; the current price chip sits at
+  the end of that swipe row. External Battery/Venus iframe views are scaled to 90%
+  inside their panes on phones so more of the embedded page is visible.
 - **Overview** (always visible): metric cards (action, SoC, price, day net, next SELL,
   PV remaining) + the current decision and its plain-English reason.
 - **Live** (tab): real-time power-flow diagram — Solar / Grid / Battery / House
@@ -95,6 +103,12 @@ sharing the host's `/dev/shm` (so it can read the published plan). Expose
   collapsed **"Previous day"** row above the tree expands into the prior day's
   *settled* schedule (`/api/history/day`) for a continuous 2–3 day view; past-day
   consumption is derived from the cumulative load counter in the cycle records.
+  On phones, the wide table reflows into stacked hour cards and the current hour
+  starts expanded.
+- **Import Schedule** (tab): mirrors the five Victron/CerboGX scheduled-charge
+  slots from the published optimizer plan. The **Clear schedule** button asks for
+  confirmation and then calls the same broker helper used internally to disable
+  those five Victron slots.
 - **Advisor** (tab): a manually-triggered, read-only AI review. Click to stream a
   short markdown report on recent performance, or ask a free-text question ("why did
   we sell at 15:00 yesterday?"). It sends recent history + the allow-listed tunables
@@ -103,6 +117,7 @@ sharing the host's `/dev/shm` (so it can read the published plan). Expose
   a hard prompt cap. For deep questions it pulls extra days from `data/history/` on
   demand (`NEED_HISTORY` protocol). See the advisor config in `.env` / `.secrets`.
 - **Configuration** (tab): click any value to edit it (number/select), confirm, and Save.
+  On phones, descriptions sit behind an info toggle so edit targets remain large.
 
 ## Config knobs — how writes propagate
 
@@ -147,17 +162,22 @@ reuses `MOSQUITTO_IP` and `VRM_PORTAL_ID`.
 - `GET /api/config` — settings schema with current values.
 - `POST /api/config` — `{ "key": ..., "value": ... }`, writes one allow-listed setting.
 - `POST /api/replan` — ask the main service to re-run the optimizer now.
+- `POST /api/victron/clear-schedule` — clear the five Victron scheduled-charge slots.
 - `GET /healthz` — liveness.
 
 ## Notes / roadmap
 
 - No authentication in v1 (intended for a trusted LAN). Add a reverse proxy / auth
-  before exposing beyond the LAN, especially now that config is writable.
+  before exposing beyond the LAN, especially now that config is writable and
+  schedule clearing is exposed.
 - **Done:** ✅ (1) SoC + price horizon chart; ✅ (2) live power-flow diagram (rebuilt
   HASS-style, source-coloured direct flows); ✅ (4) **historical performance** — monthly
   net chart + month-to-date chip (sum of settled daily totals); ✅ (6) unified past-actuals +
   forward-plan timeline, plus a collapsed **previous-day settled** view; ✅ **AI
-  Advisor** (Phase 1) — read-only, on-demand, plain-language review + Q&A.
+  Advisor** (Phase 1) — read-only, on-demand, plain-language review + Q&A; ✅
+  mobile-responsive phone layout with bottom navigation, a guarded Menu sheet, and
+  focused Live/Trends/Advisor/Import Schedule/Configuration views that hide the
+  overview cards on phones.
 - Roadmap (next up):
   - (3) **Control toggles** (enable optimizer, net metering) written via `STATE.set`
     — the second write path, distinct from `.env` config knobs.
@@ -165,7 +185,7 @@ reuses `MOSQUITTO_IP` and `VRM_PORTAL_ID`.
     in Trends, from the new `predicted_pv_kwh` / `predicted_load_kwh` /
     `actual_load_kwh` settlement fields (groundwork landed; chart is the next build).
   - (7) **Battery-health** widget — cycles/day and €-per-cycle, to watch wear vs gain.
-  - (8) **Auth / reverse-proxy** hardening + a mobile-responsive layout.
+  - (8) **Auth / reverse-proxy** hardening.
   - (9) **CSV export** of plan + history for offline analysis.
   - Advisor **Phase 2/3** — approve-to-apply for bounded tunables (dry-run backtested),
     then model-proposed code changes via PR (human-gated). See root `TODO.md`.

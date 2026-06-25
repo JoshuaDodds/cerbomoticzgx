@@ -64,6 +64,8 @@ let lastLive = null;
 let expandedHours = new Set();   // hour keys the user has expanded (survive refreshes)
 let lastHoursGen = null;          // generated_at of the last tree we built
 let lastCurrentHourKey = null;
+const MOBILE_MQ = window.matchMedia("(max-width: 680px)");
+const isMobileLayout = () => MOBILE_MQ.matches;
 
 const liveOn = () => !!(lastLive && lastLive.connected);
 // Prefer a live MQTT value when the feed is connected and the value is present.
@@ -79,13 +81,19 @@ function gridNowText() {
 }
 
 // ---- Tabs ----
+function activateTab(tabName) {
+  const panel = $("#tab-" + tabName);
+  if (!panel) return;
+  document.querySelectorAll(".tab").forEach((x) => x.classList.remove("active"));
+  document.querySelectorAll(".tab-panel").forEach((x) => x.classList.remove("active"));
+  const tab = document.querySelector(`.tab[data-tab="${tabName}"]`);
+  if (tab) tab.classList.add("active");
+  panel.classList.add("active");
+  syncMobileNavState();
+}
+
 document.querySelectorAll(".tab").forEach((t) => {
-  t.addEventListener("click", () => {
-    document.querySelectorAll(".tab").forEach((x) => x.classList.remove("active"));
-    document.querySelectorAll(".tab-panel").forEach((x) => x.classList.remove("active"));
-    t.classList.add("active");
-    $("#tab-" + t.dataset.tab).classList.add("active");
-  });
+  t.addEventListener("click", () => activateTab(t.dataset.tab));
 });
 
 let firstRender = true;
@@ -100,6 +108,7 @@ function setAppView(viewName) {
   const link = document.querySelector(`.app-nav-link[data-app-view="${view}"]`);
   if (panel) panel.classList.add("active");
   if (link) link.classList.add("active");
+  syncMobileNavState();
 }
 
 function appViewFromHash() {
@@ -112,6 +121,135 @@ document.querySelectorAll(".app-nav-link").forEach((link) => {
 });
 window.addEventListener("hashchange", () => setAppView(appViewFromHash()));
 setAppView(appViewFromHash());
+
+// ---- Mobile chrome (guarded; hidden/no-op on desktop) ----
+function currentAppViewName() {
+  const active = document.querySelector(".app-view.active");
+  return active ? active.id.replace(/-view$/, "") : "ess";
+}
+
+function currentTabName() {
+  const active = document.querySelector(".tab-panel.active");
+  return active ? active.id.replace(/^tab-/, "") : "schedule";
+}
+
+function closeMobileMenu() {
+  const menu = $("#mobile-menu");
+  const toggle = document.querySelector("[data-mobile-menu-toggle]");
+  if (menu) menu.hidden = true;
+  if (toggle) toggle.setAttribute("aria-expanded", "false");
+  syncMobileNavState();
+}
+
+function openMobileMenu() {
+  if (!isMobileLayout()) return;
+  const menu = $("#mobile-menu");
+  const toggle = document.querySelector("[data-mobile-menu-toggle]");
+  if (menu) menu.hidden = false;
+  if (toggle) toggle.setAttribute("aria-expanded", "true");
+  syncMobileNavState();
+}
+
+function syncMobileNavState() {
+  const activeTab = currentTabName();
+  const activeView = currentAppViewName();
+  const menu = $("#mobile-menu");
+  const menuOpen = !!(menu && !menu.hidden);
+  document.body.dataset.mobileTab = activeTab;
+  document.body.dataset.mobileAppView = activeView;
+  document.querySelectorAll(".mobile-nav-item[data-mobile-tab]").forEach((btn) => {
+    btn.classList.toggle("active", activeView === "ess" && btn.dataset.mobileTab === activeTab);
+  });
+  const menuToggle = document.querySelector("[data-mobile-menu-toggle]");
+  if (menuToggle) {
+    const menuOwnsCurrent = activeView !== "ess" || activeTab === "victron" || activeTab === "config";
+    menuToggle.classList.toggle("active", menuOpen || menuOwnsCurrent);
+  }
+  document.querySelectorAll("[data-mobile-tab]").forEach((btn) => {
+    btn.classList.toggle("active", activeView === "ess" && btn.dataset.mobileTab === activeTab);
+  });
+  document.querySelectorAll("[data-mobile-app-view]").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.mobileAppView === activeView);
+  });
+}
+
+function applyMobileChrome() {
+  const on = isMobileLayout();
+  const bottomNav = document.querySelector(".mobile-bottom-nav");
+  const keyStat = $("#mobile-key-stat");
+  if (bottomNav) bottomNav.hidden = !on;
+  if (keyStat) keyStat.hidden = !on;
+  if (!on) closeMobileMenu();
+  if (on && lastPlan) {
+    renderStatus(lastPlan);
+    loadConfig();
+  }
+  syncMobileNavState();
+}
+
+function goHome(e) {
+  if (e && e.target.closest(".app-nav-link")) return;
+  if (e) {
+    e.preventDefault();
+    e.stopPropagation();
+  }
+  setAppView("ess");
+  activateTab("schedule");
+  closeMobileMenu();
+  if (window.location.hash) {
+    history.replaceState(null, "", window.location.pathname + window.location.search);
+  }
+  window.scrollTo({ top: 0, behavior: "smooth" });
+}
+
+function initMobileChrome() {
+  const home = document.querySelector("[data-home]");
+  if (home) home.addEventListener("click", goHome);
+
+  document.addEventListener("click", (e) => {
+    if (!isMobileLayout()) return;
+    const menu = $("#mobile-menu");
+
+    if (e.target.closest("[data-mobile-menu-toggle]")) {
+      e.preventDefault();
+      if (menu && !menu.hidden) closeMobileMenu();
+      else openMobileMenu();
+      return;
+    }
+
+    if (e.target.closest("[data-mobile-menu-close]") || e.target === menu) {
+      e.preventDefault();
+      closeMobileMenu();
+      return;
+    }
+
+    const tabBtn = e.target.closest("button[data-mobile-tab]");
+    if (tabBtn) {
+      e.preventDefault();
+      setAppView("ess");
+      activateTab(tabBtn.dataset.mobileTab);
+      closeMobileMenu();
+      return;
+    }
+
+    const appViewBtn = e.target.closest("button[data-mobile-app-view]");
+    if (appViewBtn) {
+      e.preventDefault();
+      setAppView(appViewBtn.dataset.mobileAppView);
+      closeMobileMenu();
+      return;
+    }
+
+    if (e.target.closest("[data-mobile-home]")) {
+      goHome(e);
+    }
+  });
+  window.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") closeMobileMenu();
+  });
+  MOBILE_MQ.addEventListener("change", applyMobileChrome);
+  applyMobileChrome();
+}
 
 function todayNet(plan) {
   plan = planWithLiveActuals(plan);
@@ -188,22 +326,42 @@ function nextSell(plan) {
 const currentCA = (c) =>
   (liveOn() && lastLive.control_action) ? String(lastLive.control_action).toUpperCase() : caOf(c);
 
+function updateMobileKeyStat(cact, soc, message) {
+  const stat = $("#mobile-key-stat");
+  if (!stat) return;
+  if (message) {
+    stat.textContent = message;
+    return;
+  }
+  const socText = soc != null ? `${Number(soc).toFixed(1)}%` : "SoC --";
+  stat.innerHTML = `${chipFor(cact || "IDLE")}<span>${socText}</span>`;
+}
+
 // ---- Render: overview (status, metrics, solar, decision) ----
 function renderStatus(plan) {
   plan = planWithLiveActuals(plan);
   const strip = $("#status-strip");
   strip.innerHTML = "";
-  if (!plan.available) { strip.appendChild(el("span", "muted", plan.message || "No plan yet")); return; }
+  if (!plan.available) {
+    updateMobileKeyStat(null, null, plan.message || "No plan yet");
+    strip.appendChild(el("span", "muted", plan.message || "No plan yet"));
+    return;
+  }
   const c = plan.current || {};
   const tNet = todayNet(plan);
   const soc = pick(plan.battery_soc, lastLive && lastLive.soc);
   // Price comes from the 15-min plan (the live MQTT topic is hourly), so the
   // header matches the Now card and the slot table.
   const price = c.price;
-  const kv = (b, s) => { const d = el("div", "kv"); d.innerHTML = `<b>${b}</b><small>${s}</small>`; return d; };
+  const kv = (b, s, cls) => {
+    const d = el("div", ["kv", cls].filter(Boolean).join(" "));
+    d.innerHTML = `<b>${b}</b><small>${s}</small>`;
+    return d;
+  };
+  updateMobileKeyStat(currentCA(c), soc);
   strip.appendChild(kv(chipFor(currentCA(c)), "action"));
   strip.appendChild(kv((soc != null ? Number(soc).toFixed(1) : "—") + "%", "battery SoC"));
-  strip.appendChild(kv("€" + Number(price || 0).toFixed(3), "price /kWh"));
+  strip.appendChild(kv("€" + Number(price || 0).toFixed(3), "price /kWh", "status-price"));
   // Today + Month header chips: signed €, green (+) profit / red (−) loss, no word.
   if (tNet != null) strip.appendChild(kv(netSigned(-tNet), "Today"));   // tNet is cost-positive
   const mtd = plan.mtd_net;
@@ -401,6 +559,23 @@ function slotDetail(s) {
 }
 
 // Reusable builders shared by today's tree and the previous-day tree.
+function dominantHourAction(h) {
+  const slots = (h && h.slots) || [];
+  if (!slots.length) return "IDLE";
+  const current = slots.find((s) => s.is_current);
+  if (current) return caOf(current);
+  const counts = { SELL: 0, BUY: 0, RETAIN: 0, IDLE: 0 };
+  slots.forEach((s) => {
+    const action = caOf(s);
+    counts[action] = (counts[action] || 0) + 1;
+  });
+  return Object.keys(counts).sort((a, b) => counts[b] - counts[a])[0] || "IDLE";
+}
+
+function decorateHourRowForMobile(row, h) {
+  row.setAttribute("data-mobile-action", dominantHourAction(h));
+}
+
 function hourRowInner(h) {
   const nowTag = h.is_current ? '<span class="now-tag">NOW</span>' : "";
   return (
@@ -461,6 +636,7 @@ function renderHours(plan) {
   plan.hours.forEach((h) => {
     const row = el("div", "hour-row" + (h.is_current ? " current" : ""));
     if (h.is_current) currentRow = row;
+    decorateHourRowForMobile(row, h);
     row.innerHTML = hourRowInner(h);
     row.querySelector(".col-bar").appendChild(timelineBar(h));
 
@@ -556,6 +732,7 @@ function renderSettledDay(box, d) {
 
   d.hours.forEach((h) => {
     const row = el("div", "hour-row");
+    decorateHourRowForMobile(row, h);
     row.innerHTML = hourRowInner(h);
     row.querySelector(".col-bar").appendChild(timelineBar(h));
     const slotsWrap = el("div", "slots");
@@ -644,7 +821,21 @@ function renderConfig(cfg) {
     g.settings.forEach((s) => {
       const item = el("div", "cfg-item");
       const val = s.value === "" ? "—" : s.value;
-      item.innerHTML = `<span>${s.label}</span><span class="v" title="click to edit">${val}</span><span class="d">${s.desc || ""}</span>`;
+      if (isMobileLayout()) {
+        item.innerHTML = `<span>${s.label}</span><span class="v" title="click to edit">${val}</span>` +
+          `<button type="button" class="cfg-info-toggle" aria-expanded="false" aria-label="Toggle description">i</button>` +
+          `<span class="d" hidden>${s.desc || ""}</span>`;
+        const info = item.querySelector(".cfg-info-toggle");
+        const desc = item.querySelector(".d");
+        info.addEventListener("click", () => {
+          const open = desc.hidden;
+          desc.hidden = !open;
+          item.classList.toggle("info-open", open);
+          info.setAttribute("aria-expanded", String(open));
+        });
+      } else {
+        item.innerHTML = `<span>${s.label}</span><span class="v" title="click to edit">${val}</span><span class="d">${s.desc || ""}</span>`;
+      }
       item.querySelector(".v").addEventListener("click", () => startEdit(item, s));
       grp.appendChild(item);
     });
@@ -809,6 +1000,36 @@ async function replan() {
 const _replanBtn = $("#replan");
 if (_replanBtn) _replanBtn.addEventListener("click", replan);
 
+async function clearImportSchedule() {
+  const btn = $("#clear-import-schedule");
+  if (!btn || btn.disabled) return;
+  if (!confirm("Clear Import Schedule?\nThis disables all five Victron scheduled-charge slots.")) return;
+
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Clearing...";
+  btn.title = "";
+  try {
+    const response = await fetch("/api/victron/clear-schedule", { method: "POST" });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok || !body.ok) throw new Error(body.error || "clear failed");
+    if (lastPlan) {
+      lastPlan = { ...lastPlan, victron_slots: [] };
+      renderVictron(lastPlan);
+    }
+    btn.textContent = "Cleared";
+    setTimeout(() => { btn.textContent = label; }, 1200);
+  } catch (e) {
+    btn.title = "Clear schedule failed: " + e.message;
+    btn.textContent = "Clear failed";
+    setTimeout(() => { btn.textContent = label; }, 1800);
+  } finally {
+    btn.disabled = false;
+  }
+}
+const _clearImportScheduleBtn = $("#clear-import-schedule");
+if (_clearImportScheduleBtn) _clearImportScheduleBtn.addEventListener("click", clearImportSchedule);
+
 // ---- Advisor (read-only AI review) ----
 const _esc = (t) => String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 function _mdInline(s) {
@@ -937,6 +1158,7 @@ async function refreshMonthly() {
   } catch (e) { /* leave the placeholder */ }
 }
 
+initMobileChrome();
 load();
 refreshMonthly();
 renderHeaderClock();

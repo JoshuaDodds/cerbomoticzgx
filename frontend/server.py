@@ -1,4 +1,4 @@
-"""Flask web server for the cerbomoticzGx dashboard (read-only v1).
+"""Flask web server for the cerbomoticzGx dashboard.
 
 Runs standalone (own process / container sidecar) via ``python -m frontend`` or
 can be started as a daemon thread from the main service via ``run_in_thread()``.
@@ -104,6 +104,22 @@ def api_replan():
         return jsonify({"ok": True})
     except Exception as e:
         logging.warning("Replan failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+def _clear_import_schedule():
+    from lib.helpers import clear_victron_schedules
+    clear_victron_schedules()
+
+
+@app.route("/api/victron/clear-schedule", methods=["POST"])
+def api_victron_clear_schedule():
+    """Clear all five Victron scheduled-charge slots."""
+    try:
+        _clear_import_schedule()
+        return jsonify({"ok": True})
+    except Exception as e:
+        logging.exception("Clear Victron import schedule failed")
         return jsonify({"ok": False, "error": str(e)}), 500
 
 

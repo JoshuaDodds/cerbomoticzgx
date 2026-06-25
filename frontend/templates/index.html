@@ -2,13 +2,14 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>cerbomoticzGx · ESS Dashboard</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.mobile.css') }}" />
 </head>
 <body>
   <header class="topbar">
-    <div class="brand">
+    <div class="brand" data-home data-mobile-home>
       <img src="{{ url_for('static', filename='img/logo_final.png') }}" alt="CerbomoticzGX" class="brand-logo"/>
       <nav class="app-nav" aria-label="Application sections">
         <a href="#ess" class="app-nav-link active" data-app-view="ess">ESS</a>
@@ -16,6 +17,7 @@
         <a href="#live" class="app-nav-link" data-app-view="live">Live</a>
       </nav>
     </div>
+    <div id="mobile-key-stat" class="mobile-key-stat" aria-live="polite" hidden></div>
     <div id="status-strip" class="status-strip">
       <span class="muted">loading…</span>
     </div>
@@ -37,7 +39,7 @@
       <button class="tab" data-tab="live">Live</button>
       <button class="tab" data-tab="trends">Trends</button>
       <button class="tab active" data-tab="schedule">Schedule</button>
-      <button class="tab" data-tab="victron">Victron</button>
+      <button class="tab" data-tab="victron">Import Schedule</button>
       <button class="tab" data-tab="advisor">Advisor</button>
       <button class="tab" data-tab="config">Configuration</button>
     </nav>
@@ -88,6 +90,9 @@
       </section>
 
       <section id="tab-victron" class="tab-panel">
+        <div class="tab-actions import-schedule-actions">
+          <button id="clear-import-schedule" type="button" class="btn-secondary btn-danger">Clear schedule</button>
+        </div>
         <p class="cfg-note">The grid-charge schedule the optimizer has programmed into the
           CerboGX (Settings → ESS → Scheduled charging). 5 slots, mirrored here.</p>
         <div id="victron-schedules" class="card"></div>
@@ -135,6 +140,46 @@
       <iframe class="live-frame" src="http://192.168.1.163/app/" title="Live system view"></iframe>
     </div>
   </section>
+
+  <nav class="mobile-bottom-nav" hidden aria-label="Mobile dashboard navigation">
+    <button type="button" class="mobile-nav-item" data-mobile-menu-toggle aria-controls="mobile-menu" aria-expanded="false">
+      <span class="mobile-nav-icon mobile-nav-menu" aria-hidden="true"></span>
+      <span>Menu</span>
+    </button>
+    <button type="button" class="mobile-nav-item" data-mobile-tab="live">
+      <span class="mobile-nav-icon mobile-nav-live" aria-hidden="true"></span>
+      <span>Live</span>
+    </button>
+    <button type="button" class="mobile-nav-item" data-mobile-tab="schedule">
+      <span class="mobile-nav-icon mobile-nav-schedule" aria-hidden="true"></span>
+      <span>Schedule</span>
+    </button>
+    <button type="button" class="mobile-nav-item" data-mobile-tab="trends">
+      <span class="mobile-nav-icon mobile-nav-trends" aria-hidden="true"></span>
+      <span>Trends</span>
+    </button>
+    <button type="button" class="mobile-nav-item" data-mobile-tab="advisor">
+      <span class="mobile-nav-icon mobile-nav-advisor" aria-hidden="true"></span>
+      <span>Advisor</span>
+    </button>
+  </nav>
+
+  <div id="mobile-menu" class="mobile-menu" hidden>
+    <div class="mobile-menu-panel" role="dialog" aria-modal="true" aria-label="Mobile menu">
+      <div class="mobile-menu-head">
+        <span>Menu</span>
+        <button type="button" class="mobile-menu-close" data-mobile-menu-close aria-label="Close menu">Close</button>
+      </div>
+      <div class="mobile-menu-group" aria-label="Dashboard tabs">
+        <button type="button" data-mobile-tab="victron">Import Schedule</button>
+        <button type="button" data-mobile-tab="config">Configuration</button>
+      </div>
+      <div class="mobile-menu-group" aria-label="Application sections">
+        <button type="button" data-mobile-app-view="battery">Battery view</button>
+        <button type="button" data-mobile-app-view="live">Venus</button>
+      </div>
+    </div>
+  </div>
 
   <!-- Self-contained, dependency-free view modules. Loaded before app.js, which
        calls them defensively (try/catch) so a failure here can't break the rest. -->

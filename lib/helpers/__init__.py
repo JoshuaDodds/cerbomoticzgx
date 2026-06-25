@@ -47,6 +47,15 @@ def publish_message(topic, message=None, qos=0, retain=False, payload=None) -> N
         logging.info(f"{e}", exc_info=True)
 
 
+def clear_victron_schedules() -> None:
+    """Disable all five Victron ESS scheduled-charge slots."""
+    from lib.constants import systemId0
+
+    for i in range(0, 5):
+        topic_stub = f"W/{systemId0}/settings/0/Settings/CGwacs/BatteryLife/Schedule/Charge/{i}/"
+        publish_message(f"{topic_stub}Day", payload="{\"value\": -1}", retain=False)
+
+
 def remove_message(topic, qos=0, retain=True):
     """
     removes messages from specified topic on the Mqtt broker
