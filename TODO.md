@@ -10,6 +10,25 @@
   on each settlement; past-day actual consumption derivable from cycle counters); the
   chart itself is the next build.
 
+## Dashboard / UX
+
+- **Projected Today profit point on the "Daily net — month so far" chart.** Today's
+  point currently shows only the *settled-so-far* net (e.g. −€2.80 in the morning,
+  which looks like a loss while the header forecasts a +€6.07 day). Add a second,
+  visually-distinct point for the **forecast full-day** net so both are visible:
+  the in-progress real amount AND the projected day total (e.g. a hollow/dashed
+  marker, or a faint "projected" segment from the settled point up to the forecast).
+
+- **HASS Live Flow as inspiration for our power-flow v2.** Ask the user to open the
+  Home Assistant Energy / power-flow card in a Chrome browser so we can inspect its
+  JS/SVG, debug ours against it, and borrow its rendering ideas to build v2 of our
+  Live flow visualization.
+
+- **Mobile (iPhone 12 Pro) UX pass.** Make the dashboard genuinely usable and
+  beautiful on a phone. Mobile-only via media queries — **must NOT change how the
+  desktop renders** (verify no desktop regressions while iterating). See the detailed
+  findings + plan in `MOBILE_UX_PLAN.md`.
+
 ## AI Advisor
 
 - ✅ **Phase 1 — Advisor tab (done).** Manually-triggered, read-only, streaming
