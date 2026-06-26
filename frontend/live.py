@@ -43,9 +43,34 @@ class MqttLive:
             "pv_w": f"N/{sid}/system/0/Dc/Pv/Power",
             "load_w": f"N/{sid}/vebus/276/Ac/Out/P",
             "batt_w": f"N/{sid}/battery/277/Dc/0/Power",
+            # --- Power-flow v2: richer per-component telemetry (all read-only) ----
+            # Grid (AC-in) and AC-loads (AC-out) per-phase active power (W). Same
+            # vebus/276 service as the totals above, so signs match the totals
+            # (grid: +import / -export).
+            "grid_l1": f"N/{sid}/vebus/276/Ac/ActiveIn/L1/P",
+            "grid_l2": f"N/{sid}/vebus/276/Ac/ActiveIn/L2/P",
+            "grid_l3": f"N/{sid}/vebus/276/Ac/ActiveIn/L3/P",
+            "load_l1": f"N/{sid}/vebus/276/Ac/Out/L1/P",
+            "load_l2": f"N/{sid}/vebus/276/Ac/Out/L2/P",
+            "load_l3": f"N/{sid}/vebus/276/Ac/Out/L3/P",
+            # Battery detail. Topic choices mirror lib/constants.py: LFP pack voltage
+            # on battery/512; current on the BMV service 277. Temperature/TimeToGo are
+            # standard Victron battery paths — if a given Venus OS build doesn't
+            # publish one, that snapshot field simply stays None and the UI hides it.
+            "batt_temp": f"N/{sid}/battery/277/Dc/0/Temperature",
+            "batt_voltage": f"N/{sid}/battery/512/Dc/0/Voltage",
+            "batt_current": f"N/{sid}/battery/277/Dc/0/Current",
+            "batt_ttg": f"N/{sid}/battery/277/TimeToGo",
+            # Inverter/charger system state (integer code -> word in the UI, mirroring
+            # lib/constants.py SystemState — e.g. 256 = "Discharging").
+            "system_state": f"N/{sid}/system/0/SystemState/State",
             # EV charging power (Watts) — the main service reads it from Domoticz
             # and publishes it here. Absent => the EV node stays hidden.
             "ev_w": "Cerbomoticzgx/GlobalState/ev_power",
+            # EV charger lifetime forward energy (kWh) + present session time (s),
+            # from the Victron evcharger service (instance 42; matches lib/constants.py).
+            "ev_energy_kwh": f"N/{sid}/evcharger/42/Ac/Energy/Forward",
+            "ev_charge_time": f"N/{sid}/evcharger/42/ChargingTime",
             "setpoint_w": f"N/{sid}/settings/0/Settings/CGwacs/AcPowerSetPoint",
             "mode": "Cerbomoticzgx/GlobalState/ai_mode",
             "control_action": "Cerbomoticzgx/GlobalState/ai_control_action",
@@ -149,7 +174,23 @@ class MqttLive:
         out["pv_w"] = _num("pv_w")
         out["load_w"] = _num("load_w")
         out["batt_w"] = _num("batt_w")
+        # Power-flow v2 richer telemetry — each stays None until its topic first
+        # publishes, so the UI can degrade gracefully (hide the line) if absent.
+        out["grid_l1"] = _num("grid_l1")
+        out["grid_l2"] = _num("grid_l2")
+        out["grid_l3"] = _num("grid_l3")
+        out["load_l1"] = _num("load_l1")
+        out["load_l2"] = _num("load_l2")
+        out["load_l3"] = _num("load_l3")
+        out["batt_temp"] = _num("batt_temp")
+        out["batt_voltage"] = _num("batt_voltage")
+        out["batt_current"] = _num("batt_current")
+        out["batt_ttg"] = _num("batt_ttg")           # seconds; None/large when not discharging
+        # System-state integer code (UI maps it to a word, mirroring SystemState).
+        out["system_state"] = _num("system_state")
         out["ev_w"] = _num("ev_w")
+        out["ev_energy_kwh"] = _num("ev_energy_kwh")  # lifetime forward energy (kWh)
+        out["ev_charge_time"] = _num("ev_charge_time")  # present session time (s)
         out["setpoint_w"] = _num("setpoint_w")
         out["mode"] = vals.get("mode")
         out["control_action"] = vals.get("control_action")

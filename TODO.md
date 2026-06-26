@@ -19,10 +19,13 @@
   the in-progress real amount AND the projected day total (e.g. a hollow/dashed
   marker, or a faint "projected" segment from the settled point up to the forecast).
 
-- **HASS Live Flow as inspiration for our power-flow v2.** Ask the user to open the
-  Home Assistant Energy / power-flow card in a Chrome browser so we can inspect its
-  JS/SVG, debug ours against it, and borrow its rendering ideas to build v2 of our
-  Live flow visualization.
+- ✅ **Power-flow v2 — done.** Mashed up the two references the operator liked:
+  **HASS Energy-distribution pathing** (perpendicular-exit + quarter-turn Bézier
+  connectors, source-coloured dots) around **Victron GUI-v2 rich info cards**
+  (Grid/AC-Loads per-phase L1/L2/L3, Battery temp·V·A·SoC·time-to-go, EV session)
+  with a top-centre inverter/charger state pill. New read-only `live.py`
+  subscriptions feed the cards (topics mirror `lib/constants.py`). Restart the
+  dashboard process to pick up the new subscriptions.
 
 - **Mobile (iPhone 12 Pro) UX pass.** Make the dashboard genuinely usable and
   beautiful on a phone. Mobile-only via media queries — **must NOT change how the

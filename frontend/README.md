@@ -84,14 +84,21 @@ sharing the host's `/dev/shm` (so it can read the published plan). Expose
   inside their panes on phones so more of the embedded page is visible.
 - **Overview** (always visible): metric cards (action, SoC, price, day net, next SELL,
   PV remaining) + the current decision and its plain-English reason.
-- **Live** (tab): real-time power-flow diagram — Solar / Grid / Battery / House
-  (+ EV / Gas when present). HASS/Domoticz-style: **no central hub** — energy flows
-  along **direct source→sink paths** computed from a flow decomposition (PV→house/
-  battery/grid, battery→house, grid→house/battery), and every flow dot keeps its
-  **source colour** end-to-end so grid/battery/solar are distinguishable. Thicker
-  ribbon connectors with a **watt label** per active flow; per-node live Watts +
-  today's kWh, SoC in the battery node. Dependency-free SVG, updated via the live
-  SSE push. An **EV** node appears automatically when an `ev_w` value is present.
+- **Live** (tab): real-time power-flow diagram (v2) — **VRM-style info cards** for
+  Solar / Grid / Battery / AC Loads (+ EV when present) wired together with
+  **HASS-style curved, source-coloured connectors**. Still **no central hub**:
+  energy flows along **direct source→sink paths** from a flow decomposition
+  (PV→house/battery/grid, battery→house/grid, grid→house/battery), and every flow
+  dot keeps its **source colour** end-to-end. Each card carries richer telemetry —
+  Grid & AC-Loads **per-phase L1/L2/L3**, Battery **temp · V · A · SoC ·
+  time-to-go**, Solar Watts + today's kWh, EV power + lifetime energy + session
+  time — plus a top-centre **inverter/charger state pill** (Bulk / Absorption /
+  Discharging …, mirroring `lib/constants.py` SystemState). A **watt label** rides
+  each active connector. Dependency-free SVG, built once and mutated in place,
+  updated via the live SSE push; the **EV** card appears automatically when an
+  `ev_w` value is present. (Note: the **top-nav "Live"** entry is a different
+  thing — an iframe to the external `http://192.168.1.163/app/` dashboard; this SVG
+  power-flow is the **ESS view's "Live" sub-tab**.)
 - **Trends** (tab): HA-style metric cards (**self-sufficiency %**, **self-consumed
   solar %**, **grid balance** bar) above a gradient SoC% + buy-price line chart with
   a `now` marker, plus a **monthly net chart** — per-day €/profit for the current
@@ -139,7 +146,14 @@ class of knob and will be written via `STATE.set()` instead of `.env`.
 `frontend/live.py` subscribes (read-only) to the same broker the main service uses
 (`MOSQUITTO_IP`) and caches the latest value for SoC, price, grid/PV/battery/load
 power, AC setpoint, Tibber daily import/export/cost counters, and the published
-`ai_mode`/`ai_reason`/`feed_in_limit_state`.
+`ai_mode`/`ai_reason`/`feed_in_limit_state`. For the **v2 power-flow cards** it also
+caches the richer per-component telemetry: **grid & AC-loads per-phase L1/L2/L3**,
+**battery temperature / voltage (LFP pack) / current / time-to-go**, the
+**inverter system-state code**, and **EV lifetime energy + session time**. Topic
+choices mirror `lib/constants.py`; any topic a given Venus OS build doesn't publish
+simply stays `None` and the UI hides that line. **Newly-added subscriptions only
+take effect when the dashboard process (re)starts** — the MQTT subscriber registers
+its topic list once at startup.
 The UI receives these via a **Server-Sent Events push** (`/api/live/stream`) — the
 server streams a fresh snapshot the instant a new MQTT value arrives, so the
 Overview, day summary, and Live diagram update in real time with no polling lag.
