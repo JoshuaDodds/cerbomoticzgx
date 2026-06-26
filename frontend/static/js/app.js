@@ -1255,6 +1255,46 @@ async function loadAdvisorLatest() {
   } catch (_) { /* keep the empty advisor placeholder */ }
 }
 
+function advisorConfirm(opts) {
+  const title = (opts && opts.title) || "Confirm";
+  const body = (opts && opts.body) || "";
+  const confirmText = (opts && opts.confirmText) || "Confirm";
+  const cancelText = opts && Object.prototype.hasOwnProperty.call(opts, "cancelText")
+    ? opts.cancelText
+    : "Cancel";
+  const danger = opts && opts.danger;
+  return new Promise((resolve) => {
+    const prior = document.querySelector(".advisor-modal-backdrop");
+    if (prior) prior.remove();
+    const overlay = document.createElement("div");
+    overlay.className = "advisor-modal-backdrop";
+    overlay.innerHTML = `<div class="advisor-modal" role="dialog" aria-modal="true" aria-labelledby="advisor-modal-title">
+      <h3 id="advisor-modal-title">${_esc(title)}</h3>
+      <p>${_esc(body)}</p>
+      <div class="advisor-modal-actions">
+        ${cancelText ? `<button type="button" class="btn-secondary" data-advisor-modal-cancel>${_esc(cancelText)}</button>` : ""}
+        <button type="button" class="btn-secondary ${danger ? "btn-danger" : ""}" data-advisor-modal-confirm>${_esc(confirmText)}</button>
+      </div>
+    </div>`;
+    const finish = (value) => {
+      document.removeEventListener("keydown", onKey);
+      overlay.remove();
+      resolve(value);
+    };
+    const onKey = (e) => {
+      if (e.key === "Escape") finish(false);
+    };
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay || e.target.closest("[data-advisor-modal-cancel]")) finish(false);
+      else if (e.target.closest("[data-advisor-modal-confirm]")) finish(true);
+    });
+    document.addEventListener("keydown", onKey);
+    document.body.appendChild(overlay);
+    const first = overlay.querySelector("[data-advisor-modal-cancel], [data-advisor-modal-confirm]");
+    if (first) first.focus();
+  });
+}
+
 function advisorTextForIndex(index) {
   const messages = advisorMessages(_advisorRecord);
   const msg = messages[index];
@@ -1300,7 +1340,13 @@ async function copyAdvisorMessage(index, btn) {
 
 async function deleteAdvisorExchange(index, btn) {
   if (_advisorBusy) return;
-  if (!confirm("Delete this advisor exchange?")) return;
+  const confirmed = await advisorConfirm({
+    title: "Delete exchange?",
+    body: "This removes the saved prompt and its paired advisor reply from this chat.",
+    confirmText: "Delete",
+    danger: true,
+  });
+  if (!confirmed) return;
   const label = btn ? btn.textContent : "";
   if (btn) {
     btn.disabled = true;
@@ -1313,15 +1359,26 @@ async function deleteAdvisorExchange(index, btn) {
       body: JSON.stringify({ index }),
     });
     const record = await response.json().catch(() => ({}));
-    if (!response.ok || record.ok === false) throw new Error(record.error || "delete failed");
+    if (!response.ok) {
+      const msg = response.status === 404
+        ? "Delete endpoint is not available. Restart the frontend service to load the new route."
+        : (record.error || "delete failed");
+      throw new Error(msg);
+    }
     renderAdvisorRecord(record);
   } catch (e) {
     if (btn) {
       btn.disabled = false;
-      btn.textContent = "Delete failed";
+      btn.textContent = e.message && e.message.includes("endpoint") ? "Restart needed" : "Delete failed";
       btn.title = e.message;
       setTimeout(() => { btn.textContent = label || "Delete exchange"; }, 1600);
     }
+    advisorConfirm({
+      title: "Delete failed",
+      body: e.message || "The exchange could not be deleted.",
+      confirmText: "OK",
+      cancelText: null,
+    });
   }
 }
 
@@ -1412,7 +1469,13 @@ const _advReview = $("#advisor-review");
 if (_advReview) _advReview.addEventListener("click", () => runAdvisor(null));
 async function clearAdvisorChat() {
   if (_advisorBusy) return;
-  if (!confirm("Clear advisor chat?")) return;
+  const confirmed = await advisorConfirm({
+    title: "Clear advisor chat?",
+    body: "This removes every saved advisor prompt and reply from this session.",
+    confirmText: "Clear chat",
+    danger: true,
+  });
+  if (!confirmed) return;
   try {
     const record = await fetch("/api/advisor/clear", { method: "POST" }).then((r) => r.json());
     renderAdvisorRecord(record);

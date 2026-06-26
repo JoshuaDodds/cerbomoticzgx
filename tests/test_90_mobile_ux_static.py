@@ -126,7 +126,11 @@ def test_advisor_latest_report_loads_on_browser_startup():
     assert 'fetch("/api/advisor/clear", { method: "POST" })' in js
     assert "function copyAdvisorMessage(" in js
     assert "function deleteAdvisorExchange(" in js
+    assert "function advisorConfirm(" in js
     assert 'fetch("/api/advisor/delete-exchange"' in js
+    assert "record.ok === false" not in js
+    assert 'confirm("Delete this advisor exchange?")' not in js
+    assert "Delete endpoint is not available" in js
     assert 'data-advisor-copy="' in js
     assert 'data-advisor-delete="' in js
     assert "Generated " in js
@@ -136,6 +140,8 @@ def test_advisor_latest_report_loads_on_browser_startup():
     assert ".advisor-turn" in css
     assert ".advisor-message-actions" in css
     assert ".advisor-turn-actions" in css
+    assert ".advisor-modal-backdrop" in css
+    assert ".advisor-modal" in css
     assert ".advisor-role-user" in css
     assert "background: #f8fafc" in css
 

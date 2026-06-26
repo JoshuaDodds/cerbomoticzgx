@@ -10,6 +10,24 @@
   on each settlement; past-day actual consumption derivable from cycle counters); the
   chart itself is the next build.
 
+- **Weather-forecast integration (Open-Meteo)** — close the ~24 % hot-day load
+  underestimate (four Daikin heat-pumps holding 21–24 °C) with a **symmetric
+  heating+cooling degree-day** load model, and sharpen next-day PV with **GTI
+  irradiance**. Open-Meteo is **free / keyless**; home lat/lon already in `.secrets`
+  (`HOME_ADDRESS_LAT` / `HOME_ADDRESS_LONG`). Build in **shadow mode** first (log the
+  adjustment vs actual), validate, then apply — it's a 16 kW controller. Full spec in
+  **`WEATHER_FORECAST_PLAN.md`**.
+
+- **Tesla EV charger — monitor now, control later.** The current Tesla Wall Connector
+  (**v1, non-controllable**) is monitor-only: we read its power (`evcharger/42` /
+  Domoticz `ev_power`) but cannot command it. A later iteration controls charging on the
+  **2018 Model S 100D** via the **Tesla Fleet API** (NOT the legacy Owner API) — which
+  first requires standing up a Tesla developer **OAuth app** (registered partner app,
+  OAuth 2.0 + partner-authentication token, signed vehicle commands). Only once that's in
+  place can the optimizer schedule EV charging into the cheapest slots and feed the
+  planned session into the load forecast. Supersedes "Decide EV handling" above; EV is
+  **out of scope** for the weather story.
+
 ## Dashboard / UX
 
 - **Projected Today profit point on the "Daily net — month so far" chart.** Today's

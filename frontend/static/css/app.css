@@ -271,6 +271,11 @@ main { padding: 12px 16px 80px; max-width: 1100px; margin: 0 auto; }
 .advisor-mini-btn:disabled { opacity: .55; cursor: default; }
 .advisor-delete-btn { color: #fca5a5; border-color: rgba(248, 113, 113, .35); }
 .advisor-delete-btn:hover { color: #fecaca; border-color: #f87171; }
+.advisor-modal-backdrop { position: fixed; inset: 0; z-index: 80; display: grid; place-items: center; padding: 18px; background: rgba(2, 6, 23, .72); backdrop-filter: blur(4px); }
+.advisor-modal { width: min(420px, 100%); border: 1px solid var(--line); border-radius: 8px; background: #111827; color: var(--text); box-shadow: 0 24px 80px rgba(0, 0, 0, .42); padding: 18px; }
+.advisor-modal h3 { margin: 0 0 8px; font-size: 17px; line-height: 1.25; }
+.advisor-modal p { margin: 0 0 16px; color: var(--muted); line-height: 1.45; }
+.advisor-modal-actions { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
 .advisor-message-body p:first-child { margin-top: 0; }
 .advisor-message-body p:last-child { margin-bottom: 0; }
 .advisor-report h3 { font-size: 16px; margin: 14px 0 6px; color: var(--text); }
