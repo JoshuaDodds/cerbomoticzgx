@@ -8,6 +8,7 @@ STATE = GlobalStateClient()
 float_voltage = float(retrieve_setting('BATTERY_FLOAT_VOLTAGE'))
 max_voltage = float(retrieve_setting('BATTERY_ABSORPTION_VOLTAGE'))
 battery_full_voltage = float(retrieve_setting('BATTERY_FULL_VOLTAGE'))
+battery_sustain_percent = float(retrieve_setting('BATTERY_SUSTAIN_PERCENT')) or 20
 
 def ac_power_setpoint(watts: str = None, override_ess_net_mettering=True, silent: bool = False):
     # disable net metering overide whenever power setpoint returns to zero
@@ -26,7 +27,7 @@ def ac_power_setpoint(watts: str = None, override_ess_net_mettering=True, silent
         if not silent:
             logging.info(f"Victron Integration: Set AC Power Set Point to: {watts} watts")
 
-def set_minimum_ess_soc(percent: int = 20):
+def set_minimum_ess_soc(percent: int = battery_sustain_percent):
     if percent:
         _msg = f"{{\"value\": {percent}}}"
         logging.info(f"Setting battery sustain percent to: {percent}%")
@@ -60,7 +61,7 @@ def regulate_battery_max_voltage(ess_soc):
             logging.info(f"Victron Integration: Adjusting max charge voltage to {battery_full_voltage} due to battery SOC reaching {retrieve_setting('MAXIMUM_ESS_SOC')}% or higher")
             publish.single("Tesla/vehicle0/solar/ess_max_charge_voltage", payload=f"{{\"value\": \"{battery_full_voltage}\"}}", qos=1, retain=True, hostname=cerboGxEndpoint, port=1883)
             # when battery is full, return Minumum batt SOC (unless grid fails) to 20%
-            set_minimum_ess_soc(20)
+            set_minimum_ess_soc(battery_sustain_percent)
 
         else:
             logging.debug(f"Victron Integration: No Action. Battery max charge voltage is appropriately set at {current_max_charge_voltage}V with ESS SOC at {ess_soc}%")
