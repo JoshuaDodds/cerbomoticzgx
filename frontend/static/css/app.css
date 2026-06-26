@@ -80,10 +80,10 @@ main { padding: 12px 16px 80px; max-width: 1100px; margin: 0 auto; }
 .app-view { display: none; }
 .app-view.active { display: block; }
 .battery-view, .live-view { padding: 12px 16px 80px; }
-.battery-frame-card, .live-frame-card { padding: 0; overflow: hidden; margin: 0; }
+.battery-frame-card, .live-frame-card { --frame-scrollbar-mask: 48px; padding: 0; overflow: hidden; margin: 0; }
 .battery-frame, .live-frame {
-  display: block; width: 100%; height: calc(100vh - 94px); min-height: 720px;
-  border: 0; background: #fff;
+  display: block; width: calc(100% + var(--frame-scrollbar-mask)); height: calc(100vh - 94px); min-height: 720px;
+  margin-right: calc(-1 * var(--frame-scrollbar-mask)); border: 0; background: #fff;
 }
 .tab-panel { display: none; }
 .tab-panel.active { display: block; }

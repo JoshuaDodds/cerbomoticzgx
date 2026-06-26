@@ -101,7 +101,7 @@ let firstRender = true;
 // ---- Top-level app views ----
 const APP_VIEWS = ["overview", "ess", "battery", "live"];
 function defaultAppViewName() {
-  return isMobileLayout() ? "ess" : "overview";
+  return "overview";
 }
 function setAppView(viewName) {
   const view = APP_VIEWS.includes(viewName) ? viewName : defaultAppViewName();
@@ -130,6 +130,8 @@ setAppView(appViewFromHash());
 
 // ---- Mobile chrome (guarded; hidden/no-op on desktop) ----
 function currentAppViewName() {
+  const view = document.body.dataset.appView;
+  if (APP_VIEWS.includes(view)) return view;
   const active = document.querySelector(".app-view.active");
   return active ? active.id.replace(/-view$/, "") : "ess";
 }
@@ -168,7 +170,10 @@ function syncMobileNavState() {
   });
   const menuToggle = document.querySelector("[data-mobile-menu-toggle]");
   if (menuToggle) {
-    const menuOwnsCurrent = activeView !== "ess" || activeTab === "victron" || activeTab === "config";
+    const menuOwnsCurrent =
+      (activeView !== "ess" && activeView !== "overview") ||
+      activeTab === "victron" ||
+      activeTab === "config";
     menuToggle.classList.toggle("active", menuOpen || menuOwnsCurrent);
   }
   document.querySelectorAll("[data-mobile-tab]").forEach((btn) => {
@@ -199,13 +204,8 @@ function goHome(e) {
     e.preventDefault();
     e.stopPropagation();
   }
-  if (isMobileLayout()) {
-    setAppView("ess");
-    activateTab("schedule");
-  } else {
-    setAppView("overview");
-    activateTab("live");
-  }
+  setAppView("overview");
+  if (!isMobileLayout()) activateTab("live");
   closeMobileMenu();
   if (window.location.hash) {
     history.replaceState(null, "", window.location.pathname + window.location.search);
@@ -239,6 +239,8 @@ function initMobileChrome() {
       e.preventDefault();
       setAppView("ess");
       activateTab(tabBtn.dataset.mobileTab);
+      if (tabBtn.dataset.mobileTab === "schedule") scrollToCurrentScheduleSlot();
+      else jumpToMobileViewTop();
       closeMobileMenu();
       return;
     }
@@ -247,6 +249,13 @@ function initMobileChrome() {
     if (appViewBtn) {
       e.preventDefault();
       setAppView(appViewBtn.dataset.mobileAppView);
+      jumpToMobileViewTop();
+      closeMobileMenu();
+      return;
+    }
+
+    if (e.target.closest("button[data-replan]")) {
+      jumpToMobileViewTop();
       closeMobileMenu();
       return;
     }
@@ -370,7 +379,7 @@ function renderStatus(plan) {
     return d;
   };
   updateMobileKeyStat(currentCA(c), soc);
-  strip.appendChild(kv(chipFor(currentCA(c)), "action"));
+  strip.appendChild(kv(chipFor(currentCA(c)), "action", "status-action"));
   strip.appendChild(kv((soc != null ? Number(soc).toFixed(1) : "—") + "%", "battery SoC"));
   strip.appendChild(kv("€" + Number(price || 0).toFixed(3), "price /kWh", "status-price"));
   // Today + Month header chips: signed €, green (+) profit / red (−) loss, no word.
@@ -395,11 +404,15 @@ function renderMetrics(plan) {
   const days = (plan.day_summary && plan.day_summary.days) || [];
   const tomorrow = days.find((d) => !d.is_today);   // null until tomorrow's prices publish
   const ns = nextSell(plan);
-  const card = (label, value) => { const d = el("div", "metric"); d.innerHTML = `<div class="label">${label}</div><div class="value">${value}</div>`; return d; };
+  const card = (label, value, cls) => {
+    const d = el("div", ["metric", cls].filter(Boolean).join(" "));
+    d.innerHTML = `<div class="label">${label}</div><div class="value">${value}</div>`;
+    return d;
+  };
   const tNet = todayNet(plan);
   const soc = pick(plan.battery_soc, lastLive && lastLive.soc);
   const price = c.price;  // 15-min plan price (live topic is hourly)
-  box.appendChild(card("Current action", chipFor(currentCA(c))));
+  box.appendChild(card("Current action", chipFor(currentCA(c)), "metric-current-action"));
   box.appendChild(card("Battery SoC", (soc != null ? Number(soc).toFixed(1) : "—") + "<small> %</small>"));
   box.appendChild(card("Price now", "€" + Number(price || 0).toFixed(3) + "<small> /kWh</small>"));
   if (tNet != null) box.appendChild(card("Today net", netHtml(tNet)));
@@ -599,6 +612,19 @@ function decorateHourRowForMobile(row, h) {
   row.setAttribute("data-mobile-action", dominantHourAction(h));
 }
 
+function scrollToCurrentScheduleSlot(behavior = "smooth") {
+  const currentSlot = document.querySelector("#hours .slot-row.current");
+  const currentHour = document.querySelector("#hours .hour-row.current");
+  const target = currentSlot && currentSlot.offsetParent !== null ? currentSlot : currentHour;
+  if (target) {
+    setTimeout(() => target.scrollIntoView({ block: "center", behavior }), 80);
+  }
+}
+
+function jumpToMobileViewTop(behavior = "smooth") {
+  setTimeout(() => window.scrollTo({ top: 0, behavior }), 80);
+}
+
 function hourRowInner(h) {
   const nowTag = h.is_current ? '<span class="now-tag">NOW</span>' : "";
   return (
@@ -695,7 +721,7 @@ function renderHours(plan) {
 
   // On first load, jump to the current slot.
   if (firstRender && currentRow) {
-    setTimeout(() => currentRow.scrollIntoView({ block: "center", behavior: "smooth" }), 80);
+    scrollToCurrentScheduleSlot();
   }
   firstRender = false;
 }
@@ -1005,9 +1031,11 @@ async function load() {
 
 // Replan: ask the main service to re-run the optimizer now (same as the 15-min
 // cycle), then reload the freshly published plan.
-async function replan() {
-  const btn = $("#replan");
-  if (btn) { btn.disabled = true; btn.textContent = "Replanning…"; }
+async function replan(e) {
+  const btn = e && e.currentTarget ? e.currentTarget : $("#replan");
+  const buttons = Array.from(document.querySelectorAll("[data-replan]"));
+  buttons.forEach((x) => { x.disabled = true; });
+  if (btn) btn.textContent = "Replanning…";
   try {
     // Runs the optimizer synchronously server-side and republishes the plan,
     // so by the time this resolves the new plan is ready to load.
@@ -1015,13 +1043,15 @@ async function replan() {
     if (!r.ok) throw new Error(r.error || "replan failed");
     await refreshPlan();
   } catch (e) {
-    if (btn) btn.title = "Replan failed — is the service running?";
+    buttons.forEach((x) => { x.title = "Replan failed — is the service running?"; });
   } finally {
-    if (btn) { btn.disabled = false; btn.textContent = "Replan"; }
+    buttons.forEach((x) => {
+      x.disabled = false;
+      x.textContent = "Replan";
+    });
   }
 }
-const _replanBtn = $("#replan");
-if (_replanBtn) _replanBtn.addEventListener("click", replan);
+document.querySelectorAll("[data-replan]").forEach((btn) => btn.addEventListener("click", replan));
 
 async function clearImportSchedule() {
   const btn = $("#clear-import-schedule");

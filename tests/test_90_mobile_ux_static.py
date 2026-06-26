@@ -4,6 +4,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 INDEX_HTML = ROOT / "frontend" / "templates" / "index.html"
 APP_JS = ROOT / "frontend" / "static" / "js" / "app.js"
+APP_CSS = ROOT / "frontend" / "static" / "css" / "app.css"
 MOBILE_CSS = ROOT / "frontend" / "static" / "css" / "app.mobile.css"
 
 
@@ -31,13 +32,17 @@ def test_mobile_navigation_markup_is_hidden_by_default():
     assert "data-mobile-menu-toggle" in html
     assert "data-mobile-app-view=\"battery\"" in html
     assert "data-mobile-app-view=\"live\"" in html
+    assert 'id="mobile-replan"' in html
+    assert "data-replan" in html
     assert "id=\"mobile-key-stat\"" in html
     assert "Import Schedule" in html
+    assert ">Battery</button>" in html
+    assert "Battery view" not in html
     assert "ESS dashboard" not in html
     assert "Venus" in html
 
 
-def test_desktop_overview_entry_precedes_ess_and_uses_power_flow_default():
+def test_overview_entry_precedes_ess_and_desktop_uses_power_flow_default():
     html = INDEX_HTML.read_text(encoding="utf-8")
     js = APP_JS.read_text(encoding="utf-8")
     css = (ROOT / "frontend" / "static" / "css" / "app.css").read_text(encoding="utf-8")
@@ -45,7 +50,7 @@ def test_desktop_overview_entry_precedes_ess_and_uses_power_flow_default():
     assert 'data-app-view="overview">Overview</a>' in html
     assert html.index('data-app-view="overview"') < html.index('data-app-view="ess"')
     assert 'const APP_VIEWS = ["overview", "ess", "battery", "live"]' in js
-    assert 'return isMobileLayout() ? "ess" : "overview"' in js
+    assert 'return "overview"' in js
     assert 'if (view === "overview" && !isMobileLayout()) activateTab("live")' in js
     assert 'body[data-app-view="ess"] .overview' in css
 
@@ -82,11 +87,15 @@ def test_mobile_css_is_scoped_to_phone_breakpoint():
     assert "order: 99" in css
     assert ".hour-row" in css
     assert ".cfg-info-toggle" in css
-    assert 'body[data-mobile-tab="live"] .overview' in css
-    assert 'body[data-mobile-tab="trends"] .overview' in css
-    assert 'body[data-mobile-tab="advisor"] .overview' in css
-    assert 'body[data-mobile-tab="victron"] .overview' in css
-    assert 'body[data-mobile-tab="config"] .overview' in css
+    assert 'body[data-app-view="overview"] main' in css
+    assert 'body[data-app-view="ess"] .overview' in css
+    assert 'body[data-mobile-tab="live"] .overview' not in css
+    assert 'body[data-mobile-tab="trends"] .overview' not in css
+    assert 'body[data-mobile-tab="advisor"] .overview' not in css
+    assert 'body[data-mobile-tab="victron"] .overview' not in css
+    assert 'body[data-mobile-tab="config"] .overview' not in css
+    assert ".foot #replan" in css
+    assert "display: none" in css
     assert ".battery-frame-card" in css
     assert ".live-frame-card" in css
     assert "--mobile-frame-scale: 0.9" in css
@@ -107,8 +116,90 @@ def test_mobile_js_is_guarded_by_phone_media_query():
     assert "data-mobile-action" in js
     assert "data-mobile-home" in js
     assert "dataset.mobileTab" in js
+    assert "dataset.appView" in js
     assert 'closest("button[data-mobile-tab]")' in js
     assert 'closest("button[data-mobile-app-view]")' in js
+    assert "activeView !== \"overview\"" in js
+
+
+def test_mobile_home_uses_overview_without_mobile_power_flow_default():
+    js = APP_JS.read_text(encoding="utf-8")
+    css = MOBILE_CSS.read_text(encoding="utf-8")
+
+    assert "function goHome(" in js
+    assert 'setAppView("overview")' in js
+    assert 'if (view === "overview" && !isMobileLayout()) activateTab("live")' in js
+    assert 'body[data-app-view="overview"] main' in css
+    assert "body[data-app-view=\"overview\"] #ess-view > .foot" in css
+
+
+def test_mobile_replan_uses_shared_action_hook_from_menu():
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    js = APP_JS.read_text(encoding="utf-8")
+
+    assert 'id="replan"' in html
+    assert 'id="mobile-replan"' in html
+    assert html.index('id="mobile-replan"') > html.index('id="mobile-menu"')
+    mobile_app_section = html.index('aria-label="Application sections"', html.index('id="mobile-menu"'))
+    dashboard_section = html.index('aria-label="Dashboard tabs"', html.index('id="mobile-menu"'))
+    assert mobile_app_section < dashboard_section
+    assert html.index('data-mobile-app-view="battery"') < html.index('data-mobile-app-view="live"')
+    assert html.index('data-mobile-app-view="live"') < html.index('data-mobile-tab="victron"')
+    assert html.index('data-mobile-tab="config"') < html.index('id="mobile-replan"')
+    assert html.count("data-replan") == 2
+    assert 'document.querySelectorAll("[data-replan]")' in js
+    assert "currentTarget" in js
+
+
+def test_mobile_schedule_button_scrolls_to_current_slot():
+    js = APP_JS.read_text(encoding="utf-8")
+
+    assert "function scrollToCurrentScheduleSlot" in js
+    assert 'document.querySelector("#hours .slot-row.current")' in js
+    assert 'document.querySelector("#hours .hour-row.current")' in js
+    assert 'tabBtn.dataset.mobileTab === "schedule"' in js
+    assert "scrollToCurrentScheduleSlot()" in js
+
+
+def test_mobile_non_schedule_navigation_jumps_to_top():
+    js = APP_JS.read_text(encoding="utf-8")
+
+    assert "function jumpToMobileViewTop" in js
+    assert 'window.scrollTo({ top: 0, behavior })' in js
+    assert 'if (tabBtn.dataset.mobileTab === "schedule") scrollToCurrentScheduleSlot();' in js
+    assert 'else jumpToMobileViewTop();' in js
+    assert "jumpToMobileViewTop();" in js
+    assert 'e.target.closest("button[data-replan]")' in js
+
+
+def test_mobile_overview_hides_redundant_current_action_card():
+    js = APP_JS.read_text(encoding="utf-8")
+    css = MOBILE_CSS.read_text(encoding="utf-8")
+
+    assert 'strip.appendChild(kv(chipFor(currentCA(c)), "action", "status-action"))' in js
+    assert "updateMobileKeyStat(currentCA(c), soc)" in js
+    assert 'card("Current action", chipFor(currentCA(c)), "metric-current-action")' in js
+    assert "  .status-strip .status-action,\n" in css
+    assert ".status-strip .status-action small" not in css
+    assert 'body[data-app-view="overview"] .metric-current-action' in css
+    assert 'body[data-app-view="overview"] #decision' in css
+
+
+def test_external_frames_hide_scrollbars_in_desktop_and_mobile():
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    css = APP_CSS.read_text(encoding="utf-8")
+    mobile_css = MOBILE_CSS.read_text(encoding="utf-8")
+
+    assert 'scrolling="no"' not in html
+    assert "--frame-scrollbar-mask: 48px" in css
+    assert "width: calc(100% + var(--frame-scrollbar-mask))" in css
+    assert "margin-right: calc(-1 * var(--frame-scrollbar-mask))" in css
+    assert "scrollbar-width: none" not in css
+    assert "-ms-overflow-style: none" not in css
+    assert ".battery-frame::-webkit-scrollbar" not in css
+    assert "--frame-scrollbar-mask: 48px" in mobile_css
+    assert "width: calc(var(--mobile-frame-fit) + var(--frame-scrollbar-mask))" in mobile_css
+    assert "overscroll-behavior: none" in mobile_css
 
 
 def test_desktop_logo_and_clear_schedule_js_hooks_exist():
@@ -116,9 +207,7 @@ def test_desktop_logo_and_clear_schedule_js_hooks_exist():
 
     assert "function goHome(" in js
     assert "setAppView(\"overview\")" in js
-    assert "setAppView(\"ess\")" in js
     assert "activateTab(\"live\")" in js
-    assert "activateTab(\"schedule\")" in js
     assert "history.replaceState" in js
     assert "function clearImportSchedule(" in js
     assert 'fetch("/api/victron/clear-schedule", { method: "POST" })' in js

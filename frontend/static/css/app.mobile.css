@@ -120,11 +120,24 @@
     order: 99;
   }
 
-  body[data-mobile-tab="live"] .overview,
-  body[data-mobile-tab="trends"] .overview,
-  body[data-mobile-tab="advisor"] .overview,
-  body[data-mobile-tab="victron"] .overview,
-  body[data-mobile-tab="config"] .overview {
+  body[data-app-view="overview"] main {
+    display: none;
+  }
+
+  body[data-app-view="overview"] #ess-view > .foot {
+    display: flex;
+  }
+
+  .status-strip .status-action,
+  body[data-app-view="overview"] .metric-current-action {
+    display: none;
+  }
+
+  body[data-app-view="overview"] #decision {
+    display: none;
+  }
+
+  body[data-app-view="ess"] .overview {
     display: none;
   }
 
@@ -491,12 +504,14 @@
   .live-frame-card {
     --mobile-frame-scale: 0.9;
     --mobile-frame-fit: 111.111%;
+    --frame-scrollbar-mask: 48px;
     overflow: hidden;
+    overscroll-behavior: none;
   }
 
   .battery-frame,
   .live-frame {
-    width: var(--mobile-frame-fit);
+    width: calc(var(--mobile-frame-fit) + var(--frame-scrollbar-mask));
     height: calc((100vh - 150px) * 1.11111);
     min-height: 622px;
     transform: scale(var(--mobile-frame-scale));
@@ -518,6 +533,10 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .foot #replan {
+    display: none;
   }
 
   .btn {

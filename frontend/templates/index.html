@@ -126,7 +126,7 @@
 
     <footer class="foot">
       <span id="meta" class="muted"></span>
-      <button id="replan" class="btn" title="Re-run the optimizer now on current data">Replan</button>
+      <button id="replan" class="btn" data-replan title="Re-run the optimizer now on current data">Replan</button>
     </footer>
   </div>
 
@@ -171,13 +171,14 @@
         <span>Menu</span>
         <button type="button" class="mobile-menu-close" data-mobile-menu-close aria-label="Close menu">Close</button>
       </div>
+      <div class="mobile-menu-group" aria-label="Application sections">
+        <button type="button" data-mobile-app-view="battery">Battery</button>
+        <button type="button" data-mobile-app-view="live">Venus</button>
+      </div>
       <div class="mobile-menu-group" aria-label="Dashboard tabs">
         <button type="button" data-mobile-tab="victron">Import Schedule</button>
         <button type="button" data-mobile-tab="config">Configuration</button>
-      </div>
-      <div class="mobile-menu-group" aria-label="Application sections">
-        <button type="button" data-mobile-app-view="battery">Battery view</button>
-        <button type="button" data-mobile-app-view="live">Venus</button>
+        <button id="mobile-replan" type="button" data-replan>Replan</button>
       </div>
     </div>
   </div>
