@@ -163,12 +163,15 @@
 
   // Explicit attach ports for the mobile hub layout, so the four links radiate
   // cleanly from the central MP-II instead of being auto-routed across cards.
+  // Mobile attach ports: connect at the CENTRE of each card's side for uniform, longer
+  // arcs — the only exception is Grid + AC Loads meeting the MP2 hub side-by-side at its
+  // top (40% / 60% positions).
   const MOBILE_PORTS = {
-    grid:  { ap: ["bottom", 0.2], bp: ["top", -0.3] },     // grid bottom -> hub top-left
-    load:  { ap: ["top", 0.3], bp: ["bottom", -0.35] },    // hub top-right -> AC-loads bottom-left
-    batt:  { ap: ["bottom", -0.3], bp: ["top", 0.1] },     // hub bottom-left -> battery top
-    solar: { ap: ["left", -0.15], bp: ["right", 0.25] },   // Solar (lower-right) curves up to Battery
-    ev:    { ap: ["bottom", 0.3], bp: ["top", 0] },        // AC-loads bottom-right -> EV (above Solar)
+    grid:  { ap: ["bottom", 0],  bp: ["top", -0.1] },   // Grid bottom-centre → MP2 top 40%
+    load:  { ap: ["top", 0.1],   bp: ["left", 0] },     // MP2 top 60% → AC-Loads left-centre
+    batt:  { ap: ["bottom", 0],  bp: ["top", 0] },      // MP2 bottom-centre → Battery top-centre
+    solar: { ap: ["left", 0],    bp: ["right", 0] },    // Solar left-centre → Battery right-centre
+    ev:    { ap: ["bottom", 0],  bp: ["top", 0] },      // AC-Loads bottom-centre → EV top-centre
   };
 
   // Width-aware (so narrow cards don't overflow) with an optional scale `k`
