@@ -84,21 +84,26 @@ sharing the host's `/dev/shm` (so it can read the published plan). Expose
   inside their panes on phones so more of the embedded page is visible.
 - **Overview** (always visible): metric cards (action, SoC, price, day net, next SELL,
   PV remaining) + the current decision and its plain-English reason.
-- **Live** (tab): real-time power-flow diagram (v2) — **VRM-style info cards** for
-  Solar / Grid / Battery / AC Loads (+ EV when present) wired together with
-  **HASS-style curved, source-coloured connectors**. Still **no central hub**:
-  energy flows along **direct source→sink paths** from a flow decomposition
-  (PV→house/battery/grid, battery→house/grid, grid→house/battery), and every flow
-  dot keeps its **source colour** end-to-end. Each card carries richer telemetry —
-  Grid & AC-Loads **per-phase L1/L2/L3**, Battery **temp · V · A · SoC ·
-  time-to-go**, Solar Watts + today's kWh, EV power + lifetime energy + session
-  time — plus a top-centre **inverter/charger state pill** (Bulk / Absorption /
-  Discharging …, mirroring `lib/constants.py` SystemState). A **watt label** rides
-  each active connector. Dependency-free SVG, built once and mutated in place,
-  updated via the live SSE push; the **EV** card appears automatically when an
-  `ev_w` value is present. (Note: the **top-nav "Live"** entry is a different
-  thing — an iframe to the external `http://192.168.1.163/app/` dashboard; this SVG
-  power-flow is the **ESS view's "Live" sub-tab**.)
+- **Live** (tab): real-time power-flow diagram (v2) — **VRM-style info cards** laid
+  out in the real Victron **physical topology**: Grid — **Inverter/Charger** — AC
+  Loads across the AC bus; the Inverter/Charger linked down to the Battery; **Solar
+  DC-coupled to the Battery**; and **EV** + **Gas** hanging off the AC Loads as two
+  compact cards. Box sizes are **deliberately non-uniform** — a wider central
+  Inverter/Charger + Battery column with smaller EV/Gas cards, echoing the Victron
+  GUI-v2 proportions (fonts scale per box). Cards are wired with smooth **HASS-style
+  connectors**; each wire stays **faintly visible** so the topology always reads, and
+  **source-coloured dots** ride it in the direction of real power (grid import/export,
+  battery charge/discharge). Each card carries richer telemetry — Grid & AC-Loads
+  **per-phase L1/L2/L3**, Battery **temp · V · A · SoC · time-to-go**, Solar Watts +
+  today's kWh, EV power + lifetime energy, Gas m³ — and the **Inverter/Charger** card
+  shows the live SystemState word (mirroring `lib/constants.py`); the Grid headline
+  shows **► import / ◄ export**. The SVG is **responsive** — it measures its container
+  and re-lays everything to fill the full width **and** height (good for embedding on
+  any screen) via a `ResizeObserver`. Dependency-free, built once and mutated in
+  place, updated via the live SSE push; the **EV** and **Gas** cards appear when
+  `ev_w` / the plan's `gas_m³` are present. (Note: the **top-nav "Live"** entry is a
+  different thing — an iframe to the external `http://192.168.1.163/app/` dashboard;
+  this SVG power-flow is the **ESS view's "Live" sub-tab**.)
 - **Trends** (tab): HA-style metric cards (**self-sufficiency %**, **self-consumed
   solar %**, **grid balance** bar) above a gradient SoC% + buy-price line chart with
   a `now` marker, plus a **monthly net chart** — per-day €/profit for the current

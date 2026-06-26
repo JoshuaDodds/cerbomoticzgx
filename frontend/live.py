@@ -57,7 +57,7 @@ class MqttLive:
             # on battery/512; current on the BMV service 277. Temperature/TimeToGo are
             # standard Victron battery paths — if a given Venus OS build doesn't
             # publish one, that snapshot field simply stays None and the UI hides it.
-            "batt_temp": f"N/{sid}/battery/277/Dc/0/Temperature",
+            "batt_temp": f"N/{sid}/battery/512/Dc/0/Temperature",
             "batt_voltage": f"N/{sid}/battery/512/Dc/0/Voltage",
             "batt_current": f"N/{sid}/battery/277/Dc/0/Current",
             "batt_ttg": f"N/{sid}/battery/277/TimeToGo",

@@ -86,7 +86,12 @@ main { padding: 12px 16px 80px; max-width: 1100px; margin: 0 auto; }
 .tab-panel.active { display: block; }
 
 /* Live power-flow diagram + horizon chart (modular views) */
-.powerflow { max-width: 720px; margin: 0 auto; }
+/* v2: fill the available width AND a tall, viewport-responsive height so the
+   SVG cards use the whole panel (and adapt when embedded on other screens). The
+   SVG measures this box and lays its 3×2 grid out to fit. Mobile overrides live
+   in app.mobile.css. */
+.powerflow { width: 100%; height: clamp(440px, 58vh, 820px); }
+.powerflow svg { width: 100%; height: 100%; display: block; }
 .pf-legend { text-align: center; font-size: 12px; margin-top: 6px; }
 .pf-legend b { color: var(--text); font-weight: 600; }
 .chart { width: 100%; }
