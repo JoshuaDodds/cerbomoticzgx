@@ -215,11 +215,48 @@
     return `<text${idAttr} x="${f(x)}" y="${f(y)}" text-anchor="${o.anchor || "start"}" font-size="${sz}"${weight} fill="${o.fill || "var(--text)"}">${content || ""}</text>`;
   }
 
+  // Source colours for the flow particles (provenance).
+  const SRC = { solar: PALETTE.solar, grid: PALETTE.grid, batt: PALETTE.batt };
+  const PF_DOTS = 2;   // particles per link (coloured by source to show provenance)
+
+  // Logical source→sink decomposition: where each sink's power actually comes from.
+  // PV serves the house first, then charges the battery, then exports; the house is
+  // topped up from the battery, then grid; battery charging is topped up from grid.
+  function decompose(pv, grid, batt, load) {
+    let pvLeft = Math.max(0, pv), homeLeft = Math.max(0, load), chgLeft = Math.max(0, batt);
+    const gexp = Math.max(0, -grid), bdis = Math.max(0, -batt);
+    const s_house = Math.min(pvLeft, homeLeft); pvLeft -= s_house; homeLeft -= s_house;
+    const b_house = Math.min(bdis, homeLeft); homeLeft -= b_house;
+    const g_house = homeLeft;
+    const s_batt = Math.min(pvLeft, chgLeft); pvLeft -= s_batt; chgLeft -= s_batt;
+    const g_batt = chgLeft;
+    const s_grid = Math.min(pvLeft, gexp); pvLeft -= s_grid;
+    const b_grid = Math.max(0, gexp - s_grid);
+    return { s_house, s_batt, s_grid, b_house, b_grid, g_house, g_batt };
+  }
+
+  // Colour each of `n` particles on a link by its source mix (proportional segments),
+  // so a link fed by two sources shows both colours intermingled.
+  function dotColors(sources, n) {
+    const list = (sources || []).filter((s) => s.m > 0);
+    const total = list.reduce((s, x) => s + x.m, 0);
+    if (!total) return new Array(n).fill("var(--muted)");
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      const frac = (i + 0.5) / n;
+      let cum = 0, col = list[0].c;
+      for (const s of list) { col = s.c; cum += s.m / total; if (frac <= cum) break; }
+      out.push(col);
+    }
+    return out;
+  }
+
   function edgeSvg(e, N, dur, fwd, mobile) {
     const d = edgePath(e, N, mobile), kp = fwd ? "0;1" : "1;0";
-    let s = `<path id="pf-base-${e.key}" d="${d}" fill="none" stroke="${e.color}" stroke-width="5.5" stroke-linecap="round" opacity="0.12"/>`;
-    for (let i = 0; i < 2; i++) {
-      const begin = (-i * parseFloat(dur) / 2).toFixed(2);
+    // Visible per-link colour trace (the "wire"); source-coloured particles ride on it.
+    let s = `<path id="pf-base-${e.key}" d="${d}" fill="none" stroke="${e.color}" stroke-width="5.5" stroke-linecap="round" opacity="0.14"/>`;
+    for (let i = 0; i < PF_DOTS; i++) {
+      const begin = (-i * parseFloat(dur) / PF_DOTS).toFixed(2);
       s += `<circle id="pf-dot-${e.key}-${i}" r="5" fill="${e.color}" opacity="0">`
          + `<animateMotion id="pf-anim-${e.key}-${i}" dur="${dur}s" begin="${begin}s" repeatCount="indefinite"`
          + ` calcMode="linear" keyPoints="${kp}" keyTimes="0;1" path="${d}"/></circle>`;
@@ -326,14 +363,13 @@
   const _edgeDur = {}, _edgeDir = {};
   function applyEdges(box, flows) {
     for (const key in flows) {
-      const { mag, fwd } = flows[key], on = A(mag), dur = durFor(mag), kp = fwd ? "0;1" : "1;0";
+      const fl = flows[key], on = A(fl.mag), dur = durFor(fl.mag), kp = fl.fwd ? "0;1" : "1;0";
       const base = box.querySelector("#pf-base-" + key);
-      if (base) base.setAttribute("opacity", on ? 0.34 : 0.12);
-      for (let i = 0; i < 2; i++) {
+      if (base) base.setAttribute("opacity", on ? 0.35 : 0.14);
+      const cols = dotColors(fl.sources, PF_DOTS);   // per-particle source colours
+      for (let i = 0; i < PF_DOTS; i++) {
         const dot = box.querySelector("#pf-dot-" + key + "-" + i);
-        if (dot) dot.setAttribute("opacity", on ? 1 : 0);
-      }
-      for (let i = 0; i < 2; i++) {
+        if (dot) { dot.setAttribute("opacity", on ? 1 : 0); if (on) dot.setAttribute("fill", cols[i]); }
         const an = box.querySelector("#pf-anim-" + key + "-" + i);
         if (!an) continue;
         if (on && _edgeDur[key] !== dur) an.setAttribute("dur", dur + "s");
@@ -370,12 +406,24 @@
     const gasM3 = today.gas_m3 != null && isFinite(Number(today.gas_m3)) ? Number(today.gas_m3) : null;
     const soc = num(live.soc);
 
+    // Source-flow decomposition → provenance-coloured particles, and a flow-consistent
+    // Inverter↔Battery direction: the link follows the net DC-bus flow (pv − batt_w),
+    // NOT raw batt_w — so a solar surplus that's exporting correctly shows the DC bus
+    // feeding the inverter *upward*, even while the battery itself trickle-charges.
+    const D = decompose(pv || 0, grid || 0, batt || 0, load || 0);
+    const evW = ev != null ? Math.max(0, ev) : 0;
+    const invDc = (pv || 0) - (batt || 0);   // + = DC→inverter (up); − = inverter→DC (down, grid-charging)
     const flows = {
-      grid:  { mag: Math.abs(grid || 0), fwd: (grid || 0) >= 0 },
-      load:  { mag: Math.max(0, load || 0), fwd: true },
-      batt:  { mag: Math.abs(batt || 0), fwd: (batt || 0) >= 0 },
-      solar: { mag: Math.max(0, pv || 0), fwd: true },
-      ev:    { mag: ev != null ? Math.max(0, ev) : 0, fwd: true },
+      grid: (grid || 0) >= 0
+        ? { mag: Math.abs(grid || 0), fwd: true,  sources: [{ c: SRC.grid, m: D.g_house + D.g_batt }] }
+        : { mag: Math.abs(grid || 0), fwd: false, sources: [{ c: SRC.solar, m: D.s_grid }, { c: SRC.batt, m: D.b_grid }] },
+      load: { mag: Math.max(0, load || 0), fwd: true,
+              sources: [{ c: SRC.solar, m: D.s_house }, { c: SRC.batt, m: D.b_house }, { c: SRC.grid, m: D.g_house }] },
+      batt: invDc >= 0
+        ? { mag: invDc,  fwd: false, sources: [{ c: SRC.solar, m: D.s_house + D.s_grid }, { c: SRC.batt, m: D.b_house + D.b_grid }] }
+        : { mag: -invDc, fwd: true,  sources: [{ c: SRC.grid, m: D.g_batt }] },
+      solar: { mag: Math.max(0, pv || 0), fwd: true, sources: [{ c: SRC.solar, m: Math.max(0, pv || 0) }] },
+      ev:    { mag: evW, fwd: true, sources: [{ c: PALETTE.ev, m: evW }] },
     };
     const active = {
       grid: A(grid), house: A(load), solar: A(pv) && pv > 0, batt: A(batt),
