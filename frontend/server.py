@@ -164,9 +164,34 @@ def api_advisor_stream():
 
 @app.route("/api/advisor/latest")
 def api_advisor_latest():
-    """Return the latest persisted advisor report, if one exists."""
+    """Return the persisted advisor chat session, if one exists."""
     from frontend import advisor
     return jsonify(advisor.latest_report())
+
+
+@app.route("/api/advisor/clear", methods=["POST"])
+def api_advisor_clear():
+    """Clear the persisted advisor chat session."""
+    from frontend import advisor
+    return jsonify(advisor.clear_chat())
+
+
+@app.route("/api/advisor/delete-exchange", methods=["POST"])
+def api_advisor_delete_exchange():
+    """Delete one persisted advisor exchange by message index."""
+    from frontend import advisor
+    body = request.get_json(silent=True) or {}
+    try:
+        index = int(body.get("index"))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "message index is required"}), 400
+    try:
+        return jsonify(advisor.delete_exchange(index))
+    except IndexError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except OSError as e:
+        logging.warning("Advisor exchange delete failed: %s", e)
+        return jsonify({"ok": False, "error": f"delete failed: {e}"}), 500
 
 
 @app.route("/healthz")

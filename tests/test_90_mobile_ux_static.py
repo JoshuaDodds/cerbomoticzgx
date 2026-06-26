@@ -112,11 +112,42 @@ def test_desktop_logo_and_clear_schedule_js_hooks_exist():
 
 def test_advisor_latest_report_loads_on_browser_startup():
     js = APP_JS.read_text(encoding="utf-8")
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    css = (ROOT / "frontend" / "static" / "css" / "app.css").read_text(encoding="utf-8")
 
     assert "function renderAdvisorRecord(" in js
+    assert "function renderAdvisorChat(" in js
+    assert "advisor-turn" in js
+    assert "messages.slice().reverse()" in js
     assert "function loadAdvisorLatest(" in js
     assert 'fetch("/api/advisor/latest")' in js
     assert "loadAdvisorLatest();" in js
+    assert "function clearAdvisorChat(" in js
+    assert 'fetch("/api/advisor/clear", { method: "POST" })' in js
+    assert "function copyAdvisorMessage(" in js
+    assert "function deleteAdvisorExchange(" in js
+    assert 'fetch("/api/advisor/delete-exchange"' in js
+    assert 'data-advisor-copy="' in js
+    assert 'data-advisor-delete="' in js
     assert "Generated " in js
     assert "dateStyle" in js
     assert "timeStyle" in js
+    assert 'id="advisor-clear"' in html
+    assert ".advisor-turn" in css
+    assert ".advisor-message-actions" in css
+    assert ".advisor-turn-actions" in css
+    assert ".advisor-role-user" in css
+    assert "background: #f8fafc" in css
+
+
+def test_advisor_markdown_tables_are_rendered_as_tables():
+    js = APP_JS.read_text(encoding="utf-8")
+    css = (ROOT / "frontend" / "static" / "css" / "app.css").read_text(encoding="utf-8")
+
+    assert "function _isMdTableSeparator" in js
+    assert "function _mdTableToHtml" in js
+    assert '<div class="advisor-table-wrap"><table>' in js
+    assert "<thead><tr>" in js
+    assert "<tbody>" in js
+    assert "advisor-message-body table" in css
+    assert ".advisor-table-wrap" in css

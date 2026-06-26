@@ -126,26 +126,29 @@
   //     · · · fold · · ·
   //          EV    Gas(small)
   function layoutMobile(W, H, hasEV, hasGas) {
-    const xL = 0.27 * W, xR = 0.73 * W, colW = 0.395 * W;   // narrower → Solar↔Battery line visible
-    // Corner cards are a FIXED, content-fit height (so there's no empty space at the
-    // bottom of the cards). The remaining vertical space becomes the gaps around the
-    // MP-II hub, which also gives the radiating connectors room to read. EV + a small
-    // Gas card sit below, side by side (no overlap).
-    const ch = 104, ch1 = 68, mph = 100, evh = 74, gash = 54;
-    const gap = Math.max(30, (H - (28 + ch + mph + ch + evh)) / 3);
-    const r1cy = 14 + ch / 2;
-    const invCy = 14 + ch + gap + mph / 2;
-    const r2cy = 14 + ch + gap + mph + gap + ch / 2;
-    const belowCy = 14 + ch + gap + mph + gap + ch + gap + evh / 2;
+    const xL = 0.225 * W, xR = 0.775 * W, colW = 0.41 * W;   // small side margins, wider cards
+    const ch = 104, mph = 100, evh = 74, solh = 68, gash = 54;
+    // Left column: Grid, Battery. Right column: AC Loads, then EV stacked above a
+    // dropped-down-and-right Solar (so its line to Battery can curve). MP-II hub
+    // centred; Gas centred at the bottom overflow. Heights are content-fit; the whole
+    // stack is scaled to fill H.
+    const ny1  = 12 + ch / 2;                               // top row (Grid / AC Loads)
+    const nHub = ny1 + ch / 2 + 26 + mph / 2;               // hub
+    const nR2  = nHub + mph / 2 + 26 + ch / 2;              // Battery (left), 26 below hub
+    const nEv  = nHub + mph / 2 + 26 + evh / 2;             // EV — top level with the hub cards (26 below hub)
+    const nSol = nEv + evh / 2 + 20 + solh / 2;             // Solar just below EV
+    const nGas = nSol + solh / 2 + 20 + gash / 2;           // Gas (centre bottom)
+    const Tnat = nGas + gash / 2 + 12;
+    const sc = H / Tnat;
     const N = {
-      grid:  { x: xL, y: r1cy, w: colW, h: ch },
-      house: { x: xR, y: r1cy, w: colW, h: ch },
-      batt:  { x: xL, y: r2cy, w: colW, h: ch },
-      solar: { x: xR, y: r2cy, w: colW, h: ch1 },          // shorter (1 detail row), centred on r2cy
-      inv:   { x: 0.5 * W, y: invCy, w: 0.36 * W, h: mph },  // centre hub (kept larger)
+      grid:  { x: xL, y: ny1 * sc, w: colW, h: ch * sc },
+      house: { x: xR, y: ny1 * sc, w: colW, h: ch * sc },
+      inv:   { x: 0.5 * W, y: nHub * sc, w: 0.36 * W, h: mph * sc },
+      batt:  { x: xL, y: nR2 * sc, w: colW, h: ch * sc },
+      solar: { x: xR + 0.015 * W, y: nSol * sc, w: 0.40 * W, h: solh * sc },   // dropped down + right
     };
-    if (hasEV)  N.ev  = { x: 0.38 * W, y: belowCy, w: 0.32 * W, h: evh };   // bottom-centre-left
-    if (hasGas) N.gas = { x: 0.69 * W, y: belowCy, w: 0.22 * W, h: gash };  // small, bottom-centre-right
+    if (hasEV)  N.ev  = { x: xR, y: nEv * sc, w: colW, h: evh * sc };          // stacked above Solar
+    if (hasGas) N.gas = { x: 0.5 * W, y: nGas * sc, w: 0.30 * W, h: gash * sc }; // centred under hub
     return N;
   }
 
@@ -161,10 +164,11 @@
   // Explicit attach ports for the mobile hub layout, so the four links radiate
   // cleanly from the central MP-II instead of being auto-routed across cards.
   const MOBILE_PORTS = {
-    grid:  { ap: ["bottom", 0.2], bp: ["top", -0.3] },    // grid bottom -> inv top-left
-    load:  { ap: ["top", 0.3], bp: ["bottom", -0.2] },    // inv top-right -> AC-loads bottom
-    batt:  { ap: ["bottom", -0.3], bp: ["top", 0.2] },    // inv bottom-left -> battery top
-    solar: { ap: ["left", 0], bp: ["right", 0] },         // solar -> battery (horizontal)
+    grid:  { ap: ["bottom", 0.2], bp: ["top", -0.3] },     // grid bottom -> hub top-left
+    load:  { ap: ["top", 0.3], bp: ["bottom", -0.35] },    // hub top-right -> AC-loads bottom-left
+    batt:  { ap: ["bottom", -0.3], bp: ["top", 0.1] },     // hub bottom-left -> battery top
+    solar: { ap: ["left", -0.15], bp: ["right", 0.25] },   // Solar (lower-right) curves up to Battery
+    ev:    { ap: ["bottom", 0.3], bp: ["top", 0] },        // AC-loads bottom-right -> EV (above Solar)
   };
 
   // Width-aware (so narrow cards don't overflow) with an optional scale `k`
@@ -467,10 +471,8 @@
     _sig = sig;
     const mobile = W < MOBILE_MAX;
     const N = layout(W, H, fr.hasEV, fr.hasGas);
-    // Mobile draws the four hub links (grid/load/batt/solar); EV/Gas are cards only.
-    const edges = mobile
-      ? FLOW_EDGES.filter((e) => e.key !== "ev")
-      : FLOW_EDGES.filter((e) => e.key !== "ev" || fr.hasEV);
+    // EV link is drawn when present (mobile shows AC-Loads→EV); Gas stays a card only.
+    const edges = FLOW_EDGES.filter((e) => e.key !== "ev" || fr.hasEV);
     edges.forEach((e) => { _edgeDur[e.key] = durFor(fr.flows[e.key].mag); _edgeDir[e.key] = fr.flows[e.key].fwd ? "0;1" : "1;0"; });
 
     const cardKeys = ["grid", "inv", "house", "solar", "batt"];

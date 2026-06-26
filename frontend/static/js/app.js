@@ -381,7 +381,8 @@ function renderMetrics(plan) {
   box.innerHTML = "";
   if (!plan.available) return;
   const c = plan.current || {};
-  const total = plan.day_summary && plan.day_summary.total;
+  const days = (plan.day_summary && plan.day_summary.days) || [];
+  const tomorrow = days.find((d) => !d.is_today);   // null until tomorrow's prices publish
   const ns = nextSell(plan);
   const card = (label, value) => { const d = el("div", "metric"); d.innerHTML = `<div class="label">${label}</div><div class="value">${value}</div>`; return d; };
   const tNet = todayNet(plan);
@@ -391,7 +392,7 @@ function renderMetrics(plan) {
   box.appendChild(card("Battery SoC", (soc != null ? Number(soc).toFixed(1) : "—") + "<small> %</small>"));
   box.appendChild(card("Price now", "€" + Number(price || 0).toFixed(3) + "<small> /kWh</small>"));
   if (tNet != null) box.appendChild(card("Today net", netHtml(tNet)));
-  if (total) box.appendChild(card("Horizon net (2 Day)", netHtml(total.net)));
+  box.appendChild(card("Tomorrow", tomorrow ? netHtml(tomorrow.net) : "<span class='muted'>Pending</span>"));
   if (ns) box.appendChild(card("Next SELL", ns.time.slice(11, 16) + " <small>€" + Number(ns.price).toFixed(3) + "</small>"));
 }
 
@@ -492,7 +493,7 @@ function renderDecision(plan) {
 function renderDaySummary(plan) {
   plan = planWithLiveActuals(plan);
   const box = $("#day-summary");
-  box.innerHTML = "<h3 style='margin:2px 0 12px'>Day cost summary (actuals + forecast)</h3>";
+  box.innerHTML = "<h3 style='margin:2px 0 12px'>P/L summary (actuals + forecast)</h3>";
   if (!plan.available || !plan.day_summary) { box.innerHTML += "<span class='muted'>—</span>"; return; }
   // Four aligned columns: label | import | export | net. The day-row and day-sub
   // rows share the same grid template so the numbers line up vertically.
@@ -501,33 +502,44 @@ function renderDaySummary(plan) {
     `<span class="num"><span class="t">import</span> <b>${impKwh}</b> <small>${impC}</small></span>` +
     `<span class="num"><span class="t">export</span> <b>${expKwh}</b> <small>${expC}</small></span>` +
     `<span class="net">${netCell}</span>`;
-  plan.day_summary.days.forEach((d) => {
-    const r = el("div", "day-row");
-    r.innerHTML = cells(`${d.label}${d.is_today ? " (today)" : ""}`,
-      kwh(d.combined.import_kwh), eur(d.combined.import_cost),
+  const days = plan.day_summary.days || [];
+  const head = (title) => { const h = el("div", "day-head"); h.textContent = title; box.appendChild(h); };
+  const sub = (lbl, vals, net) => {
+    const r = el("div", "day-sub");
+    r.innerHTML = cells(lbl, kwh(vals.import_kwh), eur(vals.import_cost),
+      kwh(vals.export_kwh), eur(vals.export_rev), netHtml(net));
+    box.appendChild(r);
+  };
+  const dayTotal = (d) => {
+    const r = el("div", "day-row day-total");
+    r.innerHTML = cells("Day total", kwh(d.combined.import_kwh), eur(d.combined.import_cost),
       kwh(d.combined.export_kwh), eur(d.combined.export_rev), netHtml(d.net));
     box.appendChild(r);
-    if (d.actual) {
-      const actNet = d.actual.import_cost - d.actual.export_rev;
-      const fcNet = d.forecast.import_cost - d.forecast.export_rev;
-      const a = el("div", "day-sub");
-      a.innerHTML = cells("actual so far",
-        kwh(d.actual.import_kwh), eur(d.actual.import_cost),
-        kwh(d.actual.export_kwh), eur(d.actual.export_rev), netHtml(actNet));
-      box.appendChild(a);
-      const f = el("div", "day-sub");
-      f.innerHTML = cells("forecast rest",
-        kwh(d.forecast.import_kwh), eur(d.forecast.import_cost),
-        kwh(d.forecast.export_kwh), eur(d.forecast.export_rev), netHtml(fcNet));
-      box.appendChild(f);
+  };
+
+  // Today — actuals so far + forecast for the rest, then today's own total.
+  const today = days.find((d) => d.is_today);
+  if (today) {
+    head(`Today · ${today.label}`);
+    if (today.actual) {
+      sub("Actual", today.actual, today.actual.import_cost - today.actual.export_rev);
+      sub("Forecasted", today.forecast, today.forecast.import_cost - today.forecast.export_rev);
     }
-  });
-  const t = plan.day_summary.total;
-  const tr = el("div", "day-row day-total");
-  tr.innerHTML = cells("TOTAL",
-    kwh(t.import_kwh), eur(t.import_cost),
-    kwh(t.export_kwh), eur(t.export_rev), netHtml(t.net));
-  box.appendChild(tr);
+    dayTotal(today);
+  }
+
+  // Tomorrow — its own separate total (forecast), or Pending until prices publish.
+  // The two days are never tallied together.
+  const tomorrow = days.find((d) => !d.is_today);
+  head("Tomorrow" + (tomorrow ? ` · ${tomorrow.label}` : ""));
+  if (tomorrow) {
+    dayTotal(tomorrow);
+  } else {
+    const p = el("div", "muted");
+    p.style.cssText = "padding: 4px 2px 2px 16px; font-size: 13.5px;";
+    p.textContent = "Pending — tomorrow's prices not published yet.";
+    box.appendChild(p);
+  }
 }
 
 // ---- Render: hours tree ----
@@ -1038,14 +1050,71 @@ function _mdInline(s) {
     .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
     .replace(/(^|[^*])\*([^*\s][^*]*)\*/g, "$1<em>$2</em>");
 }
+function _isMdTableRow(line) {
+  return /^\s*\|.*\|\s*$/.test(line || "");
+}
+function _splitMdTableRow(line) {
+  return String(line || "").trim().replace(/^\|/, "").replace(/\|$/, "")
+    .split("|").map((cell) => cell.trim());
+}
+function _isMdTableSeparator(line) {
+  if (!_isMdTableRow(line)) return false;
+  const cells = _splitMdTableRow(line);
+  return cells.length > 0 && cells.every((cell) => /^:?-{3,}:?$/.test(cell.replace(/\s/g, "")));
+}
+function _mdTableAligns(separatorLine) {
+  return _splitMdTableRow(separatorLine).map((cell) => {
+    const s = cell.replace(/\s/g, "");
+    if (s.startsWith(":") && s.endsWith(":")) return "center";
+    if (s.endsWith(":")) return "right";
+    return "";
+  });
+}
+function _mdTableToHtml(headerLine, separatorLine, bodyLines) {
+  const header = _splitMdTableRow(headerLine);
+  const aligns = _mdTableAligns(separatorLine);
+  const alignAttr = (idx) => aligns[idx] ? ` style="text-align:${aligns[idx]}"` : "";
+  const head = header.map((cell, idx) => `<th${alignAttr(idx)}>${_mdInline(cell)}</th>`).join("");
+  const body = bodyLines.map((line) => {
+    const cells = _splitMdTableRow(line);
+    return `<tr>${cells.map((cell, idx) => `<td${alignAttr(idx)}>${_mdInline(cell)}</td>`).join("")}</tr>`;
+  }).join("");
+  return `<div class="advisor-table-wrap"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
+}
 function mdToHtml(md) {
   const lines = _esc(md || "").split(/\r?\n/);
   let html = "", list = null;
   const closeList = () => { if (list) { html += `</${list}>`; list = null; } };
-  for (const raw of lines) {
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i];
     const line = raw.replace(/\s+$/, "");
     let m;
     if (!line.trim()) { closeList(); continue; }
+    if (_isMdTableRow(line)) {
+      let sepIdx = i + 1;
+      while (sepIdx < lines.length && !lines[sepIdx].trim()) sepIdx++;
+      const separator = sepIdx < lines.length ? lines[sepIdx].replace(/\s+$/, "") : "";
+      if (_isMdTableSeparator(separator)) {
+        const bodyLines = [];
+        let rowIdx = sepIdx + 1;
+        while (rowIdx < lines.length) {
+          const row = lines[rowIdx].replace(/\s+$/, "");
+          if (!row.trim()) { rowIdx++; continue; }
+          if (!_isMdTableRow(row) || _isMdTableSeparator(row)) break;
+          bodyLines.push(row);
+          rowIdx++;
+        }
+        closeList();
+        html += _mdTableToHtml(line, separator, bodyLines);
+        i = rowIdx - 1;
+        continue;
+      }
+    }
+    if (/^\s*-{3,}\s*$/.test(line)) {
+      closeList();
+      html += "<hr>";
+      continue;
+    }
     if ((m = line.match(/^(#{1,4})\s+(.*)$/))) {
       closeList(); const lvl = Math.min(6, m[1].length + 2);
       html += `<h${lvl}>${_mdInline(m[2])}</h${lvl}>`; continue;
@@ -1067,41 +1136,115 @@ function mdToHtml(md) {
 
 let _advisorBusy = false;
 let _advisorES = null;
+let _advisorRecord = { ok: false, schema: "advisor_chat_v1", messages: [] };
+
+function advisorMessages(record) {
+  return (record && Array.isArray(record.messages)) ? record.messages : [];
+}
+
+function advisorWhen(value) {
+  if (!value) return "";
+  try {
+    return new Date(value).toLocaleString([], {
+      dateStyle: "medium",
+      timeStyle: "medium",
+      hour12: false,
+    });
+  } catch (_) {
+    return value;
+  }
+}
 
 function advisorMetaText(record) {
-  if (!record) return "";
-  let when = "";
-  try {
-    when = record.generated_at
-      ? "Generated " + new Date(record.generated_at).toLocaleString([], {
-          dateStyle: "medium",
-          timeStyle: "medium",
-          hour12: false,
-        })
-      : "";
-  } catch (_) {}
+  const messages = advisorMessages(record);
+  if (!messages.length) return "";
+  const last = messages[messages.length - 1];
+  const when = last && last.created_at ? "Generated " + advisorWhen(last.created_at) : "";
   return [
-    record.mode === "question" ? "Last answer" : "Last daily review",
-    record.model,
-    record.auth,
-    record.elapsed_s != null ? record.elapsed_s + "s" : null,
+    "Advisor chat",
+    messages.length + " message" + (messages.length === 1 ? "" : "s"),
     when,
   ].filter(Boolean).join(" · ");
 }
 
-function renderAdvisorRecord(record) {
+function renderAdvisorMessage(msg, opts) {
+  const role = msg.role === "user" ? "user" : "assistant";
+  const label = role === "user" ? "You" : "Advisor";
+  const time = msg.created_at ? advisorWhen(msg.created_at) : "";
+  const status = msg.elapsed_s != null ? `${msg.elapsed_s}s` : "";
+  const meta = [label, msg.model, msg.auth, status, time].filter(Boolean).join(" · ");
+  const body = role === "assistant"
+    ? (msg.text ? mdToHtml(msg.text) : `<span class="muted">${_esc(msg.error || "Waiting for response...")}</span>`)
+    : `<p>${_esc(msg.text || "")}</p>`;
+  const id = opts && opts.id ? ` id="${opts.id}"` : "";
+  const index = opts && Number.isInteger(opts.index) ? opts.index : null;
+  const actions = index === null ? "" : `<div class="advisor-message-actions">
+      <button type="button" class="advisor-mini-btn" data-advisor-copy="${index}">Copy</button>
+    </div>`;
+  return `<article${id} class="advisor-message advisor-role-${role}">
+    <div class="advisor-message-head">
+      <div class="advisor-message-meta">${_esc(meta)}</div>
+      ${actions}
+    </div>
+    <div class="advisor-message-body">${body}</div>
+  </article>`;
+}
+
+function advisorTurns(messages) {
+  const turns = [];
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    if (msg.role === "user") {
+      const turn = { user: msg, userIndex: i, assistant: null, assistantIndex: null };
+      if (messages[i + 1] && messages[i + 1].role === "assistant") {
+        turn.assistant = messages[i + 1];
+        turn.assistantIndex = i + 1;
+        i++;
+      }
+      turns.push(turn);
+    } else {
+      turns.push({ user: null, userIndex: null, assistant: msg, assistantIndex: i });
+    }
+  }
+  return turns;
+}
+
+function renderAdvisorChat(record, pendingTurn) {
   const report = $("#advisor-report");
   const meta = $("#advisor-meta");
-  if (!report || !record || (!record.report && !record.error)) return;
-  const question = record.question
-    ? `<div class="advisor-log"><div class="alog alog-stage">Question: ${_esc(record.question)}</div></div>`
+  if (!report) return;
+  const messages = advisorMessages(record);
+  const latestMessages = messages.slice().reverse();
+  void latestMessages;
+  const turns = advisorTurns(messages).slice().reverse();
+  const pending = pendingTurn
+    ? `<section class="advisor-turn advisor-turn-pending">
+        ${renderAdvisorMessage(pendingTurn.user)}
+        ${renderAdvisorMessage(pendingTurn.assistant, { id: "advisor-streaming-message" })}
+        <div class="advisor-log" id="advisor-log"></div>
+      </section>`
     : "";
-  if (record.report) {
-    report.innerHTML = `${question}<div class="advisor-out">${mdToHtml(record.report)}</div>`;
-  } else {
-    report.innerHTML = `${question}<div class="banner">${_esc(record.error || "Advisor report unavailable.")}</div>`;
-  }
+  const saved = turns.map((turn) => {
+    const deleteIndex = turn.userIndex !== null ? turn.userIndex : turn.assistantIndex;
+    return `<section class="advisor-turn">
+      <div class="advisor-turn-actions">
+        <button type="button" class="advisor-mini-btn advisor-delete-btn" data-advisor-delete="${deleteIndex}">Delete exchange</button>
+      </div>
+      ${turn.user ? renderAdvisorMessage(turn.user, { index: turn.userIndex }) : ""}
+      ${turn.assistant ? renderAdvisorMessage(turn.assistant, { index: turn.assistantIndex }) : ""}
+    </section>`;
+  }).join("");
+  report.innerHTML = (pending || saved)
+    ? `<div class="advisor-chat">${pending}${saved}</div>`
+    : '<span class="muted">No advisor chat yet — run the daily review or ask a question.</span>';
   if (meta) meta.textContent = advisorMetaText(record);
+}
+
+function renderAdvisorRecord(record) {
+  _advisorRecord = record && Array.isArray(record.messages)
+    ? record
+    : { ok: false, schema: "advisor_chat_v1", messages: [] };
+  renderAdvisorChat(_advisorRecord);
 }
 
 async function loadAdvisorLatest() {
@@ -1112,18 +1255,95 @@ async function loadAdvisorLatest() {
   } catch (_) { /* keep the empty advisor placeholder */ }
 }
 
+function advisorTextForIndex(index) {
+  const messages = advisorMessages(_advisorRecord);
+  const msg = messages[index];
+  return msg ? (msg.text || msg.error || "") : "";
+}
+
+function copyAdvisorFallback(text) {
+  const area = document.createElement("textarea");
+  area.value = text;
+  area.setAttribute("readonly", "");
+  area.style.position = "fixed";
+  area.style.left = "-9999px";
+  document.body.appendChild(area);
+  area.select();
+  try {
+    document.execCommand("copy");
+  } finally {
+    document.body.removeChild(area);
+  }
+}
+
+async function copyAdvisorMessage(index, btn) {
+  const text = advisorTextForIndex(index);
+  if (!text) return;
+  const label = btn ? btn.textContent : "";
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      copyAdvisorFallback(text);
+    }
+    if (btn) {
+      btn.textContent = "Copied";
+      setTimeout(() => { btn.textContent = label || "Copy"; }, 1000);
+    }
+  } catch (_) {
+    if (btn) {
+      btn.textContent = "Copy failed";
+      setTimeout(() => { btn.textContent = label || "Copy"; }, 1400);
+    }
+  }
+}
+
+async function deleteAdvisorExchange(index, btn) {
+  if (_advisorBusy) return;
+  if (!confirm("Delete this advisor exchange?")) return;
+  const label = btn ? btn.textContent : "";
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Deleting...";
+  }
+  try {
+    const response = await fetch("/api/advisor/delete-exchange", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ index }),
+    });
+    const record = await response.json().catch(() => ({}));
+    if (!response.ok || record.ok === false) throw new Error(record.error || "delete failed");
+    renderAdvisorRecord(record);
+  } catch (e) {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "Delete failed";
+      btn.title = e.message;
+      setTimeout(() => { btn.textContent = label || "Delete exchange"; }, 1600);
+    }
+  }
+}
+
 // Streams the advisor run over SSE so the user sees live progress (stages, CLI log
 // lines, and the model's output as it arrives) instead of a silent hang.
 function runAdvisor(question) {
   if (_advisorBusy) return;
-  const report = $("#advisor-report"), meta = $("#advisor-meta"), rBtn = $("#advisor-review");
+  const meta = $("#advisor-meta"), rBtn = $("#advisor-review");
   _advisorBusy = true;
   if (rBtn) rBtn.disabled = true;
-  meta.textContent = "";
-  report.innerHTML = '<div class="advisor-log" id="advisor-log"></div><div class="advisor-out" id="advisor-out"></div>';
-  const logEl = $("#advisor-log"), outEl = $("#advisor-out");
+  if (meta) meta.textContent = "";
+  const now = new Date().toISOString();
+  const pendingTurn = {
+    user: { role: "user", mode: question ? "question" : "review", text: question || "Run daily review", created_at: now },
+    assistant: { role: "assistant", mode: question ? "question" : "review", text: "", created_at: now },
+  };
+  renderAdvisorChat(_advisorRecord, pendingTurn);
+  const logEl = $("#advisor-log"), streamMsg = $("#advisor-streaming-message");
+  const outEl = streamMsg && streamMsg.querySelector(".advisor-message-body");
   let acc = "", done = false;
   const addLog = (cls, msg) => {
+    if (!logEl) return;
     const d = document.createElement("div");
     d.className = "alog " + cls;
     d.textContent = msg;
@@ -1138,7 +1358,7 @@ function runAdvisor(question) {
     if (_advisorES) { _advisorES.close(); _advisorES = null; }   // stop auto-reconnect
     _advisorBusy = false;
     if (rBtn) rBtn.disabled = false;
-    if (metaTxt) meta.textContent = metaTxt;
+    if (meta && metaTxt) meta.textContent = metaTxt;
   };
 
   let es;
@@ -1146,7 +1366,7 @@ function runAdvisor(question) {
     es = new EventSource("/api/advisor/stream?question=" + encodeURIComponent(question || ""));
   } catch (e) {
     addLog("alog-err", "✗ could not open the advisor stream.");
-    outEl.innerHTML = '<div class="banner">Could not start the advisor.</div>';
+    if (outEl) outEl.innerHTML = '<div class="banner">Could not start the advisor.</div>';
     finish();
     return;
   }
@@ -1165,29 +1385,55 @@ function runAdvisor(question) {
       const th = document.getElementById("alog-think");
       if (th && !th.dataset.done) { th.dataset.done = "1"; th.textContent = "🧠 thinking complete — writing the report…"; }
       acc += ev.text;
-      outEl.innerHTML = mdToHtml(acc);
+      if (outEl) outEl.innerHTML = mdToHtml(acc);
     }
     else if (ev.type === "error") {
       addLog("alog-err", "✗ " + ev.error);
-      if (!acc) outEl.innerHTML = `<div class="banner">${_esc(ev.error)}</div>`;
+      if (!acc && outEl) outEl.innerHTML = `<div class="banner">${_esc(ev.error)}</div>`;
       finish("error");
+      loadAdvisorLatest();
     } else if (ev.type === "done") {
-      outEl.innerHTML = mdToHtml(acc);
-      const when = ev.generated_at ? new Date(ev.generated_at).toLocaleTimeString([], { hour12: false }) : "";
+      if (outEl) outEl.innerHTML = mdToHtml(acc);
+      const when = ev.generated_at ? advisorWhen(ev.generated_at) : "";
       finish([ev.mode === "question" ? "Answer" : "Daily review", ev.model, ev.auth,
               ev.elapsed_s != null ? ev.elapsed_s + "s" : null, when].filter(Boolean).join(" · "));
+      loadAdvisorLatest();
     }
   };
   es.onerror = () => {
     if (!done) {
       addLog("alog-err", "✗ stream closed (connection lost or service restarting).");
-      if (!acc) outEl.innerHTML = '<div class="banner">Advisor stream closed — is the service running?</div>';
+      if (!acc && outEl) outEl.innerHTML = '<div class="banner">Advisor stream closed — is the service running?</div>';
     }
     finish();
   };
 }
 const _advReview = $("#advisor-review");
 if (_advReview) _advReview.addEventListener("click", () => runAdvisor(null));
+async function clearAdvisorChat() {
+  if (_advisorBusy) return;
+  if (!confirm("Clear advisor chat?")) return;
+  try {
+    const record = await fetch("/api/advisor/clear", { method: "POST" }).then((r) => r.json());
+    renderAdvisorRecord(record);
+  } catch (_) { /* leave current chat visible */ }
+}
+const _advClear = $("#advisor-clear");
+if (_advClear) _advClear.addEventListener("click", clearAdvisorChat);
+const _advReport = $("#advisor-report");
+if (_advReport) _advReport.addEventListener("click", (e) => {
+  const copyBtn = e.target.closest("[data-advisor-copy]");
+  if (copyBtn) {
+    const index = Number(copyBtn.dataset.advisorCopy);
+    if (Number.isInteger(index)) copyAdvisorMessage(index, copyBtn);
+    return;
+  }
+  const deleteBtn = e.target.closest("[data-advisor-delete]");
+  if (deleteBtn) {
+    const index = Number(deleteBtn.dataset.advisorDelete);
+    if (Number.isInteger(index)) deleteAdvisorExchange(index, deleteBtn);
+  }
+});
 const _advForm = $("#advisor-ask");
 if (_advForm) _advForm.addEventListener("submit", (e) => {
   e.preventDefault();

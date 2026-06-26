@@ -132,6 +132,16 @@ out to a local CLI. None of it imports the control path or writes Victron/MQTT s
     actually exists and changes the current value, and explicit suppression of
     low/0% SoC "concerns" (intended behaviour). The primer describes the real control
     model (no BatteryLife) so the model stops attributing behaviour to it.
+  - **Persistent conversational chat.** The Advisor tab is now a multi-turn session
+    rather than a one-shot report: each prompt + response is timestamped and saved to
+    `data/advisor_latest.json` (`advisor_chat_v1`), restored on browser refresh and
+    shown newest-first. Follow-up prompts carry a compact transcript of the session
+    (`conversation_context`, ~6 KB cap) so the model keeps context across turns, and a
+    **Clear chat** button wipes the session. New routes: `GET /api/advisor/latest` +
+    `POST /api/advisor/clear` (the prior single-report JSON is read back compatibly).
+  - **EV-charging context** in the primer: the EV is a 3-phase charger (≤17 kW) behind
+    a Maxem.io load-balancer, treated as a house load chargeable from grid / PV /
+    battery, so the model reasons about EV sessions correctly.
 - **Month-to-date profit chip** (sticky header): the sum of our settled daily totals
   for the current calendar month (`Σ export_reward − Σ import_cost`, profit positive),
   including today's running total. Deterministic and always available. (A live Tibber
@@ -166,7 +176,12 @@ out to a local CLI. None of it imports the control path or writes Victron/MQTT s
   **and** height via a `ResizeObserver`, for embedding on any screen (the old
   `max-width:720px` cap and the "Live power flow" heading were removed). Box sizes are
   **deliberately non-uniform** — a wider central Inverter/Charger + Battery column and
-  small EV/Gas cards, echoing the Victron GUI-v2 proportions (per-box font scaling). `live.py`
+  small EV/Gas cards, echoing the Victron GUI-v2 proportions (per-box font scaling). **On
+  phones** (`app.mobile.css`) it reflows to a portrait **centre-hub** layout — Grid/AC
+  Loads top corners, Battery bottom-left, EV stacked above a dropped-down Solar (EV wired
+  to AC Loads), and a small Gas card centred at the bottom — with the four hub-adjacent
+  cards evenly spaced, a curved Solar→Battery flow line, and each card showing a big split
+  value over compact labelled detail rows. Desktop is unchanged. `live.py`
   gained read-only subscriptions for all of the above (topics mirror `lib/constants.py`,
   incl. battery temp on the LFP/BMS service 512; absent topics degrade to hidden). Gas
   is shown as a small card beneath AC Loads (from the plan's `gas_m³`). **Requires a
@@ -236,6 +251,7 @@ out to a local CLI. None of it imports the control path or writes Victron/MQTT s
   `CLAUDE_CONFIG_DIR`, and the secrets `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY`.
 - The month-to-date chip needs no new config — it sums the existing daily history.
 - New read-only endpoints: `GET /api/advisor` + `GET /api/advisor/stream` (SSE),
+  `GET /api/advisor/latest` + `POST /api/advisor/clear` (advisor chat persistence),
   `GET /api/history/month`, `GET /api/history/day`.
 - New tests: `tests/test_advisor_retrieval.py` (NEED_HISTORY parsing + PV/load unit
   normalisation) and `tests/test_ess_pv_headroom.py` (grid-vs-PV charge trade-off).

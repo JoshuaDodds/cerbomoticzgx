@@ -50,7 +50,7 @@ _run_lock = threading.Lock()
 
 
 # --------------------------------------------------------------------------- #
-# Latest report persistence
+# Advisor chat persistence
 # --------------------------------------------------------------------------- #
 def _atomic_write_json(path: str, payload: dict) -> None:
     directory = os.path.dirname(path)
@@ -70,7 +70,7 @@ def _atomic_write_json(path: str, payload: dict) -> None:
         raise
 
 
-def _clear_latest_report() -> None:
+def _remove_latest_report() -> None:
     try:
         os.remove(ADVISOR_LATEST_PATH)
     except FileNotFoundError:
@@ -79,36 +79,41 @@ def _clear_latest_report() -> None:
         pass
 
 
-def _latest_record(
-    *,
-    ok: bool,
-    mode: str,
-    question: str | None,
-    report: str,
-    model: str | None,
-    auth: str | None,
-    generated_at: str,
-    elapsed_s: float | None = None,
-    error: str | None = None,
-) -> dict:
-    record = {
-        "ok": ok,
-        "mode": mode,
-        "question": question,
-        "report": report or "",
-        "model": model,
-        "auth": auth,
-        "generated_at": generated_at,
+def _empty_chat(ok: bool = False) -> dict:
+    return {"ok": ok, "schema": "advisor_chat_v1", "messages": []}
+
+
+def _normalize_chat(record: dict | None) -> dict:
+    if not isinstance(record, dict):
+        return _empty_chat()
+    if isinstance(record.get("messages"), list):
+        out = {
+            "ok": bool(record.get("ok")),
+            "schema": "advisor_chat_v1",
+            "messages": [m for m in record.get("messages", []) if isinstance(m, dict)],
+        }
+        if record.get("updated_at"):
+            out["updated_at"] = record.get("updated_at")
+        return out
+    # Backward-compatible read of the prior single-report shape.
+    text = record.get("report") or record.get("error") or ""
+    if not text:
+        return _empty_chat()
+    msg = {
+        "role": "assistant",
+        "text": text,
+        "created_at": record.get("generated_at") or datetime.now().astimezone().isoformat(),
+        "ok": bool(record.get("ok")),
     }
-    if elapsed_s is not None:
-        record["elapsed_s"] = elapsed_s
-    if error:
-        record["error"] = error
-    return record
-
-
-def _save_latest_report(record: dict) -> None:
-    _atomic_write_json(ADVISOR_LATEST_PATH, record)
+    for key in ("mode", "model", "auth", "elapsed_s", "error"):
+        if record.get(key) is not None:
+            msg[key] = record.get(key)
+    return {
+        "ok": bool(record.get("ok")),
+        "schema": "advisor_chat_v1",
+        "updated_at": msg["created_at"],
+        "messages": [msg],
+    }
 
 
 def latest_report() -> dict:
@@ -116,10 +121,103 @@ def latest_report() -> dict:
         with open(ADVISOR_LATEST_PATH, encoding="utf-8") as fh:
             record = json.load(fh)
     except FileNotFoundError:
-        return {"ok": False, "report": ""}
+        return _empty_chat()
     except (OSError, json.JSONDecodeError):
-        return {"ok": False, "report": "", "error": "Latest advisor report is unavailable."}
-    return record if isinstance(record, dict) else {"ok": False, "report": ""}
+        return {**_empty_chat(), "error": "Latest advisor chat is unavailable."}
+    return _normalize_chat(record)
+
+
+def _save_chat(chat: dict) -> None:
+    _atomic_write_json(ADVISOR_LATEST_PATH, _normalize_chat(chat))
+
+
+def clear_chat() -> dict:
+    _remove_latest_report()
+    return _empty_chat(ok=True)
+
+
+def delete_exchange(index: int) -> dict:
+    chat = latest_report()
+    messages = chat.get("messages") or []
+    if not isinstance(index, int) or index < 0 or index >= len(messages):
+        raise IndexError("message index out of range")
+    msg = messages[index]
+    start, end = index, index + 1
+    if msg.get("role") == "user":
+        if index + 1 < len(messages) and messages[index + 1].get("role") == "assistant":
+            end = index + 2
+    elif msg.get("role") == "assistant" and index > 0 and messages[index - 1].get("role") == "user":
+        start = index - 1
+    del messages[start:end]
+    if not messages:
+        _remove_latest_report()
+        return _empty_chat(ok=True)
+    chat["messages"] = messages
+    chat["updated_at"] = datetime.now().astimezone().isoformat()
+    _save_chat(chat)
+    return latest_report()
+
+
+def _append_user_message(chat: dict, mode: str, question: str | None, created_at: str) -> dict:
+    message = {
+        "role": "user",
+        "mode": mode,
+        "text": question if question else "Run daily review",
+        "created_at": created_at,
+    }
+    chat.setdefault("messages", []).append(message)
+    chat["updated_at"] = created_at
+    return message
+
+
+def _append_assistant_message(
+    chat: dict,
+    *,
+    text: str,
+    created_at: str,
+    model: str | None,
+    auth: str | None,
+    mode: str,
+    elapsed_s: float | None = None,
+    ok: bool = True,
+    error: str | None = None,
+) -> dict:
+    message = {
+        "role": "assistant",
+        "mode": mode,
+        "text": text or "",
+        "created_at": created_at,
+        "ok": ok,
+    }
+    if model:
+        message["model"] = model
+    if auth:
+        message["auth"] = auth
+    if elapsed_s is not None:
+        message["elapsed_s"] = elapsed_s
+    if error:
+        message["error"] = error
+    chat.setdefault("messages", []).append(message)
+    chat["ok"] = ok
+    chat["updated_at"] = created_at
+    return message
+
+
+def _conversation_context(chat: dict, max_chars: int = 6000) -> str | None:
+    messages = _normalize_chat(chat).get("messages", [])
+    if not messages:
+        return None
+    lines = []
+    for m in messages:
+        role = "User" if m.get("role") == "user" else "Advisor"
+        stamp = m.get("created_at") or ""
+        text = (m.get("text") or m.get("error") or "").strip()
+        if text:
+            lines.append(f"{role} [{stamp}]: {text}")
+    context = "\n\n".join(lines).strip()
+    if len(context) > max_chars:
+        context = "...(earlier chat omitted)...\n" + context[-max_chars:]
+    return context or None
 
 
 # --------------------------------------------------------------------------- #
@@ -208,7 +306,7 @@ def _tunables(conf) -> list[dict]:
 # Cumulative day_* totals and net live in the day summary, not per slot.
 _CYCLE_FIELDS = ("ts", "control_action", "realized_action", "reason_code", "soc",
                  "price_buy", "price_sell", "applied_setpoint_w", "grid_w", "pv_w",
-                 "batt_w", "load_w", "pv_actual_today_kwh")
+                 "batt_w", "load_w", "pv_actual_today_kwh", "load_actual_today_wh")
 # actual_pv_kwh = per-slot realized PV; predicted_grid_kwh = predicted import/export.
 _SETTLE_FIELDS = ("ts", "predicted_control_action", "predicted_grid_kwh",
                   "predicted_net_eur", "actual_net_eur", "actual_import_kwh",
@@ -334,6 +432,10 @@ def _gather(days: int, detail_days: int = 2) -> dict:
 # --------------------------------------------------------------------------- #
 _DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}$")
 _NEED_RE = re.compile(r"NEED_HISTORY\s*:\s*(.+)", re.IGNORECASE | re.DOTALL)
+_PROMPT_DATA_RE = re.compile(
+    r"=== DATA \(JSON\) ===\n(.*?)\n=== END DATA ===",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def _history_manifest() -> dict:
@@ -392,12 +494,73 @@ def _parse_need_history(text: str, available_days: list[str], max_days: int) -> 
     return sorted(want)[:max_days]
 
 
+def _prompt_data_payload(user_prompt: str) -> dict:
+    m = _PROMPT_DATA_RE.search(user_prompt or "")
+    if not m:
+        return {}
+    try:
+        payload = json.loads(m.group(1))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _daily_summary_metric_for_question(question: str | None) -> str | None:
+    q = (question or "").lower()
+    wants_total = any(term in q for term in (
+        "total", "totals", "daily", "per day", "each day", "by day", "last ",
+        "kwh", "consumption", "produced", "production",
+    ))
+    asks_for_point_detail = any(term in q for term in (
+        "15-minute", "15 minute", "slot", "hourly", "at ", "around ",
+    ))
+    if not wants_total or asks_for_point_detail:
+        return None
+    if "load" in q or "consumption" in q or re.search(r"\bac\b", q):
+        return "load_actual_kwh"
+    if "pv" in q or "solar" in q or "produced" in q or "production" in q:
+        return "pv_actual_kwh"
+    if "import" in q:
+        return "day_import_kwh"
+    if "export" in q:
+        return "day_export_kwh"
+    if any(term in q for term in ("net", "p/l", "profit", "loss", "eur", "euro")):
+        return "realized_net_eur"
+    return None
+
+
+def _inline_data_can_satisfy_history_request(
+    question: str | None,
+    requested_days: list[str],
+    user_prompt: str,
+) -> bool:
+    """Return True when the first prompt already has the daily summary values needed.
+
+    This is a guard against unnecessary history-file reads: models sometimes ask for
+    NEED_HISTORY after seeing a manifest even though the aggregate daily answer is
+    already in `performance.daily_summaries`.
+    """
+    metric = _daily_summary_metric_for_question(question)
+    if not metric or not requested_days:
+        return False
+    payload = _prompt_data_payload(user_prompt)
+    summaries = ((payload.get("performance") or {}).get("daily_summaries") or {})
+    if not isinstance(summaries, dict):
+        return False
+    for ds in requested_days:
+        day = summaries.get(ds)
+        if not isinstance(day, dict) or day.get(metric) is None:
+            return False
+    return True
+
+
 def _load_days(date_strs: list[str], conf) -> dict:
     """Pull the requested day files as compact, budget-bounded detail (same trimmed
     shape as _gather's recent_detail). Stops adding heavy detail once the char budget
     is hit, keeping at least each day's summary."""
     budget = _conf_int(conf, "ADVISOR_RETRIEVAL_MAX_CHARS", DEFAULT_RETRIEVAL_MAX_CHARS)
     out, used = {}, 0
+    today = datetime.now().date()
     for ds in date_strs:
         try:
             d = datetime.strptime(ds, "%Y-%m-%d").date()
@@ -406,18 +569,19 @@ def _load_days(date_strs: list[str], conf) -> dict:
         recs = _read_day(d)
         if not recs:
             continue
-        block = {
-            "summary": _day_summary(recs),
+        summary = _day_summary(recs, is_today=(d == today))
+        detail = {
             "cycles": [{**_trim(r, _CYCLE_FIELDS), "ts": _hm(r.get("ts"))}
                        for r in recs if r.get("kind") == "cycle"],
             "settlements": [{**_trim(r, _SETTLE_FIELDS), "ts": _hm(r.get("ts"))}
                             for r in recs if r.get("kind") == "settlement"],
         }
+        block = {"summary": summary, **detail}
         chunk = len(json.dumps(block, default=str))
         if used + chunk > budget:
-            out[ds] = {"summary": block["summary"],
+            out[ds] = {"summary": summary,
                        "note": "per-slot detail omitted (retrieval budget reached)"}
-            break
+            continue
         out[ds] = block
         used += chunk
     return out
@@ -583,11 +747,22 @@ tunable, a new tunable, or a code change.
 Be brief. Low/0% SOC (really ~5%, the BMS floor) and draining the battery to run off
 solar or cheap grid are intended and pre-approved — never flag them as problems.
 
+SOURCE ORDER — Use the user's prompt, conversation_context, and inline data first.
+If they already contain the answer, answer directly. Do not request history just
+because history_manifest says files exist. For daily totals, `performance.daily_summaries`
+is authoritative: AC/house load totals are
+`performance.daily_summaries[date].load_actual_kwh`, PV totals are `pv_actual_kwh`,
+grid import is `day_import_kwh`, grid export is `day_export_kwh`, and economics are
+`realized_net_eur`. Say data is missing only when the date/field is absent from the
+user prompt, conversation_context, and inline data.
+
 DEEPER HISTORY: `history_manifest` lists EVERY day available in data/history/ plus
 the record schema. The inline `performance` data only covers the most recent few days
-in detail. If — and ONLY if — answering needs day(s) outside that inline detail, do
-not guess and do not say you lack data: instead make your ENTIRE reply exactly one
-line and nothing else —
+in detail, but daily_summaries can still answer daily aggregate questions. NEED_HISTORY only when
+the answer requires missing dates, missing fields, or slot-level records that are not already
+in the user's prompt, conversation_context, performance.daily_summaries, or recent_detail.
+If — and ONLY if — answering needs day(s) outside that available inline/chat context, do not
+guess and do not say you lack data: instead make your ENTIRE reply exactly one line and nothing else —
   NEED_HISTORY: <comma-separated YYYY-MM-DD, and/or A..B ranges>
 naming only days present in history_manifest (max {max_days}). You will be re-asked
 with those days attached, and then you answer. If the inline data already suffices,
@@ -596,7 +771,7 @@ just answer — never request history you don't need.
 USER QUESTION: {question}"""
 
 
-def _build_messages(question: str | None, conf) -> tuple[str, str]:
+def _build_messages(question: str | None, conf, conversation_context: str | None = None) -> tuple[str, str]:
     """Build (system, user). Keeps the prompt under ADVISOR_MAX_INPUT_CHARS by
     progressively reducing how many days of per-slot DETAIL are included (daily
     summaries are always kept), then hard-truncating as a last resort. This bounds
@@ -606,6 +781,8 @@ def _build_messages(question: str | None, conf) -> tuple[str, str]:
     base = {"tunables": _tunables(conf), "current_plan": _plan_excerpt(),
             "live_now": _live_excerpt(),   # ground-truth real-time power flow
             "now": datetime.now().astimezone().isoformat()}
+    if conversation_context:
+        base["conversation_context"] = conversation_context
     if question:
         max_days = _conf_int(conf, "ADVISOR_RETRIEVAL_MAX_DAYS", DEFAULT_RETRIEVAL_MAX_DAYS)
         task = _QUESTION_TASK.format(question=question.strip(), max_days=max_days)
@@ -959,13 +1136,13 @@ def _stream_for(mode, system, user, model, conf):
         yield from _stream_api(system, user, model, _api_key(conf))
 
 
-def _answer_with_retrieval(question, conf, mode, model):
+def _answer_with_retrieval(question, conf, mode, model, conversation_context: str | None = None):
     """Question path with on-demand history. Streams the answer live, but sniffs the
     first line: if the model replies with a NEED_HISTORY directive instead of an
     answer, pull those day files from data/history/ and re-ask (pass 2), now streaming
     the real answer. The daily review never comes through here, so it stays cheap."""
     manifest = _history_manifest()
-    system, user = _build_messages(question, conf)
+    system, user = _build_messages(question, conf, conversation_context=conversation_context)
     yield {"type": "stage", "msg": f"Prompt ~{len(system) + len(user):,} chars. Asking {model}…"}
 
     # --- Pass 1: stream, but hold back the first line to detect a directive. ---
@@ -1011,6 +1188,13 @@ def _answer_with_retrieval(question, conf, mode, model):
                "exist — answering from inline data."}
         user2 = user + ("\n\n(You requested more history but no matching days exist. "
                         "Answer with the data already provided; do not request more.)")
+    elif _inline_data_can_satisfy_history_request(question, want, user):
+        yield {"type": "stage", "msg": "Requested history is already in the inline daily "
+               "summaries — re-asking without file retrieval."}
+        user2 = (user + "\n\n(Your first reply requested history, but the inline JSON "
+                 "already contains the requested daily summary values in "
+                 f"performance.daily_summaries for: {', '.join(want)}. Use those "
+                 "values now. Do NOT request more history.)")
     else:
         loaded = _load_days(want, conf)
         yield {"type": "stage", "msg": f"Pulled {len(loaded)} day(s): "
@@ -1018,7 +1202,10 @@ def _answer_with_retrieval(question, conf, mode, model):
         extra = json.dumps({"requested_history": loaded}, default=str)
         user2 = (user + "\n\n=== ADDITIONAL HISTORY (you requested this) ===\n"
                  + extra + "\n=== END ADDITIONAL HISTORY ===\n\n"
-                 "Now answer the question using ALL data above. Do NOT request more history.")
+                 "Now answer the question using ALL data above. A day with only a "
+                 "summary and a retrieval-budget note is still present and valid for "
+                 "daily aggregate totals; do not call it missing unless the needed "
+                 "summary field itself is absent. Do NOT request more history.")
     yield from _stream_for(mode, system, user2, model, conf)
 
 
@@ -1029,6 +1216,8 @@ def run_stream(question: str | None = None):
     never leave the advisor stuck on 'already running'."""
     question_text = (question or "").strip() or None
     mode_name = "question" if question_text else "review"
+    chat = latest_report()
+    conversation = _conversation_context(chat)
     conf = _conf()
     mode = _auth_mode(conf)
     if not mode:
@@ -1037,12 +1226,13 @@ def run_stream(question: str | None = None):
             "this host, set ADVISOR_AUTH=cli. Otherwise set CLAUDE_CODE_OAUTH_TOKEN "
             "in .secrets, or ANTHROPIC_API_KEY for API use."
         )
-        _clear_latest_report()
         now = datetime.now().astimezone().isoformat()
-        _save_latest_report(_latest_record(
-            ok=False, mode=mode_name, question=question_text, report="", model=None,
-            auth=None, generated_at=now, elapsed_s=0, error=error,
-        ))
+        _append_user_message(chat, mode_name, question_text, now)
+        _append_assistant_message(
+            chat, text="", created_at=now, model=None, auth=None,
+            mode=mode_name, elapsed_s=0, ok=False, error=error,
+        )
+        _save_chat(chat)
         yield {"type": "error", "error": error}
         return
     model = _model(conf, mode)
@@ -1053,14 +1243,18 @@ def run_stream(question: str | None = None):
     report_parts = []
     error_msg = None
     try:
-        _clear_latest_report()
+        started_at = datetime.now().astimezone().isoformat()
+        _append_user_message(chat, mode_name, question_text, started_at)
+        _save_chat(chat)
         yield {"type": "stage", "msg": f"Gathering history + tunables ({mode})…"}
         yield _auth_log_event(mode, conf)
         if question_text:
             # Question path: may pull deeper history from data/history/ on demand.
-            events = _answer_with_retrieval(question_text, conf, mode, model)
+            events = _answer_with_retrieval(
+                question_text, conf, mode, model, conversation_context=conversation
+            )
         else:
-            system, user = _build_messages(None, conf)
+            system, user = _build_messages(None, conf, conversation_context=conversation)
             yield {"type": "stage", "msg": f"Prompt ~{len(system) + len(user):,} chars. "
                    f"Calling {model}…"}
             events = _stream_for(mode, system, user, model, conf)
@@ -1069,17 +1263,27 @@ def run_stream(question: str | None = None):
                 report_parts.append(ev.get("text", ""))
             elif ev.get("type") == "error":
                 error_msg = ev.get("error")
+                now = datetime.now().astimezone().isoformat()
+                _append_assistant_message(
+                    chat, text="".join(report_parts).strip(), created_at=now,
+                    model=model, auth=mode, mode=mode_name,
+                    elapsed_s=round(time.time() - t0, 1), ok=False, error=error_msg,
+                )
+                _save_chat(chat)
             yield ev
+            if ev.get("type") == "error":
+                return
         elapsed = round(time.time() - t0, 1)
         generated_at = datetime.now().astimezone().isoformat()
         report = "".join(report_parts).strip()
         if not report and not error_msg:
             error_msg = "No answer produced."
-        _save_latest_report(_latest_record(
-            ok=bool(report and not error_msg), mode=mode_name, question=question_text,
-            report=report, model=model, auth=mode, generated_at=generated_at,
-            elapsed_s=elapsed, error=error_msg,
-        ))
+        _append_assistant_message(
+            chat, text=report, created_at=generated_at, model=model, auth=mode,
+            mode=mode_name, elapsed_s=elapsed, ok=bool(report and not error_msg),
+            error=error_msg,
+        )
+        _save_chat(chat)
         yield {"type": "done", "model": model, "auth": mode,
                "mode": mode_name, "elapsed_s": elapsed, "generated_at": generated_at}
     except GeneratorExit:
@@ -1087,11 +1291,12 @@ def run_stream(question: str | None = None):
     except Exception as e:
         error = f"Advisor failed: {e}"
         now = datetime.now().astimezone().isoformat()
-        _save_latest_report(_latest_record(
-            ok=False, mode=mode_name, question=question_text,
-            report="".join(report_parts).strip(), model=model, auth=mode,
-            generated_at=now, elapsed_s=round(time.time() - t0, 1), error=error,
-        ))
+        _append_assistant_message(
+            chat, text="".join(report_parts).strip(), created_at=now,
+            model=model, auth=mode, mode=mode_name,
+            elapsed_s=round(time.time() - t0, 1), ok=False, error=error,
+        )
+        _save_chat(chat)
         yield {"type": "error", "error": error}
     finally:
         _run_lock.release()
@@ -1105,6 +1310,8 @@ def run(question: str | None = None) -> dict:
     ok / report / model / auth / generated_at / error. Read-only and best-effort."""
     question_text = (question or "").strip() or None
     mode_name = "question" if question_text else "review"
+    chat = latest_report()
+    conversation = _conversation_context(chat)
     conf = _conf()
     mode = _auth_mode(conf)
     if not mode:
@@ -1115,11 +1322,12 @@ def run(question: str | None = None) -> dict:
             ".secrets, or set ANTHROPIC_API_KEY for pay-as-you-go API use."
         )
         generated_at = datetime.now().astimezone().isoformat()
-        _clear_latest_report()
-        _save_latest_report(_latest_record(
-            ok=False, mode=mode_name, question=question_text, report="", model=None,
-            auth=None, generated_at=generated_at, error=error,
-        ))
+        _append_user_message(chat, mode_name, question_text, generated_at)
+        _append_assistant_message(
+            chat, text="", created_at=generated_at, model=None, auth=None,
+            mode=mode_name, ok=False, error=error,
+        )
+        _save_chat(chat)
         return {"ok": False, "model": None, "error": error, "generated_at": generated_at}
 
     model = _model(conf, mode)
@@ -1127,11 +1335,15 @@ def run(question: str | None = None) -> dict:
         return {"ok": False, "model": model,
                 "error": "An advisor review is already running — please wait."}
     try:
-        _clear_latest_report()
+        started_at = datetime.now().astimezone().isoformat()
+        _append_user_message(chat, mode_name, question_text, started_at)
+        _save_chat(chat)
         if question_text:
             # Question path: reuse the streaming retrieval orchestrator, collected.
             parts, err = [], None
-            for ev in _answer_with_retrieval(question_text, conf, mode, model):
+            for ev in _answer_with_retrieval(
+                question_text, conf, mode, model, conversation_context=conversation
+            ):
                 t = ev.get("type")
                 if t == "delta":
                     parts.append(ev.get("text", ""))
@@ -1141,7 +1353,7 @@ def run(question: str | None = None) -> dict:
             result = ({"ok": True, "report": text, "error": None} if text
                       else {"ok": False, "report": "", "error": err or "No answer produced."})
         else:
-            system, user = _build_messages(None, conf)
+            system, user = _build_messages(None, conf, conversation_context=conversation)
             if mode == "custom":
                 result = _call_generic_cli(system, user, conf)
             elif mode == "cli":
@@ -1153,19 +1365,21 @@ def run(question: str | None = None) -> dict:
         result["generated_at"] = datetime.now().astimezone().isoformat()
         result["mode"] = mode_name
         result["question"] = question_text
-        _save_latest_report(_latest_record(
-            ok=bool(result.get("ok")), mode=mode_name, question=question_text,
-            report=result.get("report") or "", model=model, auth=mode,
-            generated_at=result["generated_at"], error=result.get("error"),
-        ))
+        _append_assistant_message(
+            chat, text=result.get("report") or "", created_at=result["generated_at"],
+            model=model, auth=mode, mode=mode_name, ok=bool(result.get("ok")),
+            error=result.get("error"),
+        )
+        _save_chat(chat)
         return result
     except Exception as e:
         generated_at = datetime.now().astimezone().isoformat()
         error = f"Advisor failed: {e}"
-        _save_latest_report(_latest_record(
-            ok=False, mode=mode_name, question=question_text, report="", model=model,
-            auth=mode, generated_at=generated_at, error=error,
-        ))
+        _append_assistant_message(
+            chat, text="", created_at=generated_at, model=model, auth=mode,
+            mode=mode_name, ok=False, error=error,
+        )
+        _save_chat(chat)
         return {"ok": False, "model": model, "error": error,
                 "generated_at": generated_at}
     finally:

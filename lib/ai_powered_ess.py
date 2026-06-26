@@ -923,8 +923,8 @@ def format_plan_summary(result, *, batt_soc=None, source="", price_points=None,
             out.append(_row(label,
                             f_imp_kwh + a_imp_kwh, f_imp_cost + a_imp_cost,
                             f_exp_kwh + a_exp_kwh, f_exp_rev + a_exp_rev))
-            out.append(_row("    └ actual so far", a_imp_kwh, a_imp_cost, a_exp_kwh, a_exp_rev))
-            out.append(_row("    └ forecast rest", f_imp_kwh, f_imp_cost, f_exp_kwh, f_exp_rev))
+            out.append(_row("    └ Actual", a_imp_kwh, a_imp_cost, a_exp_kwh, a_exp_rev))
+            out.append(_row("    └ Forecasted", f_imp_kwh, f_imp_cost, f_exp_kwh, f_exp_rev))
         else:
             label = day_key.strftime('%a %d %b')
             if day_key == today:
