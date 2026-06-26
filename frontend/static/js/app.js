@@ -1067,6 +1067,51 @@ function mdToHtml(md) {
 
 let _advisorBusy = false;
 let _advisorES = null;
+
+function advisorMetaText(record) {
+  if (!record) return "";
+  let when = "";
+  try {
+    when = record.generated_at
+      ? "Generated " + new Date(record.generated_at).toLocaleString([], {
+          dateStyle: "medium",
+          timeStyle: "medium",
+          hour12: false,
+        })
+      : "";
+  } catch (_) {}
+  return [
+    record.mode === "question" ? "Last answer" : "Last daily review",
+    record.model,
+    record.auth,
+    record.elapsed_s != null ? record.elapsed_s + "s" : null,
+    when,
+  ].filter(Boolean).join(" · ");
+}
+
+function renderAdvisorRecord(record) {
+  const report = $("#advisor-report");
+  const meta = $("#advisor-meta");
+  if (!report || !record || (!record.report && !record.error)) return;
+  const question = record.question
+    ? `<div class="advisor-log"><div class="alog alog-stage">Question: ${_esc(record.question)}</div></div>`
+    : "";
+  if (record.report) {
+    report.innerHTML = `${question}<div class="advisor-out">${mdToHtml(record.report)}</div>`;
+  } else {
+    report.innerHTML = `${question}<div class="banner">${_esc(record.error || "Advisor report unavailable.")}</div>`;
+  }
+  if (meta) meta.textContent = advisorMetaText(record);
+}
+
+async function loadAdvisorLatest() {
+  if (_advisorBusy) return;
+  try {
+    const record = await fetch("/api/advisor/latest").then((r) => r.json());
+    if (!_advisorBusy) renderAdvisorRecord(record);
+  } catch (_) { /* keep the empty advisor placeholder */ }
+}
+
 // Streams the advisor run over SSE so the user sees live progress (stages, CLI log
 // lines, and the model's output as it arrives) instead of a silent hang.
 function runAdvisor(question) {
@@ -1160,6 +1205,7 @@ async function refreshMonthly() {
 
 initMobileChrome();
 load();
+loadAdvisorLatest();
 refreshMonthly();
 renderHeaderClock();
 startLiveStream();              // instant live updates via SSE

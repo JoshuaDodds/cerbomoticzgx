@@ -162,6 +162,13 @@ def api_advisor_stream():
                              "Connection": "keep-alive"})
 
 
+@app.route("/api/advisor/latest")
+def api_advisor_latest():
+    """Return the latest persisted advisor report, if one exists."""
+    from frontend import advisor
+    return jsonify(advisor.latest_report())
+
+
 @app.route("/healthz")
 def healthz():
     return jsonify({"ok": True})

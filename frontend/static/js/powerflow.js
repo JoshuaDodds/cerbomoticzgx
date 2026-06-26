@@ -30,7 +30,7 @@
     258: "Recharge", 259: "Scheduled",
   };
 
-  const NODE_LABEL = { grid: "Grid", inv: "Inverter / Charger", house: "AC Loads", solar: "Solar", batt: "Battery", ev: "EV", gas: "Gas" };
+  const NODE_LABEL = { grid: "Grid", inv: "MultiPlus-II", house: "AC Loads", solar: "Solar", batt: "Battery", ev: "EV", gas: "Gas" };
 
   // Origin-centred glyphs (the group's translate sets the visual centre).
   const ICON = {
@@ -43,13 +43,16 @@
     inv: '<g transform="translate(-13,-13) scale(1.15)"><rect x="2" y="2" width="20" height="20" rx="3" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M5 12 q3 -6 6 0 t6 0" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></g>',
   };
 
-  // Animated physical links (source-coloured dots). `ap`/`bp` = [side, offsetFrac].
+  // Animated physical links (source-coloured dots). `ap`/`bp` = [side, offsetFrac];
+  // when omitted, attach sides are auto-picked from the live layout, so the same
+  // edges work for the desktop 3-column AND the narrow 2-column mobile arrangement.
+  // EV/Gas keep an explicit bottom-of-AC-Loads attach with a splay offset.
   const FLOW_EDGES = [
-    { key: "grid",  a: "grid",  ap: ["right", 0],     b: "inv",   bp: ["left", 0],  color: PALETTE.grid },
-    { key: "load",  a: "inv",   ap: ["right", 0],     b: "house", bp: ["left", 0],  color: PALETTE.house },
-    { key: "batt",  a: "inv",   ap: ["bottom", 0],    b: "batt",  bp: ["top", 0],   color: PALETTE.batt },
-    { key: "solar", a: "solar", ap: ["right", 0],     b: "batt",  bp: ["left", 0],  color: PALETTE.solar },
-    { key: "ev",    a: "house", ap: ["bottom", -0.26], b: "ev",   bp: ["top", 0],   color: PALETTE.ev },
+    { key: "grid",  a: "grid",  b: "inv",   color: PALETTE.grid },
+    { key: "load",  a: "inv",   b: "house", color: PALETTE.house },
+    { key: "batt",  a: "inv",   b: "batt",  color: PALETTE.batt },
+    { key: "solar", a: "solar", b: "batt",  color: PALETTE.solar },
+    { key: "ev",    a: "house", ap: ["bottom", -0.26], b: "ev", bp: ["top", 0], color: PALETTE.ev },
   ];
   // Gas is a static link (no instantaneous power to animate), drawn faint to show
   // the connection beneath AC Loads.
@@ -83,8 +86,14 @@
     return "1.8";
   }
 
-  // ---- layout: Victron-style proportions (center column wider; EV+Gas small) --
+  const MOBILE_MAX = 600;   // container width (px) below which the 2-column layout kicks in
+
   function layout(W, H, hasEV, hasGas) {
+    return W < MOBILE_MAX ? layoutMobile(W, H, hasEV, hasGas) : layoutDesktop(W, H, hasEV, hasGas);
+  }
+
+  // Desktop / wide: Victron-style proportions — wider central column, EV+Gas small.
+  function layoutDesktop(W, H, hasEV, hasGas) {
     const xL = 0.145 * W, xC = 0.485 * W, xR = 0.825 * W;
     const wSide = 0.215 * W, wCtr = 0.30 * W;
     const yT = 0.25 * H, yB = 0.72 * H, rowH = 0.36 * H;
@@ -107,13 +116,68 @@
     return N;
   }
 
-  function boxFonts(r) {
+  // Narrow / phone: 2×2 corner cards (Grid/AC-Loads on top, Battery/Solar on the
+  // bottom) around a central MP-II hub — echoing the Victron VRM advanced view — with
+  // EV + a small Gas card below the fold (Gas bottom-centre). Connectors use the
+  // explicit MOBILE_PORTS below so the links radiate cleanly from the hub.
+  //     Grid          AC Loads
+  //            [ MP-II ]
+  //     Battery       Solar
+  //     · · · fold · · ·
+  //          EV    Gas(small)
+  function layoutMobile(W, H, hasEV, hasGas) {
+    const xL = 0.27 * W, xR = 0.73 * W, colW = 0.395 * W;   // narrower → Solar↔Battery line visible
+    // Corner cards are a FIXED, content-fit height (so there's no empty space at the
+    // bottom of the cards). The remaining vertical space becomes the gaps around the
+    // MP-II hub, which also gives the radiating connectors room to read. EV + a small
+    // Gas card sit below, side by side (no overlap).
+    const ch = 104, ch1 = 68, mph = 100, evh = 74, gash = 54;
+    const gap = Math.max(30, (H - (28 + ch + mph + ch + evh)) / 3);
+    const r1cy = 14 + ch / 2;
+    const invCy = 14 + ch + gap + mph / 2;
+    const r2cy = 14 + ch + gap + mph + gap + ch / 2;
+    const belowCy = 14 + ch + gap + mph + gap + ch + gap + evh / 2;
+    const N = {
+      grid:  { x: xL, y: r1cy, w: colW, h: ch },
+      house: { x: xR, y: r1cy, w: colW, h: ch },
+      batt:  { x: xL, y: r2cy, w: colW, h: ch },
+      solar: { x: xR, y: r2cy, w: colW, h: ch1 },          // shorter (1 detail row), centred on r2cy
+      inv:   { x: 0.5 * W, y: invCy, w: 0.36 * W, h: mph },  // centre hub (kept larger)
+    };
+    if (hasEV)  N.ev  = { x: 0.38 * W, y: belowCy, w: 0.32 * W, h: evh };   // bottom-centre-left
+    if (hasGas) N.gas = { x: 0.69 * W, y: belowCy, w: 0.22 * W, h: gash };  // small, bottom-centre-right
+    return N;
+  }
+
+  // Auto-pick attach sides from the two boxes' relative position (horizontal bias so
+  // same-row cards connect side-to-side and stacked cards connect top/bottom).
+  function autoPorts(ra, rb) {
+    const dx = rb.x - ra.x, dy = rb.y - ra.y;
+    if (Math.abs(dx) * 1.7 >= Math.abs(dy))
+      return dx >= 0 ? [["right", 0], ["left", 0]] : [["left", 0], ["right", 0]];
+    return dy >= 0 ? [["bottom", 0], ["top", 0]] : [["top", 0], ["bottom", 0]];
+  }
+
+  // Explicit attach ports for the mobile hub layout, so the four links radiate
+  // cleanly from the central MP-II instead of being auto-routed across cards.
+  const MOBILE_PORTS = {
+    grid:  { ap: ["bottom", 0.2], bp: ["top", -0.3] },    // grid bottom -> inv top-left
+    load:  { ap: ["top", 0.3], bp: ["bottom", -0.2] },    // inv top-right -> AC-loads bottom
+    batt:  { ap: ["bottom", -0.3], bp: ["top", 0.2] },    // inv bottom-left -> battery top
+    solar: { ap: ["left", 0], bp: ["right", 0] },         // solar -> battery (horizontal)
+  };
+
+  // Width-aware (so narrow cards don't overflow) with an optional scale `k`
+  // (mobile passes k<1 to shrink fonts/labels a touch — desktop uses k=1, unchanged).
+  function boxFonts(r, k) {
+    k = k || 1;
+    const fit = (a, b, lo, hi) => clamp(Math.min(a, b) * k, lo, hi);
     return {
-      title: clamp(r.h * 0.11, 10, 17),
-      big: clamp(Math.min(r.h * 0.22, r.w * 0.17), 13, 46),
-      row: clamp(r.h * 0.085, 9, 15),
-      state: clamp(r.w * 0.115, 13, 36),
-      iscale: clamp(r.h * 0.11 / 17, 0.42, 0.8),
+      title: fit(r.h * 0.11, r.w * 0.135, 8, 17),
+      big: fit(r.h * 0.22, r.w * 0.17, 11, 46),
+      row: fit(r.h * 0.085, r.w * 0.11, 7.5, 15),
+      state: fit(r.w * 0.115, r.h * 0.18, 12, 34),
+      iscale: clamp(Math.min(r.h, r.w) * 0.11 / 17 * k, 0.38, 0.8),
     };
   }
 
@@ -132,7 +196,12 @@
     const c2 = { x: t.x + t.dx * L, y: t.y + t.dy * L };
     return `M${f(s.x)},${f(s.y)} C${f(c1.x)},${f(c1.y)} ${f(c2.x)},${f(c2.y)} ${f(t.x)},${f(t.y)}`;
   }
-  const edgePath = (e, N) => pathBetween(port(N[e.a], e.ap), port(N[e.b], e.bp));
+  function edgePath(e, N, mobile) {
+    let ap = e.ap, bp = e.bp;
+    if (mobile && MOBILE_PORTS[e.key]) { ap = MOBILE_PORTS[e.key].ap; bp = MOBILE_PORTS[e.key].bp; }
+    if (!ap || !bp) { const a = autoPorts(N[e.a], N[e.b]); ap = ap || a[0]; bp = bp || a[1]; }
+    return pathBetween(port(N[e.a], ap), port(N[e.b], bp));
+  }
 
   function txt(id, x, y, o, content) {
     o = o || {};
@@ -142,8 +211,8 @@
     return `<text${idAttr} x="${f(x)}" y="${f(y)}" text-anchor="${o.anchor || "start"}" font-size="${sz}"${weight} fill="${o.fill || "var(--text)"}">${content || ""}</text>`;
   }
 
-  function edgeSvg(e, N, dur, fwd) {
-    const d = edgePath(e, N), kp = fwd ? "0;1" : "1;0";
+  function edgeSvg(e, N, dur, fwd, mobile) {
+    const d = edgePath(e, N, mobile), kp = fwd ? "0;1" : "1;0";
     let s = `<path id="pf-base-${e.key}" d="${d}" fill="none" stroke="${e.color}" stroke-width="5.5" stroke-linecap="round" opacity="0.12"/>`;
     for (let i = 0; i < 2; i++) {
       const begin = (-i * parseFloat(dur) / 2).toFixed(2);
@@ -155,10 +224,10 @@
   }
   const gasSvg = (N) => `<path id="pf-base-gas" d="${edgePath(GAS_EDGE, N)}" fill="none" stroke="${PALETTE.gas}" stroke-width="5.5" stroke-linecap="round" opacity="0.12"/>`;
 
-  function buildCard(key, N) {
+  function buildCard(key, N, mobile) {
     const r = N[key]; if (!r) return "";
-    const F = boxFonts(r), x0 = r.x - r.w / 2, y0 = r.y - r.h / 2;
-    const pad = clamp(r.w * 0.06, 8, 20), L = x0 + pad, R = x0 + r.w - pad;
+    const F = boxFonts(r, mobile ? 0.8 : 1), x0 = r.x - r.w / 2, y0 = r.y - r.h / 2;
+    const pad = clamp(r.w * (mobile ? 0.05 : 0.06), mobile ? 5 : 8, mobile ? 12 : 20), L = x0 + pad, R = x0 + r.w - pad;
     let s = `<rect id="pf-card-${key}" x="${f(x0)}" y="${f(y0)}" width="${f(r.w)}" height="${f(r.h)}" rx="14" fill="var(--panel-2)" stroke="var(--line)" stroke-width="2.5"/>`;
     s += `<g id="pf-icon-${key}" transform="translate(${f(x0 + pad + 9)},${f(y0 + pad + 9)}) scale(${F.iscale.toFixed(2)})" color="var(--muted)">${ICON[key]}</g>`;
     s += txt(null, x0 + pad + 22, y0 + pad + F.title + 1, { size: F.title, fill: "var(--muted)" }, NODE_LABEL[key]);
@@ -185,6 +254,66 @@
       s += txt(`pf-ev-energy`, L, y0 + r.h * 0.82, { size: F.row, fill: "var(--muted)" }, "");
     } else if (key === "gas") {
       s += txt(`pf-gas-big`, L, y0 + r.h * 0.58, { size: F.big, weight: 700 }, "—");
+    }
+    return s;
+  }
+
+  // Mobile-only VRM-style card: icon+name header → big value (large number, small
+  // unit via tspans) → divider → compact labelled detail rows. Uses data we already
+  // have. (Desktop keeps buildCard above, untouched.)
+  const MOBILE_ROWS = {
+    grid:  [["L1", "pf-grid-l1"], ["L2", "pf-grid-l2"], ["L3", "pf-grid-l3"]],
+    house: [["L1", "pf-house-l1"], ["L2", "pf-house-l2"], ["L3", "pf-house-l3"]],
+    batt:  [["Voltage", "pf-batt-volt"], ["Current", "pf-batt-curr"], ["Temp", "pf-batt-temp"]],
+    solar: [["Yield today", "pf-solar-kwh"]],
+    ev:    [["Total", "pf-ev-energy"]],
+  };
+  function buildCardMobile(key, N) {
+    const r = N[key]; if (!r) return "";
+    const x0 = r.x - r.w / 2, y0 = r.y - r.h / 2;
+    const pad = clamp(r.w * 0.07, 6, 12), L = x0 + pad, R = x0 + r.w - pad;
+    // Fonts scale with the card's (content-fit) height so the rows fill it tightly.
+    const nameF = clamp(Math.min(r.h * 0.115, r.w * 0.12), 9, 13.5);
+    const bigF = clamp(Math.min(r.h * 0.24, r.w * 0.18), 14, 27);
+    const unitF = Math.max(9, bigF * 0.52);
+    const rowF = clamp(Math.min(r.h * 0.105, r.w * 0.105), 9, 12.5);
+    const iscale = clamp(nameF / 15, 0.42, 0.6);
+    let s = `<rect id="pf-card-${key}" x="${f(x0)}" y="${f(y0)}" width="${f(r.w)}" height="${f(r.h)}" rx="12" fill="var(--panel-2)" stroke="var(--line)" stroke-width="2"/>`;
+
+    // Centre hub: centred icon + name + state word.
+    if (key === "inv") {
+      s += `<g id="pf-icon-inv" transform="translate(${f(r.x)},${f(y0 + r.h * 0.34)}) scale(${(iscale * 1.6).toFixed(2)})" color="var(--muted)">${ICON.inv}</g>`;
+      s += txt(null, r.x, y0 + r.h * 0.62, { size: nameF, anchor: "middle", fill: "var(--muted)" }, NODE_LABEL.inv);
+      s += `<text id="pf-inv-bignum" x="${f(r.x)}" y="${f(y0 + r.h * 0.85)}" text-anchor="middle" font-size="${(bigF * 0.66).toFixed(1)}" font-weight="700" fill="var(--text)">—</text>`;
+      return s;
+    }
+
+    // Header: icon + name (Battery shows charge-state + power instead of the name).
+    s += `<g id="pf-icon-${key}" transform="translate(${f(x0 + pad + 7)},${f(y0 + pad + 7)}) scale(${iscale.toFixed(2)})" color="var(--muted)">${ICON[key]}</g>`;
+    if (key === "batt") {
+      s += txt(`pf-batt-charge`, x0 + pad + 17, y0 + pad + nameF, { size: nameF, fill: "var(--muted)" }, "—");
+      s += txt(`pf-batt-power`, R, y0 + pad + nameF, { size: nameF, anchor: "end", fill: "var(--muted)" }, "");
+    } else {
+      s += txt(null, x0 + pad + 17, y0 + pad + nameF, { size: nameF, fill: "var(--muted)" }, NODE_LABEL[key]);
+    }
+
+    // Big split value (number large, unit small) as inline tspans.
+    const bigY = y0 + pad + nameF + bigF + 2;
+    s += `<text x="${f(L)}" y="${f(bigY)}" font-size="${bigF.toFixed(1)}" font-weight="700" fill="var(--text)">`
+       + `<tspan id="pf-${key}-bignum">—</tspan> `
+       + `<tspan id="pf-${key}-bigunit" font-size="${unitF.toFixed(1)}" font-weight="600" fill="var(--muted)"></tspan></text>`;
+
+    // Compact labelled detail rows.
+    const rows = MOBILE_ROWS[key];
+    if (rows && rows.length) {
+      const divY = bigY + 5;
+      s += `<line x1="${f(L)}" y1="${f(divY)}" x2="${f(R)}" y2="${f(divY)}" stroke="var(--line)"/>`;
+      const startY = divY + rowF + 4, step = rowF + 3;   // tight line spacing
+      rows.forEach(([lab, id], i) => {
+        const y = startY + i * step;
+        s += txt(null, L, y, { size: rowF, fill: "var(--muted)" }, lab);
+        s += txt(id, R, y, { size: rowF, anchor: "end" }, "—");
+      });
     }
     return s;
   }
@@ -249,7 +378,8 @@
       ev: ev != null && A(ev),
     };
 
-    let battState = A(batt) ? (batt > 0 ? "Charging" : "Discharging") : "Idle";
+    const chargeWord = A(batt) ? (batt > 0 ? "Charging" : "Discharging") : "Idle";
+    let battState = chargeWord;
     const ttg = num(live.batt_ttg);
     if (batt < -15 && ttg != null && ttg > 0 && ttg < 360000) battState += " · " + fmtHM(ttg);
     const vaw = [
@@ -263,24 +393,35 @@
                   : (A(batt) ? (batt > 0 ? "Charging" : "Discharging") : "Idle");
     const invCol = (batt || 0) > 15 ? PALETTE.batt : ((batt || 0) < -15 ? "#eab308" : "var(--line)");
 
-    const V = {
-      "pf-grid-big": gridBig(grid),
-      "pf-grid-l1": fmtWs(num(live.grid_l1)), "pf-grid-l2": fmtWs(num(live.grid_l2)), "pf-grid-l3": fmtWs(num(live.grid_l3)),
-      "pf-house-big": fmtW(load),
-      "pf-house-l1": fmtWs(num(live.load_l1)), "pf-house-l2": fmtWs(num(live.load_l2)), "pf-house-l3": fmtWs(num(live.load_l3)),
-      "pf-solar-big": fmtW(pv),
-      "pf-solar-sub": today.solar_kwh != null ? kwh(today.solar_kwh) + " today" : "",
-      "pf-batt-temp": live.batt_temp != null && isFinite(Number(live.batt_temp)) ? Math.round(Number(live.batt_temp)) + " °C" : "",
-      "pf-batt-big": soc != null ? Math.round(soc) + " %" : "—",
-      "pf-batt-state": battState,
-      "pf-batt-vaw": vaw,
-      "pf-inv-big": sysWord,
+    const V = {};
+    // Combined value (desktop pf-X-big) + split number/unit (mobile VRM tspans).
+    const big = (key, str) => {
+      V["pf-" + key + "-big"] = str;
+      const m = /^(.*\S)\s(\S+)$/.exec(String(str));
+      V["pf-" + key + "-bignum"] = m ? m[1] : str;
+      V["pf-" + key + "-bigunit"] = m ? m[2] : "";
     };
+    big("grid", gridBig(grid));
+    V["pf-grid-l1"] = fmtWs(num(live.grid_l1)); V["pf-grid-l2"] = fmtWs(num(live.grid_l2)); V["pf-grid-l3"] = fmtWs(num(live.grid_l3));
+    big("house", fmtW(load));
+    V["pf-house-l1"] = fmtWs(num(live.load_l1)); V["pf-house-l2"] = fmtWs(num(live.load_l2)); V["pf-house-l3"] = fmtWs(num(live.load_l3));
+    big("solar", fmtW(pv));
+    V["pf-solar-sub"] = today.solar_kwh != null ? kwh(today.solar_kwh) + " today" : "";
+    V["pf-solar-kwh"] = today.solar_kwh != null ? kwh(today.solar_kwh) : "—";
+    big("batt", soc != null ? Math.round(soc) + " %" : "—");
+    V["pf-batt-temp"] = live.batt_temp != null && isFinite(Number(live.batt_temp)) ? Math.round(Number(live.batt_temp)) + " °C" : "—";
+    V["pf-batt-state"] = battState;
+    V["pf-batt-charge"] = chargeWord;
+    V["pf-batt-vaw"] = vaw;
+    V["pf-batt-volt"] = live.batt_voltage != null && isFinite(Number(live.batt_voltage)) ? Number(live.batt_voltage).toFixed(2) + " V" : "—";
+    V["pf-batt-curr"] = live.batt_current != null && isFinite(Number(live.batt_current)) ? Number(live.batt_current).toFixed(1) + " A" : "—";
+    V["pf-batt-power"] = isFinite(batt) ? fmtWs(batt) : "";
+    V["pf-inv-big"] = sysWord; V["pf-inv-bignum"] = sysWord; V["pf-inv-bigunit"] = "";
     if (ev != null) {
-      V["pf-ev-big"] = fmtW(ev);
+      big("ev", fmtW(ev));
       V["pf-ev-energy"] = fmtEnergy(num(live.ev_energy_kwh));
     }
-    if (gasM3 != null) V["pf-gas-big"] = gasM3.toFixed(2) + " m³";
+    if (gasM3 != null) big("gas", gasM3.toFixed(2) + " m³");
 
     return { flows, active, invCol, V, hasEV: ev != null, hasGas: gasM3 != null, gasOn: gasM3 != null && gasM3 > 0 };
   }
@@ -313,7 +454,7 @@
     if (H < 120) H = Math.round(W * 0.58);
 
     const fr = computeFrame(live, plan);
-    const sig = `${fr.hasEV ? 1 : 0}${fr.hasGas ? 1 : 0}|${Math.round(W / 8)}|${Math.round(H / 8)}`;
+    const sig = `${W < MOBILE_MAX ? "m" : "d"}${fr.hasEV ? 1 : 0}${fr.hasGas ? 1 : 0}|${Math.round(W / 8)}|${Math.round(H / 8)}`;
 
     if (sig === _sig && box.querySelector("svg")) {
       applyEdges(box, fr.flows);
@@ -324,8 +465,12 @@
 
     // ---- full (re)build ------------------------------------------------------
     _sig = sig;
+    const mobile = W < MOBILE_MAX;
     const N = layout(W, H, fr.hasEV, fr.hasGas);
-    const edges = FLOW_EDGES.filter((e) => e.key !== "ev" || fr.hasEV);
+    // Mobile draws the four hub links (grid/load/batt/solar); EV/Gas are cards only.
+    const edges = mobile
+      ? FLOW_EDGES.filter((e) => e.key !== "ev")
+      : FLOW_EDGES.filter((e) => e.key !== "ev" || fr.hasEV);
     edges.forEach((e) => { _edgeDur[e.key] = durFor(fr.flows[e.key].mag); _edgeDir[e.key] = fr.flows[e.key].fwd ? "0;1" : "1;0"; });
 
     const cardKeys = ["grid", "inv", "house", "solar", "batt"];
@@ -334,9 +479,9 @@
 
     box.innerHTML = `
       <svg viewBox="0 0 ${f(W)} ${f(H)}" width="100%" height="100%" preserveAspectRatio="xMidYMid meet" style="display:block" role="img" aria-label="live power flow">
-        ${edges.map((e) => edgeSvg(e, N, _edgeDur[e.key], fr.flows[e.key].fwd)).join("")}
-        ${fr.hasGas ? gasSvg(N) : ""}
-        ${cardKeys.map((k) => buildCard(k, N)).join("")}
+        ${edges.map((e) => edgeSvg(e, N, _edgeDur[e.key], fr.flows[e.key].fwd, mobile)).join("")}
+        ${!mobile && fr.hasGas ? gasSvg(N) : ""}
+        ${cardKeys.map((k) => mobile ? buildCardMobile(k, N) : buildCard(k, N, false)).join("")}
       </svg>`;
 
     applyEdges(box, fr.flows);

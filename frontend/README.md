@@ -99,7 +99,12 @@ sharing the host's `/dev/shm` (so it can read the published plan). Expose
   shows the live SystemState word (mirroring `lib/constants.py`); the Grid headline
   shows **► import / ◄ export**. The SVG is **responsive** — it measures its container
   and re-lays everything to fill the full width **and** height (good for embedding on
-  any screen) via a `ResizeObserver`. Dependency-free, built once and mutated in
+  any screen) via a `ResizeObserver`. On phones it switches to a **VRM-style portrait
+  layout** — 2×2 corner cards (Grid · AC Loads on top, Battery · Solar below) around a
+  centre **MP-II hub**, each card showing a big split value (large number, small unit)
+  over compact labelled detail rows (Grid/Loads per-phase W; Battery Voltage/Current/
+  Temp), with EV and a small **Gas** card below the fold. The desktop 3-column layout
+  is untouched. Dependency-free, built once and mutated in
   place, updated via the live SSE push; the **EV** and **Gas** cards appear when
   `ev_w` / the plan's `gas_m³` are present. (Note: the **top-nav "Live"** entry is a
   different thing — an iframe to the external `http://192.168.1.163/app/` dashboard;
@@ -127,7 +132,10 @@ sharing the host's `/dev/shm` (so it can read the published plan). Expose
   (never secrets) + the current plan to a model via a **subscription-login CLI**
   (`ADVISOR_CLI_CMD` → Claude Code / Gemini / Codex), with extended thinking off and
   a hard prompt cap. For deep questions it pulls extra days from `data/history/` on
-  demand (`NEED_HISTORY` protocol). See the advisor config in `.env` / `.secrets`.
+  demand (`NEED_HISTORY` protocol). The latest completed report or latest error is
+  saved to `data/advisor_latest.json` and restored into the Advisor tab on browser
+  refresh. Starting a new review/question clears the previous saved result and
+  replaces it when that run finishes. See the advisor config in `.env` / `.secrets`.
 - **Configuration** (tab): click any value to edit it (number/select), confirm, and Save.
   On phones, descriptions sit behind an info toggle so edit targets remain large.
 
@@ -178,6 +186,7 @@ reuses `MOSQUITTO_IP` and `VRM_PORTAL_ID`.
 - `GET /api/history/day?days_back=1` — a prior day's settled hour-tree (previous-day view).
 - `POST /api/advisor` — run the read-only advisor (default review, or `{ "question": … }`).
 - `GET /api/advisor/stream?question=…` — Server-Sent Events stream of the advisor run.
+- `GET /api/advisor/latest` — latest saved advisor report/error restored on refresh.
 - `GET /api/config` — settings schema with current values.
 - `POST /api/config` — `{ "key": ..., "value": ... }`, writes one allow-listed setting.
 - `POST /api/replan` — ask the main service to re-run the optimizer now.

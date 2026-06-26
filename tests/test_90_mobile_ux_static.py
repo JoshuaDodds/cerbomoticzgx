@@ -108,3 +108,15 @@ def test_desktop_logo_and_clear_schedule_js_hooks_exist():
     assert "function clearImportSchedule(" in js
     assert 'fetch("/api/victron/clear-schedule", { method: "POST" })' in js
     assert "Clear Import Schedule?" in js
+
+
+def test_advisor_latest_report_loads_on_browser_startup():
+    js = APP_JS.read_text(encoding="utf-8")
+
+    assert "function renderAdvisorRecord(" in js
+    assert "function loadAdvisorLatest(" in js
+    assert 'fetch("/api/advisor/latest")' in js
+    assert "loadAdvisorLatest();" in js
+    assert "Generated " in js
+    assert "dateStyle" in js
+    assert "timeStyle" in js

@@ -44,8 +44,82 @@ DEFAULT_RETRIEVAL_MAX_CHARS = 120000     # ~30K tokens; one full day of slots is
 # Claude Code CLI streaming flags (overridable via ADVISOR_CLI_STREAM_ARGS in case a
 # CLI version differs). stream-json + partial messages gives token-by-token output.
 DEFAULT_STREAM_ARGS = "--output-format stream-json --verbose --include-partial-messages"
+ADVISOR_LATEST_PATH = os.path.join("data", "advisor_latest.json")
 
 _run_lock = threading.Lock()
+
+
+# --------------------------------------------------------------------------- #
+# Latest report persistence
+# --------------------------------------------------------------------------- #
+def _atomic_write_json(path: str, payload: dict) -> None:
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    tmp = f"{path}.tmp.{os.getpid()}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _clear_latest_report() -> None:
+    try:
+        os.remove(ADVISOR_LATEST_PATH)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def _latest_record(
+    *,
+    ok: bool,
+    mode: str,
+    question: str | None,
+    report: str,
+    model: str | None,
+    auth: str | None,
+    generated_at: str,
+    elapsed_s: float | None = None,
+    error: str | None = None,
+) -> dict:
+    record = {
+        "ok": ok,
+        "mode": mode,
+        "question": question,
+        "report": report or "",
+        "model": model,
+        "auth": auth,
+        "generated_at": generated_at,
+    }
+    if elapsed_s is not None:
+        record["elapsed_s"] = elapsed_s
+    if error:
+        record["error"] = error
+    return record
+
+
+def _save_latest_report(record: dict) -> None:
+    _atomic_write_json(ADVISOR_LATEST_PATH, record)
+
+
+def latest_report() -> dict:
+    try:
+        with open(ADVISOR_LATEST_PATH, encoding="utf-8") as fh:
+            record = json.load(fh)
+    except FileNotFoundError:
+        return {"ok": False, "report": ""}
+    except (OSError, json.JSONDecodeError):
+        return {"ok": False, "report": "", "error": "Latest advisor report is unavailable."}
+    return record if isinstance(record, dict) else {"ok": False, "report": ""}
 
 
 # --------------------------------------------------------------------------- #
@@ -953,36 +1027,72 @@ def run_stream(question: str | None = None):
     Read-only. The lock is released — and any CLI subprocess killed — when the
     generator closes, including when the browser disconnects, so a wedged run can
     never leave the advisor stuck on 'already running'."""
+    question_text = (question or "").strip() or None
+    mode_name = "question" if question_text else "review"
     conf = _conf()
     mode = _auth_mode(conf)
     if not mode:
-        yield {"type": "error", "error": (
+        error = (
             "No Claude credentials configured. If `claude` is already logged in on "
             "this host, set ADVISOR_AUTH=cli. Otherwise set CLAUDE_CODE_OAUTH_TOKEN "
-            "in .secrets, or ANTHROPIC_API_KEY for API use.")}
+            "in .secrets, or ANTHROPIC_API_KEY for API use."
+        )
+        _clear_latest_report()
+        now = datetime.now().astimezone().isoformat()
+        _save_latest_report(_latest_record(
+            ok=False, mode=mode_name, question=question_text, report="", model=None,
+            auth=None, generated_at=now, elapsed_s=0, error=error,
+        ))
+        yield {"type": "error", "error": error}
         return
     model = _model(conf, mode)
     if not _run_lock.acquire(blocking=False):
         yield {"type": "error", "error": "An advisor review is already running — please wait."}
         return
     t0 = time.time()
+    report_parts = []
+    error_msg = None
     try:
+        _clear_latest_report()
         yield {"type": "stage", "msg": f"Gathering history + tunables ({mode})…"}
         yield _auth_log_event(mode, conf)
-        if question:
+        if question_text:
             # Question path: may pull deeper history from data/history/ on demand.
-            yield from _answer_with_retrieval(question, conf, mode, model)
+            events = _answer_with_retrieval(question_text, conf, mode, model)
         else:
             system, user = _build_messages(None, conf)
             yield {"type": "stage", "msg": f"Prompt ~{len(system) + len(user):,} chars. "
                    f"Calling {model}…"}
-            yield from _stream_for(mode, system, user, model, conf)
+            events = _stream_for(mode, system, user, model, conf)
+        for ev in events:
+            if ev.get("type") == "delta":
+                report_parts.append(ev.get("text", ""))
+            elif ev.get("type") == "error":
+                error_msg = ev.get("error")
+            yield ev
+        elapsed = round(time.time() - t0, 1)
+        generated_at = datetime.now().astimezone().isoformat()
+        report = "".join(report_parts).strip()
+        if not report and not error_msg:
+            error_msg = "No answer produced."
+        _save_latest_report(_latest_record(
+            ok=bool(report and not error_msg), mode=mode_name, question=question_text,
+            report=report, model=model, auth=mode, generated_at=generated_at,
+            elapsed_s=elapsed, error=error_msg,
+        ))
         yield {"type": "done", "model": model, "auth": mode,
-               "mode": "question" if question else "review",
-               "elapsed_s": round(time.time() - t0, 1),
-               "generated_at": datetime.now().astimezone().isoformat()}
+               "mode": mode_name, "elapsed_s": elapsed, "generated_at": generated_at}
+    except GeneratorExit:
+        raise
     except Exception as e:
-        yield {"type": "error", "error": f"Advisor failed: {e}"}
+        error = f"Advisor failed: {e}"
+        now = datetime.now().astimezone().isoformat()
+        _save_latest_report(_latest_record(
+            ok=False, mode=mode_name, question=question_text,
+            report="".join(report_parts).strip(), model=model, auth=mode,
+            generated_at=now, elapsed_s=round(time.time() - t0, 1), error=error,
+        ))
+        yield {"type": "error", "error": error}
     finally:
         _run_lock.release()
 
@@ -993,24 +1103,35 @@ def run_stream(question: str | None = None):
 def run(question: str | None = None) -> dict:
     """Run the advisor (default review, or answer `question`). Returns a dict with
     ok / report / model / auth / generated_at / error. Read-only and best-effort."""
+    question_text = (question or "").strip() or None
+    mode_name = "question" if question_text else "review"
     conf = _conf()
     mode = _auth_mode(conf)
     if not mode:
-        return {"ok": False, "model": None, "error": (
+        error = (
             "No Claude credentials configured. If `claude` is already installed and "
             "logged in on this host, set ADVISOR_AUTH=cli in .env to use that login. "
             "Otherwise put a CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`) in "
-            ".secrets, or set ANTHROPIC_API_KEY for pay-as-you-go API use.")}
+            ".secrets, or set ANTHROPIC_API_KEY for pay-as-you-go API use."
+        )
+        generated_at = datetime.now().astimezone().isoformat()
+        _clear_latest_report()
+        _save_latest_report(_latest_record(
+            ok=False, mode=mode_name, question=question_text, report="", model=None,
+            auth=None, generated_at=generated_at, error=error,
+        ))
+        return {"ok": False, "model": None, "error": error, "generated_at": generated_at}
 
     model = _model(conf, mode)
     if not _run_lock.acquire(blocking=False):
         return {"ok": False, "model": model,
                 "error": "An advisor review is already running — please wait."}
     try:
-        if question:
+        _clear_latest_report()
+        if question_text:
             # Question path: reuse the streaming retrieval orchestrator, collected.
             parts, err = [], None
-            for ev in _answer_with_retrieval(question, conf, mode, model):
+            for ev in _answer_with_retrieval(question_text, conf, mode, model):
                 t = ev.get("type")
                 if t == "delta":
                     parts.append(ev.get("text", ""))
@@ -1030,10 +1151,22 @@ def run(question: str | None = None) -> dict:
         result["model"] = model
         result["auth"] = mode
         result["generated_at"] = datetime.now().astimezone().isoformat()
-        result["mode"] = "question" if question else "review"
+        result["mode"] = mode_name
+        result["question"] = question_text
+        _save_latest_report(_latest_record(
+            ok=bool(result.get("ok")), mode=mode_name, question=question_text,
+            report=result.get("report") or "", model=model, auth=mode,
+            generated_at=result["generated_at"], error=result.get("error"),
+        ))
         return result
     except Exception as e:
-        return {"ok": False, "model": model, "error": f"Advisor failed: {e}",
-                "generated_at": datetime.now().astimezone().isoformat()}
+        generated_at = datetime.now().astimezone().isoformat()
+        error = f"Advisor failed: {e}"
+        _save_latest_report(_latest_record(
+            ok=False, mode=mode_name, question=question_text, report="", model=model,
+            auth=mode, generated_at=generated_at, error=error,
+        ))
+        return {"ok": False, "model": model, "error": error,
+                "generated_at": generated_at}
     finally:
         _run_lock.release()

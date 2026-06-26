@@ -382,10 +382,20 @@
 
   .powerflow {
     max-width: none;
+    /* Portrait VRM-style flow (2×2 corners + centre MP-II hub, driven by
+       powerflow.js when the container is narrow). Content-fit cards + generous gaps
+       for the radiating connectors; sized to sit comfortably in the viewport. */
+    height: clamp(540px, 82vh, 680px);
   }
 
   .powerflow svg {
-    min-height: 330px;
+    min-height: 300px;
+  }
+
+  /* Trim the card padding around the diagram on phones so the SVG gets more width
+     (gives the energy-flow connectors more room to breathe). */
+  #tab-live .card {
+    padding: 7px;
   }
 
   .cfg-note {
