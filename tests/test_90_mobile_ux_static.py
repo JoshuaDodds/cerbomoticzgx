@@ -37,6 +37,19 @@ def test_mobile_navigation_markup_is_hidden_by_default():
     assert "Venus" in html
 
 
+def test_desktop_overview_entry_precedes_ess_and_uses_power_flow_default():
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    js = APP_JS.read_text(encoding="utf-8")
+    css = (ROOT / "frontend" / "static" / "css" / "app.css").read_text(encoding="utf-8")
+
+    assert 'data-app-view="overview">Overview</a>' in html
+    assert html.index('data-app-view="overview"') < html.index('data-app-view="ess"')
+    assert 'const APP_VIEWS = ["overview", "ess", "battery", "live"]' in js
+    assert 'return isMobileLayout() ? "ess" : "overview"' in js
+    assert 'if (view === "overview" && !isMobileLayout()) activateTab("live")' in js
+    assert 'body[data-app-view="ess"] .overview' in css
+
+
 def test_mobile_logo_has_home_action_hook():
     html = INDEX_HTML.read_text(encoding="utf-8")
 
@@ -102,7 +115,9 @@ def test_desktop_logo_and_clear_schedule_js_hooks_exist():
     js = APP_JS.read_text(encoding="utf-8")
 
     assert "function goHome(" in js
+    assert "setAppView(\"overview\")" in js
     assert "setAppView(\"ess\")" in js
+    assert "activateTab(\"live\")" in js
     assert "activateTab(\"schedule\")" in js
     assert "history.replaceState" in js
     assert "function clearImportSchedule(" in js

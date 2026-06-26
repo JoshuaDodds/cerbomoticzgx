@@ -47,6 +47,9 @@ body {
 .status-strip .kv small { color: var(--muted); }
 
 .overview { max-width: 1100px; margin: 0 auto; padding: 14px 16px 0; }
+@media (min-width: 681px) {
+  body[data-app-view="ess"] .overview { display: none; }
+}
 .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 14px; }
 .metric { background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
 .metric .label { color: var(--muted); font-size: 12px; }

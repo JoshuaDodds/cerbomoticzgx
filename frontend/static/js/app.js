@@ -99,21 +99,27 @@ document.querySelectorAll(".tab").forEach((t) => {
 let firstRender = true;
 
 // ---- Top-level app views ----
-const APP_VIEWS = ["ess", "battery", "live"];
+const APP_VIEWS = ["overview", "ess", "battery", "live"];
+function defaultAppViewName() {
+  return isMobileLayout() ? "ess" : "overview";
+}
 function setAppView(viewName) {
-  const view = APP_VIEWS.includes(viewName) ? viewName : "ess";
+  const view = APP_VIEWS.includes(viewName) ? viewName : defaultAppViewName();
+  const panelView = view === "overview" ? "ess" : view;
+  document.body.dataset.appView = view;
   document.querySelectorAll(".app-view").forEach((x) => x.classList.remove("active"));
   document.querySelectorAll(".app-nav-link").forEach((x) => x.classList.remove("active"));
-  const panel = $(`#${view}-view`);
+  const panel = $(`#${panelView}-view`);
   const link = document.querySelector(`.app-nav-link[data-app-view="${view}"]`);
   if (panel) panel.classList.add("active");
   if (link) link.classList.add("active");
+  if (view === "overview" && !isMobileLayout()) activateTab("live");
   syncMobileNavState();
 }
 
 function appViewFromHash() {
   const v = (window.location.hash || "").replace("#", "");
-  return APP_VIEWS.includes(v) ? v : "ess";
+  return APP_VIEWS.includes(v) ? v : defaultAppViewName();
 }
 
 document.querySelectorAll(".app-nav-link").forEach((link) => {
@@ -193,8 +199,13 @@ function goHome(e) {
     e.preventDefault();
     e.stopPropagation();
   }
-  setAppView("ess");
-  activateTab("schedule");
+  if (isMobileLayout()) {
+    setAppView("ess");
+    activateTab("schedule");
+  } else {
+    setAppView("overview");
+    activateTab("live");
+  }
   closeMobileMenu();
   if (window.location.hash) {
     history.replaceState(null, "", window.location.pathname + window.location.search);
