@@ -18,4 +18,4 @@ while true; do
 done &
 
 # start the gitops controller
-/app/sgc-simple-gitops-controller.sh | ts %Y-%m-%d" "%H:%M:%S
+# /app/sgc-simple-gitops-controller.sh | ts %Y-%m-%d" "%H:%M:%S
