@@ -18,11 +18,11 @@ RUN pip install -r /app/requirements.txt
 #    rm -f /etc/apt/apt.conf.d/docker-clean \
 #    && apt-get update \
 #    && apt-get install -yqq --no-install-recommends \
-#      socat netcat nano rsync curl tzdata bsdmainutils psmisc net-tools moreutils mosquitto-clients
+#      socat netcat-openbsd nano rsync curl tzdata bsdmainutils psmisc net-tools moreutils mosquitto-clients
 
 RUN apt-get update \
     && apt-get install -yqq --no-install-recommends \
-      socat netcat nano rsync curl tzdata bsdmainutils psmisc net-tools moreutils mosquitto-clients
+      socat netcat-openbsd nano rsync curl tzdata bsdmainutils psmisc net-tools moreutils mosquitto-clients
 
 # Node.js + Claude Code CLI — used by the dashboard's read-only AI advisor (the
 # advisor shells out to `claude`). Container auth is non-interactive, so provide a
