@@ -15,6 +15,7 @@
 
 ## Things to always think about when editing code
 **CRITICAL SYSTEM WARNING:** This project controls a 16KW 3-phase electrical system. System uptime is critical, and software-induced power loss is unacceptable. All changes must be made with extreme care, prioritizing stability and reliability. 
+NEVER remove a secret from .secrets - This is imperative. You may add new credentials but may not remove anything there already.
 ---
 
 ## Python code style

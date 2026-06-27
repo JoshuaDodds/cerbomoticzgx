@@ -1,5 +1,5 @@
 # syntax = docker/dockerfile:1.2
-FROM python:3.10.6
+FROM python:3.11.11
 ENV PYTHONUNBUFFERED 1
 
 # Create all directories
