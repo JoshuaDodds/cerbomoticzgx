@@ -7,8 +7,32 @@ on:
   workflow_dispatch:
 
 jobs:
+  unit_tests:
+    if: "github.event_name != 'push' || !contains(github.event.head_commit.message, 'skip ci')"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Repository Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest
+
+      - name: Run unit tests
+        run: |
+          export DEV=1
+          pytest -q
+
   build_and_push:
-    if: "!contains(github.event.head_commit.message, 'skip ci')"
+    if: "github.event_name != 'push' || !contains(github.event.head_commit.message, 'skip ci')"
+    needs: unit_tests
     runs-on: ubuntu-latest
     permissions:
       contents: write
