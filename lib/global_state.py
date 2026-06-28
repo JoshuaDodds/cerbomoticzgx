@@ -91,6 +91,12 @@ class GlobalStateClient:
                 return 0
 
     @staticmethod
+    def has(key):
+        with SQLiteConnection("/dev/shm/cerbo_state.db") as cursor:
+            cursor.execute("SELECT 1 FROM data WHERE key=? LIMIT 1", (str(key),))
+            return cursor.fetchone() is not None
+
+    @staticmethod
     def set(key, value):
         _value = reduce_decimal(value)
 

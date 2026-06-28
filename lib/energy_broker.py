@@ -1388,13 +1388,11 @@ def run_ai_optimizer():
     try:
         # 1. Retrieve data
         batt_soc = STATE.get('batt_soc')
-        # NOTE: STATE.get() returns 0 for BOTH a missing key and a real 0%. With a
-        # 0% summer reserve the battery can legitimately sit at 0%, so use battery
-        # voltage as the "is the battery actually reporting" signal — only skip when
-        # there's genuinely no battery data, not when SoC is a valid 0%.
-        battery_reporting = bool(STATE.get('batt_voltage'))
-        if batt_soc is None or (batt_soc == 0 and not battery_reporting):
-            logging.warning("AI_ESS: Battery data not available (no SoC/voltage). Skipping optimization.")
+        # STATE.get() returns 0 for both a missing key and a real 0%, so require
+        # the SoC key itself to exist before treating 0 as a valid battery reading.
+        soc_reporting = STATE.has('batt_soc') if hasattr(STATE, 'has') else batt_soc is not None
+        if not soc_reporting or batt_soc is None:
+            logging.warning("AI_ESS: Battery SoC not available yet. Skipping optimization.")
             return
 
         # Snapshot the realized power NOW, before we apply this cycle's setpoint,

@@ -45,6 +45,9 @@ class DummyState:
     def get(self, key):
         return self._values.get(key)
 
+    def has(self, key):
+        return key in self._values
+
 
 def test_hourly_load_profile_normalised(monkeypatch):
     monkeypatch.setattr(energy_broker, "retrieve_setting", lambda name: None)
@@ -336,6 +339,31 @@ def test_manual_grid_charge_on_reads_toggle(monkeypatch):
     assert energy_broker._manual_grid_charge_on() is False
     monkeypatch.setattr(energy_broker, "STATE", DummyState({}))
     assert energy_broker._manual_grid_charge_on() is False
+
+
+def test_ai_optimizer_skips_when_soc_key_missing_but_voltage_exists(monkeypatch, caplog):
+    monkeypatch.setattr(energy_broker, "retrieve_setting",
+                        lambda name: "1" if name == "AI_POWERED_ESS_ALGORITHM" else None)
+    monkeypatch.setattr(energy_broker, "STATE", DummyState({"batt_voltage": 53.4}))
+    prices = MagicMock(return_value=[{"start": "2026-06-28T09:15:00+02:00"}])
+    monkeypatch.setattr(energy_broker, "get_all_price_points", prices)
+
+    energy_broker.run_ai_optimizer()
+
+    prices.assert_not_called()
+    assert "Battery SoC not available yet" in caplog.text
+
+
+def test_ai_optimizer_accepts_reported_zero_soc(monkeypatch):
+    monkeypatch.setattr(energy_broker, "retrieve_setting",
+                        lambda name: "1" if name == "AI_POWERED_ESS_ALGORITHM" else None)
+    monkeypatch.setattr(energy_broker, "STATE", DummyState({"batt_soc": 0, "batt_voltage": 53.4}))
+    prices = MagicMock(return_value=[])
+    monkeypatch.setattr(energy_broker, "get_all_price_points", prices)
+
+    energy_broker.run_ai_optimizer()
+
+    prices.assert_called_once()
 
 
 # --- SELL hysteresis (minimum dwell + price band) ---------------------------

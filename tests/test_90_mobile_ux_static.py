@@ -42,6 +42,13 @@ def test_mobile_navigation_markup_is_hidden_by_default():
     assert "Venus" in html
 
 
+def test_venus_iframe_uses_https_endpoint():
+    html = INDEX_HTML.read_text(encoding="utf-8")
+
+    assert 'src="https://venus.hs.mfis.net/app/"' in html
+    assert "http://192.168.1.163/app/" not in html
+
+
 def test_overview_entry_precedes_ess_and_desktop_uses_power_flow_default():
     html = INDEX_HTML.read_text(encoding="utf-8")
     js = APP_JS.read_text(encoding="utf-8")

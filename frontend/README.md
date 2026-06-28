@@ -110,7 +110,7 @@ sharing the host's `/dev/shm` (so it can read the published plan). Expose
   is untouched. Dependency-free, built once and mutated in
   place, updated via the live SSE push; the **EV** and **Gas** cards appear when
   `ev_w` / the plan's `gas_m³` are present. (Note: the **top-nav "Live"** entry is a
-  different thing — an iframe to the external `http://192.168.1.163/app/` dashboard;
+  different thing — an iframe to the external `https://venus.hs.mfis.net/app/` dashboard;
   this SVG power-flow is the **ESS view's "Live" sub-tab**.)
 - **Trends** (tab): HA-style metric cards (**self-sufficiency %**, **self-consumed
   solar %**, **grid balance** bar) above a gradient SoC% + buy-price line chart with
