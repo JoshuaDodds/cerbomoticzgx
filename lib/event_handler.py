@@ -2,7 +2,7 @@ import os
 import math
 import signal
 
-from lib.helpers import get_topic_key, publish_message
+from lib.helpers import get_topic_key, publish_message, is_truthy
 from lib.constants import logging
 from lib.config_retrieval import retrieve_setting
 from lib.victron_integration import regulate_battery_max_voltage, ac_power_setpoint
@@ -21,7 +21,7 @@ from lib.energy_broker import (
 LOAD_RESERVATION = int(retrieve_setting("LOAD_RESERVATION")) or 0
 LOAD_RESERVATION_REDUCTION_FACTOR = float(retrieve_setting("LOAD_REDUCTION_FACTOR")) or 1
 MINIMUM_ESS_SOC = int(retrieve_setting("MINIMUM_ESS_SOC")) or 100
-HOME_CONNECT_APPLIANCE_SCHEDULING = bool(retrieve_setting("HOME_CONNECT_APPLIANCE_SCHEDULING")) or False
+HOME_CONNECT_APPLIANCE_SCHEDULING = is_truthy(retrieve_setting("HOME_CONNECT_APPLIANCE_SCHEDULING"))
 
 class Event:
 
@@ -171,6 +171,18 @@ class Event:
 
         if _value:
             grid_import_state = "Enabled"
+            # Apply the retain / grid-assist setpoint immediately so the override
+            # takes effect now (hold the battery; let the grid cover all loads,
+            # including a full-power EV charge) instead of waiting for the next
+            # power event or optimizer cycle. Honoured even while the AI ESS is in
+            # control via manage_grid_usage_based_on_current_price.
+            try:
+                manage_grid_usage_based_on_current_price(
+                    price=self.gs_client.get('tibber_price_now'),
+                    power=self.gs_client.get('ac_out_power'),
+                )
+            except Exception as e:
+                logging.info(f"grid_charging_enabled: immediate apply failed: {e}")
         else:
             grid_import_state = "Disabled"
             ac_power_setpoint(watts="0.0", override_ess_net_mettering=False, silent=False)

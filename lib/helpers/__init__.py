@@ -15,6 +15,21 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S')
 
 
+def is_truthy(value, default: bool = False) -> bool:
+    """Parse a config/env value as a boolean.
+
+    Accepts real booleans and the usual string spellings ("1"/"true"/"yes"/"on").
+    Critically, a string such as ``"False"`` is treated as False — plain
+    ``bool("False")`` is True because any non-empty string is truthy, which is the
+    source of several "setting ignored" config bugs.
+    """
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
 def publish_message(topic, message=None, qos=0, retain=False, payload=None) -> None:
     """
     publishes a single message to a given topic on the MQtt broker
@@ -30,6 +45,15 @@ def publish_message(topic, message=None, qos=0, retain=False, payload=None) -> N
 
     except Exception as e:
         logging.info(f"{e}", exc_info=True)
+
+
+def clear_victron_schedules() -> None:
+    """Disable all five Victron ESS scheduled-charge slots."""
+    from lib.constants import systemId0
+
+    for i in range(0, 5):
+        topic_stub = f"W/{systemId0}/settings/0/Settings/CGwacs/BatteryLife/Schedule/Charge/{i}/"
+        publish_message(f"{topic_stub}Day", payload="{\"value\": -1}", retain=False)
 
 
 def remove_message(topic, qos=0, retain=True):
@@ -155,6 +179,27 @@ def is_winter_month():
     winter_months = {9, 10, 11, 12, 1, 2}
     return datetime.now().month in winter_months
 
+
+def current_min_soc_reserve() -> float:
+    """Single source of truth for the battery minimum-SoC reserve (%).
+
+    Resolves the seasonal reserve from .env (MIN_SOC_RESERVE_WINTER / SUMMER)
+    using the one season rule (is_winter_month). Both the optimizer's planning
+    floor AND the Victron hardware MinimumSocLimit derive from this, so they can
+    never diverge. The cells' own BMS remains the ultimate low-SoC cutoff.
+    """
+    from lib.config_retrieval import retrieve_setting
+
+    def _f(name, default):
+        try:
+            return float(retrieve_setting(name))
+        except (TypeError, ValueError):
+            return default
+
+    if is_winter_month():
+        return _f('MIN_SOC_RESERVE_WINTER', 20.0)
+    return _f('MIN_SOC_RESERVE_SUMMER', 5.0)
+
 def get_seasonally_adjusted_max_charge_slots(batt_soc: float, pv_production_remaining: float = 0.0) -> int:
     """
     Returns: (int): max number of 1 hour charge slots needed to top up the battery from the grid
@@ -166,7 +211,9 @@ def get_seasonally_adjusted_max_charge_slots(batt_soc: float, pv_production_rema
 
     if pv_production_remaining:
         # convert pv_forecasted from kWh to a percentage assuming battery capacity of 40kWh
-        pv_production_remaining = round((pv_production_remaining / 40) * 100, 2)
+        from lib.config_retrieval import retrieve_setting
+        battery_capacity = float(retrieve_setting('BATTERY_CAPACITY_KWH') or 45.0)
+        pv_production_remaining = round((pv_production_remaining / battery_capacity) * 100, 2)
 
     current_month = datetime.now().month
 

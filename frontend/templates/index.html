@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>cerbomoticzGx · ESS Dashboard</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.mobile.css') }}" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand" data-home data-mobile-home>
+      <img src="{{ url_for('static', filename='img/logo_final.png') }}" alt="CerbomoticzGX" class="brand-logo"/>
+      <nav class="app-nav" aria-label="Application sections">
+        <a href="#overview" class="app-nav-link active" data-app-view="overview">Overview</a>
+        <a href="#ess" class="app-nav-link" data-app-view="ess">ESS</a>
+        <a href="#battery" class="app-nav-link" data-app-view="battery">Battery</a>
+        <a href="#live" class="app-nav-link" data-app-view="live">Victron</a>
+      </nav>
+    </div>
+    <div id="mobile-key-stat" class="mobile-key-stat" aria-live="polite" hidden></div>
+    <div id="status-strip" class="status-strip">
+      <span class="muted">loading…</span>
+    </div>
+    <div id="header-clock" class="header-clock"></div>
+  </header>
+
+  <div id="ess-view" class="app-view active">
+    <section class="overview">
+      <div id="metrics" class="metrics"></div>
+      <div class="overview-row">
+        <div id="solar" class="card solar"></div>
+        <div id="decision" class="card decision"></div>
+      </div>
+      <!-- Day cost summary lives here (above the tabs) so it's visible on every tab. -->
+      <div id="day-summary" class="card"></div>
+    </section>
+
+    <nav class="tabs">
+      <button class="tab" data-tab="live">Power Flow</button>
+      <button class="tab" data-tab="trends">Trends</button>
+      <button class="tab active" data-tab="schedule">Schedule</button>
+      <button class="tab" data-tab="victron">Import Schedule</button>
+      <button class="tab" data-tab="advisor">Advisor</button>
+      <button class="tab" data-tab="config">Configuration</button>
+    </nav>
+
+    <main>
+      <section id="tab-live" class="tab-panel">
+        <div class="card">
+          <div id="powerflow" class="powerflow"><span class="muted">waiting for live feed…</span></div>
+        </div>
+      </section>
+
+      <section id="tab-trends" class="tab-panel">
+        <div id="energy-metrics" class="metrics-grid"></div>
+        <div class="card">
+          <h3 style="margin:2px 0 10px">SoC &amp; price across the horizon</h3>
+          <div id="horizon-chart" class="chart"><span class="muted">no plan yet…</span></div>
+        </div>
+        <div class="card">
+          <h3 style="margin:2px 0 10px">Daily net — month so far</h3>
+          <div id="monthly-chart" class="chart"><span class="muted">loading…</span></div>
+        </div>
+      </section>
+
+      <section id="tab-schedule" class="tab-panel active">
+        <div class="legend">
+          <span class="chip mode-idle">IDLE</span>
+          <span class="chip mode-retain">RETAIN</span>
+          <span class="chip mode-buy">BUY</span>
+          <span class="chip mode-sell">SELL</span>
+          <span class="muted">— click an hour to expand to 15-min, click a slot for the reason</span>
+        </div>
+
+        <div class="card">
+          <div class="table-head hour-row">
+            <span class="col-time">Hour</span>
+            <span class="col-bar">Timeline</span>
+            <span class="col-num">Avg €/kWh</span>
+            <span class="col-num">Grid</span>
+            <span class="col-num">Prod.</span>
+            <span class="col-num">Cons.</span>
+            <span class="col-num">SoC</span>
+            <span class="col-num">Net</span>
+          </div>
+          <div id="prev-day" class="prev-day"></div>
+          <div id="hours"></div>
+        </div>
+      </section>
+
+      <section id="tab-victron" class="tab-panel">
+        <div class="tab-actions import-schedule-actions">
+          <button id="clear-import-schedule" type="button" class="btn-secondary btn-danger">Clear schedule</button>
+        </div>
+        <p class="cfg-note">The grid-charge schedule the optimizer has programmed into the
+          CerboGX (Settings → ESS → Scheduled charging). 5 slots, mirrored here.</p>
+        <div id="victron-schedules" class="card"></div>
+      </section>
+
+      <section id="tab-advisor" class="tab-panel">
+        <div class="card advisor">
+          <p class="cfg-note">A read-only AI review of recent optimizer behaviour. Run the daily
+            review, or ask a specific question — it analyses history + tunables and never changes
+            config or control.</p>
+          <div class="advisor-controls">
+            <button id="advisor-clear" class="btn-secondary btn-danger">Clear chat</button>
+            <button id="advisor-review" class="btn-secondary">Run daily review</button>
+            <form id="advisor-ask" class="advisor-ask">
+              <input id="advisor-q" type="text" autocomplete="off"
+                     placeholder="Ask a question, e.g. Why did we sell at 15:00 yesterday?"/>
+              <button type="submit" class="btn-secondary">Ask</button>
+            </form>
+          </div>
+          <div id="advisor-meta" class="advisor-meta muted"></div>
+          <div id="advisor-report" class="advisor-report">
+            <span class="muted">No review yet — run the daily review or ask a question.</span>
+          </div>
+        </div>
+      </section>
+
+      <section id="tab-config" class="tab-panel">
+        <div id="config"></div>
+      </section>
+    </main>
+
+    <footer class="foot">
+      <span id="meta" class="muted"></span>
+      <button id="replan" class="btn" data-replan title="Re-run the optimizer now on current data">Replan</button>
+    </footer>
+  </div>
+
+  <section id="battery-view" class="app-view battery-view" aria-label="Battery rack metrics">
+    <div class="card battery-frame-card">
+      <iframe class="battery-frame" src="https://batt.hs.mfis.net/" title="Battery rack metrics"></iframe>
+    </div>
+  </section>
+
+  <section id="live-view" class="app-view live-view" aria-label="CerboGx">
+    <div class="card live-frame-card">
+      <iframe class="live-frame" src="https://venus.hs.mfis.net/gui-v2/" title="CerboGX system view"></iframe>
+    </div>
+  </section>
+
+  <nav class="mobile-bottom-nav" hidden aria-label="Mobile dashboard navigation">
+    <button type="button" class="mobile-nav-item" data-mobile-menu-toggle aria-controls="mobile-menu" aria-expanded="false">
+      <span class="mobile-nav-icon mobile-nav-menu" aria-hidden="true"></span>
+      <span>Menu</span>
+    </button>
+    <button type="button" class="mobile-nav-item" data-mobile-tab="live">
+      <span class="mobile-nav-icon mobile-nav-live" aria-hidden="true"></span>
+      <span>Flow</span>
+    </button>
+    <button type="button" class="mobile-nav-item" data-mobile-tab="schedule">
+      <span class="mobile-nav-icon mobile-nav-schedule" aria-hidden="true"></span>
+      <span>Schedule</span>
+    </button>
+    <button type="button" class="mobile-nav-item" data-mobile-tab="trends">
+      <span class="mobile-nav-icon mobile-nav-trends" aria-hidden="true"></span>
+      <span>Trends</span>
+    </button>
+    <button type="button" class="mobile-nav-item" data-mobile-tab="advisor">
+      <span class="mobile-nav-icon mobile-nav-advisor" aria-hidden="true"></span>
+      <span>Advisor</span>
+    </button>
+  </nav>
+
+  <div id="mobile-menu" class="mobile-menu" hidden>
+    <div class="mobile-menu-panel" role="dialog" aria-modal="true" aria-label="Mobile menu">
+      <div class="mobile-menu-head">
+        <span>Menu</span>
+        <button type="button" class="mobile-menu-close" data-mobile-menu-close aria-label="Close menu">Close</button>
+      </div>
+      <div class="mobile-menu-group" aria-label="Application sections">
+        <button type="button" data-mobile-app-view="battery">Battery</button>
+        <button type="button" data-mobile-app-view="live">Venus</button>
+      </div>
+      <div class="mobile-menu-group" aria-label="Dashboard tabs">
+        <button type="button" data-mobile-tab="victron">Import Schedule</button>
+        <button type="button" data-mobile-tab="config">Configuration</button>
+        <button id="mobile-replan" type="button" data-replan>Replan</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Self-contained, dependency-free view modules. Loaded before app.js, which
+       calls them defensively (try/catch) so a failure here can't break the rest. -->
+  <script src="{{ url_for('static', filename='js/powerflow.js') }}"></script>
+  <script src="{{ url_for('static', filename='js/charts.js') }}"></script>
+  <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>

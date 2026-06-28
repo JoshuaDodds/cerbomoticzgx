@@ -35,11 +35,27 @@ LOGIN_DATA = {"username": retrieve_setting('VRM_USER'), "password": retrieve_set
 API_URL = retrieve_setting('VRM_API_URL')
 
 
-def get_consumption_readings():
-    now_tz = datetime.now(TIMEZONE)
-    start_of_today = int(now_tz.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-    end_of_today = int((now_tz + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+def _vrm_auth_headers():
+    """Return VRM API auth headers, or None on failure.
 
+    Prefers a personal access token (``VRM_API_TOKEN``). Victron deprecated the
+    username/password login flow on 2026-06-01, so access tokens are the
+    supported method: the token is sent directly as ``X-Authorization: Token
+    <token>`` (note: a single space, and ``Token`` — not ``Bearer``, which is
+    only for the legacy /auth/login session token).
+
+    Falls back to the legacy username/password login (VRM_USER/VRM_PASS ->
+    Bearer) when no access token is configured, so existing deployments keep
+    working until they migrate.
+    """
+    api_token = retrieve_setting('VRM_API_TOKEN')
+    if api_token:
+        return {
+            'Content-Type': 'application/json',
+            'x-authorization': f'Token {api_token}',
+        }
+
+    # Legacy username/password login (deprecated by Victron 2026-06-01).
     try:
         response = requests.post(LOGIN_URL, json=LOGIN_DATA, timeout=5)
         token = response.json().get("token")
@@ -48,13 +64,24 @@ def get_consumption_readings():
         return None
 
     if not token:
-        logging.info("Failed to get the token for VRM Portal API access. Check login credentials.")
+        logging.info("Failed to get the token for VRM Portal API access. Check login "
+                     "credentials, or set VRM_API_TOKEN in .secrets to use access-token auth.")
         return None
 
-    headers = {
+    return {
         'Content-Type': 'application/json',
-        'x-authorization': f'Bearer {token}'
+        'x-authorization': f'Bearer {token}',
     }
+
+
+def get_consumption_readings():
+    now_tz = datetime.now(TIMEZONE)
+    start_of_today = int(now_tz.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+    end_of_today = int((now_tz + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+
+    headers = _vrm_auth_headers()
+    if not headers:
+        return None
 
     params = {
         'type': "consumption",
@@ -96,28 +123,18 @@ def get_victron_solar_forecast():
     # now = int(now_tz.timestamp()) - 60
     now_tz = datetime.now(TIMEZONE)
     start_of_today = int(now_tz.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-    end_of_today = int((now_tz + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+    # Request a 2-day window so the forecast returns today AND tomorrow (used by
+    # the AI optimizer to plan day-2 charging around expected solar).
+    end_of_window = int((now_tz + timedelta(days=2)).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
 
-    try:
-        response = requests.post(LOGIN_URL, json=LOGIN_DATA, timeout=5)
-        token = response.json().get("token")
-    except (requests.ConnectTimeout, requests.ConnectionError) as LoginError:
-        logging.info(f"Connectivity issue to VRM Login endpoint: {LoginError}")
-        return
-
-    if not token:
-        logging.info("Failed to get the token for VRM Portal API access (solar_forecasting). Check login credentials in .env config file.")
+    headers = _vrm_auth_headers()
+    if not headers:
         return None  # We will try again in 5 minutes when the scheduler invokes this method in a new thread again.
-
-    headers = {
-        'Content-Type': 'application/json',
-        'x-authorization': f'Bearer {token}'
-    }
 
     params = {
         'type': "forecast",
         "start": start_of_today,
-        "end": end_of_today,
+        "end": end_of_window,
         "interval": "days",
     }
 
@@ -146,7 +163,9 @@ def get_victron_solar_forecast():
         try:
             # VRM solar forecast data
             solar_production = actual_solar_generation() * 1000
-            solar_production_left = round(float(data['solar_yield_forecast'][0][1]), 2) - solar_production
+            # Clamp remaining to >= 0: once actual production exceeds the day's
+            # forecast, "remaining" would otherwise go negative (meaningless).
+            solar_production_left = max(0.0, round(float(data['solar_yield_forecast'][0][1]), 2) - solar_production)
             solar_forecast_kwh = round(solar_production_left + solar_production, 2)
 
             logging.debug(
@@ -154,6 +173,16 @@ def get_victron_solar_forecast():
 
             STATE.set('pv_projected_today', solar_forecast_kwh)
             STATE.set('pv_projected_remaining', solar_production_left)
+
+            # Tomorrow's forecast daily solar total (Wh) for day-2 planning. The
+            # 2-day window returns index [1] for tomorrow; guarded so a missing
+            # second day never affects today's values.
+            try:
+                pv_tomorrow_wh = round(float(data['solar_yield_forecast'][1][1]), 2)
+                STATE.set('pv_projected_tomorrow', pv_tomorrow_wh)
+                logging.debug(f"Tomorrow pv forecast: {pv_tomorrow_wh} Wh")
+            except (ValueError, TypeError, IndexError, KeyError):
+                STATE.set('pv_projected_tomorrow', 0.0)
 
             # VRM consumption forecast data
             try:

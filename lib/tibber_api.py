@@ -1,25 +1,70 @@
 import tibber
 import time
+import requests
+import json
+import os
+import threading
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dateutil import parser, tz
+
+# Tibber GraphQL endpoint used for direct price queries (needed to request
+# quarter-hourly resolution, which the tibber python library does not expose).
+TIBBER_GQL_URL = "https://api.tibber.com/v1-beta/gql"
 
 from lib.config_retrieval import retrieve_setting
 from lib.constants import logging, systemId0
 from lib.domoticz_updater import domoticz_update
 from lib.clients.mqtt_client_factory import VictronClient
-from gql.transport.exceptions import TransportClosed
+from gql.transport.exceptions import TransportClosed, TransportQueryError
 from websockets.exceptions import ConnectionClosedError
 
 logging.getLogger("gql.transport").setLevel(logging.ERROR)
 
 tzinfos = {"UTC": tz.gettz(retrieve_setting('TIMEZONE'))}
-account = tibber.Account(retrieve_setting('TIBBER_ACCESS_TOKEN'))
-_home = account.homes[0]
+
+
+# The tibber library fetches the GraphQL schema over the network IN the Account()
+# constructor, so initialising it inline would block import (and thus the whole
+# service start) — and crash outright if Tibber is down. Start with no account and
+# populate it from a background daemon thread that retries with backoff, so a slow
+# or unreachable Tibber can never block or crash startup. The single consumer
+# (``live_measurements``) reads ``_home`` at call time and skips if not ready yet.
+account = None
+_home = None
+
+
+def _account_init_worker(delay: float = 5.0):
+    global account, _home
+    token = retrieve_setting('TIBBER_ACCESS_TOKEN')
+    while True:
+        try:
+            acct = tibber.Account(token)
+            account, _home = acct, (acct.homes[0] if acct.homes else None)
+            logging.info("Tibber: account initialised.")
+            return
+        except Exception as e:                      # network/timeout/transport errors
+            logging.warning("Tibber: account init failed (retry in %ss): %s", int(delay), e)
+            time.sleep(delay)
+            delay = min(delay * 2, 60.0)            # exponential backoff, capped at 60s
+
+
+threading.Thread(target=_account_init_worker, name="tibber-account-init", daemon=True).start()
 
 client = VictronClient().get_client()
 
-def live_measurements(home=_home or None):
+_PRICE_CACHE = {}
+DEFAULT_PRICE_CACHE_PATH = "/dev/shm/cerbo_tibber_price_cache.json"
+
+def live_measurements(home=None):
+    # Resolve the account-backed home at CALL time (it's initialised in the
+    # background), and skip gracefully if Tibber isn't ready yet — the caller/
+    # scheduler will retry.
+    home = home if home is not None else _home
+    if home is None:
+        logging.warning("Tibber: live_measurements skipped — account not ready yet.")
+        return
+
     @home.event("live_measurement")
     async def log_accumulated(data):
         try:
@@ -62,10 +107,15 @@ def live_measurements(home=_home or None):
         home.start_live_feed(user_agent=f"cerbomoticzgx/{retrieve_setting('VERSION')}",
                              retries=10,
                              retry_interval=10)
-    except (TransportClosed, ConnectionClosedError) as e:
+    except (TransportClosed, ConnectionClosedError, TransportQueryError) as e:
+        # TransportQueryError covers Tibber refusing to start the live stream
+        # (e.g. "unable to start stream ... for device") — typically a transient
+        # Tibber-side issue or a stale/duplicate session. Route it through the
+        # same supervised restart instead of letting it crash main().
         logging.warning(
             "Tibber Error: %s. It seems we have a network/connectivity issue. "
-            "This can also be caused by a Tibber API outage. Attempting a service restart...",
+            "This can also be caused by a Tibber API outage or a stale live-feed "
+            "session. Attempting a service restart...",
             e,
         )
         # this will trigger event_handler to restart the whole service
@@ -82,7 +132,12 @@ def dip_peak_data(caller=None, level="CHEAP", day=0, price_cap=0.22):
     _account = tibber.Account(retrieve_setting('TIBBER_ACCESS_TOKEN'))
     home = _account.homes[0]
 
-    for i in range(1, 25):
+    prices = home.current_subscription.price_info.today if day == 0 else home.current_subscription.price_info.tomorrow
+
+    if not prices:
+        return data
+
+    for i in range(1, len(prices) + 1):
         if day == 0:
             hour = today_price_points(home, i)
             if level in hour[2] and time.localtime()[3] <= today_price_points(home, i)[0].hour and hour[3] <= price_cap:
@@ -106,6 +161,13 @@ def publish_pricing_data(caller):
         mqtt_publish_highest_price_points(home)
         mqtt_publish_current_price(home)
 
+        # Publish all price points for AI optimizer. Accept any truthy form of
+        # the flag ("1", "true", "yes", "on", "True") for consistency with the
+        # EnergyBroker truthiness check.
+        ai_flag = str(retrieve_setting('AI_POWERED_ESS_ALGORITHM') or "").strip().lower()
+        if ai_flag in {"1", "true", "yes", "on"}:
+            mqtt_publish_all_prices(home)
+
         # c = _account.websession.close()
         # c.close()
         # del home, _account
@@ -115,8 +177,305 @@ def publish_pricing_data(caller):
     except Exception as e:
         logging.error(f"Tibber: (publish_pricing_data) (Error): {e}")
 
+def mqtt_publish_all_prices(home):
+    """
+    Publishes all available price points (today and tomorrow) to MQTT for the AI optimizer.
+    """
+    try:
+        prices = []
+        if home.current_subscription.price_info.today:
+            prices.extend(home.current_subscription.price_info.today)
+        if home.current_subscription.price_info.tomorrow:
+            prices.extend(home.current_subscription.price_info.tomorrow)
+
+        if prices:
+            # Sort by time just in case, though usually they are sorted
+            prices.sort(key=lambda x: x.starts_at)
+
+            # Create a simplified list of dicts
+            price_list = []
+            for p in prices:
+                 price_list.append({
+                     "start": p.starts_at,
+                     "total": p.total,
+                     "level": p.level
+                 })
+
+            # Publish as a single JSON blob
+            import json
+            payload = json.dumps(price_list)
+            client.publish("Tibber/home/price_info/all", payload=payload, qos=0, retain=True)
+            logging.debug(f"Tibber: Published {len(price_list)} price points to Tibber/home/price_info/all")
+
+    except Exception as e:
+        logging.error(f"Tibber: Error publishing all prices: {e}")
+
+def _price_cache_path(resolution: str) -> str:
+    configured = retrieve_setting('TIBBER_PRICE_CACHE_PATH') or DEFAULT_PRICE_CACHE_PATH
+    root, ext = os.path.splitext(configured)
+    ext = ext or ".json"
+    return f"{root}_{resolution}{ext}"
+
+
+def _parse_price_start(value):
+    if isinstance(value, datetime):
+        return value
+    text = str(value)
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return parser.parse(text, tzinfos=tzinfos)
+
+
+def _normalise_price_points(points: list) -> list:
+    normalised = []
+    for p in points or []:
+        start = p.get("start")
+        try:
+            start_iso = _parse_price_start(start).isoformat()
+            normalised.append({
+                "start": start_iso,
+                "total": float(p["total"]),
+                "level": p.get("level"),
+            })
+        except (KeyError, TypeError, ValueError):
+            continue
+    normalised.sort(key=lambda x: x["start"])
+    return normalised
+
+
+def _cache_price_points(resolution: str, points: list) -> None:
+    """Persist the last good price horizon in memory and /dev/shm.
+
+    This gives the optimizer a safe fallback when Tibber has a transient API
+    timeout. Best-effort only: cache write failures must never block planning.
+    """
+    normalised = _normalise_price_points(points)
+    if not normalised:
+        return
+
+    payload = {
+        "resolution": resolution,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "points": normalised,
+    }
+    _PRICE_CACHE[resolution] = payload
+
+    try:
+        path = _price_cache_path(resolution)
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        tmp = f"{path}.tmp"
+        with open(tmp, "w") as fh:
+            json.dump(payload, fh)
+        os.replace(tmp, path)
+    except OSError as e:
+        logging.debug("Tibber: could not write %s price cache: %s", resolution, e)
+
+
+def _load_price_cache(resolution: str) -> dict | None:
+    cached = _PRICE_CACHE.get(resolution)
+    if cached:
+        return cached
+
+    try:
+        with open(_price_cache_path(resolution)) as fh:
+            cached = json.load(fh)
+        if cached.get("resolution") == resolution:
+            _PRICE_CACHE[resolution] = cached
+            return cached
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    return None
+
+
+def _cached_price_points(resolution: str) -> list:
+    """Return cached prices only when they still cover the current slot horizon."""
+    cached = _load_price_cache(resolution)
+    if not cached:
+        return []
+
+    points = _normalise_price_points(cached.get("points") or [])
+    if not points:
+        return []
+
+    try:
+        starts = [_parse_price_start(p["start"]) for p in points]
+        starts.sort()
+        now = datetime.now(starts[0].tzinfo)
+        if len(starts) > 1:
+            gaps = [(starts[i] - starts[i - 1]).total_seconds() for i in range(1, len(starts))]
+            positive_gaps = [g for g in gaps if g > 0]
+            slot_h = min(positive_gaps) / 3600.0 if positive_gaps else 0.25
+        else:
+            slot_h = 0.25 if resolution == "QUARTER_HOURLY" else 1.0
+
+        # Need at least one slot whose window has not fully elapsed. Old cache
+        # from yesterday must not drive today's optimizer.
+        current_slot_cutoff = now - timedelta(hours=slot_h)
+        if starts[-1] <= current_slot_cutoff:
+            return []
+        return points
+    except (TypeError, ValueError) as e:
+        logging.debug("Tibber: ignoring malformed %s price cache: %s", resolution, e)
+        return []
+
+
+def _fetch_price_points_graphql_once(resolution: str) -> list:
+    """Query the Tibber GraphQL API directly for price points at the requested
+    resolution.
+
+    Tibber added ``priceInfo(resolution: QUARTER_HOURLY)`` (15-minute prices),
+    which it bills on; the tibber python library does not expose this argument,
+    so we issue the query ourselves. ``resolution`` is 'QUARTER_HOURLY' or
+    'HOURLY'. Returns [] on any failure so the caller can fall back.
+    """
+    token = retrieve_setting('TIBBER_ACCESS_TOKEN')
+    if not token:
+        return []
+
+    query = (
+        "{ viewer { homes { currentSubscription { priceInfo("
+        f"resolution: {resolution}"
+        ") { today { total startsAt level } tomorrow { total startsAt level } } } } } }"
+    )
+    try:
+        resp = requests.post(
+            TIBBER_GQL_URL,
+            json={"query": query},
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            logging.warning("Tibber: priceInfo(%s) query failed with HTTP %s", resolution, resp.status_code)
+            return []
+
+        payload = resp.json()
+        if payload.get("errors"):
+            logging.warning("Tibber: priceInfo(%s) returned GraphQL errors: %s", resolution, payload["errors"])
+            return []
+
+        homes = payload["data"]["viewer"]["homes"]
+        price_info = homes[0]["currentSubscription"]["priceInfo"]
+
+        points = []
+        for bucket in ("today", "tomorrow"):
+            for p in (price_info.get(bucket) or []):
+                points.append({"start": p["startsAt"], "total": p["total"], "level": p.get("level")})
+        return points
+
+    except (requests.RequestException, KeyError, TypeError, ValueError, IndexError) as e:
+        logging.warning("Tibber: priceInfo(%s) fetch error: %s", resolution, e)
+        return []
+
+
+def _fetch_price_points_graphql(resolution: str, attempts: int = 3, retry_delay_s: float = 2.0) -> list:
+    """Fetch GraphQL prices with short retry/backoff for transient failures."""
+    attempts = max(1, int(attempts or 1))
+    for attempt in range(1, attempts + 1):
+        points = _fetch_price_points_graphql_once(resolution)
+        if points:
+            _cache_price_points(resolution, points)
+            return points
+        if attempt < attempts:
+            logging.info(
+                "Tibber: priceInfo(%s) unavailable; retrying (%s/%s).",
+                resolution, attempt + 1, attempts,
+            )
+            time.sleep(max(0.0, retry_delay_s))
+    return []
+
+
+def _get_all_price_points_via_library() -> list:
+    """Fallback: hourly price points via the tibber python library."""
+    try:
+        _account = tibber.Account(retrieve_setting('TIBBER_ACCESS_TOKEN'))
+        home = _account.homes[0]
+
+        prices = []
+        if home.current_subscription.price_info.today:
+             prices.extend([{'start': p.starts_at, 'total': p.total, 'level': p.level} for p in home.current_subscription.price_info.today])
+        if home.current_subscription.price_info.tomorrow:
+             prices.extend([{'start': p.starts_at, 'total': p.total, 'level': p.level} for p in home.current_subscription.price_info.tomorrow])
+
+        return prices
+    except Exception as e:
+        logging.error(f"Tibber: Error getting all prices: {e}")
+        return []
+
+
+def get_all_price_points():
+    """
+    Returns a list of all available price points (today and tomorrow) as dicts
+    of {'start': ISO-8601 str, 'total': float, 'level': str}. Used by the AI
+    optimizer.
+
+    Prefers quarter-hourly (15-minute) prices via a direct GraphQL query, which
+    is how Tibber bills as of October 2025. Configure with TIBBER_PRICE_RESOLUTION
+    ('QUARTER_HOURLY' default, or 'HOURLY'). Falls back to hourly library data if
+    the direct query yields nothing (e.g. market/home does not support it yet).
+    """
+    resolution = str(retrieve_setting('TIBBER_PRICE_RESOLUTION') or 'QUARTER_HOURLY').strip().upper()
+    if resolution not in ('QUARTER_HOURLY', 'HOURLY'):
+        resolution = 'QUARTER_HOURLY'
+
+    points = _fetch_price_points_graphql(resolution)
+    if points:
+        return points
+
+    if resolution == 'QUARTER_HOURLY':
+        cached = _cached_price_points('QUARTER_HOURLY')
+        if cached:
+            logging.warning("Tibber: Quarter-hourly fetch failed; using cached quarter-hourly prices.")
+            return cached
+
+        # Try hourly via GraphQL before falling all the way back to the library.
+        points = _fetch_price_points_graphql('HOURLY')
+        if points:
+            logging.warning("Tibber: Quarter-hourly prices unavailable and cache unusable; using hourly GraphQL prices.")
+            return points
+
+    logging.warning("Tibber: Falling back to hourly price points via the tibber library.")
+    return _get_all_price_points_via_library()
+
+def _current_quarter_hour_price():
+    """Return the price of the 15-minute slot containing 'now', or None.
+
+    Uses the same quarter-hourly feed the optimizer uses so the published
+    'now' price matches the AI's view (the tibber library's current price is
+    hourly).
+    """
+    try:
+        points = get_all_price_points()
+        if not points:
+            return None
+        parsed = []
+        for p in points:
+            start = p['start']
+            if not isinstance(start, datetime):
+                start = parser.parse(start, tzinfos=tzinfos)
+            parsed.append((start, p['total']))
+        parsed.sort(key=lambda x: x[0])
+        now = datetime.now(parsed[0][0].tzinfo)
+        current = None
+        for start, total in parsed:
+            if start <= now:
+                current = total
+            else:
+                break
+        return current
+    except Exception as e:
+        logging.debug(f"Tibber: could not derive 15-min current price: {e}")
+        return None
+
+
 def mqtt_publish_current_price(home):
-    value = home.current_subscription.price_info.current.total
+    # Publish the current 15-minute price when available (matches the optimizer);
+    # fall back to the library's hourly current price.
+    value = _current_quarter_hour_price()
+    if value is None:
+        value = home.current_subscription.price_info.current.total
     client.publish("Tibber/home/price_info/now/total", payload=f"{{\"value\": \"{value}\"}}", qos=0, retain=True)
 
 def current_price(home):

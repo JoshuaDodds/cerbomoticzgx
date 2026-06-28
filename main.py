@@ -12,7 +12,7 @@ from lib.ev_charge_controller import EvCharger
 from lib.task_scheduler import TaskScheduler
 from lib.victron_integration import restore_default_battery_max_voltage
 from lib.tibber_api import live_measurements, publish_pricing_data
-from lib.helpers import publish_message, retrieve_message
+from lib.helpers import publish_message, retrieve_message, is_truthy
 from lib.global_state import GlobalStateDatabase, GlobalStateClient
 from lib.solar_forecasting import get_victron_solar_forecast
 from lib.energy_broker import (
@@ -25,7 +25,7 @@ GlobalStateDB = GlobalStateDatabase()
 STATE = GlobalStateClient()
 
 ACTIVE_MODULES = json.loads(retrieve_setting('ACTIVE_MODULES'))
-HOME_CONNECT_APPLIANCE_SCHEDULING = bool(retrieve_setting("HOME_CONNECT_APPLIANCE_SCHEDULING")) or False
+HOME_CONNECT_APPLIANCE_SCHEDULING = is_truthy(retrieve_setting("HOME_CONNECT_APPLIANCE_SCHEDULING"))
 
 def ev_charge_controller(): EvCharger().main()
 
@@ -78,6 +78,8 @@ def post_startup():
 
     if HOME_CONNECT_APPLIANCE_SCHEDULING:
         logging.info(f"HomeConnect Appliance Scheduling module is enabled.")
+    else:
+        logging.info(f"HomeConnect Appliance Scheduling module is disabled.")
 
     logging.info(f"post_startup() actions executing...")
 
@@ -92,24 +94,43 @@ def post_startup():
     restore_and_publish('grid_charging_enabled_by_price', default=False)
     restore_and_publish('tesla_charge_requested', default=False)
 
-    # clear the energy sale scheduling status message
-    logging.info(f"post_startup(): Retrieving latest pricing data...")
-    get_todays_n_highest_prices(0, 100)
+    # Start the read-only dashboard EARLY (if enabled), BEFORE any network-bound
+    # pricing/forecast work, so the web server is available immediately and can
+    # never be delayed by a slow/unreachable Tibber or VRM. Guarded — a frontend
+    # failure can never crash the controller.
+    if str(retrieve_setting('FRONTEND_ENABLED') or '').strip().lower() in ('1', 'true', 'yes', 'on'):
+        try:
+            from frontend.server import run_in_thread
+            run_in_thread()
+            logging.info("Frontend dashboard started in-process (FRONTEND_ENABLED).")
+        except Exception as FrontendError:
+            logging.warning(f"Frontend dashboard failed to start; continuing without it: {FrontendError}")
 
-    # update tibber pricing info and solar forecast
-    logging.info(f"post_startup(): Publishing latest pricing and solar forecast data to data bus...")
-    publish_pricing_data(__name__)
-    get_victron_solar_forecast()
-    retrieve_latest_tibber_pricing()
+    # Pricing/forecast warm-up hits Tibber + VRM and can block for tens of seconds
+    # (or fail) during a third-party outage. Run it in a background daemon thread so
+    # it can NEVER block startup, the scheduler, or the web server. Each step is
+    # isolated so one failure doesn't skip the rest; the scheduler refreshes all of
+    # this periodically, so a failed warm-up self-heals on the next cycle.
+    def _startup_warm_up():
+        logging.info("post_startup(): warming up pricing + solar forecast (background)…")
+        for label, fn in (
+            ("today's highest prices", lambda: get_todays_n_highest_prices(0, 100)),
+            ("publish pricing", lambda: publish_pricing_data(__name__)),
+            ("solar forecast", get_victron_solar_forecast),
+            ("latest pricing", retrieve_latest_tibber_pricing),
+            ("energy-broker recovery", apply_energy_broker_logic),
+        ):
+            try:
+                fn()
+            except Exception as e:
+                logging.warning("post_startup warm-up '%s' failed (recovers on schedule): %s", label, e)
+        logging.info("post_startup(): warm-up complete.")
 
-    # Make sure we apply energy broker logic post startup to recover if the service restarts while in a
-    # managed state.
-    apply_energy_broker_logic()
+    threading.Thread(target=_startup_warm_up, name="startup-warmup", daemon=True).start()
 
-    # Start service scheduled tasks
+    # Start service scheduled tasks + the .env config watcher (independent of the
+    # warm-up above, so they come up immediately).
     TaskScheduler()
-
-    # Start the .env file config watcher / change handler
     config_watcher = ConfigWatcher(handler=handle_env_change)
     config_watcher.start()
 
@@ -134,14 +155,32 @@ def main():
             mqtt_thread.start()
 
         if ACTIVE_MODULES[0]['async']['tibber_api']:
-            try:
-                post_startup()
-                asyncio.run(live_measurements())  # This blocks & acts as the parent pid of the cerbomoticGx service
-
-            except Exception as E:
-                logging.error(f"Tibber: live measurements stopped with reason: {E}. Restarting...")
-                time.sleep(5.0)
-                asyncio.run(live_measurements())  # This would also block if reached and would be our service's parent pid
+            post_startup()
+            # The live feed blocks & acts as the parent pid of the service. A
+            # transient Tibber transport error must not hard-crash the whole
+            # controller, so retry with exponential backoff instead of a single
+            # retry. Recoverable transport errors are handled inside
+            # live_measurements() (which requests a supervised restart); this loop
+            # is the safety net for anything that still bubbles up.
+            backoff = 5.0
+            while True:
+                started = time.monotonic()
+                try:
+                    asyncio.run(live_measurements())
+                    # A clean return means a handled transport error requested a
+                    # restart; loop to re-establish the feed.
+                    logging.warning("Tibber: live feed ended; re-establishing in %.0fs...", backoff)
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except Exception as E:
+                    logging.error("Tibber: live measurements stopped with reason: %s. Retrying in %.0fs...", E, backoff)
+                # A feed that ran for a meaningful duration was healthy; reset the
+                # backoff so an isolated drop reconnects quickly. Only escalate on
+                # rapid, repeated failures.
+                if time.monotonic() - started > 120.0:
+                    backoff = 5.0
+                time.sleep(backoff)
+                backoff = min(backoff * 2.0, 60.0)
 
     except (KeyboardInterrupt, SystemExit):
         shutdown()

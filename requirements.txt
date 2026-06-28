@@ -6,12 +6,15 @@ oauthlib~=3.2.2
 python-dotenv~=0.21.0
 tibber.py==0.6.0
 python-dateutil~=2.8.2
+async-timeout>=4.0.3,<6
 graphql_subscription_manager==0.7.1
 pandas==1.5.1
 numpy==1.23.4
 plotly==5.11.0
 kaleido==0.2.1
 schedule==1.1.0
+flask~=3.0
 requests==2.32.3
 boto3==1.34.78
 watchdog==6.0.0
+anthropic>=0.40            # AI advisor (ANTHROPIC_API_KEY path)
