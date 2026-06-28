@@ -762,6 +762,60 @@ def _apply_sell_hysteresis(result):
     return result
 
 
+def _apply_low_soc_retain_before_cheaper_buy(result, batt_soc):
+    """At the configured reserve floor, hold instead of IDLE when a cheaper BUY is planned.
+
+    Victron/BMS may protect an empty pack by importing even though the optimizer's
+    IDLE model is neutral. If the next scheduled grid-charge window is cheaper
+    than the current slot, make the current command explicit RETAIN so grid-assist
+    covers only the PV deficit and defers battery charging to the cheaper BUY.
+    """
+    if (result.get('control_action') or '') != 'IDLE':
+        return result
+
+    try:
+        reserve = float(current_min_soc_reserve())
+        soc = float(batt_soc)
+    except (TypeError, ValueError):
+        return result
+    if soc > reserve + 1e-6:
+        return result
+
+    schedule = result.get('schedule') or []
+    next_buy = next(
+        (s for s in schedule[1:] if (s.get('control_action') or '') == 'BUY'),
+        None,
+    )
+    if not next_buy:
+        return result
+
+    def _price(row, fallback=None):
+        try:
+            return float(row.get('price'))
+        except (AttributeError, TypeError, ValueError):
+            return fallback
+
+    current_price = _price(result, _price(schedule[0], None) if schedule else None)
+    next_buy_price = _price(next_buy)
+    if current_price is None or next_buy_price is None or current_price <= next_buy_price + 1e-6:
+        return result
+
+    result['control_action'] = 'RETAIN'
+    result['grid_assist'] = True
+    result['mode'] = 'hold'
+    result['setpoint'] = 0.0
+    result['reason_code'] = 'LOW_SOC_DEFER_CHEAPER_BUY'
+    result['reason'] = (
+        f"At reserve floor ({reserve:.0f}%); holding battery now at €{current_price:.3f}/kWh "
+        f"and deferring grid charge to cheaper planned BUY (€{next_buy_price:.3f}/kWh)"
+    )
+    logging.info(
+        "AI_ESS: Low-SoC IDLE converted to RETAIN; current €%.3f > next BUY €%.3f at reserve %.1f%%.",
+        current_price, next_buy_price, reserve,
+    )
+    return result
+
+
 def _grid_assist_setpoint_watts(load_watts=None) -> int:
     """Grid setpoint (W) for retain mode: import only the load the PV cannot cover.
 
@@ -1470,6 +1524,7 @@ def run_ai_optimizer():
             )
         else:
             result = _apply_sell_hysteresis(result)
+            result = _apply_low_soc_retain_before_cheaper_buy(result, batt_soc)
 
         # 5. Apply immediate control for the current slot.
         setpoint = result.get('setpoint', 0.0)

@@ -146,6 +146,7 @@ def test_pv_intraday_correction_disabled_by_setting(monkeypatch):
 def test_load_forecast_prefers_historical_average(monkeypatch):
     from datetime import datetime
     # Realised 0.8 kW for the 06:00 quarter-hours over the last few days.
+    monkeypatch.setattr(energy_broker, "STATE", DummyState({"consumption_total_projected": 20000}))
     monkeypatch.setattr(energy_broker, "_historical_load_by_slot",
                         lambda days=3: {"06:00": 0.8, "06:15": 0.8, "06:30": 0.8, "06:45": 0.8})
     slots = [{"start": datetime(2026, 6, 17, 6, m, 0)} for m in (0, 15, 30, 45)]
@@ -364,6 +365,69 @@ def test_ai_optimizer_accepts_reported_zero_soc(monkeypatch):
     energy_broker.run_ai_optimizer()
 
     prices.assert_called_once()
+
+
+def test_low_soc_idle_retain_defers_to_cheaper_planned_buy(monkeypatch):
+    monkeypatch.setattr(energy_broker, "current_min_soc_reserve", lambda: 0.0)
+    result = {
+        "control_action": "IDLE",
+        "grid_assist": False,
+        "mode": "hold",
+        "setpoint": 0.0,
+        "current_price": 0.182,
+        "schedule": [
+            {"control_action": "IDLE", "price": 0.182},
+            {"control_action": "BUY", "price": 0.134},
+        ],
+    }
+
+    out = energy_broker._apply_low_soc_retain_before_cheaper_buy(result, batt_soc=0.0)
+
+    assert out["control_action"] == "RETAIN"
+    assert out["grid_assist"] is True
+    assert out["mode"] == "hold"
+    assert out["setpoint"] == 0.0
+    assert out["reason_code"] == "LOW_SOC_DEFER_CHEAPER_BUY"
+
+
+def test_low_soc_idle_retain_uses_existing_reserve_threshold(monkeypatch):
+    monkeypatch.setattr(energy_broker, "current_min_soc_reserve", lambda: 40.0)
+    result = {
+        "control_action": "IDLE",
+        "grid_assist": False,
+        "mode": "hold",
+        "setpoint": 0.0,
+        "current_price": 0.182,
+        "schedule": [
+            {"control_action": "IDLE", "price": 0.182},
+            {"control_action": "BUY", "price": 0.134},
+        ],
+    }
+
+    out = energy_broker._apply_low_soc_retain_before_cheaper_buy(result, batt_soc=41.0)
+
+    assert out["control_action"] == "IDLE"
+    assert out["grid_assist"] is False
+
+
+def test_low_soc_idle_retain_requires_cheaper_future_buy(monkeypatch):
+    monkeypatch.setattr(energy_broker, "current_min_soc_reserve", lambda: 0.0)
+    result = {
+        "control_action": "IDLE",
+        "grid_assist": False,
+        "mode": "hold",
+        "setpoint": 0.0,
+        "current_price": 0.132,
+        "schedule": [
+            {"control_action": "IDLE", "price": 0.132},
+            {"control_action": "BUY", "price": 0.134},
+        ],
+    }
+
+    out = energy_broker._apply_low_soc_retain_before_cheaper_buy(result, batt_soc=0.0)
+
+    assert out["control_action"] == "IDLE"
+    assert out["grid_assist"] is False
 
 
 # --- SELL hysteresis (minimum dwell + price band) ---------------------------
