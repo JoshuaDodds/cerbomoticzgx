@@ -90,6 +90,7 @@ def post_startup():
     restore_and_publish('ess_net_metering_batt_min_soc', default='80.0')
     restore_and_publish('ess_net_metering_enabled', default=False)
     restore_and_publish('ess_net_metering_overridden', default=False)
+    restore_and_publish('ai_ess_override_enabled', default=False)
     restore_and_publish('grid_charging_enabled', default=False)
     restore_and_publish('grid_charging_enabled_by_price', default=False)
     restore_and_publish('tesla_charge_requested', default=False)

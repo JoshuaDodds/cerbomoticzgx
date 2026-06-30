@@ -12,11 +12,13 @@ Design notes
   charge/discharge efficiency, PV and load forecasts into account), enforces
   power and SoC-reserve limits, and accumulates the monetary cost using the
   per-slot *buy* price for imports and *sell* price for exports.
-* Stored energy at the end of the horizon is given a terminal value so the
-  optimizer does not simply dump the battery to the grid at the end of the
+* Stored energy at the end of a multi-day horizon is given a terminal value so
+  the optimizer does not simply dump the battery to the grid at the end of the
   window. This is what lets a 48h (today + tomorrow) plan defer cheap charging
   or expensive discharging into the next day when that is more profitable over
-  the monthly settlement period.
+  the monthly settlement period. Same-day-only horizons do not get this terminal
+  credit, so a late Tibber next-day publication does not make the plan retain
+  profitable evening energy through midnight.
 * Negative prices are handled naturally by the cost function (importing at a
   negative price is revenue; exporting at a negative price is a loss, so the
   optimizer avoids it). The caller additionally hard-limits grid feed-in to 0W
@@ -26,7 +28,9 @@ All energy is in kWh, power in kW, prices in currency/kWh, durations in hours
 unless otherwise noted.
 """
 import logging
+import json
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from dateutil import parser as date_parser
 
@@ -57,11 +61,22 @@ CONTROL_BATTERY = {
     'SELL': 'discharging to the grid',
 }
 
+# Internal daily-settlement policy constants. These are intentionally code-only:
+# the threshold adapts from local history instead of adding more user-facing knobs.
+DAILY_POLICY_HISTORY_DAYS = 21
+DAILY_POLICY_FALLBACK_EXCEPTIONAL_EUR = 6.0
+DAILY_POLICY_MIN_EXCEPTIONAL_EUR = 3.0
+DAILY_POLICY_MAX_EXCEPTIONAL_EUR = 25.0
+DAILY_POLICY_FALLBACK_RISK_EUR = 1.5
+DAILY_POLICY_MAX_RISK_EUR = 20.0
+DAILY_POLICY_SPIKE_MULTIPLIER = 1.75
+DAILY_POLICY_SPIKE_ABSOLUTE_EUR = 0.25
+
 
 def control_action_for(action, soc_start, soc_end, grid_energy):
     """Map an internal plan step to the canonical control action we command.
 
-    * ``BUY``    — force charge from the grid (``action == 'buy'``).
+    * ``BUY``    — force charge from the grid (SoC rising with grid import).
     * ``SELL``   — force discharge to the grid (battery actually discharges, SoC falls).
     * ``RETAIN`` — force the grid to cover the load so the battery is held
                    (grid-assist: a hold that imports).
@@ -69,7 +84,7 @@ def control_action_for(action, soc_start, soc_end, grid_energy):
                    and a hold where PV already covers the load. The real import/export
                    is only known retroactively.
     """
-    if action == 'buy':
+    if action == 'buy' and grid_energy > EPS:
         return 'BUY'
     if action == 'sell' and soc_end < soc_start - EPS:
         return 'SELL'
@@ -104,6 +119,313 @@ def _coerce_datetime(value) -> datetime:
     if isinstance(value, datetime):
         return value
     return date_parser.parse(value)
+
+
+def _as_float(value, default=None):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+def _percentile(values, q):
+    vals = sorted(float(v) for v in values if v is not None)
+    if not vals:
+        return None
+    if len(vals) == 1:
+        return vals[0]
+    q = _clamp(float(q), 0.0, 1.0)
+    pos = (len(vals) - 1) * q
+    lower = int(pos)
+    upper = min(lower + 1, len(vals) - 1)
+    if lower == upper:
+        return vals[lower]
+    frac = pos - lower
+    return vals[lower] * (1.0 - frac) + vals[upper] * frac
+
+
+def _date_key(value):
+    try:
+        return _coerce_datetime(value).date()
+    except Exception:
+        return None
+
+
+def _slot_net_eur(step):
+    """Forecast settlement contribution for one slot: reward minus cost."""
+    grid = _as_float(step.get('grid_energy'), 0.0) or 0.0
+    price = _as_float(step.get('price'), 0.0) or 0.0
+    sell = _as_float(step.get('sell'), price)
+    if sell is None:
+        sell = price
+    if grid > EPS:
+        return -grid * price
+    if grid < -EPS:
+        return -grid * sell
+    return 0.0
+
+
+def _plan_economics(plan):
+    by_day = {}
+    for step in (plan or {}).get('schedule', []) or []:
+        day = _date_key(step.get('time'))
+        if day is None:
+            continue
+        by_day[day] = by_day.get(day, 0.0) + _slot_net_eur(step)
+    return {
+        'by_day': by_day,
+        'total_net_eur': sum(by_day.values()),
+    }
+
+
+def _policy_round(value, digits=3):
+    try:
+        return round(float(value), digits)
+    except (TypeError, ValueError):
+        return value
+
+
+def _opportunity_model_from_history(history_dir=None, days=DAILY_POLICY_HISTORY_DAYS):
+    """Infer what counts as a large future opportunity from local history.
+
+    Uses completed-day net outcomes as the "normal win" distribution, settlement
+    prediction errors as forecast risk, and observed prices for spike detection.
+    Falls back to conservative defaults when history is absent or too sparse.
+    """
+    model = {
+        'source': 'fallback',
+        'history_days': 0,
+        'daily_profit_samples': 0,
+        'settlement_error_samples': 0,
+        'price_samples': 0,
+        'exceptional_threshold_eur': DAILY_POLICY_FALLBACK_EXCEPTIONAL_EUR,
+        'forecast_risk_eur': DAILY_POLICY_FALLBACK_RISK_EUR,
+        'historical_price_p95': 0.60,
+    }
+    try:
+        root = Path(history_dir or retrieve_setting('HISTORY_DIR') or 'data/history')
+        if not root.exists():
+            return model
+
+        today = datetime.now().date()
+        daily_latest = {}
+        settlement_error_by_day = {}
+        prices = []
+        files = sorted(root.glob('ess-*.ndjson'), reverse=True)
+        considered = 0
+        for path in files:
+            if considered >= max(1, int(days)):
+                break
+            try:
+                file_day = datetime.strptime(path.stem.replace('ess-', ''), '%Y-%m-%d').date()
+            except ValueError:
+                file_day = None
+            if file_day is not None and file_day >= today:
+                continue
+            considered += 1
+            with path.open() as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    ts = rec.get('ts')
+                    try:
+                        when = _coerce_datetime(ts) if ts else None
+                    except Exception:
+                        when = None
+                    rec_day = when.date() if when else file_day
+
+                    price = _as_float(rec.get('price_buy'))
+                    if price is not None:
+                        prices.append(price)
+
+                    if rec.get('kind') == 'settlement':
+                        pred = _as_float(rec.get('predicted_net_eur'))
+                        actual = _as_float(rec.get('actual_net_eur'))
+                        if pred is not None and actual is not None and rec_day is not None:
+                            settlement_error_by_day[rec_day] = (
+                                settlement_error_by_day.get(rec_day, 0.0) + abs(actual - pred)
+                            )
+                        continue
+
+                    imp_cost = _as_float(rec.get('day_import_cost'))
+                    exp_reward = _as_float(rec.get('day_export_reward'))
+                    if imp_cost is None or exp_reward is None or rec_day is None:
+                        continue
+                    net = exp_reward - imp_cost
+                    prev = daily_latest.get(rec_day)
+                    if prev is None or (when is not None and when > prev[0]):
+                        daily_latest[rec_day] = (when or datetime.min, net)
+
+        profits = [net for _, net in daily_latest.values() if net > EPS]
+        exceptional = _percentile(profits, 0.75)
+        if exceptional is None:
+            exceptional = DAILY_POLICY_FALLBACK_EXCEPTIONAL_EUR
+        exceptional = _clamp(
+            exceptional,
+            DAILY_POLICY_MIN_EXCEPTIONAL_EUR,
+            DAILY_POLICY_MAX_EXCEPTIONAL_EUR,
+        )
+
+        daily_errors = list(settlement_error_by_day.values())
+        risk = _percentile(daily_errors, 0.75)
+        if risk is None:
+            risk = DAILY_POLICY_FALLBACK_RISK_EUR
+        risk = _clamp(risk, 0.0, DAILY_POLICY_MAX_RISK_EUR)
+
+        p95 = _percentile(prices, 0.95)
+        if p95 is None:
+            p95 = model['historical_price_p95']
+
+        model.update({
+            'source': 'history',
+            'history_days': considered,
+            'daily_profit_samples': len(profits),
+            'settlement_error_samples': len(daily_errors),
+            'price_samples': len(prices),
+            'exceptional_threshold_eur': _policy_round(exceptional),
+            'forecast_risk_eur': _policy_round(risk),
+            'historical_price_p95': _policy_round(p95, 4),
+        })
+        return model
+    except Exception as e:  # pragma: no cover - defensive
+        logging.debug("AI_ESS: daily settlement history model unavailable: %s", e)
+        return model
+
+
+def _select_daily_settlement_candidate(full_horizon, today_first, opportunity_model=None):
+    """Choose between full-horizon optimization and day-settling optimization."""
+    model = opportunity_model or _opportunity_model_from_history()
+    full_econ = _plan_economics(full_horizon)
+    today_econ = _plan_economics(today_first)
+    full_days = sorted(full_econ['by_day'])
+
+    def _base(selected, rejected, reason):
+        return {
+            'selected': selected,
+            'rejected': rejected,
+            'reason_code': reason,
+            'source': model.get('source'),
+            'history_days': model.get('history_days'),
+            'daily_profit_samples': model.get('daily_profit_samples'),
+            'settlement_error_samples': model.get('settlement_error_samples'),
+            'full_total_net_eur': _policy_round(full_econ['total_net_eur']),
+            'today_first_total_net_eur': _policy_round(today_econ['total_net_eur']),
+            'learned_exceptional_threshold_eur': _policy_round(
+                model.get('exceptional_threshold_eur', DAILY_POLICY_FALLBACK_EXCEPTIONAL_EUR)
+            ),
+            'forecast_risk_eur': _policy_round(
+                model.get('forecast_risk_eur', DAILY_POLICY_FALLBACK_RISK_EUR)
+            ),
+            'historical_price_p95': _policy_round(
+                model.get('historical_price_p95', 0.60), 4
+            ),
+        }
+
+    if not (full_horizon or {}).get('schedule'):
+        return full_horizon, _base('full_horizon', 'today_first', 'NO_FULL_HORIZON_PLAN')
+
+    if not full_days or len(full_days) <= 1:
+        policy = _base('full_horizon', 'none', 'SAME_DAY_HORIZON')
+        if full_days:
+            day = full_days[0]
+            policy.update({
+                'first_day': day.isoformat(),
+                'full_today_net_eur': _policy_round(full_econ['by_day'].get(day, 0.0)),
+                'today_first_today_net_eur': _policy_round(full_econ['by_day'].get(day, 0.0)),
+                'today_sacrifice_eur': 0.0,
+                'future_gain_eur': 0.0,
+                'future_max_price': None,
+                'price_spike': False,
+            })
+        return full_horizon, policy
+
+    if not (today_first or {}).get('schedule'):
+        return full_horizon, _base('full_horizon', 'today_first', 'NO_TODAY_FIRST_PLAN')
+
+    first_day = full_days[0]
+    full_today = full_econ['by_day'].get(first_day, 0.0)
+    today_first_today = today_econ['by_day'].get(first_day, 0.0)
+    today_sacrifice = max(0.0, today_first_today - full_today)
+    future_gain = full_econ['total_net_eur'] - today_econ['total_net_eur']
+
+    future_prices = []
+    for step in (full_horizon or {}).get('schedule', []) or []:
+        day = _date_key(step.get('time'))
+        if day is not None and day > first_day:
+            p = _as_float(step.get('sell'), _as_float(step.get('price')))
+            if p is not None:
+                future_prices.append(p)
+    future_max_price = max(future_prices) if future_prices else None
+    historical_p95 = _as_float(model.get('historical_price_p95'), 0.60) or 0.60
+    spike_floor = max(
+        historical_p95 * DAILY_POLICY_SPIKE_MULTIPLIER,
+        historical_p95 + DAILY_POLICY_SPIKE_ABSOLUTE_EUR,
+    )
+    price_spike = future_max_price is not None and future_max_price >= spike_floor
+
+    threshold = _as_float(
+        model.get('exceptional_threshold_eur'), DAILY_POLICY_FALLBACK_EXCEPTIONAL_EUR
+    ) or DAILY_POLICY_FALLBACK_EXCEPTIONAL_EUR
+    risk = _as_float(
+        model.get('forecast_risk_eur'), DAILY_POLICY_FALLBACK_RISK_EUR
+    ) or DAILY_POLICY_FALLBACK_RISK_EUR
+
+    if full_econ['total_net_eur'] < today_econ['total_net_eur'] - EPS:
+        selected, rejected, reason = today_first, 'full_horizon', 'TODAY_FIRST_BETTER_TOTAL'
+        selected_name = 'today_first'
+    elif today_sacrifice <= EPS:
+        selected, rejected, reason = full_horizon, 'today_first', 'FULL_HORIZON_NO_TODAY_SACRIFICE'
+        selected_name = 'full_horizon'
+    elif future_gain > today_sacrifice + threshold + risk:
+        selected, rejected, reason = full_horizon, 'today_first', 'EXCEPTIONAL_FUTURE_GAIN_ACCEPTED'
+        selected_name = 'full_horizon'
+    elif price_spike and future_gain > today_sacrifice + risk:
+        selected, rejected, reason = full_horizon, 'today_first', 'FUTURE_SPIKE_ACCEPTED'
+        selected_name = 'full_horizon'
+    else:
+        selected, rejected, reason = today_first, 'full_horizon', 'DAILY_SETTLEMENT_PROTECTED'
+        selected_name = 'today_first'
+
+    policy = _base(selected_name, rejected, reason)
+    policy.update({
+        'first_day': first_day.isoformat(),
+        'full_today_net_eur': _policy_round(full_today),
+        'today_first_today_net_eur': _policy_round(today_first_today),
+        'today_sacrifice_eur': _policy_round(today_sacrifice),
+        'future_gain_eur': _policy_round(future_gain),
+        'future_max_price': _policy_round(future_max_price, 4),
+        'price_spike': bool(price_spike),
+        'price_spike_floor': _policy_round(spike_floor, 4),
+    })
+    return selected, policy
+
+
+def _filter_forecast_for_indices(forecast, indices):
+    if forecast is None or isinstance(forecast, dict):
+        return forecast
+    try:
+        return [forecast[i] for i in indices if i < len(forecast)]
+    except TypeError:
+        return forecast
+
+
+def _combine_today_first_plans(today_plan, future_plan):
+    combined = dict(today_plan)
+    combined['schedule'] = list(today_plan.get('schedule', [])) + list(future_plan.get('schedule', []))
+    slots = list(today_plan.get('victron_slots', [])) + list(future_plan.get('victron_slots', []))
+    slots.sort(key=lambda s: s.get('start'))
+    combined['victron_slots'] = slots[:5]
+    return combined
 
 
 class OptimizationEngine:
@@ -160,17 +482,6 @@ class OptimizationEngine:
         # cycle_cost so wear and trading-margin stay conceptually distinct.
         self.arbitrage_margin = _safe_float('ESS_ARBITRAGE_MARGIN', 0.0)
 
-        # (#3) Grid-charge price ceilings — only charge the battery FROM THE GRID
-        # when energy is genuinely cheap, so we don't store expensive grid energy
-        # for a thin resale margin (PV charging is never gated). A charge slot
-        # must satisfy BOTH limits that are enabled:
-        #   * absolute: buy price must be <= ESS_MAX_GRID_CHARGE_PRICE (0 = off)
-        #   * relative: buy price must sit in the cheapest ESS_GRID_CHARGE_CHEAP_PCT
-        #               percent of the horizon (0 or >=100 = off)
-        # Charging only to reach the seasonal reserve (safety) is always allowed.
-        self.max_grid_charge_price = _safe_float('ESS_MAX_GRID_CHARGE_PRICE', 0.0)
-        self.grid_charge_cheap_pct = _safe_float('ESS_GRID_CHARGE_CHEAP_PCT', 0.0)
-
         # Planning resolution in minutes. When the native price data is coarser
         # than this (e.g. hourly Tibber prices with a 15-minute target) each
         # native price slot is sub-divided so the engine is ready for true
@@ -188,6 +499,8 @@ class OptimizationEngine:
         self.is_winter = is_winter_month()
         self.min_soc = current_min_soc_reserve()
         self.max_soc = 100.0
+        raw_grid_charge_soc = _safe_float('ESS_MAX_GRID_CHARGE_SOC', 100.0)
+        self.max_grid_charge_soc = max(self.min_soc, min(100.0, max(0.0, raw_grid_charge_soc)))
 
         # DP SoC discretization step (percentage points).
         self.soc_step = _safe_float('OPTIMIZER_SOC_STEP_PCT', SOC_STEP)
@@ -333,18 +646,7 @@ class OptimizationEngine:
         sell_prices = [self._sell_price(b) for b in buy_prices]
         net_loads = [p['load'] - p['pv'] for p in future_prices]
 
-        # (#3) Effective grid-charge price ceiling for this horizon: the lowest of
-        # any enabled absolute/relative limit. Grid-sourced charging above this is
-        # blocked (PV charging and reaching the safety reserve are never blocked).
-        charge_ceilings = []
-        if self.max_grid_charge_price > 0:
-            charge_ceilings.append(self.max_grid_charge_price)
-        if 0 < self.grid_charge_cheap_pct < 100 and buy_prices:
-            ordered = sorted(buy_prices)
-            idx = min(len(ordered) - 1,
-                      max(0, int(len(ordered) * self.grid_charge_cheap_pct / 100.0)))
-            charge_ceilings.append(ordered[idx])
-        grid_charge_ceiling = min(charge_ceilings) if charge_ceilings else None
+        grid_charge_soc_cap = max(self.min_soc, min(100.0, self.max_grid_charge_soc))
 
         # DP tables. dp[t][soc] = minimum cost to reach soc at slot boundary t.
         dp = [{s: float('inf') for s in self.soc_states} for _ in range(steps + 1)]
@@ -403,16 +705,12 @@ class OptimizationEngine:
                     if export_kwh > EPS and dc_change_kwh < -EPS and sell < self._effective_sell_floor() - EPS:
                         continue
 
-                    # (#3) Block grid-sourced charging when the price is above the
-                    # cheap-charge ceiling. Only applies to charging that draws
-                    # from the grid (import) and lifts SoC ABOVE the seasonal
-                    # reserve — PV charging (no import) and topping up to the
-                    # safety reserve are always allowed.
-                    if (grid_charge_ceiling is not None
-                            and dc_change_kwh > EPS
+                    # User preference: don't force grid-sourced charging above
+                    # the configured SoC cap. PV-only charging is allowed above
+                    # this cap because it does not buy grid energy.
+                    if (dc_change_kwh > EPS
                             and import_kwh > EPS
-                            and nsoc > self.min_soc + EPS
-                            and buy > grid_charge_ceiling + EPS):
+                            and nsoc > grid_charge_soc_cap + EPS):
                         continue
 
                     step_cost = import_kwh * buy - export_kwh * sell
@@ -430,15 +728,17 @@ class OptimizationEngine:
                         dp[t + 1][nsoc] = total
                         parent[t + 1][nsoc] = (soc, grid_energy)
 
-        # Terminal valuation: value usable stored energy so the plan keeps
-        # charge for future peaks rather than dumping it at the end of the
-        # horizon. Use the higher of the horizon mean (scaled) and the expected
-        # peak price, so charge is preserved for the typical morning/evening
-        # peaks even before the next day's prices are published.
-        mean_buy = sum(buy_prices) / len(buy_prices)
-        terminal_price = mean_buy * self.terminal_value_factor
-        if self.expected_peak_price > 0:
-            terminal_price = max(terminal_price, self.expected_peak_price)
+        # Terminal valuation: value usable stored energy only when the known
+        # horizon crosses a day boundary. If Tibber has not published tomorrow
+        # yet, a same-day-only evening horizon should still sell profitable
+        # energy instead of retaining it through midnight for an unknown day.
+        horizon_dates = {p['start'].date() for p in future_prices}
+        terminal_price = 0.0
+        if len(horizon_dates) > 1:
+            mean_buy = sum(buy_prices) / len(buy_prices)
+            terminal_price = mean_buy * self.terminal_value_factor
+            if self.expected_peak_price > 0:
+                terminal_price = max(terminal_price, self.expected_peak_price)
 
         best_end_soc = None
         best_objective = float('inf')
@@ -483,6 +783,91 @@ class OptimizationEngine:
             return None
 
         return self._post_process(schedule, slot_seconds)
+
+    def optimize_with_daily_policy(self, current_soc_percent, price_data,
+                                   load_forecast=None, pv_forecast=None,
+                                   opportunity_model=None):
+        """Optimize the horizon, then protect same-day settlement when warranted.
+
+        The full 48h DP remains the baseline. When the known horizon crosses a
+        local day boundary, we also build a "today-first" candidate: optimize the
+        remainder of today without terminal value, then optimize future slots from
+        the projected end SoC. The selector chooses full-horizon only when its
+        future advantage is large relative to today's sacrifice, learned history,
+        and forecast risk.
+        """
+        full = self.optimize(current_soc_percent, price_data, load_forecast, pv_forecast)
+        if not full:
+            return full
+
+        model = opportunity_model or _opportunity_model_from_history()
+        schedule = full.get('schedule') or []
+        horizon_days = sorted({
+            d for d in (_date_key(s.get('time')) for s in schedule)
+            if d is not None
+        })
+        if len(horizon_days) <= 1:
+            _, policy = _select_daily_settlement_candidate(full, full, model)
+            out = dict(full)
+            out['planning_policy'] = policy
+            return out
+
+        first_day = horizon_days[0]
+        normalised = []
+        for idx, p in enumerate(price_data or []):
+            try:
+                normalised.append((idx, {
+                    'start': _coerce_datetime(p['start']),
+                    'total': float(p['total']),
+                    'level': p.get('level'),
+                }))
+            except (KeyError, TypeError, ValueError) as e:
+                logging.debug("AI_ESS: Skipping malformed policy price point %s (%s).", p, e)
+        normalised.sort(key=lambda item: item[1]['start'])
+
+        today_items = [(idx, p) for idx, p in normalised if p['start'].date() == first_day]
+        future_items = [(idx, p) for idx, p in normalised if p['start'].date() > first_day]
+        if not today_items or not future_items:
+            _, policy = _select_daily_settlement_candidate(full, None, model)
+            out = dict(full)
+            out['planning_policy'] = policy
+            return out
+
+        today_indices = [idx for idx, _ in today_items]
+        future_indices = [idx for idx, _ in future_items]
+        today_prices = [p for _, p in today_items]
+        future_prices = [p for _, p in future_items]
+
+        today_plan = self.optimize(
+            current_soc_percent,
+            today_prices,
+            _filter_forecast_for_indices(load_forecast, today_indices),
+            _filter_forecast_for_indices(pv_forecast, today_indices),
+        )
+        if not today_plan or not today_plan.get('schedule'):
+            _, policy = _select_daily_settlement_candidate(full, None, model)
+            out = dict(full)
+            out['planning_policy'] = policy
+            return out
+
+        future_start_soc = today_plan['schedule'][-1]['soc_end']
+        future_plan = self.optimize(
+            future_start_soc,
+            future_prices,
+            _filter_forecast_for_indices(load_forecast, future_indices),
+            _filter_forecast_for_indices(pv_forecast, future_indices),
+        )
+        if not future_plan or not future_plan.get('schedule'):
+            _, policy = _select_daily_settlement_candidate(full, None, model)
+            out = dict(full)
+            out['planning_policy'] = policy
+            return out
+
+        today_first = _combine_today_first_plans(today_plan, future_plan)
+        selected, policy = _select_daily_settlement_candidate(full, today_first, model)
+        out = dict(selected)
+        out['planning_policy'] = policy
+        return out
 
     @staticmethod
     def _classify_action(soc_start, soc_end, grid_energy) -> str:
@@ -533,6 +918,10 @@ class OptimizationEngine:
         horizon_max = max((s['price'] for s in schedule[idx:]), default=price)
 
         if mode == 'buy':
+            if cur.get('grid_energy', 0.0) <= EPS:
+                return ('PV_CHARGING',
+                        f"Surplus solar is charging the battery at €{price:.3f}/kWh; "
+                        "no grid charge is planned")
             if next_sell:
                 ns_sell = next_sell.get('sell', next_sell['price'])
                 return ('PRECHARGE_FOR_PEAK',
@@ -602,6 +991,7 @@ class OptimizationEngine:
         cap = self.battery_capacity
         if cap <= 0:
             return
+        grid_charge_soc_cap = max(self.min_soc, min(100.0, self.max_grid_charge_soc))
         n = len(schedule)
         i = 0
         while i < n:
@@ -621,9 +1011,19 @@ class OptimizationEngine:
                 max_dc_power = self.max_charge_power * slot_h
                 # grid_energy = net_load + dc/eff must stay within the import limit.
                 max_dc_grid = (self.max_power_import * slot_h - net_load) * self.charge_efficiency
-                dc = min(room_dc, max_dc_power, max(0.0, max_dc_grid))
-                # Always at least absorb free PV surplus (charges with no import).
-                dc = max(dc, min(room_dc, max(0.0, -net_load) * self.charge_efficiency))
+                dc_limit = min(room_dc, max_dc_power, max(0.0, max_dc_grid))
+
+                # PV surplus can always charge the battery, including above the
+                # user grid-charge SoC cap. Only grid-sourced charge is constrained
+                # by the user's SoC cap.
+                pv_only_dc = min(room_dc, max(0.0, -net_load) * self.charge_efficiency)
+                if soc < grid_charge_soc_cap - EPS:
+                    grid_room_dc = max(0.0, (grid_charge_soc_cap - soc) / 100.0 * cap)
+                    dc_limit = min(dc_limit, pv_only_dc + grid_room_dc)
+                else:
+                    dc_limit = min(dc_limit, pv_only_dc)
+
+                dc = max(0.0, dc_limit)
                 ac_for_batt = dc / self.charge_efficiency if dc > EPS else 0.0
                 new_end = soc + (dc / cap * 100.0)
                 step['soc_start'] = round(soc, 4)
@@ -631,10 +1031,15 @@ class OptimizationEngine:
                 step['grid_energy'] = round(net_load + ac_for_batt, 4)
                 step['action'] = self._classify_action(soc, new_end, step['grid_energy'])
                 soc = new_end
-            # Safety: guarantee the run still ends exactly on the original target so
-            # the downstream SoC trajectory (and Victron target) is untouched.
-            schedule[j]['soc_end'] = round(target, 4)
             i = j + 1
+
+    def _guardrail_snapshot(self):
+        return {
+            'max_grid_charge_soc': self.max_grid_charge_soc,
+            'min_sell_price': self.min_sell_price,
+            'battery_cycle_cost': self.cycle_cost,
+            'arbitrage_margin': self.arbitrage_margin,
+        }
 
     def _post_process(self, schedule, slot_seconds):
         slot_h = slot_seconds / 3600.0
@@ -646,17 +1051,18 @@ class OptimizationEngine:
         victron_slots = []
         current_slot = None
         for i, step in enumerate(schedule):
-            if step['action'] == 'buy':
+            if step['action'] == 'buy' and step.get('grid_energy', 0.0) > EPS:
+                target_soc = min(100, int(round(min(step['soc_end'], self.max_grid_charge_soc))))
                 if current_slot is not None and i == current_slot['_end_index'] + 1:
                     current_slot['duration'] += slot_seconds
                     current_slot['_end_index'] = i
-                    current_slot['target_soc'] = min(100, int(round(step['soc_end'])))
+                    current_slot['target_soc'] = target_soc
                     current_slot['_prices'].append(step['price'])
                 else:
                     current_slot = {
                         'start': step['time'],
                         'duration': slot_seconds,
-                        'target_soc': min(100, int(round(step['soc_end']))),
+                        'target_soc': target_soc,
                         '_end_index': i,
                         '_prices': [step['price']],
                     }
@@ -723,6 +1129,7 @@ class OptimizationEngine:
         return {
             'schedule': schedule,
             'victron_slots': formatted_slots,
+            'optimizer_guardrails': self._guardrail_snapshot(),
             'setpoint': setpoint,
             'mode': mode,
             # Canonical control action for the current slot (forecast-based here;
@@ -747,7 +1154,7 @@ def optimize_schedule(current_soc, price_data, load_forecast=None, pv_forecast=N
         engine.set_cost_basis_floor(ess_cost_basis.current_basis())
     except Exception as e:  # pragma: no cover - defensive
         logging.warning("AI_ESS: cost-basis floor unavailable (%s); planning without it.", e)
-    return engine.optimize(current_soc, price_data, load_forecast, pv_forecast)
+    return engine.optimize_with_daily_policy(current_soc, price_data, load_forecast, pv_forecast)
 
 
 def format_plan_summary(result, *, batt_soc=None, source="", price_points=None,
@@ -848,6 +1255,20 @@ def format_plan_summary(result, *, batt_soc=None, source="", price_points=None,
                    f"(plan slot ~ {result.get('slot_duration_h', 0):.2f}h)")
     if pv_remaining is not None:
         out.append(f"PV remaining (STATE)  : {pv_remaining} Wh")
+
+    policy = result.get('planning_policy') or {}
+    if policy:
+        out.append(line)
+        out.append("DAILY SETTLEMENT POLICY")
+        out.append(f"  Selected   : {policy.get('selected')}  ({policy.get('reason_code')})")
+        if policy.get('today_sacrifice_eur') is not None:
+            out.append(f"  Today loss : €{policy.get('today_sacrifice_eur'):.2f} protected threshold")
+        if policy.get('future_gain_eur') is not None:
+            out.append(f"  Future gain: €{policy.get('future_gain_eur'):.2f} vs today-first")
+        if policy.get('learned_exceptional_threshold_eur') is not None:
+            out.append("  Learned    : exceptional €"
+                       f"{policy.get('learned_exceptional_threshold_eur'):.2f}, "
+                       f"risk €{policy.get('forecast_risk_eur', 0.0):.2f}")
 
     out.append(line)
     vslots = result.get('victron_slots', [])

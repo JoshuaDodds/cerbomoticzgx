@@ -8,6 +8,7 @@ import os
 sys.path.append(os.getcwd())
 
 from lib.ai_powered_ess import OptimizationEngine, control_action_for
+from lib import ai_powered_ess
 
 class TestAIPoweredESS(unittest.TestCase):
     def setUp(self):
@@ -23,11 +24,10 @@ class TestAIPoweredESS(unittest.TestCase):
         self.engine.expected_peak_price = 0.0
         self.engine.min_sell_price = 0.0
         self.engine.cycle_cost = 0.0
-        # New hurdle/ceiling knobs: disabled by default so tests are deterministic
+        # Hurdle knobs: disabled by default so tests are deterministic
         # regardless of the host .env values.
         self.engine.arbitrage_margin = 0.0
-        self.engine.max_grid_charge_price = 0.0
-        self.engine.grid_charge_cheap_pct = 0.0
+        self.engine.max_grid_charge_soc = 100.0
         # Plan at native (hourly) resolution by default in tests; individual
         # tests override this to exercise sub-slot resampling.
         self.engine.slot_minutes = 60.0
@@ -37,6 +37,18 @@ class TestAIPoweredESS(unittest.TestCase):
             'time': datetime.now(tz.UTC).replace(second=0, microsecond=0),
             'action': action, 'soc_start': soc_start, 'soc_end': soc_end,
             'grid_energy': grid_energy, 'price': price, 'sell': price,
+        }
+
+    def _policy_step(self, day, hour, grid_energy, price=1.0):
+        return {
+            'time': datetime(2099, 6, day, hour, 0, tzinfo=tz.UTC),
+            'action': 'hold',
+            'control_action': 'IDLE',
+            'soc_start': 50.0,
+            'soc_end': 50.0,
+            'grid_energy': grid_energy,
+            'price': price,
+            'sell': price,
         }
 
     def test_control_action_mapping(self):
@@ -50,6 +62,8 @@ class TestAIPoweredESS(unittest.TestCase):
         self.assertEqual(control_action_for('hold', 50.0, 50.0, -0.1), 'IDLE')
         # IDLE: PV surplus (export while SoC flat — not a real discharge).
         self.assertEqual(control_action_for('sell', 50.0, 50.0, -0.09), 'IDLE')
+        # IDLE: PV-only charging. SoC rises, but no grid energy is bought.
+        self.assertEqual(control_action_for('buy', 50.0, 55.0, 0.0), 'IDLE')
         # IDLE: self-supply (battery powers loads, no export).
         self.assertEqual(control_action_for('self_supply', 50.0, 45.0, 0.0), 'IDLE')
 
@@ -197,6 +211,28 @@ class TestAIPoweredESS(unittest.TestCase):
         end_with_terminal = with_terminal['schedule'][-1]['soc_end']
         self.assertGreaterEqual(end_with_terminal, end_no_terminal)
 
+    def test_terminal_value_does_not_preserve_charge_on_same_day_only_horizon(self):
+        # When Tibber has not published tomorrow yet, the remaining horizon ends
+        # tonight. The terminal-value guard must not treat that truncated same-day
+        # window as a reason to retain profitable energy through the evening.
+        base_time = datetime(2099, 6, 28, 20, 0, tzinfo=tz.UTC)
+        prices = [
+            {'start': base_time + timedelta(hours=i), 'total': 0.40, 'level': 'NORMAL'}
+            for i in range(4)
+        ]
+
+        e = self._arb_engine(terminal_value_factor=1.0)
+        result = e.optimize(
+            90.0,
+            prices,
+            load_forecast=[0.0] * len(prices),
+            pv_forecast=[0.0] * len(prices),
+        )
+
+        self.assertIsNotNone(result)
+        self.assertLessEqual(result['schedule'][-1]['soc_end'], e.min_soc + e.soc_step)
+        self.assertTrue(any(s['control_action'] == 'SELL' for s in result['schedule']))
+
     def test_classify_action_four_modes(self):
         c = self.engine._classify_action
         # charging (SoC rising) -> BUY
@@ -266,8 +302,7 @@ class TestAIPoweredESS(unittest.TestCase):
             e.slot_minutes = 60.0
             e.cycle_cost = cycle_cost
             e.arbitrage_margin = 0.0
-            e.max_grid_charge_price = 0.0
-            e.grid_charge_cheap_pct = 0.0
+            e.max_grid_charge_soc = 100.0
             return e
 
         sells_zero = sum(s['action'] == 'sell' for s in make(0.0).optimize(50.0, prices)['schedule'])
@@ -292,8 +327,7 @@ class TestAIPoweredESS(unittest.TestCase):
         e.slot_minutes = 60.0
         e.cycle_cost = 0.0
         e.arbitrage_margin = 0.0
-        e.max_grid_charge_price = 0.0
-        e.grid_charge_cheap_pct = 0.0
+        e.max_grid_charge_soc = 100.0
         for k, v in overrides.items():
             setattr(e, k, v)
         return e
@@ -316,29 +350,77 @@ class TestAIPoweredESS(unittest.TestCase):
         self.assertGreater(sells_none, 0)
         self.assertEqual(sells_marg, 0)  # 0.10/kWh hurdle dwarfs the 0.03 spread
 
-    def test_grid_charge_ceiling_blocks_expensive_charging(self):
-        # Expensive window (0.30), cheap window (0.10), then a high peak (0.60).
-        # With a ceiling of 0.15, grid charging may only happen in the cheap
-        # window; no 'buy' slot should have a price above the ceiling.
+    def test_profitable_grid_charge_is_inferred_from_path_economics(self):
+        # The optimizer should infer whether charging is profitable from the full
+        # buy->sell path, without a user price ceiling.
         base_time = datetime.now(tz.UTC).replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
         prices = []
         for i in range(12):
             t = base_time + timedelta(hours=i)
-            if i < 3:
-                p = 0.30          # expensive overnight
-            elif i < 7:
-                p = 0.10          # cheap window
+            if i < 6:
+                p = 0.245         # above the old 0.23 cap, still excellent vs peak
             else:
                 p = 0.60          # peak to sell into
             prices.append({'start': t, 'total': p, 'level': 'NORMAL'})
 
-        # No PV, so any charge is grid-sourced. Start low so charging is needed.
         pv = [0.0] * 12
-        sched = self._arb_engine(max_grid_charge_price=0.15).optimize(10.0, prices, pv_forecast=pv)['schedule']
-        buys = [s for s in sched if s['action'] == 'buy']
-        self.assertTrue(buys, "expected some grid charging in the cheap window")
-        self.assertTrue(all(s['price'] <= 0.15 + 1e-9 for s in buys),
-                        "grid charging must not occur above the 0.15 ceiling")
+        sched = self._arb_engine().optimize(
+            5.0,
+            prices,
+            load_forecast=[0.0] * len(prices),
+            pv_forecast=pv,
+        )['schedule']
+        buys = [s for s in sched if s['action'] == 'buy' and s['grid_energy'] > 1e-6]
+        sells = [s for s in sched if s['control_action'] == 'SELL']
+        self.assertTrue(buys, "expected grid charging for a profitable spread")
+        self.assertTrue(any(s['price'] > 0.23 for s in buys))
+        self.assertTrue(sells, "expected the charged energy to sell into the peak")
+
+    def test_flat_prices_do_not_trigger_pointless_grid_charging(self):
+        # Removing hard caps must not make the optimizer buy blindly; with no
+        # profitable spread and no avoided future cost, it should stay out.
+        base_time = datetime.now(tz.UTC).replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        prices = [
+            {'start': base_time + timedelta(hours=i), 'total': 0.25, 'level': 'NORMAL'}
+            for i in range(12)
+        ]
+
+        sched = self._arb_engine().optimize(
+            5.0,
+            prices,
+            load_forecast=[0.0] * len(prices),
+            pv_forecast=[0.0] * len(prices),
+        )['schedule']
+
+        self.assertFalse(any(s['action'] == 'buy' and s['grid_energy'] > 1e-6 for s in sched))
+        self.assertFalse(any(s['control_action'] == 'SELL' for s in sched))
+
+    def test_max_grid_charge_soc_caps_grid_sourced_charging(self):
+        # Cheap early slots and expensive later slots make grid arbitrage worth
+        # doing, but the user cap must stop grid-forced charging at 90% while
+        # still allowing later discharge.
+        base_time = datetime.now(tz.UTC).replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        prices = []
+        for i in range(10):
+            t = base_time + timedelta(hours=i)
+            prices.append({'start': t, 'total': 0.10 if i < 5 else 0.60, 'level': 'NORMAL'})
+
+        result = self._arb_engine(max_grid_charge_soc=90.0).optimize(
+            80.0,
+            prices,
+            load_forecast=[0.0] * len(prices),
+            pv_forecast=[0.0] * len(prices),
+        )
+
+        self.assertIsNotNone(result)
+        grid_buys = [
+            s for s in result['schedule']
+            if s['action'] == 'buy' and s['grid_energy'] > 1e-6
+        ]
+        self.assertTrue(grid_buys, "expected some grid-sourced charging below the cap")
+        self.assertLessEqual(max(s['soc_end'] for s in grid_buys), 90.0 + 1e-6)
+        self.assertTrue(result['victron_slots'], "expected a Victron grid-charge window")
+        self.assertTrue(all(s['target_soc'] <= 90 for s in result['victron_slots']))
 
     def test_cost_basis_floor_math_and_precedence(self):
         # basis €0.27/kWh DC at 90% discharge eff -> €0.30/kWh AC floor.
@@ -418,6 +500,161 @@ class TestAIPoweredESS(unittest.TestCase):
         # 0.8 kWh, but never above the grid limit).
         self.assertAlmostEqual(sched[0]['grid_energy'], 1.0, places=2)
         self.assertAlmostEqual(sched[-1]['soc_end'], 10.0, places=2)
+
+    def test_frontload_charging_does_not_create_grid_buy_above_soc_cap(self):
+        # A legal DP trajectory may reach the user grid-charge cap from grid,
+        # then rise further from PV surplus. Re-timing must not turn that later
+        # PV-only charge into an earlier grid BUY above the cap.
+        self.engine.battery_capacity = 40.0
+        self.engine.charge_efficiency = 1.0
+        self.engine.max_charge_power = 40.0
+        self.engine.max_power_import = 40.0
+        self.engine.max_grid_charge_soc = 85.0
+        slot_h = 0.25
+        base = datetime.now(tz.UTC).replace(second=0, microsecond=0)
+
+        sched = [
+            {'time': base, 'action': 'buy', 'soc_start': 83.0, 'soc_end': 85.0,
+             'grid_energy': 0.8, 'load': 0.0, 'pv': 0.0, 'price': 0.10, 'sell': 0.10},
+            {'time': base + timedelta(minutes=15), 'action': 'buy', 'soc_start': 85.0, 'soc_end': 88.0,
+             'grid_energy': -0.2, 'load': 0.0, 'pv': 1.4, 'price': 0.10, 'sell': 0.10},
+            {'time': base + timedelta(minutes=30), 'action': 'buy', 'soc_start': 88.0, 'soc_end': 91.0,
+             'grid_energy': -0.2, 'load': 0.0, 'pv': 1.4, 'price': 0.10, 'sell': 0.10},
+        ]
+
+        self.engine._frontload_charging(sched, slot_h)
+
+        grid_buys = [s for s in sched if s['grid_energy'] > 1e-6 and s['soc_end'] > s['soc_start']]
+        self.assertTrue(grid_buys)
+        self.assertLessEqual(max(s['soc_end'] for s in grid_buys), 85.0 + 1e-6)
+        self.assertGreater(sched[-1]['soc_end'], 85.0, "PV surplus may still charge above the grid cap")
+
+    def test_frontload_charging_keeps_valid_charge_run(self):
+        # Re-timing mirrors the active optimizer constraints and must keep an
+        # otherwise valid charge run intact.
+        self.engine.battery_capacity = 40.0
+        self.engine.charge_efficiency = 1.0
+        self.engine.max_charge_power = 40.0
+        self.engine.max_power_import = 40.0
+        slot_h = 0.25
+        base = datetime.now(tz.UTC).replace(second=0, microsecond=0)
+
+        sched = [
+            {'time': base, 'action': 'buy', 'soc_start': 80.0, 'soc_end': 82.0,
+             'grid_energy': 0.8, 'load': 0.0, 'pv': 0.0, 'price': 0.30, 'sell': 0.30},
+            {'time': base + timedelta(minutes=15), 'action': 'buy', 'soc_start': 82.0, 'soc_end': 86.0,
+             'grid_energy': 1.6, 'load': 0.0, 'pv': 0.0, 'price': 0.10, 'sell': 0.10},
+            {'time': base + timedelta(minutes=30), 'action': 'buy', 'soc_start': 86.0, 'soc_end': 90.0,
+             'grid_energy': 1.6, 'load': 0.0, 'pv': 0.0, 'price': 0.10, 'sell': 0.10},
+        ]
+
+        self.engine._frontload_charging(sched, slot_h)
+
+        grid_buys = [s for s in sched if s['grid_energy'] > 1e-6 and s['soc_end'] > s['soc_start']]
+        self.assertTrue(grid_buys)
+        self.assertTrue(any(s['price'] > 0.20 + 1e-9 for s in grid_buys))
+
+    def test_pv_only_charging_is_reported_as_idle_not_grid_buy(self):
+        base = datetime.now(tz.UTC).replace(second=0, microsecond=0)
+        sched = [{
+            'time': base,
+            'action': 'buy',
+            'soc_start': 90.0,
+            'soc_end': 92.0,
+            'grid_energy': 0.0,
+            'load': 0.4,
+            'pv': 1.5,
+            'price': 0.24,
+            'sell': 0.24,
+        }]
+
+        result = self.engine._post_process(sched, 900)
+
+        slot = result['schedule'][0]
+        self.assertEqual(slot['control_action'], 'IDLE')
+        self.assertEqual(slot['reason_code'], 'PV_CHARGING')
+        self.assertEqual(result['control_action'], 'IDLE')
+        self.assertEqual(result['setpoint'], 0.0)
+
+    def test_daily_settlement_policy_protects_today_from_small_future_gain(self):
+        full = {
+            'schedule': [
+                self._policy_step(28, 18, 10.0),
+                self._policy_step(29, 8, -17.0),
+            ]
+        }
+        today_first = {
+            'schedule': [
+                self._policy_step(28, 18, 0.0),
+                self._policy_step(29, 8, -4.0),
+            ]
+        }
+        model = {
+            'exceptional_threshold_eur': 8.0,
+            'forecast_risk_eur': 1.0,
+            'historical_price_p95': 2.0,
+        }
+
+        selected, policy = ai_powered_ess._select_daily_settlement_candidate(
+            full, today_first, model)
+
+        self.assertIs(selected, today_first)
+        self.assertEqual(policy['selected'], 'today_first')
+        self.assertEqual(policy['reason_code'], 'DAILY_SETTLEMENT_PROTECTED')
+        self.assertAlmostEqual(policy['today_sacrifice_eur'], 10.0)
+        self.assertAlmostEqual(policy['future_gain_eur'], 3.0)
+
+    def test_daily_settlement_policy_allows_exceptional_future_gain(self):
+        full = {
+            'schedule': [
+                self._policy_step(28, 18, 2.0),
+                self._policy_step(29, 8, -50.0),
+            ]
+        }
+        today_first = {
+            'schedule': [
+                self._policy_step(28, 18, 0.0),
+                self._policy_step(29, 8, -10.0),
+            ]
+        }
+        model = {
+            'exceptional_threshold_eur': 8.0,
+            'forecast_risk_eur': 1.0,
+            'historical_price_p95': 2.0,
+        }
+
+        selected, policy = ai_powered_ess._select_daily_settlement_candidate(
+            full, today_first, model)
+
+        self.assertIs(selected, full)
+        self.assertEqual(policy['selected'], 'full_horizon')
+        self.assertEqual(policy['reason_code'], 'EXCEPTIONAL_FUTURE_GAIN_ACCEPTED')
+        self.assertAlmostEqual(policy['today_sacrifice_eur'], 2.0)
+        self.assertAlmostEqual(policy['future_gain_eur'], 38.0)
+
+    def test_optimize_with_daily_policy_same_day_attaches_policy(self):
+        base_time = datetime(2099, 6, 28, 18, 0, tzinfo=tz.UTC)
+        prices = [
+            {'start': base_time + timedelta(hours=i), 'total': 0.25, 'level': 'NORMAL'}
+            for i in range(4)
+        ]
+
+        result = self._arb_engine().optimize_with_daily_policy(
+            60.0,
+            prices,
+            load_forecast=[0.0] * len(prices),
+            pv_forecast=[0.0] * len(prices),
+            opportunity_model={
+                'exceptional_threshold_eur': 8.0,
+                'forecast_risk_eur': 1.0,
+                'historical_price_p95': 2.0,
+            },
+        )
+
+        self.assertIsNotNone(result)
+        self.assertIn('planning_policy', result)
+        self.assertEqual(result['planning_policy']['selected'], 'full_horizon')
+        self.assertEqual(result['planning_policy']['reason_code'], 'SAME_DAY_HORIZON')
 
 if __name__ == '__main__':
     unittest.main()

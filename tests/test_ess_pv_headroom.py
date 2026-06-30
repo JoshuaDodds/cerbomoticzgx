@@ -36,8 +36,7 @@ def _engine():
     e.min_sell_price = 0.0
     e.cycle_cost = 0.0
     e.arbitrage_margin = 0.0
-    e.max_grid_charge_price = 0.0      # ceilings off — exercise the pure cost trade-off
-    e.grid_charge_cheap_pct = 0.0
+    # Exercise the pure path-economic trade-off.
     e.slot_minutes = 60.0
     e.max_charge_power = 20.0
     e.max_discharge_power = 20.0

@@ -14,6 +14,7 @@ from lib.energy_broker import (
     set_charging_schedule,
     clear_victron_schedules,
     manage_grid_usage_based_on_current_price,
+    _apply_grid_assist_setpoint,
     # Utils
 )
 
@@ -171,20 +172,22 @@ class Event:
 
         if _value:
             grid_import_state = "Enabled"
+            self.gs_client.set('ai_grid_assist', 'on')
             # Apply the retain / grid-assist setpoint immediately so the override
             # takes effect now (hold the battery; let the grid cover all loads,
             # including a full-power EV charge) instead of waiting for the next
             # power event or optimizer cycle. Honoured even while the AI ESS is in
             # control via manage_grid_usage_based_on_current_price.
             try:
-                manage_grid_usage_based_on_current_price(
-                    price=self.gs_client.get('tibber_price_now'),
-                    power=self.gs_client.get('ac_out_power'),
+                _apply_grid_assist_setpoint(
+                    load_watts=self.gs_client.get('ac_out_power'),
+                    cover_all_load=True,
                 )
             except Exception as e:
                 logging.info(f"grid_charging_enabled: immediate apply failed: {e}")
         else:
             grid_import_state = "Disabled"
+            self.gs_client.set('ai_grid_assist', 'off')
             ac_power_setpoint(watts="0.0", override_ess_net_mettering=False, silent=False)
 
         logging.info(f"Grid assisted charging toggled to {grid_import_state}")

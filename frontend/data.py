@@ -15,13 +15,14 @@ from datetime import datetime, timedelta
 from dotenv import dotenv_values
 
 from frontend.config_schema import CONFIG_SCHEMA
+from lib.config_paths import env_path as runtime_env_path
 
 DEFAULT_PLAN_PATH = "/dev/shm/cerbo_ai_plan.json"
 
 
 def _env():
     # Read fresh each call so config edits show up without a restart.
-    return dotenv_values(".env")
+    return dotenv_values(runtime_env_path())
 
 
 def plan_path() -> str:
@@ -84,12 +85,13 @@ def monthly_history() -> list:
     today = datetime.now().date()
     d = today.replace(day=1)
     out = []
+    today_projection = projected_today_net_eur()
     while d <= today:
         t = _day_totals(os.path.join(history_dir(), f"ess-{d.strftime('%Y-%m-%d')}.ndjson"))
         if t is not None:
             imp_cost = t["import_cost"] or 0.0
             exp_rev = t["export_reward"] or 0.0
-            out.append({
+            row = {
                 "date": d.strftime("%Y-%m-%d"),
                 "day": d.day,
                 "net_eur": round(exp_rev - imp_cost, 2),   # profit positive
@@ -98,9 +100,122 @@ def monthly_history() -> list:
                 "import_kwh": t["import_kwh"],
                 "export_kwh": t["export_kwh"],
                 "is_today": d == today,
-            })
+            }
+            if d == today and today_projection is not None:
+                row["projected_net_eur"] = today_projection
+            out.append(row)
         d += timedelta(days=1)
     return out
+
+
+def projected_today_net_eur() -> float | None:
+    """Projected full-day profit-positive net from the current plan JSON."""
+    raw = load_raw_plan()
+    if not raw:
+        return None
+    schedule = raw.get("schedule") or []
+    if not schedule:
+        return None
+    try:
+        today = datetime.now().date().isoformat()
+        summary = day_summary(schedule, raw.get("today_actuals"))
+        row = next((d for d in summary.get("days", []) if d.get("date") == today), None)
+        if not row or row.get("net") is None:
+            return None
+        return round(-float(row["net"]), 2)  # day_summary net is cost-positive.
+    except Exception:
+        return None
+
+
+def forecast_accuracy(days: int = 3) -> dict:
+    """Recent actual-vs-forecast PV/load settlement rows for the Trends overlay."""
+    try:
+        days = max(1, min(14, int(days)))
+    except (TypeError, ValueError):
+        days = 3
+
+    today = datetime.now().date()
+    slots = []
+    for offset in range(days - 1, -1, -1):
+        day = today - timedelta(days=offset)
+        path = os.path.join(history_dir(), f"ess-{day.isoformat()}.ndjson")
+        load_map = None
+        try:
+            with open(path) as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if rec.get("kind") != "settlement" or rec.get("incomplete"):
+                        continue
+                    start = _parse_time(rec.get("slot_start"))
+                    if start is None:
+                        continue
+
+                    predicted_load = _f(rec.get("predicted_load_kwh"))
+                    actual_load = _f(rec.get("actual_load_kwh"))
+                    if actual_load is None:
+                        if load_map is None:
+                            load_map = _actual_load_by_slot(day)
+                        actual_load = load_map.get(_slot_key(start))
+
+                    predicted_pv = _f(rec.get("predicted_pv_kwh"))
+                    actual_pv = _f(rec.get("actual_pv_kwh"))
+                    if (predicted_load is None or actual_load is None) and (
+                        predicted_pv is None or actual_pv is None
+                    ):
+                        continue
+
+                    row = {
+                        "time": start.isoformat(),
+                        "label": start.strftime("%a %H:%M"),
+                        "predicted_load_kwh": predicted_load,
+                        "actual_load_kwh": actual_load,
+                        "predicted_pv_kwh": predicted_pv,
+                        "actual_pv_kwh": actual_pv,
+                    }
+                    if predicted_load is not None and actual_load is not None:
+                        row["load_error_kwh"] = round(actual_load - predicted_load, 3)
+                    if predicted_pv is not None and actual_pv is not None:
+                        row["pv_error_kwh"] = round(actual_pv - predicted_pv, 3)
+                    slots.append(row)
+        except (FileNotFoundError, OSError):
+            continue
+
+    slots.sort(key=lambda s: s["time"])
+
+    def _metric_summary(prefix):
+        pairs = [
+            (s.get(f"predicted_{prefix}_kwh"), s.get(f"actual_{prefix}_kwh"))
+            for s in slots
+        ]
+        pairs = [(p, a) for p, a in pairs if p is not None and a is not None]
+        if not pairs:
+            return {f"{prefix}_points": 0, f"{prefix}_mae_kwh": None, f"{prefix}_bias_kwh": None}
+        errors = [a - p for p, a in pairs]
+        return {
+            f"{prefix}_points": len(pairs),
+            f"{prefix}_mae_kwh": round(sum(abs(e) for e in errors) / len(errors), 3),
+            f"{prefix}_bias_kwh": round(sum(errors), 3),
+        }
+
+    summary = {"slots": len(slots), "days": days}
+    summary.update(_metric_summary("load"))
+    summary.update(_metric_summary("pv"))
+    return {"available": bool(slots), "slots": slots, "summary": summary}
+
+
+def weather_dashboard() -> dict:
+    """Weather summary for the desktop Weather tab."""
+    try:
+        from lib import weather
+        return weather.weather_snapshot()
+    except Exception as e:
+        return {"available": False, "reason": str(e)}
 
 
 def mtd_net_eur() -> dict:
@@ -380,6 +495,7 @@ def group_by_hour(schedule: list) -> list:
         result.append({
             "key": h["key"],
             "label": h["label"],
+            "hour_start": h["hour_start"],
             "is_current": (h["key"] == current_hour_key),
             "dominant_action": dominant,
             "mixed": len(modes) > 1,
@@ -495,6 +611,11 @@ def get_plan() -> dict:
         "stale": (age_s is not None and age_s > 1800),  # >30 min old
         "battery_soc": raw.get("battery_soc"),
         "pv_remaining_wh": raw.get("pv_remaining_wh"),
+        "pv_remaining_raw_wh": raw.get("pv_remaining_raw_wh"),
+        "pv_remaining_raw_source": raw.get("pv_remaining_raw_source"),
+        "pv_adjusted_remaining_wh": raw.get("pv_adjusted_remaining_wh"),
+        "pv_adjusted_remaining_source": raw.get("pv_adjusted_remaining_source"),
+        "pv_adjustment_kwh": raw.get("pv_adjustment_kwh"),
         "pv_today_total_kwh": raw.get("pv_today_total_kwh"),
         "pv_tomorrow_wh": raw.get("pv_tomorrow_wh"),
         "price_points": raw.get("price_points"),
@@ -553,7 +674,7 @@ def _coerce_value(spec, raw):
     return raw
 
 
-def update_env_setting(key: str, value, env_path: str = ".env") -> dict:
+def update_env_setting(key: str, value, env_path: str | None = None) -> dict:
     """Persist a single allow-listed setting to .env (durable source of truth).
 
     The main service's retrieve_setting() re-reads .env on every call (so the
@@ -562,6 +683,7 @@ def update_env_setting(key: str, value, env_path: str = ".env") -> dict:
     change. Only keys present in CONFIG_SCHEMA can be written. The write is
     atomic and preserves comments/formatting.
     """
+    env_path = env_path or runtime_env_path()
     spec = _schema_index().get(key)
     if spec is None:
         raise KeyError(f"Unknown or non-writable setting: {key}")

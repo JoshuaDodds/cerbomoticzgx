@@ -35,11 +35,18 @@ def test_mobile_navigation_markup_is_hidden_by_default():
     assert 'id="mobile-replan"' in html
     assert "data-replan" in html
     assert "id=\"mobile-key-stat\"" in html
-    assert "Import Schedule" in html
+    assert "Victron Schedule" in html
     assert ">Battery</button>" in html
     assert "Battery view" not in html
     assert "ESS dashboard" not in html
-    assert "Venus" in html
+    assert "Victron" in html
+
+
+def test_favicon_uses_existing_brand_asset():
+    html = INDEX_HTML.read_text(encoding="utf-8")
+
+    assert 'rel="icon"' in html
+    assert "img/logo.svg" in html
 
 
 def test_venus_iframe_uses_https_endpoint():
@@ -72,7 +79,7 @@ def test_mobile_logo_has_home_action_hook():
 def test_import_schedule_tab_has_clear_schedule_action():
     html = INDEX_HTML.read_text(encoding="utf-8")
 
-    assert '<button class="tab" data-tab="victron">Import Schedule</button>' in html
+    assert '<button class="tab" data-tab="victron">Victron Schedule</button>' in html
     assert 'id="clear-import-schedule"' in html
     assert html.index('id="tab-victron"') < html.index('id="clear-import-schedule"')
     assert html.index('id="clear-import-schedule"') < html.index('id="victron-schedules"')
@@ -158,6 +165,40 @@ def test_mobile_replan_uses_shared_action_hook_from_menu():
     assert "currentTarget" in js
 
 
+def test_restart_action_exists_beside_replan_and_in_mobile_menu():
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    js = APP_JS.read_text(encoding="utf-8")
+
+    assert 'id="restart"' in html
+    assert 'id="mobile-restart"' in html
+    assert 'data-restart' in html
+    assert html.index('id="replan"') < html.index('id="restart"')
+    assert html.index('id="mobile-replan"') < html.index('id="mobile-restart"')
+    assert html.count("data-restart") == 2
+    assert 'document.querySelectorAll("[data-restart]")' in js
+    assert 'fetch("/api/restart", { method: "POST" })' in js
+    assert 'e.target.closest("button[data-restart]")' in js
+
+
+def test_override_and_grid_assist_controls_exist_after_restart():
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    js = APP_JS.read_text(encoding="utf-8")
+
+    assert 'id="override"' in html
+    assert 'id="grid-assist"' in html
+    assert 'id="mobile-override"' in html
+    assert 'id="mobile-grid-assist"' in html
+    assert html.index('id="restart"') < html.index('id="override"') < html.index('id="grid-assist"')
+    assert html.index('id="mobile-restart"') < html.index('id="mobile-override"') < html.index('id="mobile-grid-assist"')
+    assert html.count("data-ai-override") == 2
+    assert html.count("data-grid-assist") == 2
+    assert '"/api/control/ai-override"' in js
+    assert '"/api/control/grid-assist"' in js
+    assert "function toggleControl(" in js
+    assert 'document.querySelectorAll("[data-ai-override]")' in js
+    assert 'document.querySelectorAll("[data-grid-assist]")' in js
+
+
 def test_mobile_schedule_button_scrolls_to_current_slot():
     js = APP_JS.read_text(encoding="utf-8")
 
@@ -192,6 +233,15 @@ def test_mobile_overview_hides_redundant_current_action_card():
     assert 'body[data-app-view="overview"] #decision' in css
 
 
+def test_solar_card_shows_adjusted_remaining_and_vrm_source():
+    js = APP_JS.read_text(encoding="utf-8")
+
+    assert "pv_adjusted_remaining_wh" in js
+    assert "pv_remaining_raw_wh" in js
+    assert "VRM forecast" in js
+    assert "adjusted remaining" in js
+
+
 def test_external_frames_hide_scrollbars_in_desktop_and_mobile():
     html = INDEX_HTML.read_text(encoding="utf-8")
     css = APP_CSS.read_text(encoding="utf-8")
@@ -218,7 +268,14 @@ def test_desktop_logo_and_clear_schedule_js_hooks_exist():
     assert "history.replaceState" in js
     assert "function clearImportSchedule(" in js
     assert 'fetch("/api/victron/clear-schedule", { method: "POST" })' in js
-    assert "Clear Import Schedule?" in js
+
+
+def test_operator_actions_do_not_use_browser_blocking_dialogs():
+    js = APP_JS.read_text(encoding="utf-8")
+
+    assert "confirm(" not in js
+    assert "alert(" not in js
+    assert "prompt(" not in js
 
 
 def test_advisor_latest_report_loads_on_browser_startup():
@@ -268,3 +325,121 @@ def test_advisor_markdown_tables_are_rendered_as_tables():
     assert "<tbody>" in js
     assert "advisor-message-body table" in css
     assert ".advisor-table-wrap" in css
+
+
+def test_trends_forecast_accuracy_overlay_exists_between_charts():
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    js = APP_JS.read_text(encoding="utf-8")
+    charts = (ROOT / "frontend" / "static" / "js" / "charts.js").read_text(encoding="utf-8")
+
+    assert 'id="forecast-accuracy-chart"' in html
+    assert html.index('id="horizon-chart"') < html.index('id="forecast-accuracy-chart"')
+    assert html.index('id="forecast-accuracy-chart"') < html.index('id="monthly-chart"')
+    assert 'fetch("/api/history/accuracy")' in js
+    assert "refreshForecastAccuracy();" in js
+    assert "renderForecastAccuracyChart" in charts
+    assert "Forecast accuracy" in charts
+
+
+def test_forecast_accuracy_chart_has_tooltips_now_marker_and_toggles():
+    charts = (ROOT / "frontend" / "static" / "js" / "charts.js").read_text(encoding="utf-8")
+
+    assert "forecast-accuracy-hover" in charts
+    assert "Forecast vs actual" in charts
+    assert "forecast-now-line" in charts
+    assert "forecast-now-label" in charts
+    assert "data-acc-toggle=\"load\"" in charts
+    assert "data-acc-toggle=\"pv\"" in charts
+    assert "Mean absolute error" in charts
+    assert "toggleForecastAccuracySeries" in charts
+
+
+def test_horizon_weather_and_weather_impact_legends_are_toggleable():
+    charts = (ROOT / "frontend" / "static" / "js" / "charts.js").read_text(encoding="utf-8")
+
+    assert 'data-horizon-toggle="soc"' in charts
+    assert 'data-horizon-toggle="price"' in charts
+    assert "toggleHorizonSeries" in charts
+    assert 'data-weather-toggle="temp"' in charts
+    assert 'data-weather-toggle="cloud"' in charts
+    assert "toggleWeatherSeries" in charts
+    assert 'data-weather-impact-toggle="load"' in charts
+    assert 'data-weather-impact-toggle="gti"' in charts
+    assert "toggleWeatherImpactSeries" in charts
+
+
+def test_desktop_weather_tab_exists_without_mobile_nav_entry():
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    js = APP_JS.read_text(encoding="utf-8")
+    charts = (ROOT / "frontend" / "static" / "js" / "charts.js").read_text(encoding="utf-8")
+
+    assert '<button class="tab" data-tab="weather">Weather</button>' in html
+    assert html.index('data-tab="victron"') < html.index('data-tab="weather"')
+    assert html.index('data-tab="weather"') < html.index('data-tab="advisor"')
+    assert 'id="tab-weather"' in html
+    assert 'id="weather-chart"' in html
+    assert 'id="weather-impact-chart"' in html
+    assert 'data-mobile-tab="weather"' not in html
+    assert 'fetch("/api/weather")' in js
+    assert "refreshWeather();" in js
+    assert "renderWeatherChart" in charts
+    assert "renderWeatherImpactChart" in charts
+
+
+def test_weather_charts_include_interactive_tooltips():
+    charts = (ROOT / "frontend" / "static" / "js" / "charts.js").read_text(encoding="utf-8")
+    css = (ROOT / "frontend" / "static" / "css" / "app.css").read_text(encoding="utf-8")
+
+    assert "installWeatherTooltip" in charts
+    assert "weather-tip" in charts
+    assert "weather-now-line" in charts
+    assert "weather-impact-today-line" in charts
+    assert "Weather forecast" in charts
+    assert "HVAC shadow" in charts
+    assert "GTI irradiance" in charts
+    assert "mousemove" in charts
+    assert "touchstart" in charts
+    assert ".chart-tip.weather-tip" in css
+    assert "white-space: normal" in css
+    assert "min-width: 220px" in css
+
+
+def test_horizon_weather_and_impact_tooltips_use_large_multiline_style():
+    charts = (ROOT / "frontend" / "static" / "js" / "charts.js").read_text(encoding="utf-8")
+    css = (ROOT / "frontend" / "static" / "css" / "app.css").read_text(encoding="utf-8")
+
+    assert 'tip.className = "chart-tip rich-tip";' in charts
+    assert 'tip.className = `chart-tip rich-tip${tipClass ? " " + tipClass : ""}`;' in charts
+    assert ".chart-tip.rich-tip" in css
+    assert ".chart-tip.rich-tip span { display: block" in css
+    assert "font-size: 14px" in css
+
+
+def test_monthly_chart_renders_projected_today_marker():
+    charts = (ROOT / "frontend" / "static" / "js" / "charts.js").read_text(encoding="utf-8")
+
+    assert "projected_net_eur" in charts
+    assert "projected-today" in charts
+    assert "Projected full day" in charts
+    assert 'tip.className = "chart-tip rich-tip monthly-tip";' in charts
+    assert "Import " in charts
+    assert "Export " in charts
+
+
+def test_schedule_timeline_has_running_today_ledger_row():
+    js = APP_JS.read_text(encoding="utf-8")
+    css = APP_CSS.read_text(encoding="utf-8")
+
+    assert "makeRunningLedgerRow" in js
+    assert "makeForecastedLedgerRow" in js
+    assert "running-ledger-row" in js
+    assert "forecasted-ledger-row" in js
+    assert "todayRunningNet" in js
+    assert "todayForecastedNet" in js
+    assert "box.appendChild(makeRunningLedgerRow(plan));" in js
+    assert "const hourDayKey = (h) =>" in js
+    assert "key.slice(0, 10)" in js
+    assert "lastTodayHourKey" in js
+    assert "if (h.key === lastTodayHourKey)" in js
+    assert ".running-ledger-row" in css
+    assert ".forecasted-ledger-row" in css

@@ -23,6 +23,32 @@ def _load_tibber_api(monkeypatch, tmp_path):
     mqtt_stub.VictronClient = _ClientFactory
     monkeypatch.setitem(sys.modules, "lib.clients.mqtt_client_factory", mqtt_stub)
 
+    gql_stub = types.ModuleType("gql")
+    gql_transport_stub = types.ModuleType("gql.transport")
+    gql_exceptions_stub = types.ModuleType("gql.transport.exceptions")
+
+    class _TransportClosed(Exception):
+        pass
+
+    class _TransportQueryError(Exception):
+        pass
+
+    gql_exceptions_stub.TransportClosed = _TransportClosed
+    gql_exceptions_stub.TransportQueryError = _TransportQueryError
+    monkeypatch.setitem(sys.modules, "gql", gql_stub)
+    monkeypatch.setitem(sys.modules, "gql.transport", gql_transport_stub)
+    monkeypatch.setitem(sys.modules, "gql.transport.exceptions", gql_exceptions_stub)
+
+    websockets_stub = types.ModuleType("websockets")
+    websockets_exceptions_stub = types.ModuleType("websockets.exceptions")
+
+    class _ConnectionClosedError(Exception):
+        pass
+
+    websockets_exceptions_stub.ConnectionClosedError = _ConnectionClosedError
+    monkeypatch.setitem(sys.modules, "websockets", websockets_stub)
+    monkeypatch.setitem(sys.modules, "websockets.exceptions", websockets_exceptions_stub)
+
     spec = importlib.util.spec_from_file_location(
         "tibber_api_under_test",
         Path(__file__).resolve().parents[1] / "lib" / "tibber_api.py",
@@ -84,6 +110,7 @@ def test_quarter_hour_fetch_retries_and_caches(monkeypatch, tmp_path):
     module, cache_path = _load_tibber_api(monkeypatch, tmp_path)
     points = _points()
     calls = {"count": 0}
+    monkeypatch.setattr(module, "_next_day_prices_expected", lambda: False)
 
     class _Resp:
         status_code = 200
@@ -144,3 +171,48 @@ def test_stale_quarter_hour_cache_falls_back_to_hourly(monkeypatch, tmp_path):
 
     assert calls == ["QUARTER_HOURLY", "HOURLY"]
     assert result == hourly
+
+
+def test_after_publish_today_only_quarter_hour_tries_hourly_tomorrow(monkeypatch, tmp_path):
+    module, _cache_path = _load_tibber_api(monkeypatch, tmp_path)
+    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    tomorrow_start = today_start + timedelta(days=1)
+    today_only = _points(start=today_start, count=96, step_min=15, price=0.20)
+    tomorrow = _points(start=tomorrow_start, count=24, step_min=60, price=0.30)
+    hourly = _points(start=today_start, count=24, step_min=60, price=0.22) + tomorrow
+    calls = []
+
+    monkeypatch.setattr(module, "_next_day_prices_expected", lambda: True)
+
+    def _fetch(resolution, *args, **kwargs):
+        calls.append(resolution)
+        return today_only if resolution == "QUARTER_HOURLY" else hourly
+
+    monkeypatch.setattr(module, "_fetch_price_points_graphql", _fetch)
+
+    result = module.get_all_price_points()
+
+    assert calls == ["QUARTER_HOURLY", "HOURLY"]
+    assert result == hourly
+
+
+def test_after_publish_today_only_result_logs_truthful_warning(monkeypatch, tmp_path, caplog):
+    module, _cache_path = _load_tibber_api(monkeypatch, tmp_path)
+    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    today_only = _points(start=today_start, count=96, step_min=15, price=0.20)
+    calls = []
+
+    monkeypatch.setattr(module, "_next_day_prices_expected", lambda: True)
+
+    def _fetch(resolution, *args, **kwargs):
+        calls.append(resolution)
+        return today_only if resolution == "QUARTER_HOURLY" else []
+
+    monkeypatch.setattr(module, "_fetch_price_points_graphql", _fetch)
+    caplog.set_level("WARNING")
+
+    result = module.get_all_price_points()
+
+    assert calls == ["QUARTER_HOURLY", "HOURLY"]
+    assert result == today_only
+    assert "next-day quarter-hourly prices still unavailable" in caplog.text

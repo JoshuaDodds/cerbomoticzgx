@@ -68,6 +68,8 @@ const MOBILE_MQ = window.matchMedia("(max-width: 680px)");
 const isMobileLayout = () => MOBILE_MQ.matches;
 
 const liveOn = () => !!(lastLive && lastLive.connected);
+const truthy = (v) => v === true || v === 1 || String(v || "").trim().toLowerCase() === "true" ||
+  String(v || "").trim() === "1" || String(v || "").trim().toLowerCase() === "on";
 // Prefer a live MQTT value when the feed is connected and the value is present.
 function pick(planVal, liveVal) {
   return (liveOn() && liveVal != null) ? liveVal : planVal;
@@ -260,6 +262,18 @@ function initMobileChrome() {
       return;
     }
 
+    if (e.target.closest("button[data-restart]")) {
+      jumpToMobileViewTop();
+      closeMobileMenu();
+      return;
+    }
+
+    if (e.target.closest("button[data-ai-override]") || e.target.closest("button[data-grid-assist]")) {
+      jumpToMobileViewTop();
+      closeMobileMenu();
+      return;
+    }
+
     if (e.target.closest("[data-mobile-home]")) {
       goHome(e);
     }
@@ -278,6 +292,23 @@ function todayNet(plan) {
   if (!days) return null;
   const t = days.find((d) => d.is_today);
   return t ? t.net : null;
+}
+
+function todayRunningNet(plan) {
+  const actual = liveTodayActuals();
+  if (actual) return Number(actual.import_cost || 0) - Number(actual.export_rev || 0);
+  const days = plan && plan.day_summary && plan.day_summary.days;
+  const today = days && days.find((d) => d.is_today);
+  if (today && today.actual) {
+    return Number(today.actual.import_cost || 0) - Number(today.actual.export_rev || 0);
+  }
+  return null;
+}
+
+function todayForecastedNet(plan) {
+  const days = plan && plan.day_summary && plan.day_summary.days;
+  const today = days && days.find((d) => d.is_today);
+  return today ? today.net : null;
 }
 
 function liveTodayActuals() {
@@ -357,6 +388,21 @@ function updateMobileKeyStat(cact, soc, message) {
   stat.innerHTML = `${chipFor(cact || "IDLE")}<span>${socText}</span>`;
 }
 
+function setToggleButtons(selector, active, baseLabel) {
+  document.querySelectorAll(selector).forEach((btn) => {
+    btn.classList.toggle("active", active);
+    btn.setAttribute("aria-pressed", active ? "true" : "false");
+    btn.textContent = active ? `${baseLabel} on` : baseLabel;
+  });
+}
+
+function updateControlButtons() {
+  const overrideOn = truthy(lastLive && lastLive.ai_ess_override_enabled);
+  const gridAssistOn = truthy(lastLive && lastLive.grid_charging_enabled);
+  setToggleButtons("[data-ai-override]", overrideOn, "Override");
+  setToggleButtons("[data-grid-assist]", gridAssistOn, "Grid assist");
+}
+
 // ---- Render: overview (status, metrics, solar, decision) ----
 function renderStatus(plan) {
   plan = planWithLiveActuals(plan);
@@ -423,9 +469,19 @@ function renderMetrics(plan) {
 function renderSolar(plan) {
   const box = $("#solar");
   if (!plan.available) { box.innerHTML = `<div class="label">Solar forecast</div><div class="big">—</div>`; return; }
-  // "Remaining today" can go negative when actual production already exceeded
-  // the day's forecast — clamp to 0 (forecast met).
-  const today = plan.pv_remaining_wh != null ? Math.max(0, plan.pv_remaining_wh / 1000).toFixed(1) : "—";
+  // Show the optimizer-adjusted remaining PV as the main value, while preserving
+  // the original VRM forecast as explicit source context underneath.
+  const adjustedWh = plan.pv_adjusted_remaining_wh;
+  const rawWh = plan.pv_remaining_raw_wh != null ? plan.pv_remaining_raw_wh : plan.pv_remaining_wh;
+  const mainWh = adjustedWh != null ? adjustedWh : rawWh;
+  const today = mainWh != null ? Math.max(0, mainWh / 1000).toFixed(1) : "—";
+  const rawToday = rawWh != null ? Math.max(0, rawWh / 1000).toFixed(1) : "—";
+  const rawSource = plan.pv_remaining_raw_source || "VRM forecast";
+  const adjSource = plan.pv_adjusted_remaining_source || "optimizer forecast";
+  const adjustment = plan.pv_adjustment_kwh != null ? Number(plan.pv_adjustment_kwh) : null;
+  const adjustmentText = adjustment != null && Math.abs(adjustment) >= 0.05
+    ? ` &nbsp;·&nbsp; ${adjSource} ${adjustment >= 0 ? "+" : "−"}${Math.abs(adjustment).toFixed(1)} kWh`
+    : "";
   const totalToday = plan.pv_today_total_kwh != null ? Number(plan.pv_today_total_kwh).toFixed(1) : null;
   const tom = plan.pv_tomorrow_wh != null ? (plan.pv_tomorrow_wh / 1000).toFixed(1) : "—";
   const pvnow = (liveOn() && lastLive.pv_w != null) ? fmtPower(lastLive.pv_w) : null;
@@ -445,8 +501,9 @@ function renderSolar(plan) {
     + priceRow("Tomorrow", L.price_tom_low, L.price_tom_low_at, L.price_tom_high, L.price_tom_high_at);
 
   box.innerHTML = `<div class="label">Solar forecast</div>
-    <div class="big">${today}<small style="font-size:13px;color:var(--muted)"> kWh${totalToday ? ` (of ${totalToday})` : ""} remaining.</small></div>
-    <div class="sub">${tom} kWh forecast tomorrow${pvnow ? ` &nbsp;·&nbsp; producing ${pvnow} now` : ""}</div>
+    <div class="big">${today}<small style="font-size:13px;color:var(--muted)"> kWh adjusted remaining.</small></div>
+    <div class="sub">${rawSource}: ${rawToday} kWh remaining${totalToday ? ` (${totalToday} kWh day)` : ""}${adjustmentText}</div>
+    <div class="sub">VRM forecast tomorrow: ${tom} kWh${pvnow ? ` &nbsp;·&nbsp; producing ${pvnow} now` : ""}</div>
     ${pricesHtml ? `<div class="solar-prices">${pricesHtml}</div>` : ""}`;
 }
 
@@ -639,6 +696,36 @@ function hourRowInner(h) {
   );
 }
 
+function makeRunningLedgerRow(plan) {
+  const net = todayRunningNet(plan);
+  const row = el("div", "running-ledger-row");
+  row.innerHTML =
+    `<span class="col-time">Today so far</span>` +
+    `<span class="col-bar">midnight → now</span>` +
+    `<span class="col-num muted">—</span>` +
+    `<span class="col-num muted">—</span>` +
+    `<span class="col-num muted">—</span>` +
+    `<span class="col-num muted">—</span>` +
+    `<span class="col-num muted">—</span>` +
+    `<span class="col-num">${net == null ? "—" : netHtml(net)}</span>`;
+  return row;
+}
+
+function makeForecastedLedgerRow(plan) {
+  const net = todayForecastedNet(plan);
+  const row = el("div", "running-ledger-row forecasted-ledger-row");
+  row.innerHTML =
+    `<span class="col-time">Forecasted</span>` +
+    `<span class="col-bar">full day total</span>` +
+    `<span class="col-num muted">—</span>` +
+    `<span class="col-num muted">—</span>` +
+    `<span class="col-num muted">—</span>` +
+    `<span class="col-num muted">—</span>` +
+    `<span class="col-num muted">—</span>` +
+    `<span class="col-num">${net == null ? "—" : netHtml(net)}</span>`;
+  return row;
+}
+
 function makeSlotRow(s) {
   const sr = el("div", "slot-row" + (s.is_current ? " current" : ""));
   const g = Number(s.grid_energy);
@@ -675,14 +762,28 @@ function renderHours(plan) {
   box.innerHTML = "";
   if (!plan.available) return;
   let currentRow = null;
-  const currentHour = (plan.hours || []).find((h) => h.is_current);
+  const hours = plan.hours || [];
+  const hourDayKey = (h) => {
+    const start = h && h.hour_start ? String(h.hour_start).slice(0, 10) : "";
+    if (start) return start;
+    const key = h && h.key ? String(h.key) : "";
+    return /^\d{4}-\d{2}-\d{2}/.test(key) ? key.slice(0, 10) : "";
+  };
+  const currentHour = hours.find((h) => h.is_current);
   const currentKey = currentHour && currentHour.key;
+  const currentDayKey = plan.current && plan.current.time
+    ? String(plan.current.time).slice(0, 10)
+    : hourDayKey(currentHour);
+  const firstDayKey = hourDayKey(hours[0]);
+  const todayKey = currentDayKey || firstDayKey;
+  const todayHours = hours.filter((h) => hourDayKey(h) === todayKey);
+  const lastTodayHourKey = todayHours.length ? todayHours[todayHours.length - 1].key : null;
   if ((firstRender || currentKey !== lastCurrentHourKey) && currentKey) {
     if (lastCurrentHourKey) expandedHours.delete(lastCurrentHourKey);
     expandedHours.add(currentKey);
     lastCurrentHourKey = currentKey;
   }
-  plan.hours.forEach((h) => {
+  hours.forEach((h) => {
     const row = el("div", "hour-row" + (h.is_current ? " current" : ""));
     if (h.is_current) currentRow = row;
     decorateHourRowForMobile(row, h);
@@ -715,8 +816,12 @@ function renderHours(plan) {
       row.querySelector(".caret").textContent = "▾";
     }
 
+    if (h.is_current) box.appendChild(makeRunningLedgerRow(plan));
     box.appendChild(row);
     box.appendChild(slotsWrap);
+    if (h.key === lastTodayHourKey) {
+      box.appendChild(makeForecastedLedgerRow(plan));
+    }
   });
 
   // On first load, jump to the current slot.
@@ -852,8 +957,6 @@ function startEdit(item, s) {
 
   cancel.addEventListener("click", () => loadConfig());
   save.addEventListener("click", async () => {
-    // Deliberate confirm step before changing a setting on a live 16kW system.
-    if (!confirm(`Set ${s.key} = ${input.value}?\nThis applies on the next optimization cycle.`)) return;
     const ok = await saveSetting(s.key, input.value, msg);
     if (ok) setTimeout(loadConfig, 700);
   });
@@ -985,6 +1088,7 @@ function applyLive(data) {
   lastLive = data;
   renderOverview();             // overlay live values onto the plan
   if (lastPlan) renderDaySummary(lastPlan);
+  updateControlButtons();
   safeRenderPowerFlow();
   if (lastPlan) renderMeta(lastPlan);
 }
@@ -1053,10 +1157,63 @@ async function replan(e) {
 }
 document.querySelectorAll("[data-replan]").forEach((btn) => btn.addEventListener("click", replan));
 
+async function restartService(e) {
+  const btn = e && e.currentTarget ? e.currentTarget : $("#restart");
+  const buttons = Array.from(document.querySelectorAll("[data-restart]"));
+  buttons.forEach((x) => { x.disabled = true; });
+  if (btn) btn.textContent = "Restarting...";
+  try {
+    const r = await fetch("/api/restart", { method: "POST" }).then((x) => x.json());
+    if (!r.ok) throw new Error(r.error || "restart failed");
+    buttons.forEach((x) => { x.textContent = "Restart requested"; });
+  } catch (e) {
+    buttons.forEach((x) => { x.title = "Restart failed - is the service running?"; });
+  } finally {
+    setTimeout(() => {
+      buttons.forEach((x) => {
+        x.disabled = false;
+        x.textContent = "Restart";
+      });
+    }, 3000);
+  }
+}
+document.querySelectorAll("[data-restart]").forEach((btn) => btn.addEventListener("click", restartService));
+
+async function toggleControl(selector, endpoint, currentValue, baseLabel) {
+  const buttons = Array.from(document.querySelectorAll(selector));
+  const desired = !truthy(currentValue);
+  buttons.forEach((x) => { x.disabled = true; });
+  try {
+    const r = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: desired }),
+    }).then((x) => x.json());
+    if (!r.ok) throw new Error(r.error || "control failed");
+    if (!lastLive) lastLive = {};
+    if (selector === "[data-ai-override]") lastLive.ai_ess_override_enabled = desired;
+    if (selector === "[data-grid-assist]") lastLive.grid_charging_enabled = desired;
+    updateControlButtons();
+  } catch (e) {
+    buttons.forEach((x) => { x.title = `${baseLabel} failed - is the service running?`; });
+  } finally {
+    buttons.forEach((x) => { x.disabled = false; });
+  }
+}
+
+function toggleAiOverride() {
+  return toggleControl("[data-ai-override]", "/api/control/ai-override", lastLive && lastLive.ai_ess_override_enabled, "Override");
+}
+document.querySelectorAll("[data-ai-override]").forEach((btn) => btn.addEventListener("click", toggleAiOverride));
+
+function toggleGridAssist() {
+  return toggleControl("[data-grid-assist]", "/api/control/grid-assist", lastLive && lastLive.grid_charging_enabled, "Grid assist");
+}
+document.querySelectorAll("[data-grid-assist]").forEach((btn) => btn.addEventListener("click", toggleGridAssist));
+
 async function clearImportSchedule() {
   const btn = $("#clear-import-schedule");
   if (!btn || btn.disabled) return;
-  if (!confirm("Clear Import Schedule?\nThis disables all five Victron scheduled-charge slots.")) return;
 
   const label = btn.textContent;
   btn.disabled = true;
@@ -1553,9 +1710,26 @@ async function refreshMonthly() {
   } catch (e) { /* leave the placeholder */ }
 }
 
+async function refreshForecastAccuracy() {
+  try {
+    const r = await fetch("/api/history/accuracy").then((x) => x.json());
+    if (window.renderForecastAccuracyChart) renderForecastAccuracyChart("forecast-accuracy-chart", r);
+  } catch (e) { /* leave the placeholder */ }
+}
+
+async function refreshWeather() {
+  try {
+    const r = await fetch("/api/weather").then((x) => x.json());
+    if (window.renderWeatherChart) renderWeatherChart("weather-chart", r);
+    if (window.renderWeatherImpactChart) renderWeatherImpactChart("weather-impact-chart", r);
+  } catch (e) { /* leave the placeholder */ }
+}
+
 initMobileChrome();
 load();
 loadAdvisorLatest();
+refreshForecastAccuracy();
+refreshWeather();
 refreshMonthly();
 renderHeaderClock();
 startLiveStream();              // instant live updates via SSE
@@ -1564,4 +1738,6 @@ startLiveStream();              // instant live updates via SSE
 setInterval(refreshPlan, 30000);
 setInterval(pollLive, 20000);
 setInterval(renderHeaderClock, 1000);
+setInterval(refreshForecastAccuracy, 120000);
+setInterval(refreshWeather, 1800000);
 setInterval(refreshMonthly, 120000);   // month chart changes slowly

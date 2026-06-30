@@ -8,10 +8,11 @@ import json
 import logging
 import threading
 
-from flask import Flask, jsonify, render_template, request, Response
+from flask import Flask, jsonify, render_template, request, Response, redirect, url_for
 
 from frontend import data
 from frontend.live import live
+from lib.helpers import publish_message
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 # Don't let browsers cache the dashboard's JS/CSS — it's edited often and served
@@ -29,6 +30,11 @@ def index():
     return render_template("index.html")
 
 
+@app.route("/favicon.ico")
+def favicon():
+    return redirect(url_for("static", filename="img/logo.svg"), code=302)
+
+
 @app.route("/api/plan")
 def api_plan():
     return jsonify(data.get_plan())
@@ -43,6 +49,22 @@ def api_config():
 def api_history_month():
     """Per-day net totals for the current month (Trends monthly chart)."""
     return jsonify({"days": data.monthly_history()})
+
+
+@app.route("/api/history/accuracy")
+def api_history_accuracy():
+    """Recent actual-vs-forecast PV/load settlements for the Trends overlay."""
+    try:
+        days = max(1, min(14, int(request.args.get("days", 3))))
+    except (TypeError, ValueError):
+        days = 3
+    return jsonify(data.forecast_accuracy(days))
+
+
+@app.route("/api/weather")
+def api_weather():
+    """Cached weather forecast and shadow adjustment summary."""
+    return jsonify(data.weather_dashboard())
 
 
 @app.route("/api/history/day")
@@ -112,6 +134,62 @@ def _clear_import_schedule():
     clear_victron_schedules()
 
 
+def _request_service_restart():
+    publish_message("Cerbomoticzgx/system/shutdown", message="True", retain=True)
+
+
+def _boolish(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _set_ai_ess_override(enabled: bool):
+    """Persist the runtime AI ESS override and idle Victron once when enabling.
+
+    The optimizer reads this state and stands down while it is on; it does not keep
+    writing setpoints, so external/Victron changes remain undisturbed afterwards.
+    """
+    from lib.global_state import GlobalStateClient
+    from lib.victron_integration import ac_power_setpoint
+
+    state = GlobalStateClient()
+    state.set("ai_ess_override_enabled", bool(enabled))
+    publish_message("Cerbomoticzgx/system/ai_ess_override_enabled", message="True" if enabled else "False", retain=True)
+    if enabled:
+        state.set("ai_grid_assist", "off")
+        ac_power_setpoint(watts="0.0", override_ess_net_mettering=False, silent=False)
+
+
+def _set_grid_assist_toggle(enabled: bool):
+    """Reuse the existing manual grid-charge/retain toggle."""
+    from lib.global_state import GlobalStateClient
+    from lib.energy_broker import _apply_grid_assist_setpoint
+    from lib.victron_integration import ac_power_setpoint
+
+    state = GlobalStateClient()
+    state.set("grid_charging_enabled", bool(enabled))
+    publish_message("Cerbomoticzgx/system/grid_charging_enabled", message="True" if enabled else "False", retain=True)
+    if enabled:
+        load_watts = state.get("ac_out_power")
+        state.set("ai_grid_assist", "on")
+        _apply_grid_assist_setpoint(
+            load_watts=load_watts,
+            cover_all_load=True,
+        )
+        try:
+            load_label = f"{int(round(float(load_watts or 0)))}W"
+        except (TypeError, ValueError):
+            load_label = "unknown load"
+        logging.info("Grid assist enabled: matching grid setpoint to current AC load %s.", load_label)
+    else:
+        state.set("ai_grid_assist", "off")
+        ac_power_setpoint(watts="0.0", override_ess_net_mettering=False, silent=False)
+        logging.info("Grid assist disabled: returned AC setpoint to 0W.")
+
+
 @app.route("/api/victron/clear-schedule", methods=["POST"])
 def api_victron_clear_schedule():
     """Clear all five Victron scheduled-charge slots."""
@@ -120,6 +198,46 @@ def api_victron_clear_schedule():
         return jsonify({"ok": True})
     except Exception as e:
         logging.exception("Clear Victron import schedule failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/restart", methods=["POST"])
+def api_restart():
+    """Request the existing supervised restart path via MQTT.
+
+    The service already subscribes to Cerbomoticzgx/system/shutdown, kills its own
+    process when it sees True, and the outer loop handles the restart. Do not add a
+    second restart mechanism here.
+    """
+    try:
+        _request_service_restart()
+        return jsonify({"ok": True})
+    except Exception as e:
+        logging.warning("Restart request failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/control/ai-override", methods=["POST"])
+def api_control_ai_override():
+    body = request.get_json(silent=True) or {}
+    enabled = _boolish(body.get("enabled"), False)
+    try:
+        _set_ai_ess_override(enabled)
+        return jsonify({"ok": True, "enabled": enabled})
+    except Exception as e:
+        logging.warning("AI ESS override request failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/control/grid-assist", methods=["POST"])
+def api_control_grid_assist():
+    body = request.get_json(silent=True) or {}
+    enabled = _boolish(body.get("enabled"), False)
+    try:
+        _set_grid_assist_toggle(enabled)
+        return jsonify({"ok": True, "enabled": enabled})
+    except Exception as e:
+        logging.warning("Grid assist request failed: %s", e)
         return jsonify({"ok": False, "error": str(e)}), 500
 
 

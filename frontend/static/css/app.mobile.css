@@ -224,6 +224,32 @@
     background: var(--panel);
   }
 
+  .running-ledger-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 6px 10px;
+    padding: 10px;
+    border-radius: 8px;
+    border: 1px solid var(--accent);
+    margin: 8px 0;
+  }
+
+  .running-ledger-row .col-bar {
+    grid-column: 1;
+    grid-row: 2;
+  }
+
+  .running-ledger-row .col-num {
+    display: none;
+  }
+
+  .running-ledger-row .col-num:last-child {
+    display: block;
+    grid-column: 2;
+    grid-row: 1 / span 2;
+    align-self: center;
+    text-align: right;
+  }
+
   .hour-row[data-mobile-action]::after {
     content: attr(data-mobile-action);
     grid-column: 2;
@@ -535,7 +561,10 @@
     white-space: nowrap;
   }
 
-  .foot #replan {
+  .foot #replan,
+  .foot #restart,
+  .foot #override,
+  .foot #grid-assist {
     display: none;
   }
 

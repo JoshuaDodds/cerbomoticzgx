@@ -10,6 +10,7 @@ import json
 import threading
 
 from dotenv import dotenv_values
+from lib.config_paths import env_path, secrets_path
 
 try:
     import paho.mqtt.client as mqtt
@@ -19,8 +20,8 @@ except Exception:  # paho optional at import time
 
 def _config():
     cfg = {}
-    cfg.update(dotenv_values(".secrets") or {})
-    cfg.update(dotenv_values(".env") or {})
+    cfg.update(dotenv_values(secrets_path()) or {})
+    cfg.update(dotenv_values(env_path()) or {})
     return cfg
 
 
@@ -76,6 +77,8 @@ class MqttLive:
             "control_action": "Cerbomoticzgx/GlobalState/ai_control_action",
             "reason": "Cerbomoticzgx/GlobalState/ai_reason",
             "feed_in_state": "Cerbomoticzgx/GlobalState/feed_in_limit_state",
+            "ai_ess_override_enabled": "Cerbomoticzgx/system/ai_ess_override_enabled",
+            "grid_charging_enabled": "Cerbomoticzgx/system/grid_charging_enabled",
             "day_import_kwh": "Tibber/home/energy/day/imported",
             "day_import_cost": "Tibber/home/energy/day/cost",
             "day_export_kwh": "Tibber/home/energy/day/exported",
@@ -196,6 +199,8 @@ class MqttLive:
         out["control_action"] = vals.get("control_action")
         out["reason"] = vals.get("reason")
         out["feed_in_state"] = vals.get("feed_in_state")
+        out["ai_ess_override_enabled"] = vals.get("ai_ess_override_enabled")
+        out["grid_charging_enabled"] = vals.get("grid_charging_enabled")
         out["day_import_kwh"] = _num("day_import_kwh")
         out["day_import_cost"] = _num("day_import_cost")
         out["day_export_kwh"] = _num("day_export_kwh")

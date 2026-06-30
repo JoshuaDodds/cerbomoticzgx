@@ -23,6 +23,7 @@ from datetime import datetime, timedelta
 from dotenv import dotenv_values
 
 from frontend.config_schema import CONFIG_SCHEMA
+from lib.config_paths import env_path, secrets_path
 from frontend import data as _data
 
 # Current Claude models (override via ADVISOR_MODEL). Sonnet is the sensible
@@ -227,11 +228,11 @@ def _conf() -> dict:
     """Merge .secrets + .env (secrets first so .env can't shadow a key name)."""
     cfg = {}
     try:
-        cfg.update(dotenv_values(".secrets") or {})
+        cfg.update(dotenv_values(secrets_path()) or {})
     except Exception:
         pass
     try:
-        cfg.update(dotenv_values(".env") or {})
+        cfg.update(dotenv_values(env_path()) or {})
     except Exception:
         pass
     return cfg

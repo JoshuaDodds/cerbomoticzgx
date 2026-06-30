@@ -34,11 +34,24 @@ def _get_float_setting(setting_name: str, default: float) -> float:
         return default
 
 
+def _optimizer_guardrails_snapshot() -> dict:
+    return {
+        'max_grid_charge_soc': _get_float_setting('ESS_MAX_GRID_CHARGE_SOC', 100.0),
+        'min_sell_price': _get_float_setting('ESS_MIN_SELL_PRICE', 0.0),
+        'battery_cycle_cost': _get_float_setting('ESS_BATTERY_CYCLE_COST', 0.0),
+        'arbitrage_margin': _get_float_setting('ESS_ARBITRAGE_MARGIN', 0.0),
+    }
+
+
 # Module configuration parsed safely so a missing/blank setting can never crash
 # the import of this module (which controls critical power infrastructure).
 MAX_TIBBER_BUY_PRICE = _get_float_setting('MAX_TIBBER_BUY_PRICE', 0.20)
 ESS_EXPORT_AC_SETPOINT = _get_float_setting('ESS_EXPORT_AC_SETPOINT', -10000.0)
 DAILY_HOME_ENERGY_CONSUMPTION = _get_float_setting('DAILY_HOME_ENERGY_CONSUMPTION', 12.0)
+_LAST_WEATHER_LOG_SIGNATURE = None
+_WEATHER_LOAD_LOG_THRESHOLD_KWH = 0.10
+_WEATHER_PV_SHIFT_LOG_THRESHOLD_KWH = 0.25
+_WEATHER_PV_TOTAL_LOG_THRESHOLD_KWH = 0.10
 
 
 def _is_truthy(value: str | None, default: bool) -> bool:
@@ -46,6 +59,91 @@ def _is_truthy(value: str | None, default: bool) -> bool:
         return default
 
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _weather_context_log_message(summary: dict | None) -> str | None:
+    if not summary:
+        return None
+
+    def _f(key, default=0.0):
+        try:
+            return float(summary.get(key, default) or 0.0)
+        except (TypeError, ValueError):
+            return default
+
+    source = str(summary.get('source') or 'weather').replace('-', ' ').title().replace(' ', '-')
+    max_temp = summary.get('max_temp_c')
+    load_delta = _f('load_adj_today_kwh')
+    pv_shift = _f('pv_shadow_abs_delta_kwh')
+    pv_net = _f('pv_shadow_net_delta_kwh')
+    hvac_apply = bool(summary.get('hvac_apply'))
+    pv_apply = bool(summary.get('pv_apply'))
+
+    def _signed(value):
+        return f"{value:+.2f}"
+
+    max_temp_txt = ""
+    try:
+        max_temp_txt = f" (max {float(max_temp):.1f}C)"
+    except (TypeError, ValueError):
+        pass
+
+    parts = []
+    if abs(load_delta) >= _WEATHER_LOAD_LOG_THRESHOLD_KWH:
+        parts.append(f"load {_signed(load_delta)} kWh today{max_temp_txt}")
+    if abs(pv_shift) >= _WEATHER_PV_SHIFT_LOG_THRESHOLD_KWH or abs(pv_net) >= _WEATHER_PV_TOTAL_LOG_THRESHOLD_KWH:
+        if abs(pv_net) >= _WEATHER_PV_TOTAL_LOG_THRESHOLD_KWH:
+            parts.append(f"PV total {_signed(pv_net)} kWh, timing shifted {abs(pv_shift):.2f} kWh")
+        else:
+            parts.append(f"PV timing shifted {abs(pv_shift):.2f} kWh, total unchanged")
+
+    if not parts:
+        return None
+
+    action = "applied" if (hvac_apply or pv_apply) else "observed (not applied)"
+    detail = "; ".join(parts)
+    return f"Weather forecast {action}: {source} {detail}."
+
+
+def _weather_context_log_signature(summary: dict | None) -> tuple | None:
+    if not summary:
+        return None
+
+    def _float_value(key):
+        try:
+            return float(summary.get(key) or 0.0)
+        except (TypeError, ValueError, AttributeError):
+            return 0.0
+
+    def _nearest_bucket(value, step):
+        return round(value / step) if step else value
+
+    def _floor_bucket(value, step):
+        return int(abs(value) / step) if step else value
+
+    return (
+        summary.get('source'),
+        bool(summary.get('hvac_apply')),
+        bool(summary.get('pv_apply')),
+        _nearest_bucket(_float_value('max_temp_c'), 0.5),
+        _nearest_bucket(_float_value('load_adj_today_kwh'), 0.25),
+        _floor_bucket(_float_value('pv_shadow_abs_delta_kwh'), 1.0),
+        _nearest_bucket(_float_value('pv_shadow_net_delta_kwh'), 0.10),
+    )
+
+
+def _log_weather_context_once(summary: dict | None) -> None:
+    global _LAST_WEATHER_LOG_SIGNATURE
+
+    msg = _weather_context_log_message(summary)
+    if not msg:
+        return
+
+    signature = _weather_context_log_signature(summary)
+    if signature == _LAST_WEATHER_LOG_SIGNATURE:
+        return
+    _LAST_WEATHER_LOG_SIGNATURE = signature
+    logging.info(msg)
 
 
 def _should_skip_night_charge(
@@ -308,13 +406,14 @@ def manage_grid_usage_based_on_current_price(price: float = None, power: any = N
     # AI grid-assist ("retain") mode, where we DO match the grid setpoint to the
     # live house load so the battery is held.
     if _ai_optimizer_active_and_healthy():
-        if STATE.get('ai_grid_assist') == 'on' or _manual_grid_charge_on():
+        manual_grid_assist = _manual_grid_charge_on()
+        if STATE.get('ai_grid_assist') == 'on' or manual_grid_assist:
             # Retain mode (AI plan OR manual grid-charge override): import only what
             # PV can't cover; stay at 0 when PV covers the load so surplus PV charges
             # the battery / exports. The manual override keeps the setpoint tracking
             # live load between 15-min cycles so a full-power EV charge is covered by
             # the grid the instant it ramps, without draining the battery.
-            _apply_grid_assist_setpoint(power)
+            _apply_grid_assist_setpoint(power, cover_all_load=manual_grid_assist)
         return
 
     ess_net_metering_overridden = STATE.get('ess_net_metering_overridden') or False
@@ -473,12 +572,13 @@ def push_notification(hour, day, price):
 
 def run_daily_price_update_and_optimize():
     """Refresh Tibber pricing (so the just-published next-day prices are
-    available) and immediately re-run the optimizer over the full 48h horizon.
+    available) and immediately re-run the optimizer over the latest available
+    horizon.
 
     Scheduled for 13:05 local time, shortly after Tibber publishes day-ahead
     prices for tomorrow."""
     retrieve_latest_tibber_pricing()
-    logging.info("EnergyBroker: 13:05 next-day pricing refresh complete; running optimizer over 48h horizon.")
+    logging.info("EnergyBroker: 13:05 pricing refresh requested; running optimizer with latest available horizon.")
     run_ai_optimizer()
 
 
@@ -666,6 +766,220 @@ def _build_pv_forecast_by_slot(price_slots: list, slot_duration_h: float) -> dic
     return {**_distribute(today_kwh, today_slots), **_distribute(tomorrow_kwh, tomorrow_slots)}
 
 
+def _forecast_slots_for_optimizer(price_slots: list, slot_duration_h: float, now=None) -> list:
+    """Return the same current/future horizon the optimizer will keep.
+
+    The optimizer keeps the slot whose window contains ``now`` plus future slots.
+    Forecast builders must use that same horizon, otherwise "remaining today" PV
+    can be spread into already-elapsed daylight slots and then disappear when the
+    optimizer drops those past slots.
+    """
+    if not price_slots:
+        return []
+    try:
+        starts = [slot['start'] for slot in price_slots if slot.get('start') is not None]
+    except AttributeError:
+        return []
+    if not starts:
+        return []
+    tzinfo = starts[0].tzinfo
+    if now is None:
+        from datetime import datetime as _dt
+        now = _dt.now(tzinfo)
+    keep_after = now - _td_hours(slot_duration_h)
+    return [slot for slot in price_slots if slot.get('start') and slot['start'] > keep_after]
+
+
+def _td_hours(hours: float):
+    from datetime import timedelta as _td
+    return _td(hours=max(0.0, float(hours or 0.0)))
+
+
+def _latest_settled_pv_slot_kwh(slot_duration_h: float, now=None) -> float | None:
+    import os
+    import json
+    from datetime import datetime as _dt
+
+    try:
+        now = now or _dt.now().astimezone()
+        history_dir = retrieve_setting('HISTORY_DIR') or 'data/history'
+        path = os.path.join(history_dir, f"ess-{now.strftime('%Y-%m-%d')}.ndjson")
+        if not os.path.exists(path):
+            return None
+        with open(path) as fh:
+            lines = fh.readlines()
+        target_s = max(60.0, float(slot_duration_h or 0.25) * 3600.0)
+        for line in reversed(lines):
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if row.get('kind') != 'settlement' or row.get('incomplete'):
+                continue
+            try:
+                pv = float(row.get('actual_pv_kwh'))
+                start = _dt.fromisoformat(row.get('slot_start'))
+                end = _dt.fromisoformat(row.get('slot_end'))
+            except (TypeError, ValueError):
+                continue
+            if pv < 0:
+                continue
+            duration_s = max(1.0, (end - start).total_seconds())
+            if not (0.75 * target_s <= duration_s <= 1.30 * target_s):
+                continue
+            if (now - end).total_seconds() > max(2.0 * target_s, 1800.0):
+                continue
+            return pv * target_s / duration_s
+    except Exception as e:
+        logging.debug("EnergyBroker: PV nowcast recent settlement read failed: %s", e)
+    return None
+
+
+def _pv_nowcast_anchor_kwh(slot_duration_h: float, now=None) -> dict | None:
+    """Choose a per-slot PV anchor from the latest actual slot and live PV.
+
+    The latest settled slot captures what the system just did; live PV captures
+    sudden drop-offs. When live output is materially below the previous slot, use
+    live PV and reduce confidence so the forecast follows the tree-line/sundown
+    drop instead of projecting stale high output forward.
+    """
+    try:
+        slot_h = max(0.01, float(slot_duration_h or 0.25))
+    except (TypeError, ValueError):
+        slot_h = 0.25
+
+    recent = _latest_settled_pv_slot_kwh(slot_h, now=now)
+    live = None
+    try:
+        pv_w = float(STATE.get('pv_power') or 0.0)
+        if pv_w > 0:
+            live = pv_w / 1000.0 * slot_h
+    except (TypeError, ValueError):
+        live = None
+
+    if recent is None and live is None:
+        return None
+
+    drop_ratio = 1.0
+    source = "live" if live is not None else "recent"
+    if recent is not None and live is not None and recent > 0.05:
+        drop_ratio = max(0.0, min(1.5, live / recent))
+        if drop_ratio < 0.75:
+            anchor = live
+            source = "live_drop"
+        else:
+            anchor = max(live, recent)
+            source = "live_recent"
+    else:
+        anchor = live if live is not None else recent
+
+    if anchor is None or anchor <= 0.03:
+        return None
+    return {
+        "slot_kwh": float(anchor),
+        "source": source,
+        "drop_ratio": float(drop_ratio),
+        "live_slot_kwh": live,
+        "recent_slot_kwh": recent,
+    }
+
+
+def _apply_pv_nowcast(pv_forecast: dict, forecast_slots: list, weather_context: dict | None,
+                      slot_duration_h: float, now=None) -> dict:
+    """Blend live/recent PV evidence into the near-term PV forecast.
+
+    The baseline forecast still owns the full-day shape. This overlay only raises
+    current-day near-term slots when live production and GTI imply the baseline is
+    clearly too low, and fades out over a few hours.
+    """
+    if not pv_forecast or not forecast_slots:
+        return pv_forecast
+
+    starts = [slot.get('start') for slot in forecast_slots if slot.get('start') is not None]
+    if not starts:
+        return pv_forecast
+
+    from datetime import datetime as _dt
+    now = now or _dt.now(starts[0].tzinfo)
+    anchor = _pv_nowcast_anchor_kwh(slot_duration_h, now=now)
+    if not anchor:
+        return pv_forecast
+
+    weather_context = weather_context if isinstance(weather_context, dict) else {}
+    slot_context = weather_context.setdefault("slots", {})
+    summary = weather_context.setdefault("summary", {})
+
+    def _gti(start):
+        try:
+            row = slot_context.get(start.isoformat()) or {}
+            return float(row.get("gti_forecast_wm2") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    anchor_gti = next((_gti(s) for s in starts if _gti(s) > 0), 0.0)
+    today = now.date()
+    out = dict(pv_forecast)
+    delta = 0.0
+    adjusted_slots = 0
+    drop_ratio = float(anchor.get("drop_ratio", 1.0) or 1.0)
+
+    for start in starts:
+        if start.date() != today:
+            continue
+        hours_ahead = max(0.0, (start - now).total_seconds() / 3600.0)
+        if hours_ahead > 4.0:
+            continue
+        if hours_ahead <= 2.0:
+            weight = 0.90 - 0.20 * (hours_ahead / 2.0)
+        else:
+            weight = 0.70 * max(0.0, 1.0 - (hours_ahead - 2.0) / 2.0)
+        if drop_ratio < 0.75:
+            weight *= max(0.25, drop_ratio)
+        if weight <= 0:
+            continue
+
+        gti = _gti(start)
+        if anchor_gti > 0 and gti > 0:
+            gti_ratio = max(0.0, min(1.15, gti / anchor_gti))
+        elif hours_ahead <= 1.0:
+            gti_ratio = 1.0
+        else:
+            gti_ratio = 0.0
+
+        nowcast = float(anchor["slot_kwh"]) * gti_ratio
+        base = max(0.0, float(pv_forecast.get(start, 0.0) or 0.0))
+        if nowcast <= base + 0.01:
+            continue
+        adjusted = base * (1.0 - weight) + nowcast * weight
+        out[start] = adjusted
+        delta += adjusted - base
+        adjusted_slots += 1
+        row = slot_context.setdefault(start.isoformat(), {})
+        row["pv_nowcast_kwh"] = round(adjusted, 4)
+        row["pv_nowcast_weight"] = round(weight, 3)
+
+    summary.update({
+        "pv_nowcast_applied": adjusted_slots > 0,
+        "pv_nowcast_source": anchor.get("source"),
+        "pv_nowcast_anchor_kwh": round(float(anchor["slot_kwh"]), 3),
+        "pv_nowcast_live_slot_kwh": (
+            round(float(anchor["live_slot_kwh"]), 3)
+            if anchor.get("live_slot_kwh") is not None else None
+        ),
+        "pv_nowcast_recent_slot_kwh": (
+            round(float(anchor["recent_slot_kwh"]), 3)
+            if anchor.get("recent_slot_kwh") is not None else None
+        ),
+        "pv_nowcast_drop_ratio": round(drop_ratio, 3),
+        "pv_nowcast_delta_kwh": round(delta, 3),
+        "pv_nowcast_slots": adjusted_slots,
+    })
+    if adjusted_slots:
+        weather_context["pv_nowcast_forecast"] = out
+        weather_context["pv_forecast"] = out
+    return out
+
+
 def _set_grid_assist(enabled: bool) -> None:
     """Track AI grid-assist ("retain") mode in global state.
 
@@ -696,6 +1010,11 @@ def _manual_grid_charge_on() -> bool:
     button and a "retain the battery" hold.
     """
     return _is_truthy(STATE.get('grid_charging_enabled'), False)
+
+
+def _ai_ess_override_on() -> bool:
+    """Runtime dashboard override: AI ESS stands down completely while true."""
+    return _is_truthy(STATE.get('ai_ess_override_enabled'), False)
 
 
 def _apply_sell_hysteresis(result):
@@ -816,16 +1135,86 @@ def _apply_low_soc_retain_before_cheaper_buy(result, batt_soc):
     return result
 
 
-def _grid_assist_setpoint_watts(load_watts=None) -> int:
-    """Grid setpoint (W) for retain mode: import only the load the PV cannot cover.
+def _filter_victron_slots_for_grid_charge_cap(victron_slots, batt_soc, now=None):
+    """Apply ESS_MAX_GRID_CHARGE_SOC to Victron forced charge windows.
 
-    Returns max(0, house_load - PV). A value of 0 means "do not import" — PV is
-    already covering the load, so we leave the grid setpoint at 0 and let excess
-    PV charge the battery (and export when the battery is full) rather than pulling
-    from the grid while solar is available.
+    The optimizer already avoids planning grid-sourced charging above this cap.
+    This publication-side guard is defensive and handles live drift: if the pack
+    has reached the cap while a charge window is active, the active window is not
+    re-published after the normal clear-all-schedules step. Future windows remain,
+    since an intervening SELL/self-supply period may lower SoC before they start.
+    """
+    cap = max(0.0, min(100.0, _get_float_setting('ESS_MAX_GRID_CHARGE_SOC', 100.0)))
+    if not victron_slots:
+        return []
+
+    try:
+        soc = float(batt_soc)
+    except (TypeError, ValueError):
+        soc = None
+
+    if now is None:
+        from datetime import datetime as _dt
+        first_start = next((s.get('start') for s in victron_slots if s.get('start') is not None), None)
+        tzinfo = getattr(first_start, 'tzinfo', None)
+        now = _dt.now(tzinfo)
+
+    def _active(slot):
+        from datetime import timedelta as _td
+        start = slot.get('start')
+        if start is None:
+            return False
+        try:
+            end = start + _td(seconds=float(slot.get('duration') or 0))
+        except Exception:
+            return False
+        try:
+            return start <= now < end
+        except TypeError:
+            try:
+                start_naive = start.replace(tzinfo=None)
+                now_naive = now.replace(tzinfo=None)
+                end_naive = end.replace(tzinfo=None)
+                return start_naive <= now_naive < end_naive
+            except Exception:
+                return False
+
+    filtered = []
+    removed_active = 0
+    for slot in victron_slots:
+        if cap < 100.0 and soc is not None and soc >= cap - 1e-6 and _active(slot):
+            removed_active += 1
+            continue
+        capped = dict(slot)
+        if cap < 100.0:
+            try:
+                capped['target_soc'] = min(int(capped.get('target_soc', 100)), int(round(cap)))
+            except (TypeError, ValueError):
+                capped['target_soc'] = int(round(cap))
+        filtered.append(capped)
+
+    if removed_active:
+        logging.info(
+            "AI_ESS: Battery SoC %.1f%% reached grid-charge cap %.1f%%; cleared %d active charge slot(s).",
+            soc, cap, removed_active,
+        )
+    return filtered
+
+
+def _grid_assist_setpoint_watts(load_watts=None, cover_all_load: bool = False) -> int:
+    """Grid setpoint (W) for retain mode.
+
+    AI retain imports only the load PV cannot cover. Manual Grid assist imports the
+    full AC load so sudden loads (for example EV charging) are covered by grid
+    immediately instead of PV/battery.
     """
     if load_watts is None:
         load_watts = STATE.get('ac_out_power')
+    if cover_all_load:
+        try:
+            return max(0, int(round(float(load_watts or 0))))
+        except (TypeError, ValueError):
+            return 0
     pv_watts = STATE.get('pv_power')
     try:
         net = float(load_watts or 0) - float(pv_watts or 0)
@@ -834,9 +1223,9 @@ def _grid_assist_setpoint_watts(load_watts=None) -> int:
     return max(0, int(round(net)))
 
 
-def _apply_grid_assist_setpoint(load_watts=None, deadband_w: int = 50) -> None:
+def _apply_grid_assist_setpoint(load_watts=None, deadband_w: int = 50, cover_all_load: bool = False) -> None:
     """Apply the retain-mode grid setpoint (PV-aware), avoiding redundant writes."""
-    target = _grid_assist_setpoint_watts(load_watts)
+    target = _grid_assist_setpoint_watts(load_watts, cover_all_load=cover_all_load)
     try:
         current_sp = float(STATE.get('ac_power_setpoint') or 0)
     except (TypeError, ValueError):
@@ -854,6 +1243,12 @@ def _apply_grid_assist_setpoint(load_watts=None, deadband_w: int = 50) -> None:
         # above — otherwise only the zero-writes log, spamming the service log.
         if abs(current_sp) >= deadband_w:
             ac_power_setpoint(watts="0.0", override_ess_net_mettering=False, silent=True)
+
+
+def _grid_assist_control_action(applied_setpoint, manual_grid_assist: bool = False) -> str:
+    if manual_grid_assist:
+        return 'RETAIN'
+    return 'RETAIN' if (applied_setpoint or 0) > 0 else 'IDLE'
 
 
 # Default relative residential load shape (per clock hour, 0-23). Normalised at
@@ -1039,6 +1434,26 @@ def _publish_plan_json(result, *, batt_soc, price_points, pv_remaining,
         except AttributeError:
             return v
 
+    def _json_safe(v):
+        """Convert internal optimizer objects into JSON-safe plan payload values."""
+        if isinstance(v, dict):
+            out = {}
+            for key, val in v.items():
+                if isinstance(key, (str, int, float, bool)) or key is None:
+                    safe_key = key
+                else:
+                    safe_key = _iso(key)
+                    if safe_key is key:
+                        safe_key = str(key)
+                out[safe_key] = _json_safe(val)
+            return out
+        if isinstance(v, (list, tuple)):
+            return [_json_safe(x) for x in v]
+        if isinstance(v, set):
+            return [_json_safe(x) for x in sorted(v, key=str)]
+        converted = _iso(v)
+        return converted
+
     try:
         path = retrieve_setting('AI_PLAN_EXPORT_PATH') or '/dev/shm/cerbo_ai_plan.json'
 
@@ -1098,11 +1513,49 @@ def _publish_plan_json(result, *, batt_soc, price_points, pv_remaining,
             'sun_set': STATE.get('sun_set') or None,
         }
 
+        def _adjusted_pv_remaining_wh():
+            if not schedule:
+                return None
+            first_day = str(schedule[0].get('time') or '')[:10]
+            if not first_day:
+                return None
+            total_kwh = 0.0
+            seen = False
+            for slot in schedule:
+                if not str(slot.get('time') or '').startswith(first_day):
+                    continue
+                pv_kwh = _fnum(slot.get('pv'))
+                if pv_kwh is None:
+                    continue
+                total_kwh += max(0.0, pv_kwh)
+                seen = True
+            return round(total_kwh * 1000.0, 3) if seen else None
+
+        weather_context = result.get('weather_context') or {}
+        weather_summary = weather_context.get('summary') or {}
+        pv_remaining_raw_wh = _fnum(pv_remaining)
+        pv_adjusted_remaining_wh = _adjusted_pv_remaining_wh()
+        pv_adjustment_kwh = None
+        if pv_adjusted_remaining_wh is not None and pv_remaining_raw_wh is not None:
+            pv_adjustment_kwh = round((pv_adjusted_remaining_wh - pv_remaining_raw_wh) / 1000.0, 3)
+        pv_adjusted_source = (
+            'optimizer nowcast'
+            if weather_summary.get('pv_nowcast_applied')
+            else 'optimizer schedule'
+            if pv_adjusted_remaining_wh is not None
+            else None
+        )
+
         payload = {
             'generated_at': _dt.now().astimezone().isoformat(),
             'battery_soc': batt_soc,
             'price_points': price_points,
             'pv_remaining_wh': pv_remaining,
+            'pv_remaining_raw_wh': pv_remaining,
+            'pv_remaining_raw_source': 'VRM forecast',
+            'pv_adjusted_remaining_wh': pv_adjusted_remaining_wh,
+            'pv_adjusted_remaining_source': pv_adjusted_source,
+            'pv_adjustment_kwh': pv_adjustment_kwh,
             'pv_today_total_kwh': STATE.get('pv_projected_today'),
             'pv_tomorrow_wh': STATE.get('pv_projected_tomorrow'),
             'slot_duration_h': result.get('slot_duration_h'),
@@ -1118,6 +1571,11 @@ def _publish_plan_json(result, *, batt_soc, price_points, pv_remaining,
             },
             'today_actuals': today_actuals,
             'today': today_block,
+            'weather': _json_safe(weather_context),
+            'optimizer_guardrails': _json_safe(
+                result.get('optimizer_guardrails') or _optimizer_guardrails_snapshot()
+            ),
+            'planning_policy': _json_safe(result.get('planning_policy')),
             'victron_slots': victron_slots,
             'schedule': schedule,
         }
@@ -1271,6 +1729,17 @@ def _append_history(result, *, batt_soc, applied_setpoint, today_actuals, realiz
             "day_export_kwh": act.get('exp_kwh'),
             "day_export_reward": act.get('exp_rev'),
         }
+        weather_summary = (result.get('weather_context') or {}).get('summary') or {}
+        if weather_summary:
+            record.update({
+                "weather_source": weather_summary.get("source"),
+                "weather_fetched_at": weather_summary.get("fetched_at"),
+                "weather_hvac_apply": weather_summary.get("hvac_apply"),
+                "weather_pv_apply": weather_summary.get("pv_apply"),
+                "weather_load_adj_today_kwh": weather_summary.get("load_adj_today_kwh"),
+                "weather_max_temp_c": weather_summary.get("max_temp_c"),
+                "weather_pv_shadow_abs_delta_kwh": weather_summary.get("pv_shadow_abs_delta_kwh"),
+            })
 
         path = os.path.join(history_dir, f"ess-{now.strftime('%Y-%m-%d')}.ndjson")
         with open(path, "a") as fh:
@@ -1321,6 +1790,16 @@ def _settle_prior_slot(result, *, batt_soc, today_actuals) -> None:
             'load_actual_wh': _f(STATE.get('consumption_total_cumulative')),
         }
         sched0 = (result.get('schedule') or [{}])[0]
+        weather_slots = (result.get('weather_context') or {}).get('slots') or {}
+
+        def _slot_weather(slot):
+            try:
+                key = slot.get('time').isoformat()
+            except AttributeError:
+                key = slot.get('time')
+            return weather_slots.get(key) or {}
+
+        w0 = _slot_weather(sched0)
         cur['prediction'] = {
             'control_action': result.get('control_action'),
             'predicted_grid_kwh': _f(sched0.get('grid_energy')),
@@ -1330,6 +1809,11 @@ def _settle_prior_slot(result, *, batt_soc, today_actuals) -> None:
             # settlement pairs prediction vs actual for PV and consumption too.
             'predicted_pv_kwh': _f(sched0.get('pv')),
             'predicted_load_kwh': _f(sched0.get('load')),
+            'temp_forecast_c': _f(w0.get('temp_forecast_c')),
+            'gti_forecast_wm2': _f(w0.get('gti_forecast_wm2')),
+            'cloud_forecast_pct': _f(w0.get('cloud_forecast_pct')),
+            'weather_load_adj_kwh': _f(w0.get('weather_load_adj_kwh')),
+            'weather_pv_shadow_kwh': _f(w0.get('weather_pv_shadow_kwh')),
         }
 
         prev = None
@@ -1410,6 +1894,11 @@ def _settle_prior_slot(result, *, batt_soc, today_actuals) -> None:
                 'actual_load_kwh': round(load_act_wh / 1000.0, 3) if load_act_wh is not None else None,
                 'predicted_pv_kwh': pred.get('predicted_pv_kwh'),
                 'predicted_load_kwh': pred.get('predicted_load_kwh'),
+                'temp_forecast_c': pred.get('temp_forecast_c'),
+                'gti_forecast_wm2': pred.get('gti_forecast_wm2'),
+                'cloud_forecast_pct': pred.get('cloud_forecast_pct'),
+                'weather_load_adj_kwh': pred.get('weather_load_adj_kwh'),
+                'weather_pv_shadow_kwh': pred.get('weather_pv_shadow_kwh'),
                 'soc_start': soc_start,
                 'soc_end': soc_end,
                 'soc_delta': round(soc_delta, 2) if soc_delta is not None else None,
@@ -1437,6 +1926,11 @@ def run_ai_optimizer():
     negative-price feed-in protection).
     """
     if not _is_truthy(retrieve_setting('AI_POWERED_ESS_ALGORITHM'), False):
+        return
+    if _ai_ess_override_on():
+        if STATE.get('ai_grid_assist') == 'on':
+            STATE.set('ai_grid_assist', 'off')
+        logging.info("AI_ESS: Override active; optimizer standing down.")
         return
 
     try:
@@ -1484,16 +1978,40 @@ def run_ai_optimizer():
             if positive_gaps:
                 slot_duration_h = min(positive_gaps) / 3600.0
 
-        pv_forecast = _build_pv_forecast_by_slot(normalised_slots, slot_duration_h)
+        forecast_slots = _forecast_slots_for_optimizer(normalised_slots, slot_duration_h)
+        pv_forecast = _build_pv_forecast_by_slot(forecast_slots, slot_duration_h)
         # Self-consumption: forecast house load per slot from VRM consumption
         # data shaped by a diurnal profile, so SoC predictions reflect real usage.
-        load_forecast = _build_load_forecast_by_slot(normalised_slots, slot_duration_h)
+        load_forecast = _build_load_forecast_by_slot(forecast_slots, slot_duration_h)
+        weather_context = None
+        try:
+            from lib.weather import weather_context_for_slots
+            weather_context = weather_context_for_slots(
+                forecast_slots,
+                slot_duration_h,
+                load_forecast,
+                pv_forecast,
+            )
+            if weather_context.get('available'):
+                load_forecast = weather_context.get('load_forecast') or load_forecast
+                pv_forecast = weather_context.get('pv_forecast') or pv_forecast
+                pv_forecast = _apply_pv_nowcast(
+                    pv_forecast,
+                    forecast_slots,
+                    weather_context,
+                    slot_duration_h,
+                )
+                _log_weather_context_once(weather_context.get('summary') or {})
+        except Exception as e:
+            logging.warning("Weather: shadow forecast skipped: %s", e)
 
         # 3. Optimize
         result = optimize_schedule(batt_soc, prices, load_forecast, pv_forecast)
         if not result:
             logging.warning("AI_ESS: Optimization failed or returned nothing.")
             return
+        if weather_context:
+            result['weather_context'] = weather_context
 
         # 4. Negative-price grid feed-in protection.
         # When the current price is negative, exporting costs money, so limit
@@ -1534,11 +2052,13 @@ def run_ai_optimizer():
             # charges the battery / exports. Applied immediately here and
             # maintained on ac_out_power events via manage_grid_usage_based_on_current_price.
             _set_grid_assist(True)
-            _apply_grid_assist_setpoint()
-            applied_setpoint = _grid_assist_setpoint_watts()
-            # RETAIN only when we actually import to cover load; if PV covers it,
-            # the setpoint is neutral and Victron decides -> IDLE.
-            applied_control_action = 'RETAIN' if applied_setpoint > 0 else 'IDLE'
+            manual_grid_assist = _manual_grid_charge_on()
+            _apply_grid_assist_setpoint(cover_all_load=manual_grid_assist)
+            applied_setpoint = _grid_assist_setpoint_watts(cover_all_load=manual_grid_assist)
+            # Manual Grid assist is an explicit RETAIN lock even if the current
+            # load is momentarily near zero. AI retain only labels RETAIN when it
+            # actually has to import a PV deficit.
+            applied_control_action = _grid_assist_control_action(applied_setpoint, manual_grid_assist)
         else:
             # Ensure HOLD is off, then apply the planned setpoint
             # (export for SELL, 0W for BUY/IDLE).
@@ -1578,7 +2098,11 @@ def run_ai_optimizer():
         STATE.set('ai_reason_code', result.get('reason_code'))
 
         # 6. Program the Victron grid-charge schedule slots.
-        victron_slots = result.get('victron_slots', [])
+        victron_slots = _filter_victron_slots_for_grid_charge_cap(
+            result.get('victron_slots', []),
+            batt_soc,
+        )
+        result['victron_slots'] = victron_slots
         clear_victron_schedules()
 
         for i, slot in enumerate(victron_slots):

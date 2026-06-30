@@ -6,12 +6,12 @@ optimizer for the 16 kW Victron ESS. The previous engine crashed on live Tibber
 data, planned at the wrong slot duration, had no terminal value for stored energy,
 and could mislabel PV surplus as active selling. The new implementation plans
 across the current Tibber horizon with PV/load forecasts, applies only deliberate
-control actions, exports a read-only dashboard view, and records history for
+control actions, exports a dashboard view, and records history for
 forecast-vs-actual learning.
 
 Later updates address live behavior observed during manual low-SoC testing and a
 June 18–20 data/code review of the running system:
-- Near-empty batteries no longer churn SELL->HOLD->SELL on tiny price differences,
+- Near-empty batteries no longer churn SELL->RETAIN/IDLE->SELL on tiny price differences,
   and the manual `grid_charging_enabled` override is honored again while the AI
   optimizer is active.
 - The PV forecast self-corrects intraday so a better-than-forecast day is no longer
@@ -42,6 +42,26 @@ model:
 - **Control model clarified:** this ESS runs *ESS Optimized (without BatteryLife)*,
   driven by commanded setpoints under DVCC (the inverters report "External control").
   There is no BatteryLife scheduling — earlier wording to that effect was corrected.
+
+The current branch also adds:
+- A **best daily settlement** planner policy: the optimizer compares a today-first
+  result with the full-horizon result and only sacrifices today's settlement for
+  clearly exceptional future upside relative to learned history and forecast risk.
+- **Path-economic grid charging**: obsolete grid-charge price cap tunables were
+  removed. The optimizer now decides whether to grid charge from the modeled buy,
+  sell, PV, load, cycle-cost, and cost-basis path; `ESS_MAX_GRID_CHARGE_SOC` only
+  limits forced grid-charge target SoC.
+- **Weather shadow mode** with Open-Meteo (`lib/weather.py`), cached weather history,
+  a desktop Weather tab, and apply gates left off until validation.
+- **Same-day PV nowcast correction**: VRM remains the raw solar forecast source, but
+  the optimizer now reconciles today's near-term PV slots with live PV power and the
+  latest settled PV slot, then the Solar card shows the adjusted remaining PV while
+  labelling the raw value as `VRM forecast`.
+- A persistent, newest-first Advisor chat with timestamps, markdown rendering,
+  copy/delete exchange controls, and clear-chat persistence.
+- Desktop and mobile dashboard reorganization around an Overview entry point,
+  ESS module tabs, phone bottom navigation, external Battery/Venus panes, and
+  hidden-but-scrollable embedded views.
 
 ## How (High Level)
 - Rewrote `lib/ai_powered_ess.py` as a SoC-to-SoC dynamic program that supports
@@ -81,6 +101,12 @@ model:
   the remaining estimate is now scaled **up** toward a projection from actual
   production so far (damped, capped, and only after enough daylight has elapsed).
   It only ever raises the forecast and is a no-op on a normal day.
+- Added a measured PV nowcast layer in `lib/energy_broker.py`
+  (`_latest_settled_pv_slot_kwh`, `_pv_nowcast_anchor_kwh`,
+  `_apply_pv_nowcast`). It corrects the next few current-day PV slots from live PV
+  power and the latest settled slot, fades the correction with GTI/sunset shape, and
+  leaves tomorrow untouched. This fixes cases where VRM's remaining forecast has
+  collapsed to zero while the array is still producing.
 - Modeled charging as full-power-to-target for reporting/settlement
   (`_frontload_charging` in `lib/ai_powered_ess.py`). The system charges at full
   power until the target SoC (commanded via setpoints under DVCC — *ESS Optimized
@@ -103,10 +129,12 @@ model:
 - Frontend: the Live power-flow battery node now shows power large with `% SoC`
   beneath, matching the other nodes.
 
-## Dashboard, Advisor & live insights (read-only)
-All of the following is strictly read-only — a separate Flask process that reads the
-published plan JSON, history NDJSON, `.env`/`.secrets`, and (for the advisor) shells
-out to a local CLI. None of it imports the control path or writes Victron/MQTT state.
+## Dashboard, Advisor & live insights
+The Flask dashboard is mostly observational, but it now includes a small set of
+guarded operator controls: allow-listed `.env` writes, replan requests, and Import
+Schedule clearing through the existing Victron helper. The Advisor remains read-only:
+it reads plan/history/config context and shells out to a local CLI, but cannot change
+Victron, MQTT state, or configuration.
 
 - **AI Advisor tab** (`frontend/advisor.py`): a manually-triggered analyst. It sends
   the recent performance history + the allow-listed tunables (never secrets) + the
@@ -215,6 +243,9 @@ out to a local CLI. None of it imports the control path or writes Victron/MQTT s
   hardware floor.
 - Avoids classifying PV-surplus export as active battery SELL.
 - Stops the PV forecast collapsing to ~0 on a better-than-forecast day.
+- Aligns the Overview Solar card with the optimizer schedule: the card's main value
+  is the optimizer-adjusted remaining PV, and the original source is explicitly
+  labelled as `VRM forecast` underneath.
 - Makes BUY settlement predictions match real full-power charging (were 2–20x low).
 - Removes the midnight rollover artifact (first record carried yesterday's totals).
 - Fixes `HOME_CONNECT_APPLIANCE_SCHEDULING=False` being ignored (`bool("False")`).
@@ -231,12 +262,17 @@ out to a local CLI. None of it imports the control path or writes Victron/MQTT s
 
 ## Config / Docs
 - Added and documented AI ESS tunables in `.env.example`, `.env`, README, and
-  frontend docs, including cycle cost, arbitrage margin, grid-charge ceilings,
+  frontend docs, including cycle cost, arbitrage margin, grid-charge SoC cap,
   min sell price, expected peak price, terminal value, optimizer step size, cost
   basis path, and SELL hysteresis thresholds.
 - New tunables: `ESS_PV_SHAPE_DAYS`, `ESS_PV_INTRADAY_CORRECTION`,
   `ESS_PV_INTRADAY_MAX_RATIO`, `ESS_PV_INTRADAY_MIN_ELAPSED` (intraday PV
   correction); `ESS_MODEL_CHARGE_RATE` (full-power-to-target reporting).
+- The PV nowcast layer is intentionally non-tunable: it is based on measured live and
+  settled PV rather than a speculative weather apply gate. `/api/plan` now exposes
+  `pv_remaining_raw_wh`, `pv_remaining_raw_source`, `pv_adjusted_remaining_wh`,
+  `pv_adjusted_remaining_source`, and `pv_adjustment_kwh` for dashboard display and
+  debugging.
 - Tuning changes: `ESS_MAX_GRID_EXPORT_KW=13`, `ESS_MAX_DISCHARGE_KW=15`,
   `ESS_EXPORT_AC_SETPOINT=-13000` (from measured peaks); `ESS_ARBITRAGE_MARGIN`
   raised `0.00 -> 0.03` as a forecast-error cushion (the large midday->evening
@@ -263,9 +299,9 @@ out to a local CLI. None of it imports the control path or writes Victron/MQTT s
 ## Tuning / Validation Notes
 - The dry-run workflow is intentionally read-only and should be used for tuning
   before changing live values.
-- A tuning pass found the baseline snapshot at about `EUR 2.45` forecast profit
-  and `1.405` estimated cycles. `ESS_MAX_GRID_CHARGE_PRICE=0.23` improved that
-  snapshot to about `EUR 2.56` while reducing estimated cycles to `0.780`.
+- The latest optimizer no longer exposes a hard grid-charge price cap. A previous
+  tuning pass used `ESS_MAX_GRID_CHARGE_PRICE`, but that knob has been removed in
+  favor of path-economic charging plus the `ESS_MAX_GRID_CHARGE_SOC` target cap.
 - Lowering `ESS_BATTERY_CYCLE_COST` to zero produced higher paper profit but more
   cycling; that is not recommended because it is fragile to forecast error and
   underprices battery wear.
@@ -293,8 +329,8 @@ out to a local CLI. None of it imports the control path or writes Victron/MQTT s
   feed-in limits.
 - New protective/analytic logic is conservative and safe: cost-basis failures are
   best-effort and never block control; the cost-basis floor only prevents active
-  discharge; hysteresis only suppresses marginal SELL entry; the PV correction only
-  ever raises the forecast and falls back to the VRM value on error; the charge-rate
+  discharge; hysteresis only suppresses marginal SELL entry; the PV corrections only
+  raise current-day forecast slots and fall back to the VRM value on error; the charge-rate
   re-time is reporting-only (Victron windows + the BUY setpoint of 0 unchanged) and
   wrapped in try/except; the midnight guard and `realized_action` are logging-only;
   and history writes are best-effort.
@@ -307,10 +343,11 @@ out to a local CLI. None of it imports the control path or writes Victron/MQTT s
   and sell-state files are temporary and reset on reboot.
 - Confirm the Venus OS `Settings/CGwacs/MaxFeedInPower` path on hardware before
   relying on negative-price limiting.
-- The dashboard and AI Advisor are **read-only and out-of-process**: they read the
-  plan/history/`.env`/`.secrets` and (for the advisor) shell out to a local CLI, but
-  never import the control path or write Victron / MQTT / config. The advisor surfaces
-  any error in its tab. To disable, simply don't run the frontend (or leave
+- The Advisor is **read-only and out-of-process**: it reads the plan/history,
+  allow-listed `.env` values, and (when configured) shells out to a local CLI, but
+  never writes Victron / MQTT / config. The dashboard itself can write only
+  allow-listed config keys, request a replan, and clear scheduled-charge slots through
+  explicit POST routes. To disable it, simply don't run the frontend (or leave
   `ADVISOR_CLI_CMD`/tokens unset so the Advisor stays idle).
 
 ## Human Testing Criteria
@@ -336,7 +373,9 @@ out to a local CLI. None of it imports the control path or writes Victron/MQTT s
    confirm settlement records include predicted-vs-actual values, a `realized_action`
    field, and that the 00:00 record no longer carries a full day of PV/load.
 10. On a sunny day that beats the VRM forecast, confirm the rest-of-day PV forecast
-    no longer collapses to ~0. On the next BUY window, confirm settlement
+    no longer collapses to ~0. Check `/api/plan` for `pv_remaining_raw_source =
+    "VRM forecast"` and a distinct `pv_adjusted_remaining_wh`; the Solar card should
+    show the adjusted value above the source-labelled VRM value. On the next BUY window, confirm settlement
     `predicted_grid_kwh` tracks `actual_import_kwh` (no 2–20x gap). Confirm the
     startup log does not claim HomeConnect is enabled while it is set `False`.
 11. **Advisor:** with `ADVISOR_CLI_CMD` set to a working subscription CLI (or
