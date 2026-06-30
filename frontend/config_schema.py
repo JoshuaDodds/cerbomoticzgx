@@ -142,3 +142,53 @@ CONFIG_SCHEMA = [
         ],
     },
 ]
+
+_NUMERIC_BOUNDS = {
+    "OPTIMIZER_SLOT_MINUTES": (5, 60),
+    "OPTIMIZER_SOC_STEP_PCT": (0.25, 10),
+    "ESS_TERMINAL_VALUE_FACTOR": (0, 5),
+    "ESS_EXPECTED_PEAK_PRICE": (0, 2),
+    "ESS_MIN_SELL_PRICE": (0, 2),
+    "ESS_BATTERY_CYCLE_COST": (0, 1),
+    "ESS_ARBITRAGE_MARGIN": (0, 1),
+    "ESS_MODEL_CHARGE_RATE": (0, 1),
+    "ESS_SELL_MIN_DWELL_MIN": (0, 240),
+    "ESS_SELL_HYSTERESIS_EUR": (0, 1),
+    "BATTERY_CAPACITY_KWH": (1, 200),
+    "AC_DC_CHARGE_EFFICIENCY": (0.1, 1),
+    "AC_DC_DISCHARGE_EFFICIENCY": (0.1, 1),
+    "ESS_MAX_CHARGE_KW": (0, 50),
+    "ESS_MAX_DISCHARGE_KW": (0, 50),
+    "ESS_MAX_GRID_CHARGE_SOC": (0, 100),
+    "ESS_MAX_GRID_IMPORT_KW": (0, 50),
+    "ESS_MAX_GRID_EXPORT_KW": (0, 50),
+    "ESS_EXPORT_AC_SETPOINT": (-50000, 0),
+    "MIN_SOC_RESERVE_WINTER": (0, 100),
+    "MIN_SOC_RESERVE_SUMMER": (0, 100),
+    "ESS_EXPORT_PRICE_FACTOR": (0, 2),
+    "ESS_EXPORT_FEE": (0, 1),
+    "DAILY_HOME_ENERGY_CONSUMPTION": (0, 200),
+    "ESS_PV_SHAPE_DAYS": (1, 60),
+    "ESS_PV_INTRADAY_CORRECTION": (0, 1),
+    "ESS_PV_INTRADAY_MAX_RATIO": (1, 5),
+    "ESS_PV_INTRADAY_MIN_ELAPSED": (0, 1),
+    "PV_PANEL_TILT": (0, 90),
+    "PV_PANEL_AZIMUTH": (0, 360),
+    "WEATHER_FETCH_TTL_MIN": (1, 1440),
+    "HVAC_T_COMFORT_LOW": (-30, 50),
+    "HVAC_T_COMFORT_HIGH": (-30, 50),
+    "HVAC_ALPHA_COOL": (0, 20),
+    "HVAC_ALPHA_HEAT": (0, 20),
+    "HVAC_LOAD_MAX_DELTA_KWH": (0, 100),
+    "PV_WEATHER_BLEND": (0, 1),
+    "ADVISOR_HISTORY_DAYS": (1, 30),
+    "ADVISOR_MAX_THINKING_TOKENS": (0, 200000),
+    "ADVISOR_MAX_INPUT_CHARS": (1000, 1000000),
+    "ADVISOR_RETRIEVAL_MAX_DAYS": (1, 90),
+    "ADVISOR_RETRIEVAL_MAX_CHARS": (1000, 1000000),
+}
+
+for _group in CONFIG_SCHEMA:
+    for _setting in _group["settings"]:
+        if _setting.get("type") in ("int", "float"):
+            _setting["min"], _setting["max"] = _NUMERIC_BOUNDS[_setting["key"]]

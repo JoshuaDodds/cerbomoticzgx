@@ -1,4 +1,5 @@
 import json
+import pytest
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -38,6 +39,28 @@ def test_config_schema_exposes_grid_charge_cap_and_advisor_safe_knobs():
     assert "ADVISOR_MAX_INPUT_CHARS" in keys
     assert "ADVISOR_RETRIEVAL_MAX_DAYS" in keys
     assert "ADVISOR_RETRIEVAL_MAX_CHARS" in keys
+
+
+def test_numeric_config_schema_entries_have_bounds():
+    for group in CONFIG_SCHEMA:
+        for setting in group["settings"]:
+            if setting.get("type") in ("int", "float"):
+                assert "min" in setting, setting["key"]
+                assert "max" in setting, setting["key"]
+
+
+def test_numeric_config_writes_reject_values_outside_schema_bounds(tmp_path):
+    env_path = tmp_path / "runtime.env"
+    env_path.write_text("ESS_MAX_DISCHARGE_KW=12\nMIN_SOC_RESERVE_SUMMER=0\n")
+
+    with pytest.raises(ValueError, match="between 0 and 50"):
+        data.update_env_setting("ESS_MAX_DISCHARGE_KW", "99999", env_path=str(env_path))
+    with pytest.raises(ValueError, match="between 0 and 100"):
+        data.update_env_setting("MIN_SOC_RESERVE_SUMMER", "-50", env_path=str(env_path))
+
+    text = env_path.read_text()
+    assert "ESS_MAX_DISCHARGE_KW=12\n" in text
+    assert "MIN_SOC_RESERVE_SUMMER=0\n" in text
 
 
 def test_weather_behavior_toggles_are_first_in_weather_config_group():

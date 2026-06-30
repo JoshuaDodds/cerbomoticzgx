@@ -156,7 +156,8 @@ sharing the host's `/dev/shm` (so it can read the published plan). Expose
   pair. **Clear chat** empties the saved JSON and starts a fresh session. See the
   advisor config in `.env` / `.secrets`.
 - **Configuration** (tab): click any value to edit it (number/select), confirm, and Save.
-  On phones, descriptions sit behind an info toggle so edit targets remain large.
+  Numeric settings expose schema min/max bounds and the server rejects out-of-range
+  writes. On phones, descriptions sit behind an info toggle so edit targets remain large.
 
 ## Config knobs — how writes propagate
 
@@ -231,9 +232,10 @@ reuses `MOSQUITTO_IP` and `VRM_PORTAL_ID`.
 
 ## Notes / roadmap
 
-- No authentication in v1 (intended for a trusted LAN). Add a reverse proxy / auth
-  before exposing beyond the LAN, especially now that config is writable and
-  schedule clearing is exposed.
+- No authentication in v1 by design: this is an internally deployed trusted-LAN
+  operator app, no egress is allowed, and unauthenticated LAN users are intended
+  to have full access. Add a reverse proxy / auth before exposing beyond the LAN,
+  especially now that config is writable and schedule clearing is exposed.
 - **Done:** ✅ (1) SoC + price horizon chart; ✅ (2) live power-flow diagram (rebuilt
   HASS-style, source-coloured direct flows); ✅ (4) **historical performance** — monthly
   net chart + month-to-date chip (sum of settled daily totals); ✅ (6) unified past-actuals +

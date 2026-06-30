@@ -1,4 +1,5 @@
 import time
+import threading
 import schedule as scheduler
 
 from paho.mqtt import publish
@@ -52,6 +53,7 @@ _LAST_WEATHER_LOG_SIGNATURE = None
 _WEATHER_LOAD_LOG_THRESHOLD_KWH = 0.10
 _WEATHER_PV_SHIFT_LOG_THRESHOLD_KWH = 0.25
 _WEATHER_PV_TOTAL_LOG_THRESHOLD_KWH = 0.10
+_AI_OPTIMIZER_LOCK = threading.Lock()
 
 
 def _is_truthy(value: str | None, default: bool) -> bool:
@@ -1920,6 +1922,18 @@ def _settle_prior_slot(result, *, batt_soc, today_actuals) -> None:
 
 
 def run_ai_optimizer():
+    """Run the optimizer as a single writer; skip overlapping scheduler/UI calls."""
+    if not _AI_OPTIMIZER_LOCK.acquire(blocking=False):
+        logging.info("AI_ESS: Optimization already running; skipping overlapping request.")
+        return False
+    try:
+        _run_ai_optimizer_once()
+        return True
+    finally:
+        _AI_OPTIMIZER_LOCK.release()
+
+
+def _run_ai_optimizer_once():
     """
     Runs the AI optimizer if enabled and applies the resulting plan to the
     Victron system (charge schedule, AC setpoint, grid-assist/retain, and
@@ -1983,7 +1997,7 @@ def run_ai_optimizer():
         # Self-consumption: forecast house load per slot from VRM consumption
         # data shaped by a diurnal profile, so SoC predictions reflect real usage.
         load_forecast = _build_load_forecast_by_slot(forecast_slots, slot_duration_h)
-        weather_context = None
+        weather_context = {"available": False, "summary": {}, "slots": {}}
         try:
             from lib.weather import weather_context_for_slots
             weather_context = weather_context_for_slots(
@@ -1995,15 +2009,16 @@ def run_ai_optimizer():
             if weather_context.get('available'):
                 load_forecast = weather_context.get('load_forecast') or load_forecast
                 pv_forecast = weather_context.get('pv_forecast') or pv_forecast
-                pv_forecast = _apply_pv_nowcast(
-                    pv_forecast,
-                    forecast_slots,
-                    weather_context,
-                    slot_duration_h,
-                )
                 _log_weather_context_once(weather_context.get('summary') or {})
         except Exception as e:
             logging.warning("Weather: shadow forecast skipped: %s", e)
+
+        pv_forecast = _apply_pv_nowcast(
+            pv_forecast,
+            forecast_slots,
+            weather_context,
+            slot_duration_h,
+        )
 
         # 3. Optimize
         result = optimize_schedule(batt_soc, prices, load_forecast, pv_forecast)
@@ -2103,6 +2118,8 @@ def run_ai_optimizer():
             batt_soc,
         )
         result['victron_slots'] = victron_slots
+        # Clear-then-program leaves a brief empty-slot window; missing a grid charge
+        # is the safe failure mode, and the next optimizer cycle self-heals it.
         clear_victron_schedules()
 
         for i, slot in enumerate(victron_slots):

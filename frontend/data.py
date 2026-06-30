@@ -10,6 +10,7 @@ templates/JS stay thin and this stays unit-testable.
 import os
 import json
 import time
+import logging
 from datetime import datetime, timedelta
 
 from dotenv import dotenv_values
@@ -123,7 +124,8 @@ def projected_today_net_eur() -> float | None:
         if not row or row.get("net") is None:
             return None
         return round(-float(row["net"]), 2)  # day_summary net is cost-positive.
-    except Exception:
+    except Exception as exc:
+        logging.debug("Projected today net unavailable: %s", exc)
         return None
 
 
@@ -550,7 +552,6 @@ def day_summary(schedule: list, today_actuals: dict | None) -> dict:
     rows = []
     _keys = ("import_kwh", "import_cost", "export_kwh", "export_rev",
              "idle_imp_cost", "idle_exp_rev")
-    tot = {k: 0.0 for k in _keys}
     for d in order:
         row = days[d]
         forecast = {k: round(row[k], 3) for k in _keys}
@@ -567,8 +568,6 @@ def day_summary(schedule: list, today_actuals: dict | None) -> dict:
         if actual:
             for k in combined:
                 combined[k] = round(combined[k] + actual.get(k, 0.0), 3)
-        for k in tot:
-            tot[k] += combined[k]
         rows.append({
             "date": d, "label": row["label"], "is_today": d == today,
             "forecast": forecast, "actual": actual, "combined": combined,
@@ -580,9 +579,6 @@ def day_summary(schedule: list, today_actuals: dict | None) -> dict:
 
     return {
         "days": rows,
-        "total": {**{k: round(v, 3) for k, v in tot.items()},
-                  "net": round(tot["import_cost"] - tot["export_rev"], 3),
-                  "projected_idle_net": round(tot["idle_exp_rev"] - tot["idle_imp_cost"], 3)},
     }
 
 
@@ -650,6 +646,28 @@ def _schema_index():
     return idx
 
 
+def _format_bound(value):
+    try:
+        return f"{float(value):g}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _validate_bounds(spec, value):
+    minimum = spec.get("min")
+    maximum = spec.get("max")
+    if minimum is not None and value < minimum or maximum is not None and value > maximum:
+        label = spec.get("key", "value")
+        if minimum is not None and maximum is not None:
+            raise ValueError(
+                f"{label} must be between {_format_bound(minimum)} and {_format_bound(maximum)}"
+            )
+        if minimum is not None:
+            raise ValueError(f"{label} must be >= {_format_bound(minimum)}")
+        raise ValueError(f"{label} must be <= {_format_bound(maximum)}")
+    return value
+
+
 def _coerce_value(spec, raw):
     """Validate/normalise a value for a setting, returning the string to persist.
 
@@ -665,9 +683,9 @@ def _coerce_value(spec, raw):
             return "False"
         raise ValueError("expected true/false")
     if t == "int":
-        return str(int(float(raw)))
+        return str(_validate_bounds(spec, int(float(raw))))
     if t == "float":
-        return str(float(raw))
+        return str(_validate_bounds(spec, float(raw)))
     # str / enum
     if "options" in spec and raw not in spec["options"]:
         raise ValueError(f"must be one of {spec['options']}")

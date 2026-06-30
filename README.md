@@ -68,11 +68,11 @@ Note: The name of this project is a nod to both Victron Energy & the Domoticz pr
 - Configure the nightly charging skip guardrails if desired: `NIGHT_CHARGE_SKIP_ENABLED` toggles the behaviour and `NIGHT_CHARGE_SKIP_MIN_SOC` / `NIGHT_CHARGE_SKIP_MAX_SOC` bound the state-of-charge window that will skip the 21:30 schedule run.
 - **AI Optimization Configuration**:
   - `AI_POWERED_ESS_ALGORITHM=True`: Enable the new AI optimizer.
-  - `BATTERY_CAPACITY_KWH`: Your battery capacity in kWh (default 45.0).
+  - `BATTERY_CAPACITY_KWH`: Your battery capacity in kWh (default 42.0).
   - `AC_DC_CHARGE_EFFICIENCY`: Efficiency of charging (e.g. 0.90).
   - `AC_DC_DISCHARGE_EFFICIENCY`: Efficiency of discharging (e.g. 0.90).
   - `MIN_SOC_RESERVE_WINTER` / `MIN_SOC_RESERVE_SUMMER`: Minimum SoC reserve (%) the optimizer always keeps (defaults 20 / 5).
-  - `OPTIMIZER_SOC_STEP_PCT`: DP SoC discretization step in percentage points (default 5.0; smaller = finer control, more compute).
+  - `OPTIMIZER_SOC_STEP_PCT`: DP SoC discretization step in percentage points (default 1.0; smaller = finer control, more compute).
   - `ESS_MAX_GRID_IMPORT_KW` / `ESS_MAX_GRID_EXPORT_KW`: Grid power limits (kW) for the optimizer's feasibility checks.
   - `ESS_MAX_CHARGE_KW` / `ESS_MAX_DISCHARGE_KW`: Optional battery power caps (default to the grid limits).
   - `ESS_MAX_GRID_CHARGE_SOC`: Maximum SoC the optimizer may target with forced grid charging; PV surplus can still charge above it. There is intentionally no user-facing grid-charge price cap: the optimizer evaluates the full path economics instead.

@@ -944,7 +944,10 @@ function startEdit(item, s) {
   } else {
     input = el("input");
     input.type = (s.type === "int" || s.type === "float") ? "number" : "text";
+    if (s.min !== undefined) input.min = s.min;
+    if (s.max !== undefined) input.max = s.max;
     if (s.type === "float") input.step = "0.01";
+    if (s.type === "int") input.step = "1";
     input.value = s.value;
     input.style.width = "110px";
   }

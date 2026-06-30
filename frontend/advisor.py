@@ -17,6 +17,7 @@ import re
 import glob
 import json
 import time
+import logging
 import threading
 from datetime import datetime, timedelta
 
@@ -229,12 +230,12 @@ def _conf() -> dict:
     cfg = {}
     try:
         cfg.update(dotenv_values(secrets_path()) or {})
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.debug("Advisor config: unable to read secrets file: %s", exc)
     try:
         cfg.update(dotenv_values(env_path()) or {})
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.debug("Advisor config: unable to read env file: %s", exc)
     return cfg
 
 

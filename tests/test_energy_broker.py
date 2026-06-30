@@ -45,6 +45,9 @@ class DummyState:
     def get(self, key):
         return self._values.get(key)
 
+    def set(self, key, value):
+        self._values[key] = value
+
     def has(self, key):
         return key in self._values
 
@@ -645,6 +648,22 @@ def test_ai_ess_override_stands_optimizer_down(monkeypatch):
     optimizer.assert_not_called()
 
 
+def test_run_ai_optimizer_skips_when_optimizer_lock_is_held(monkeypatch, caplog):
+    runner = MagicMock()
+    monkeypatch.setattr(energy_broker, "_run_ai_optimizer_once", runner)
+    caplog.set_level("INFO")
+
+    acquired = energy_broker._AI_OPTIMIZER_LOCK.acquire(blocking=False)
+    assert acquired
+    try:
+        assert energy_broker.run_ai_optimizer() is False
+    finally:
+        energy_broker._AI_OPTIMIZER_LOCK.release()
+
+    runner.assert_not_called()
+    assert "Optimization already running" in caplog.text
+
+
 def test_ai_optimizer_skips_when_soc_key_missing_but_voltage_exists(monkeypatch, caplog):
     monkeypatch.setattr(energy_broker, "retrieve_setting",
                         lambda name: "1" if name == "AI_POWERED_ESS_ALGORITHM" else None)
@@ -668,6 +687,86 @@ def test_ai_optimizer_accepts_reported_zero_soc(monkeypatch):
     energy_broker.run_ai_optimizer()
 
     prices.assert_called_once()
+
+
+def test_ai_optimizer_applies_pv_nowcast_when_weather_unavailable(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    import lib.weather as weather
+
+    start = datetime(2026, 6, 29, 13, 0, tzinfo=timezone.utc)
+    prices = [
+        {"start": (start + timedelta(minutes=15 * i)).isoformat(), "total": 0.20}
+        for i in range(2)
+    ]
+    monkeypatch.setattr(
+        energy_broker,
+        "retrieve_setting",
+        lambda name: "1" if name == "AI_POWERED_ESS_ALGORITHM" else None,
+    )
+    monkeypatch.setattr(
+        energy_broker,
+        "STATE",
+        DummyState({
+            "batt_soc": 42,
+            "ac_in_power": 0,
+            "pv_power": 6000,
+            "ac_out_power": 1000,
+            "batt_power": 5000,
+            "pv_projected_remaining": 8000,
+        }),
+    )
+    monkeypatch.setattr(energy_broker, "get_all_price_points", lambda: prices)
+    monkeypatch.setattr(
+        energy_broker,
+        "_build_pv_forecast_by_slot",
+        lambda slots, slot_h: {slot["start"]: 0.1 for slot in slots},
+    )
+    monkeypatch.setattr(
+        energy_broker,
+        "_build_load_forecast_by_slot",
+        lambda slots, slot_h: {slot["start"]: 0.2 for slot in slots},
+    )
+    monkeypatch.setattr(
+        weather,
+        "weather_context_for_slots",
+        lambda *args, **kwargs: {"available": False, "summary": {}, "slots": {}},
+    )
+    nowcast = MagicMock(side_effect=lambda pv, slots, ctx, slot_h: pv)
+    monkeypatch.setattr(energy_broker, "_apply_pv_nowcast", nowcast)
+    monkeypatch.setattr(
+        energy_broker,
+        "optimize_schedule",
+        lambda *args, **kwargs: {
+            "schedule": [{
+                "time": prices[0]["start"],
+                "control_action": "IDLE",
+                "soc_start": 42.0,
+                "soc_end": 42.0,
+                "grid_energy": 0.0,
+                "price": 0.20,
+            }],
+            "victron_slots": [],
+            "slot_duration_h": 0.25,
+            "setpoint": 0.0,
+            "control_action": "IDLE",
+            "grid_assist": False,
+            "mode": "hold",
+            "current_price": 0.20,
+            "limit_feed_in": False,
+        },
+    )
+    monkeypatch.setattr(energy_broker, "_set_grid_assist", lambda enabled: None)
+    monkeypatch.setattr(energy_broker, "ac_power_setpoint", lambda **kwargs: None)
+    monkeypatch.setattr(energy_broker, "clear_victron_schedules", lambda: None)
+    monkeypatch.setattr(energy_broker, "get_today_energy_actuals", lambda: {})
+    monkeypatch.setattr(energy_broker, "_append_history", lambda *args, **kwargs: None)
+    monkeypatch.setattr(energy_broker, "_settle_prior_slot", lambda *args, **kwargs: None)
+    monkeypatch.setattr(energy_broker, "_publish_plan_json", lambda *args, **kwargs: None)
+
+    assert energy_broker.run_ai_optimizer() is True
+
+    nowcast.assert_called_once()
+    assert nowcast.call_args.args[2]["available"] is False
 
 
 def test_low_soc_idle_retain_defers_to_cheaper_planned_buy(monkeypatch):

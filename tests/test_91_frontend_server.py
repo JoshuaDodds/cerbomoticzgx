@@ -83,6 +83,21 @@ def test_restart_route_reports_publish_failure(monkeypatch):
     assert "mqtt publish failed" in body["error"]
 
 
+def test_replan_route_reports_optimizer_already_running(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "lib.energy_broker",
+        types.SimpleNamespace(run_ai_optimizer=lambda: False),
+    )
+
+    response = server.app.test_client().post("/api/replan")
+
+    assert response.status_code == 409
+    body = response.get_json()
+    assert body["ok"] is False
+    assert body["skipped"] is True
+
+
 def test_ai_override_route_sets_state_and_idles_once(monkeypatch):
     calls = []
 

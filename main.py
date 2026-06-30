@@ -65,7 +65,8 @@ def init():
         # let post_startup() know that this is a manually requested restart
         publish_message("Cerbomoticzgx/system/manual_restart", message="True", retain=True)
 
-    # Set shutdown state to false (prevent a looping restart condition)
+    # /api/restart publishes a retained True; clear it on boot so MQTT replay
+    # cannot trigger a looping restart condition.
     publish_message("Cerbomoticzgx/system/shutdown", message="False", retain=True)
 
     # set higher than 0 zero cost at startup until actual pricing is retreived or auto sell/auto grid-assist might flap

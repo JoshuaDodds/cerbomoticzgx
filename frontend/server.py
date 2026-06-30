@@ -122,7 +122,13 @@ def api_replan():
     synchronously and republishes the plan, so the caller can reload immediately."""
     try:
         from lib.energy_broker import run_ai_optimizer
-        run_ai_optimizer()
+        ran = run_ai_optimizer()
+        if ran is False:
+            return jsonify({
+                "ok": False,
+                "skipped": True,
+                "message": "optimizer already running",
+            }), 409
         return jsonify({"ok": True})
     except Exception as e:
         logging.warning("Replan failed: %s", e)
