@@ -1,8 +1,33 @@
-# Weather-forecast integration — implementation plan
+# Weather-forecast integration — shadow-mode status and apply plan
 
 > User story / spec for a coding agent. Scope: improve the optimizer's **load** and
 > **PV** forecasts with weather data. **EV is explicitly out of scope** here (it needs
 > Tesla Fleet-API control first — see `TODO.md`).
+
+## Current status on this branch
+
+Implemented in shadow mode:
+
+- `lib/weather.py` fetches keyless Open-Meteo forecasts using
+  `HOME_ADDRESS_LAT` / `HOME_ADDRESS_LONG` from `.secrets`.
+- Forecast snapshots are cached in `data/weather/latest.json`, and compact weather
+  summaries are appended to `data/weather/weather.ndjson` for later correlation.
+- The dashboard has a desktop Weather tab (`GET /api/weather`) with temperature,
+  cloud/irradiance, and shadow impact charts.
+- The optimizer logs a weather shadow context. By default the HVAC and GTI weather
+  apply gates remain off (`HVAC_LOAD_APPLY=False`, `PV_WEATHER_APPLY=False`), but
+  the separate **PV nowcast** layer always reconciles today's near-term slots with
+  live PV power and recent settled PV when the raw VRM remaining value has drifted.
+- `.env.example`, `frontend/config_schema.py`, and `README.md` document the weather
+  knobs.
+
+Still pending:
+
+- Validate 1-2 weeks of weather shadow output against actual load/PV history.
+- Fit or tune `HVAC_ALPHA_COOL` / `HVAC_ALPHA_HEAT` from observed degree-day error
+  instead of trusting the defaults blindly.
+- Enable `HVAC_LOAD_APPLY` and/or `PV_WEATHER_APPLY` only after shadow validation
+  shows lower forecast error.
 
 ## Why
 
@@ -14,9 +39,9 @@ hot days is the signature of the **four Daikin split heat-pump units** holding t
 house at 21–24 °C — a large, *forecastable*, physically-causal load the VRM model
 can't see. Temperature is the high-value lever.
 
-Secondary: a cloud/irradiance forecast sharpens **next-day** PV. (Same-day PV misses
-are already absorbed by the existing intraday self-correction, so this is lower
-priority — see "Priority" below.)
+Secondary: a cloud/irradiance forecast sharpens **next-day** PV. Same-day PV misses
+are handled by the intraday correction plus the newer PV nowcast layer, so weather PV
+is lower priority for same-day control than HVAC.
 
 ## Data source — Open-Meteo (chosen over OpenWeatherMap)
 
@@ -44,7 +69,7 @@ Endpoint shape (no key):
 are already present as `HOME_ADDRESS_LAT` / `HOME_ADDRESS_LONG`. Leave the existing
 `OPENWEATHERMAP` key in place as an optional fallback provider only.
 
-`.env` + `config_schema.py` (new tunables, all documented inline + in README):
+`.env` + `config_schema.py` (implemented tunables, documented inline + in README):
 
 | Key | Default | Purpose |
 |---|---|---|
@@ -64,15 +89,15 @@ are already present as `HOME_ADDRESS_LAT` / `HOME_ADDRESS_LONG`. Leave the exist
 
 ## Architecture
 
-- New module `lib/weather.py`: `WeatherProvider` interface + `OpenMeteoProvider`.
+- Implemented module `lib/weather.py`: `WeatherProvider` interface + `OpenMeteoProvider`.
   `fetch(lat, lon, tilt, azimuth, horizon) -> list[{ts, temp_c, gti_wm2, ghi_wm2,
   dni_wm2, diffuse_wm2, cloud_pct}]`, cached with `WEATHER_FETCH_TTL_MIN`.
 - **Off the critical path** (AGENTS rule): refresh on a background thread / cached read;
   the optimizer only ever reads the last good snapshot. A fetch must never block or
   crash the 15-min planning cycle.
-- **Fallback:** on any fetch/parse error, return `None`; the optimizer proceeds with the
-  **unmodified VRM forecast** and logs a warning. The feature can only *improve* the
-  forecast, never break the cycle.
+- **Fallback:** on any weather fetch/parse error, return `None`; the optimizer proceeds
+  from the VRM/history baseline forecast and any measured nowcast data still available
+  locally. Weather can only improve or be skipped; it must never break the cycle.
 
 ## HVAC load adjustment (the high-value piece) — symmetric degree-day model
 
@@ -87,7 +112,7 @@ HDD = Σ_slots max(0, HVAC_T_COMFORT_LOW − T_slot)         # heating degree-°
 
 - Distribute `Δload_kWh` across slots weighted by the day's load shape (or
   proportionally to the VRM slot load), then add to the VRM slot load forecast.
-- **Fit** `α_cool`, `α_heat` by linear regression over the last *N* completed days of
+- **Next validation step:** fit `α_cool`, `α_heat` by linear regression over the last *N* completed days of
   `(CDD, HDD, load_actual − load_baseline)`; until enough history exists, use the
   tunable defaults (manual override). Refit on a rolling 14-day window.
 - **Cap** `|Δload| ≤ HVAC_LOAD_MAX_DELTA_KWH` per day to prevent runaway adjustments
@@ -102,31 +127,58 @@ HDD = Σ_slots max(0, HVAC_T_COMFORT_LOW − T_slot)         # heating degree-°
   performance ratio (or `GTI_slot / GTI_clearsky_ref · pv_vrm`), `B = PV_WEATHER_BLEND`.
 - Use **GTI/irradiance, not cloud-%** (cloud-% → PV is crude and nonlinear).
 - Clamp to a sane `[0, max]`; log the per-slot adjustment ratio.
-- Note: the intraday self-correction already handles most *same-day* PV misses; the real
-  win here is **next-day** planning, hence lower priority than HVAC.
+- Note: intraday self-correction plus the live/settled PV nowcast now handles most
+  *same-day* PV misses. The real weather-PV win is **next-day** planning, hence lower
+  priority than HVAC.
+
+## Same-day PV nowcast (implemented outside the weather apply gate)
+
+The current branch also adds a non-tunable near-term PV nowcast in
+`lib/energy_broker.py`:
+
+- `_latest_settled_pv_slot_kwh()` reads the newest complete settlement row for today,
+  rejects stale/incomplete slots, and normalizes it to the optimizer slot duration.
+- `_pv_nowcast_anchor_kwh()` blends that settled slot with live `pv_power`; if live PV
+  has dropped sharply below the settled slot it treats that as sunset/tree-line
+  drop-off instead of extrapolating the earlier high output.
+- `_apply_pv_nowcast()` raises only today's near-term PV slots, weighting the live
+  anchor by Open-Meteo GTI ratios and fading over the next few hours. Tomorrow's
+  forecast is left unchanged.
+
+Why this is separate from `PV_WEATHER_APPLY`: this is not trusting a weather model to
+reshape the day; it is correcting the active plan with measured production from the
+system itself. The dashboard Solar card therefore shows the adjusted remaining PV as
+the main value and the original `VRM forecast` value as source-labelled subtext.
 
 ## Forecast-quality tracking (prove it before trusting it)
 
-- Add to settlement rows (`lib/energy_broker.py`): `temp_forecast_c`, `gti_forecast_wm2`,
-  `weather_pv_adj_kwh`, `weather_load_adj_kwh`, and (if a temp sensor is available)
-  `temp_actual_c` — so the existing predicted-vs-actual tracking can measure improvement.
+- Current branch tracking: `data/weather/weather.ndjson` records a compact summary of
+  the forecast and shadow adjustment per run, while the existing settlement history
+  records predicted-vs-actual PV/load for dashboard and Advisor analysis.
+- Future richer tracking: add per-slot weather fields to settlement rows
+  (`temp_forecast_c`, `gti_forecast_wm2`, `weather_pv_adj_kwh`,
+  `weather_load_adj_kwh`, and, if a temp sensor is available, `temp_actual_c`) so
+  forecast improvement can be measured at slot granularity.
 - Surface `temp_forecast_c` and the day's irradiance summary in the daily summary so the
   **AI Advisor** can reason about weather (it already flagged the hot-day pattern).
 
 ## Shadow-mode validation (it's a 16 kW controller)
 
 1. **Phase 1 — shadow.** `HVAC_LOAD_APPLY=False`, `PV_WEATHER_APPLY=False`: compute and
-   **log** the adjustments only; the optimizer still uses the raw VRM forecast. Run 1–2
-   weeks and compare forecast-vs-actual error *with vs without* the adjustment.
+   **log** the weather adjustments only. The optimizer still starts from the
+   VRM/history forecast, then applies the measured PV nowcast for today's near-term
+   slots. Run 1-2 weeks and compare forecast-vs-actual error *with vs without* the
+   weather adjustment.
 2. **Phase 2 — apply.** Once the adjustment demonstrably reduces the error, flip the
    APPLY gates to `True`. Keep the caps + fallback in place.
 
 ## Priority / phasing
 
-1. Provider + fetch + cache + config + **daily-temperature logging** (foundation; low risk).
-2. **HVAC symmetric degree-day adjustment in shadow mode** + α fitting (the high-value item).
-3. Validate, then enable `HVAC_LOAD_APPLY`.
-4. PV irradiance adjustment (shadow → apply) — lower priority.
+1. ✅ Provider + fetch + cache + config + summary logging (foundation; low risk).
+2. ✅ HVAC symmetric degree-day adjustment in shadow mode (the high-value item).
+3. ✅ PV irradiance adjustment in shadow mode.
+4. Fit/tune α values and validate forecast error over 1-2 weeks.
+5. Enable `HVAC_LOAD_APPLY` and/or `PV_WEATHER_APPLY` only after validation.
 
 ## Timing / ROI note
 

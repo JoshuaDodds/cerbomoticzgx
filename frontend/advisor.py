@@ -17,12 +17,14 @@ import re
 import glob
 import json
 import time
+import logging
 import threading
 from datetime import datetime, timedelta
 
 from dotenv import dotenv_values
 
 from frontend.config_schema import CONFIG_SCHEMA
+from lib.config_paths import env_path, secrets_path
 from frontend import data as _data
 
 # Current Claude models (override via ADVISOR_MODEL). Sonnet is the sensible
@@ -227,13 +229,13 @@ def _conf() -> dict:
     """Merge .secrets + .env (secrets first so .env can't shadow a key name)."""
     cfg = {}
     try:
-        cfg.update(dotenv_values(".secrets") or {})
-    except Exception:
-        pass
+        cfg.update(dotenv_values(secrets_path()) or {})
+    except Exception as exc:
+        logging.debug("Advisor config: unable to read secrets file: %s", exc)
     try:
-        cfg.update(dotenv_values(".env") or {})
-    except Exception:
-        pass
+        cfg.update(dotenv_values(env_path()) or {})
+    except Exception as exc:
+        logging.debug("Advisor config: unable to read env file: %s", exc)
     return cfg
 
 

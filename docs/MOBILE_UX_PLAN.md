@@ -3,6 +3,24 @@
 Goal: make the cerbomoticzGx dashboard genuinely **usable and beautiful on a phone**,
 using best‑in‑class mobile UX patterns — without regressing the desktop experience.
 
+## Current status
+
+This plan has been implemented as the phone breakpoint in
+`frontend/static/css/app.mobile.css` with guarded mobile-only JavaScript in
+`frontend/static/js/app.js`.
+
+Current mobile behavior:
+
+- Compact sticky top header plus swipeable status chips.
+- Bottom navigation ordered **Menu · Flow · Schedule · Trends · Advisor**.
+- Hamburger menu for Battery, Venus, Victron Schedule, Configuration, and Replan.
+- Overview is the mobile entry point; Schedule/Trends/Advisor/Flow focus their main
+  content and hide redundant overview cards.
+- Schedule auto-scrolls to the currently expanded time slot.
+- Battery/Venus embedded panes remain scrollable while scrollbar chrome is hidden.
+- The Overview Solar card uses the optimizer-adjusted remaining PV as the primary
+  value and keeps the raw source visible as `VRM forecast` subtext, matching desktop.
+
 ## Hard constraint (read first)
 
 **The desktop rendering must not change at all.** The current desktop layout is the
@@ -80,9 +98,9 @@ The app currently has **no phone breakpoint**, so the desktop layout is force‑
 
 ### 2. Navigation → bottom tab bar
 - Add an **iOS‑style bottom nav** (fixed, safe‑area padded) for the primary ESS tabs,
-  using icon + short label and 44px targets. Candidate set: **Live · Schedule · Trends ·
-  Advisor · More** (Victron + Configuration fold into "More" to keep ≤5 primary items —
-  the iOS guideline).
+  using icon + short label and 44px targets. Implemented set: **Menu · Flow ·
+  Schedule · Trends · Advisor** (Battery, Venus, Victron Schedule, Configuration, and
+  Replan fold into Menu).
 - The app‑views **ESS / Battery / Live(external)** become a compact **segmented control**
   in the header (or the top of "More"), since they're a different axis than the ESS tabs.
 - The existing top `.tabs` row is hidden on mobile (`display:none` inside the media
@@ -121,7 +139,7 @@ The app currently has **no phone breakpoint**, so the desktop layout is force‑
 - 44px minimum touch targets across nav/tabs/slots/config.
 - Respect `prefers-reduced-motion` for the flow dots.
 
-## Implementation strategy (when we build it)
+## Implementation strategy used
 
 1. Create `static/css/app.mobile.css`, loaded after `app.css`; everything inside
    `@media (max-width: 680px)`. (Optionally a `680–1024px` tablet tier later.)
@@ -136,4 +154,3 @@ The app currently has **no phone breakpoint**, so the desktop layout is force‑
 ## Out of scope for this round
 - No desktop visual changes whatsoever.
 - Tablet (680–1024px) tuning is a later, separate tier.
-- This document is the plan only — no code changes yet.

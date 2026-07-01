@@ -5,12 +5,14 @@ set of explicit operator actions.
 It shows the current decision, the full optimizer schedule (expandable hour → 15-min
 → reasoning tree, including a collapsed **previous-day settled** view), a live
 power-flow diagram, day/month cost summaries, a Tibber-sourced **month-to-date
-profit** chip, a **Trends** view (SoC/price + monthly net), an **AI Advisor** that
+profit** chip, a **Trends** view (SoC/price + forecast accuracy + monthly net), a
+desktop **Weather** view, an **AI Advisor** that
 reviews recent performance on demand, and allow-listed `.env` config editing.
-The only direct Victron control action exposed here is the guarded **Import
+The only direct Victron control action exposed here is the guarded **Victron
 Schedule** clear button, which disables the five scheduled-charge slots; config
-edits go to `.env`, and the advisor only reads history and shells out to a local
-subscription CLI.
+edits go to `.env`; **Restart** publishes the existing supervised restart MQTT
+message (`Cerbomoticzgx/system/shutdown=True`) and does not kill the process from
+HTTP; the advisor only reads history and shells out to a local subscription CLI.
 
 ## Architecture / separation of concerns
 
@@ -18,7 +20,7 @@ subscription CLI.
 frontend/
   __main__.py        # python -m frontend
   server.py          # Flask routes + run()/run_in_thread()
-  data.py            # read-only data layer (plan/history/.env), hour grouping, day/month summary, Tibber MTD
+  data.py            # plan/history/.env readers, hour grouping, day/month/accuracy summary, Tibber MTD
   live.py            # read-only MQTT subscriber -> live snapshot (SSE source)
   advisor.py         # read-only AI advisor: builds the prompt, shells out to a subscription CLI, streams the review
   config_schema.py   # declarative settings schema (drives the config view + advisor's allow-listed tunables)
@@ -35,8 +37,9 @@ failure in either is isolated and cannot break the core dashboard.
 
 - The **main service** publishes its plan as JSON (atomic write) to
   `AI_PLAN_EXPORT_PATH` (default `/dev/shm/cerbo_ai_plan.json`) on every optimizer
-  run. Plan/history/live views only read that file plus `.env`; explicit operator
-  POST routes import control helpers inside the request handler.
+  run, including `planning_policy` metadata for the daily-settlement selector.
+  Plan/history/live views only read that file plus `.env`; explicit operator POST
+  routes import control helpers inside the request handler.
 - Control-action colors: IDLE (grey), RETAIN (amber), BUY (blue), SELL (green).
 
 ## Running
@@ -83,7 +86,11 @@ sharing the host's `/dev/shm` (so it can read the published plan). Expose
   the end of that swipe row. External Battery/Venus iframe views are scaled to 90%
   inside their panes on phones so more of the embedded page is visible.
 - **Overview** (always visible): metric cards (action, SoC, price, day net, next SELL,
-  PV remaining) + the current decision and its plain-English reason.
+  PV remaining) + the current decision and its plain-English reason. The Solar card's
+  main number is the optimizer-adjusted remaining PV for the rest of today; the
+  original source value is shown underneath as `VRM forecast: ... kWh remaining`, so
+  the card and schedule use the same number without hiding where the raw forecast
+  came from.
 - **Live** (tab): real-time power-flow diagram (v2) — **VRM-style info cards** laid
   out in the real Victron **physical topology**: Grid — **Inverter/Charger** — AC
   Loads across the AC bus; the Inverter/Charger linked down to the Battery; **Solar
@@ -114,21 +121,27 @@ sharing the host's `/dev/shm` (so it can read the published plan). Expose
   this SVG power-flow is the **ESS view's "Live" sub-tab**.)
 - **Trends** (tab): HA-style metric cards (**self-sufficiency %**, **self-consumed
   solar %**, **grid balance** bar) above a gradient SoC% + buy-price line chart with
-  a `now` marker, plus a **monthly net chart** — per-day €/profit for the current
-  month with hover tooltips (`/api/history/month`).
+  a `now` marker and clickable series legends, an actual-vs-forecast PV/load overlay,
+  plus a **monthly net chart** with today's projected full-day marker
+  (`/api/history/month`).
 - **Schedule** (tab): expandable hour → 15-min → reasoning tree, color-coded by
   control action, with a per-hour timeline bar and aggregates. For today, the
   timeline starts at midnight with settled history rows, then flows into the forward
   plan from the active slot onward (`NOW` highlighted, auto-scrolls to now). A
-  collapsed **"Previous day"** row above the tree expands into the prior day's
+  moving ledger row sits above the currently running hour and shows the settled
+  cost/profit accumulated from midnight to now. A collapsed **"Previous day"** row
+  above the tree expands into the prior day's
   *settled* schedule (`/api/history/day`) for a continuous 2–3 day view; past-day
   consumption is derived from the cumulative load counter in the cycle records.
   On phones, the wide table reflows into stacked hour cards and the current hour
   starts expanded.
-- **Import Schedule** (tab): mirrors the five Victron/CerboGX scheduled-charge
-  slots from the published optimizer plan. The **Clear schedule** button asks for
-  confirmation and then calls the same broker helper used internally to disable
-  those five Victron slots.
+- **Victron Schedule** (tab): mirrors the five Victron/CerboGX scheduled-charge
+  slots from the published optimizer plan. The **Clear schedule** button calls the
+  same broker helper used internally to disable those five Victron slots.
+- **Weather** (desktop tab): visualizes cached Open-Meteo temperature/cloud patterns
+  and shadow-mode HVAC load / GTI summaries with clickable series legends. It is
+  observational unless `HVAC_LOAD_APPLY` or `PV_WEATHER_APPLY` are deliberately
+  enabled after validation.
 - **Advisor** (tab): a manually-triggered, read-only AI review. Click to stream a
   short markdown report on recent performance, or ask a free-text question ("why did
   we sell at 15:00 yesterday?"). It sends recent history + the allow-listed tunables
@@ -143,12 +156,15 @@ sharing the host's `/dev/shm` (so it can read the published plan). Expose
   pair. **Clear chat** empties the saved JSON and starts a fresh session. See the
   advisor config in `.env` / `.secrets`.
 - **Configuration** (tab): click any value to edit it (number/select), confirm, and Save.
-  On phones, descriptions sit behind an info toggle so edit targets remain large.
+  Numeric settings expose schema min/max bounds and the server rejects out-of-range
+  writes. On phones, descriptions sit behind an info toggle so edit targets remain large.
 
 ## Config knobs — how writes propagate
 
 Editing a setting writes it to `.env` (the durable source of truth) via an
-allow-listed, type-validated, atomic write. The main service picks it up because:
+allow-listed, type-validated, atomic write. If Kubernetes mounts the writable env
+file somewhere else, set `APP_ENV_PATH` so the dashboard writer, runtime reader,
+and watcher all use the same file. The main service picks it up because:
 
 - `lib.config_retrieval.retrieve_setting()` re-reads `.env` on every call, so the
   value applies on the **next optimization/decision cycle** (and it republishes the
@@ -159,6 +175,11 @@ allow-listed, type-validated, atomic write. The main service picks it up because
 Only keys in `config_schema.py` are writable. Runtime *control* values that live in
 `GlobalState`/the MQTT bus (e.g. `ess_net_metering_enabled`) are a separate future
 class of knob and will be written via `STATE.set()` instead of `.env`.
+
+The config view intentionally omits obsolete grid-charge price cap knobs. Forced
+grid charging is now selected by modeled path economics; the remaining
+`ESS_MAX_GRID_CHARGE_SOC` setting only limits the SoC target of grid charging, while
+PV surplus may still charge above it.
 
 ## Real-time data
 
@@ -184,11 +205,15 @@ reuses `MOSQUITTO_IP` and `VRM_PORTAL_ID`.
 
 ## API
 
-- `GET /api/plan` — current decision, hour-grouped schedule, day summary,
-  month-to-date net (`mtd_net`, from settled history), staleness.
+- `GET /api/plan` — current decision, `planning_policy`, hour-grouped schedule, day
+  summary, month-to-date net (`mtd_net`, from settled history), staleness, and both
+  raw VRM PV remaining (`pv_remaining_raw_*`) and optimizer-adjusted PV remaining
+  (`pv_adjusted_remaining_*`) for the Solar card.
 - `GET /api/live` — live MQTT values (SoC, price, grid/PV/battery/load/EV W, …).
 - `GET /api/live/stream` — Server-Sent Events; pushes a live snapshot on each MQTT update.
 - `GET /api/history/month` — per-day net €/profit for the current month (Trends chart).
+- `GET /api/history/accuracy` — recent actual-vs-forecast PV/load slots.
+- `GET /api/weather` — cached Open-Meteo forecast and shadow-mode impact summary.
 - `GET /api/history/day?days_back=1` — a prior day's settled hour-tree (previous-day view).
 - `POST /api/advisor` — run the read-only advisor (default review, or `{ "question": … }`).
 - `GET /api/advisor/stream?question=…` — Server-Sent Events stream of the advisor run.
@@ -197,28 +222,34 @@ reuses `MOSQUITTO_IP` and `VRM_PORTAL_ID`.
 - `GET /api/config` — settings schema with current values.
 - `POST /api/config` — `{ "key": ..., "value": ... }`, writes one allow-listed setting.
 - `POST /api/replan` — ask the main service to re-run the optimizer now.
+- `POST /api/restart` — request the existing supervised service restart via MQTT.
+- `POST /api/control/ai-override` — toggle AI ESS override; enabling idles Victron once
+  and makes the optimizer stand down until toggled off.
+- `POST /api/control/grid-assist` — toggle the existing manual grid-assist/retain mode
+  (`grid_charging_enabled`) so grid covers loads and the battery is held.
 - `POST /api/victron/clear-schedule` — clear the five Victron scheduled-charge slots.
 - `GET /healthz` — liveness.
 
 ## Notes / roadmap
 
-- No authentication in v1 (intended for a trusted LAN). Add a reverse proxy / auth
-  before exposing beyond the LAN, especially now that config is writable and
-  schedule clearing is exposed.
+- No authentication in v1 by design: this is an internally deployed trusted-LAN
+  operator app, no egress is allowed, and unauthenticated LAN users are intended
+  to have full access. Add a reverse proxy / auth before exposing beyond the LAN,
+  especially now that config is writable and schedule clearing is exposed.
 - **Done:** ✅ (1) SoC + price horizon chart; ✅ (2) live power-flow diagram (rebuilt
   HASS-style, source-coloured direct flows); ✅ (4) **historical performance** — monthly
   net chart + month-to-date chip (sum of settled daily totals); ✅ (6) unified past-actuals +
   forward-plan timeline, plus a collapsed **previous-day settled** view; ✅ **AI
   Advisor** (Phase 1) — read-only, on-demand, plain-language review + Q&A; ✅
   mobile-responsive phone layout with bottom navigation, a guarded Menu sheet, and
-  focused Live/Trends/Advisor/Import Schedule/Configuration views that hide the
-  overview cards on phones.
+  focused Live/Trends/Advisor/Victron Schedule/Configuration views that hide the
+  overview cards on phones; ✅ forecast-accuracy overlay; ✅ desktop Weather tab;
+  ✅ best-daily-settlement selector and path-economic grid charging; ✅ clickable
+  chart legends; ✅ runtime Override and Grid assist controls; ✅ Solar card alignment
+  with the optimizer PV nowcast while preserving the source-labelled VRM forecast.
 - Roadmap (next up):
-  - (3) **Control toggles** (enable optimizer, net metering) written via `STATE.set`
-    — the second write path, distinct from `.env` config knobs.
-  - (5) **Forecast-accuracy overlay** — actual-vs-forecast PV and consumption per slot
-    in Trends, from the new `predicted_pv_kwh` / `predicted_load_kwh` /
-    `actual_load_kwh` settlement fields (groundwork landed; chart is the next build).
+  - (3) More runtime control toggles, if needed, should follow the `STATE.set` /
+    retained-MQTT pattern used by Override and Grid assist.
   - (7) **Battery-health** widget — cycles/day and €-per-cycle, to watch wear vs gain.
   - (8) **Auth / reverse-proxy** hardening.
   - (9) **CSV export** of plan + history for offline analysis.

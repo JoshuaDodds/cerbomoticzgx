@@ -109,6 +109,17 @@ main { padding: 12px 16px 80px; max-width: 1100px; margin: 0 auto; }
 }
 .chart-tip b { display: block; font-weight: 600; }
 .chart-tip span { color: var(--muted); font-size: 11px; }
+.chart-tip.rich-tip {
+  min-width: 220px; max-width: min(380px, calc(100vw - 36px)); white-space: normal;
+  padding: 9px 12px; font-size: 15px; line-height: 1.42;
+}
+.chart-tip.rich-tip span { display: block; color: var(--muted); font-size: 14px; margin-top: 3px; }
+.chart-tip.rich-tip b { margin-bottom: 4px; font-size: 15px; }
+.chart-tip.weather-tip {
+  min-width: 240px;
+}
+.chart-legend .legend-toggle { cursor: pointer; user-select: none; }
+.chart-legend .legend-toggle.is-off { opacity: 0.42; text-decoration: line-through; }
 
 /* HA-style energy metric cards (Trends tab) */
 .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin-bottom: 14px; }
@@ -147,7 +158,7 @@ main { padding: 12px 16px 80px; max-width: 1100px; margin: 0 auto; }
 
 
 /* hour table — Hour | Timeline | Avg | Grid | Prod | Cons | SoC | Net */
-.table-head, .hour-row, .slot-row {
+.table-head, .hour-row, .slot-row, .running-ledger-row {
   display: grid;
   grid-template-columns: 116px 1fr 82px 74px 64px 64px 88px 100px;
   align-items: center; gap: 8px;
@@ -164,6 +175,20 @@ main { padding: 12px 16px 80px; max-width: 1100px; margin: 0 auto; }
 .hour-row:hover { background: var(--panel-2); }
 .hour-row.open { background: var(--panel-2); border-color: var(--line); }
 .hour-row.current, .slot-row.current { box-shadow: inset 3px 0 0 var(--accent); background: #11202e; }
+.running-ledger-row {
+  margin: 8px 0 6px;
+  padding: 7px 8px;
+  border-top: 1px solid var(--accent);
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  background: rgba(96, 165, 250, .06);
+  font-size: 12px;
+}
+.running-ledger-row .col-time { color: var(--text); font-weight: 700; }
+.forecasted-ledger-row {
+  border-top-style: dashed;
+  background: rgba(148, 163, 184, .05);
+}
 .now-tag { font-size: 10px; font-weight: 700; color: #06121f; background: var(--accent); border-radius: 999px; padding: 1px 6px; margin-left: 8px; }
 .hour-row .col-time { font-weight: 600; }
 .hour-row .col-time .caret { color: var(--muted); margin-right: 6px; display: inline-block; width: 10px; }
@@ -320,4 +345,8 @@ main { padding: 12px 16px 80px; max-width: 1100px; margin: 0 auto; }
   gap: 12px; padding: 8px 16px; background: var(--panel); border-top: 1px solid var(--line);
 }
 .btn { margin-left: auto; background: var(--accent); color: #06121f; border: none; border-radius: 8px; padding: 7px 14px; font-weight: 600; cursor: pointer; }
+.foot .btn + .btn { margin-left: 0; }
+.btn-toggle { background: var(--panel-2); color: var(--text); border: 1px solid var(--line); }
+.btn-toggle.active { background: var(--retain); color: #06121f; border-color: var(--retain); }
+.btn-toggle[data-ai-override].active { background: #fca5a5; border-color: #fca5a5; color: #2b0b0b; }
 .banner { padding: 10px 12px; border-radius: 8px; background: #3a2a12; border: 1px solid #6b4e1f; color: #f5d99b; margin-bottom: 12px; }

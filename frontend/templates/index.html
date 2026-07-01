@@ -4,6 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>cerbomoticzGx · ESS Dashboard</title>
+  <link rel="icon" href="{{ url_for('static', filename='img/logo.svg') }}" type="image/svg+xml" />
   <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}" />
   <link rel="stylesheet" href="{{ url_for('static', filename='css/app.mobile.css') }}" />
 </head>
@@ -39,8 +40,9 @@
     <nav class="tabs">
       <button class="tab" data-tab="live">Power Flow</button>
       <button class="tab" data-tab="trends">Trends</button>
-      <button class="tab active" data-tab="schedule">Schedule</button>
-      <button class="tab" data-tab="victron">Import Schedule</button>
+      <button class="tab active" data-tab="schedule">Timeline</button>
+      <button class="tab" data-tab="victron">Victron Schedule</button>
+      <button class="tab" data-tab="weather">Weather</button>
       <button class="tab" data-tab="advisor">Advisor</button>
       <button class="tab" data-tab="config">Configuration</button>
     </nav>
@@ -57,6 +59,10 @@
         <div class="card">
           <h3 style="margin:2px 0 10px">SoC &amp; price across the horizon</h3>
           <div id="horizon-chart" class="chart"><span class="muted">no plan yet…</span></div>
+        </div>
+        <div class="card">
+          <h3 style="margin:2px 0 10px">Forecast accuracy</h3>
+          <div id="forecast-accuracy-chart" class="chart"><span class="muted">loading…</span></div>
         </div>
         <div class="card">
           <h3 style="margin:2px 0 10px">Daily net — month so far</h3>
@@ -98,6 +104,17 @@
         <div id="victron-schedules" class="card"></div>
       </section>
 
+      <section id="tab-weather" class="tab-panel">
+        <div class="card">
+          <h3 style="margin:2px 0 10px">Weather forecast</h3>
+          <div id="weather-chart" class="chart"><span class="muted">loading…</span></div>
+        </div>
+        <div class="card">
+          <h3 style="margin:2px 0 10px">Forecast impact</h3>
+          <div id="weather-impact-chart" class="chart"><span class="muted">loading…</span></div>
+        </div>
+      </section>
+
       <section id="tab-advisor" class="tab-panel">
         <div class="card advisor">
           <p class="cfg-note">A read-only AI review of recent optimizer behaviour. Run the daily
@@ -127,6 +144,9 @@
     <footer class="foot">
       <span id="meta" class="muted"></span>
       <button id="replan" class="btn" data-replan title="Re-run the optimizer now on current data">Replan</button>
+      <button id="restart" class="btn" data-restart title="Request a supervised service restart">Restart</button>
+      <button id="override" class="btn btn-toggle" data-ai-override title="Disable AI ESS control until toggled off">Override</button>
+      <button id="grid-assist" class="btn btn-toggle" data-grid-assist title="Force retain/grid assist until toggled off">Grid assist</button>
     </footer>
   </div>
 
@@ -153,7 +173,7 @@
     </button>
     <button type="button" class="mobile-nav-item" data-mobile-tab="schedule">
       <span class="mobile-nav-icon mobile-nav-schedule" aria-hidden="true"></span>
-      <span>Schedule</span>
+      <span>Timeline</span>
     </button>
     <button type="button" class="mobile-nav-item" data-mobile-tab="trends">
       <span class="mobile-nav-icon mobile-nav-trends" aria-hidden="true"></span>
@@ -173,12 +193,15 @@
       </div>
       <div class="mobile-menu-group" aria-label="Application sections">
         <button type="button" data-mobile-app-view="battery">Battery</button>
-        <button type="button" data-mobile-app-view="live">Venus</button>
+        <button type="button" data-mobile-app-view="live">Victron</button>
       </div>
       <div class="mobile-menu-group" aria-label="Dashboard tabs">
-        <button type="button" data-mobile-tab="victron">Import Schedule</button>
+        <button type="button" data-mobile-tab="victron">Victron Schedule</button>
         <button type="button" data-mobile-tab="config">Configuration</button>
         <button id="mobile-replan" type="button" data-replan>Replan</button>
+        <button id="mobile-restart" type="button" data-restart>Restart</button>
+        <button id="mobile-override" type="button" data-ai-override>Override</button>
+        <button id="mobile-grid-assist" type="button" data-grid-assist>Grid assist</button>
       </div>
     </div>
   </div>

@@ -65,7 +65,8 @@ def init():
         # let post_startup() know that this is a manually requested restart
         publish_message("Cerbomoticzgx/system/manual_restart", message="True", retain=True)
 
-    # Set shutdown state to false (prevent a looping restart condition)
+    # /api/restart publishes a retained True; clear it on boot so MQTT replay
+    # cannot trigger a looping restart condition.
     publish_message("Cerbomoticzgx/system/shutdown", message="False", retain=True)
 
     # set higher than 0 zero cost at startup until actual pricing is retreived or auto sell/auto grid-assist might flap
@@ -90,6 +91,7 @@ def post_startup():
     restore_and_publish('ess_net_metering_batt_min_soc', default='80.0')
     restore_and_publish('ess_net_metering_enabled', default=False)
     restore_and_publish('ess_net_metering_overridden', default=False)
+    restore_and_publish('ai_ess_override_enabled', default=False)
     restore_and_publish('grid_charging_enabled', default=False)
     restore_and_publish('grid_charging_enabled_by_price', default=False)
     restore_and_publish('tesla_charge_requested', default=False)
