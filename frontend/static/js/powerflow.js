@@ -127,24 +127,27 @@
   //          EV    Gas(small)
   function layoutMobile(W, H, hasEV, hasGas) {
     const xL = 0.225 * W, xR = 0.775 * W, colW = 0.41 * W;   // small side margins, wider cards
-    const ch = 104, mph = 100, evh = 74, solh = 68, gash = 54;
+    // Battery + Solar carry extra BMS/string detail rows, so they're taller than the
+    // Grid/AC-Loads cards; the whole stack is scaled to fill H below.
+    const ch = 104, batth = 172, mph = 100, evh = 74, solh = 178, gash = 54;
     // Left column: Grid, Battery. Right column: AC Loads, then EV stacked above a
     // dropped-down-and-right Solar (so its line to Battery can curve). MP-II hub
     // centred; Gas centred at the bottom overflow. Heights are content-fit; the whole
     // stack is scaled to fill H.
     const ny1  = 12 + ch / 2;                               // top row (Grid / AC Loads)
     const nHub = ny1 + ch / 2 + 26 + mph / 2;               // hub
-    const nR2  = nHub + mph / 2 + 26 + ch / 2;              // Battery (left), 26 below hub
+    const nR2  = nHub + mph / 2 + 26 + batth / 2;          // Battery (left, taller), 26 below hub
     const nEv  = nHub + mph / 2 + 26 + evh / 2;             // EV — top level with the hub cards (26 below hub)
     const nSol = nEv + evh / 2 + 20 + solh / 2;             // Solar just below EV
     const nGas = nSol + solh / 2 + 20 + gash / 2;           // Gas (centre bottom)
-    const Tnat = nGas + gash / 2 + 12;
+    // Tallest of the two columns (left ends at Battery, right at Gas) sets the scale.
+    const Tnat = Math.max(nR2 + batth / 2, nGas + gash / 2) + 12;
     const sc = H / Tnat;
     const N = {
       grid:  { x: xL, y: ny1 * sc, w: colW, h: ch * sc },
       house: { x: xR, y: ny1 * sc, w: colW, h: ch * sc },
       inv:   { x: 0.5 * W, y: nHub * sc, w: 0.36 * W, h: mph * sc },
-      batt:  { x: xL, y: nR2 * sc, w: colW, h: ch * sc },
+      batt:  { x: xL, y: nR2 * sc, w: colW, h: batth * sc },
       solar: { x: xR + 0.015 * W, y: nSol * sc, w: 0.40 * W, h: solh * sc },   // dropped down + right
     };
     if (hasEV)  N.ev  = { x: xR, y: nEv * sc, w: colW, h: evh * sc };          // stacked above Solar
@@ -284,13 +287,25 @@
         s += txt(`pf-${key}-l${i + 1}`, R, y, { size: F.row, anchor: "end" }, "—");
       });
     } else if (key === "solar") {
-      s += txt(`pf-solar-big`, L, bigY, { size: F.big, weight: 700 }, "—");
-      s += txt(`pf-solar-sub`, L, y0 + r.h * 0.66, { size: F.row, fill: "var(--muted)" }, "");
+      s += txt(`pf-solar-big`, L, y0 + r.h * 0.40, { size: F.big, weight: 700 }, "—");
+      s += txt(`pf-solar-sub`, L, y0 + r.h * 0.53, { size: F.row, fill: "var(--muted)" }, "");
+      [["Forecast", "pf-solar-forecast"], ["A", "pf-solar-a"], ["B", "pf-solar-b"], ["C", "pf-solar-c"],
+       ["Amps", "pf-solar-amps"], ["Surplus", "pf-solar-surplus"]].forEach(([lab, id], i) => {
+        const y = y0 + r.h * 0.62 + i * (r.h * 0.062);
+        s += txt(null, L, y, { size: F.row, fill: "var(--muted)" }, lab);
+        s += txt(id, R, y, { size: F.row, anchor: "end" }, "—");
+      });
     } else if (key === "batt") {
       s += txt(`pf-batt-temp`, R, y0 + pad + F.title + 1, { size: F.row, fill: "var(--muted)", anchor: "end" }, "");
-      s += txt(`pf-batt-big`, L, bigY, { size: F.big, weight: 700 }, "—");
-      s += txt(`pf-batt-state`, L, y0 + r.h * 0.66, { size: F.row + 1 }, "");
-      s += txt(`pf-batt-vaw`, L, y0 + r.h * 0.82, { size: F.row, fill: "var(--muted)" }, "");
+      s += txt(`pf-batt-big`, L, y0 + r.h * 0.40, { size: F.big, weight: 700 }, "—");
+      s += txt(`pf-batt-state`, L, y0 + r.h * 0.55, { size: F.row + 1 }, "");
+      // BMS detail rows (label left / value right); min/max cell temps sit top-right.
+      [["Voltage", "pf-batt-volt"], ["Current", "pf-batt-curr"], ["Min / Max (V)", "pf-batt-cells"],
+       ["Capacity", "pf-batt-cap"], ["Modules Online", "pf-batt-mods"]].forEach(([lab, id], i) => {
+        const y = y0 + r.h * 0.66 + i * (r.h * 0.075);
+        s += txt(null, L, y, { size: F.row, fill: "var(--muted)" }, lab);
+        s += txt(id, R, y, { size: F.row, anchor: "end" }, "—");
+      });
     } else if (key === "inv") {
       s += txt(`pf-inv-big`, L, bigY + 4, { size: F.state, weight: 700 }, "—");
     } else if (key === "ev") {
@@ -308,8 +323,10 @@
   const MOBILE_ROWS = {
     grid:  [["L1", "pf-grid-l1"], ["L2", "pf-grid-l2"], ["L3", "pf-grid-l3"]],
     house: [["L1", "pf-house-l1"], ["L2", "pf-house-l2"], ["L3", "pf-house-l3"]],
-    batt:  [["Voltage", "pf-batt-volt"], ["Current", "pf-batt-curr"], ["Temp", "pf-batt-temp"]],
-    solar: [["Yield today", "pf-solar-kwh"]],
+    batt:  [["Voltage", "pf-batt-volt"], ["Current", "pf-batt-curr"], ["Cells", "pf-batt-cells"],
+            ["Temps", "pf-batt-temps"], ["Capacity", "pf-batt-cap"], ["Modules", "pf-batt-mods"]],
+    solar: [["Today", "pf-solar-kwh"], ["Forecast", "pf-solar-forecast"], ["A", "pf-solar-a"],
+            ["B", "pf-solar-b"], ["C", "pf-solar-c"], ["Amps", "pf-solar-amps"], ["Surplus", "pf-solar-surplus"]],
     ev:    [["Total", "pf-ev-energy"]],
   };
   function buildCardMobile(key, N) {
@@ -335,7 +352,9 @@
     // Header: icon + name (Battery shows charge-state + power instead of the name).
     s += `<g id="pf-icon-${key}" transform="translate(${f(x0 + pad + 7)},${f(y0 + pad + 7)}) scale(${iscale.toFixed(2)})" color="var(--muted)">${ICON[key]}</g>`;
     if (key === "batt") {
-      s += txt(`pf-batt-charge`, x0 + pad + 17, y0 + pad + nameF, { size: nameF, fill: "var(--muted)" }, "—");
+      // Name + live power in the header. The Charging/Discharging word was dropped —
+      // it overflowed at high watts; the SoC value + the power sign convey the same.
+      s += txt(null, x0 + pad + 17, y0 + pad + nameF, { size: nameF, fill: "var(--muted)" }, NODE_LABEL.batt);
       s += txt(`pf-batt-power`, R, y0 + pad + nameF, { size: nameF, anchor: "end", fill: "var(--muted)" }, "");
     } else {
       s += txt(null, x0 + pad + 17, y0 + pad + nameF, { size: nameF, fill: "var(--muted)" }, NODE_LABEL[key]);
@@ -471,6 +490,30 @@
     V["pf-batt-volt"] = live.batt_voltage != null && isFinite(Number(live.batt_voltage)) ? Number(live.batt_voltage).toFixed(2) + " V" : "—";
     V["pf-batt-curr"] = live.batt_current != null && isFinite(Number(live.batt_current)) ? Number(live.batt_current).toFixed(1) + " A" : "—";
     V["pf-batt-power"] = isFinite(batt) ? fmtWs(batt) : "";
+    // Battery pack detail (BMS service 512): cell V/temp extremes, Ah, modules.
+    const _pair = (a, b, dp, unit) => (a != null && isFinite(Number(a)) && b != null && isFinite(Number(b)))
+      ? Number(a).toFixed(dp) + " / " + Number(b).toFixed(dp) + " " + unit : "—";
+    const cellTemps = _pair(live.batt_min_cell_t, live.batt_max_cell_t, 0, "°C");
+    V["pf-batt-cells"] = _pair(live.batt_min_cell_v, live.batt_max_cell_v, 2, "V");
+    V["pf-batt-temps"] = cellTemps;
+    V["pf-batt-temp"] = cellTemps;   // repurpose the desktop top-right temp to min/max
+    V["pf-batt-cap"] = _pair(live.batt_capacity, live.batt_installed_capacity, 0, "Ah");
+    V["pf-batt-mods"] = live.batt_modules_online != null && isFinite(Number(live.batt_modules_online))
+      ? String(Math.round(Number(live.batt_modules_online))) : "—";
+    // Solar detail: per-string V·kW (A/B/C), total DC amps, day forecast, surplus.
+    const _strn = (v, p) => {
+      const vv = (v != null && isFinite(Number(v))) ? Math.round(Number(v)) + " V" : "—";
+      const pp = (p != null && isFinite(Number(p)))
+        ? (Math.abs(Number(p)) >= 100 ? (Number(p) / 1000).toFixed(2) + " kW" : Math.round(Number(p)) + " W") : "—";
+      return vv + " · " + pp;
+    };
+    V["pf-solar-a"] = _strn(live.pv_a_v, live.pv_a_p);
+    V["pf-solar-b"] = _strn(live.pv_b_v, live.pv_b_p);
+    V["pf-solar-c"] = _strn(live.pv_c_v, live.pv_c_p);
+    V["pf-solar-amps"] = live.pv_current != null && isFinite(Number(live.pv_current)) ? Number(live.pv_current).toFixed(1) + " A" : "—";
+    // pv_projected_today is published in Wh (a known mislabel), so ÷1000 for kWh.
+    V["pf-solar-forecast"] = live.pv_forecast_today != null && isFinite(Number(live.pv_forecast_today)) ? (Number(live.pv_forecast_today) / 1000).toFixed(1) + " kWh" : "—";
+    V["pf-solar-surplus"] = live.pv_surplus_w != null && isFinite(Number(live.pv_surplus_w)) ? fmtW(Number(live.pv_surplus_w)) : "—";
     V["pf-inv-big"] = sysWord; V["pf-inv-bignum"] = sysWord; V["pf-inv-bigunit"] = "";
     if (ev != null) {
       big("ev", fmtW(ev));

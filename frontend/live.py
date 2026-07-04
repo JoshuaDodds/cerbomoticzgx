@@ -62,6 +62,27 @@ class MqttLive:
             "batt_voltage": f"N/{sid}/battery/512/Dc/0/Voltage",
             "batt_current": f"N/{sid}/battery/277/Dc/0/Current",
             "batt_ttg": f"N/{sid}/battery/277/TimeToGo",
+            # Battery pack detail from the BMS (service 512): per-cell voltage/temp
+            # extremes, module count, and remaining/installed capacity (Ah).
+            "batt_min_cell_v": f"N/{sid}/battery/512/System/MinCellVoltage",
+            "batt_max_cell_v": f"N/{sid}/battery/512/System/MaxCellVoltage",
+            "batt_min_cell_t": f"N/{sid}/battery/512/System/MinCellTemperature",
+            "batt_max_cell_t": f"N/{sid}/battery/512/System/MaxCellTemperature",
+            "batt_modules_online": f"N/{sid}/battery/512/System/NrOfModulesOnline",
+            "batt_capacity": f"N/{sid}/battery/512/Capacity",
+            "batt_installed_capacity": f"N/{sid}/battery/512/InstalledCapacity",
+            # Solar detail: total DC current, per-string V/W (2 MPPT RS chargers, 2
+            # strings each — string D on 283/Pv/1 is unused, so we surface A/B/C),
+            # live surplus watts, and the optimizer's projected full-day PV total.
+            "pv_current": f"N/{sid}/system/0/Dc/Pv/Current",
+            "pv_a_v": f"N/{sid}/solarcharger/283/Pv/0/V",
+            "pv_a_p": f"N/{sid}/solarcharger/283/Pv/0/P",
+            "pv_b_v": f"N/{sid}/solarcharger/282/Pv/1/V",
+            "pv_b_p": f"N/{sid}/solarcharger/282/Pv/1/P",
+            "pv_c_v": f"N/{sid}/solarcharger/282/Pv/0/V",
+            "pv_c_p": f"N/{sid}/solarcharger/282/Pv/0/P",
+            "pv_surplus_w": "Tesla/vehicle0/solar/surplus_watts",
+            "pv_forecast_today": "Cerbomoticzgx/GlobalState/pv_projected_today",
             # Inverter/charger system state (integer code -> word in the UI, mirroring
             # lib/constants.py SystemState — e.g. 256 = "Discharging").
             "system_state": f"N/{sid}/system/0/SystemState/State",
@@ -189,6 +210,19 @@ class MqttLive:
         out["batt_voltage"] = _num("batt_voltage")
         out["batt_current"] = _num("batt_current")
         out["batt_ttg"] = _num("batt_ttg")           # seconds; None/large when not discharging
+        out["batt_min_cell_v"] = _num("batt_min_cell_v")
+        out["batt_max_cell_v"] = _num("batt_max_cell_v")
+        out["batt_min_cell_t"] = _num("batt_min_cell_t")
+        out["batt_max_cell_t"] = _num("batt_max_cell_t")
+        out["batt_modules_online"] = _num("batt_modules_online")
+        out["batt_capacity"] = _num("batt_capacity")            # remaining Ah
+        out["batt_installed_capacity"] = _num("batt_installed_capacity")  # total Ah
+        out["pv_current"] = _num("pv_current")                  # total solar DC current (A)
+        out["pv_a_v"] = _num("pv_a_v"); out["pv_a_p"] = _num("pv_a_p")
+        out["pv_b_v"] = _num("pv_b_v"); out["pv_b_p"] = _num("pv_b_p")
+        out["pv_c_v"] = _num("pv_c_v"); out["pv_c_p"] = _num("pv_c_p")
+        out["pv_surplus_w"] = _num("pv_surplus_w")
+        out["pv_forecast_today"] = _num("pv_forecast_today")    # projected full-day PV (Wh; UI ÷1000)
         # System-state integer code (UI maps it to a word, mirroring SystemState).
         out["system_state"] = _num("system_state")
         out["ev_w"] = _num("ev_w")
