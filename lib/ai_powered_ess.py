@@ -1186,7 +1186,6 @@ def format_plan_summary(result, *, batt_soc=None, source="", price_points=None,
     shown = 0
     rows = []
     total_import_cost = total_export_rev = total_import_kwh = total_export_kwh = 0.0
-    idle_imp_cost = idle_exp_rev = 0.0  # IDLE = projected only, not committed
     day_totals = {}  # date -> {imp_kwh, imp_cost, exp_kwh, exp_rev, slots}
     for step in schedule:
         g = step['grid_energy']
@@ -1203,23 +1202,23 @@ def format_plan_summary(result, *, batt_soc=None, source="", price_points=None,
                                              'exp_kwh': 0.0, 'exp_rev': 0.0, 'slots': 0})
         dt['slots'] += 1
 
-        # IDLE is not a commanded flow — its import/export is a projection that
-        # settles retroactively, so keep it OUT of the committed net (Option A).
-        if ca == 'IDLE':
-            if g > 0:
-                idle_imp_cost += g * buy
-            elif g < 0:
-                idle_exp_rev += -g * sell
-        elif g > 0:
+        # Project the grid flow that will actually settle: an IDLE slot's PV surplus
+        # into a non-full battery charges it (SoC up / cost basis down) instead of
+        # exporting, so book no grid revenue for it — the stored value is realised
+        # later (a SELL slot or an avoided import). Keeps the forecast honest and
+        # convergent with the settled actuals.
+        if g > 0:
             total_import_kwh += g
             total_import_cost += g * buy
             dt['imp_kwh'] += g
             dt['imp_cost'] += g * buy
         elif g < 0:
-            total_export_kwh += -g
-            total_export_rev += -g * sell
-            dt['exp_kwh'] += -g
-            dt['exp_rev'] += -g * sell
+            battery_full = step.get('soc_end') is not None and step['soc_end'] >= 99.0
+            if ca != 'IDLE' or battery_full:
+                total_export_kwh += -g
+                total_export_rev += -g * sell
+                dt['exp_kwh'] += -g
+                dt['exp_rev'] += -g * sell
 
         if cutoff is not None and step['time'] > cutoff:
             continue
@@ -1358,13 +1357,7 @@ def format_plan_summary(result, *, batt_soc=None, source="", price_points=None,
     g_exp_rev = total_export_rev + (a_exp_rev if has_actuals else 0.0)
 
     out.append("  " + "─" * 74)
-    out.append(_row("TOTAL (committed)", g_imp_kwh, g_imp_cost, g_exp_kwh, g_exp_rev))
-    idle_net = idle_exp_rev - idle_imp_cost
-    if abs(idle_net) > 0.005:
-        sign = 'profit' if idle_net >= 0 else 'cost'
-        out.append(f"  {'+ projected (idle)':<24}"
-                   f"~€{abs(idle_net):.2f} {sign} from Victron-managed slots "
-                   f"(self-consume / surplus PV) — settles per slot, not in committed net")
+    out.append(_row("TOTAL", g_imp_kwh, g_imp_cost, g_exp_kwh, g_exp_rev))
     out.append(f"  ({len(schedule)} forecast slots, ~{len(schedule) * result.get('slot_duration_h', 0):.1f}h"
                + (" + today's actuals)" if has_actuals else ")"))
     out.append(line)

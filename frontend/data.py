@@ -42,18 +42,23 @@ def _f(v):
 
 
 def _day_totals(path: str):
-    """A day's cumulative grid cost/reward/kWh as the MAX of each counter across the
-    day's cycle records. The daily counters only increase within a day, so the max is
-    the end-of-day total — and unlike reading just the final record, this is robust to
-    a malformed or partial last record (one written with e.g. day_export_reward=null
-    previously dropped the WHOLE day out of the month total)."""
+    """A day's cumulative grid cost/reward/kWh, taken as the LAST valid reading of each
+    daily counter across the day's cycle records.
+
+    Tibber resets these counters at midnight and they climb monotonically through the
+    day, so the final reading IS the day total. We deliberately do NOT take the MAX:
+    the first cycle written just after midnight still holds the PREVIOUS day's
+    cumulative total (Tibber resets a moment later), so a MAX picks up yesterday's
+    higher value and corrupts the day — e.g. reporting a loss on a day that was
+    actually profitable, and skewing the month total. Taking the last non-null reading
+    skips that stale opening record and stays robust to a malformed/partial LAST
+    record: a trailing null is ignored and the prior valid reading is used instead of
+    dropping the whole day."""
     imp_cost = exp_rev = imp_kwh = exp_kwh = None
 
-    def _mx(cur, v):
+    def _last(cur, v):
         v = _f(v)
-        if v is None:
-            return cur
-        return v if (cur is None or v > cur) else cur
+        return v if v is not None else cur
 
     try:
         with open(path) as fh:
@@ -67,10 +72,10 @@ def _day_totals(path: str):
                     continue
                 if r.get("kind") not in (None, "cycle"):
                     continue
-                imp_cost = _mx(imp_cost, r.get("day_import_cost"))
-                exp_rev = _mx(exp_rev, r.get("day_export_reward"))
-                imp_kwh = _mx(imp_kwh, r.get("day_import_kwh"))
-                exp_kwh = _mx(exp_kwh, r.get("day_export_kwh"))
+                imp_cost = _last(imp_cost, r.get("day_import_cost"))
+                exp_rev = _last(exp_rev, r.get("day_export_reward"))
+                imp_kwh = _last(imp_kwh, r.get("day_import_kwh"))
+                exp_kwh = _last(exp_kwh, r.get("day_export_kwh"))
     except (FileNotFoundError, OSError):
         return None
     if imp_cost is None and exp_rev is None:
@@ -246,13 +251,38 @@ def _parse_time(s):
 
 
 def is_idle(slot) -> bool:
-    """True when a slot is IDLE (Victron-managed, neutral setpoint).
-
-    IDLE flow (self-consumption, surplus PV) is not a commanded action — it's a
-    projection that settles retroactively — so it's kept OUT of the committed net
-    (Option A) and shown separately as projected.
-    """
+    """True when a slot is IDLE (Victron-managed, neutral setpoint)."""
     return str(slot.get("control_action") or "").upper() == "IDLE"
+
+
+# At/above this SoC the battery is treated as full, so PV surplus feeds the grid.
+# Below it, an IDLE slot's surplus stores into the battery instead of exporting.
+PV_SURPLUS_FULL_SOC = 99.0
+
+
+def _forward_grid_econ(slot):
+    """Projected grid economics ``(import_kwh, import_cost, export_kwh, export_rev)``
+    for an unsettled slot, matched to what will actually settle at the meter.
+
+    A commanded import (BUY / RETAIN) or a SELL battery discharge crosses the meter
+    as planned. But an IDLE slot's PV surplus only reaches the grid when the battery
+    is full; below that the neutral setpoint stores it in the battery — raising SoC
+    and lowering the stored-energy cost basis — so it books NO grid revenue here.
+    That stored value is realised later (a SELL slot, or an avoided future import),
+    so the running projection still converges to the settled day total without
+    booking phantom self-consumption "profit".
+    """
+    g = slot.get("grid_energy", 0.0) or 0.0
+    buy = slot.get("price", 0.0) or 0.0
+    sell = slot.get("sell", buy) or buy
+    if g > 0:
+        return g, g * buy, 0.0, 0.0
+    if g < 0:
+        soc_end = slot.get("soc_end")
+        battery_full = soc_end is not None and soc_end >= PV_SURPLUS_FULL_SOC
+        if not is_idle(slot) or battery_full:
+            return 0.0, 0.0, -g, -g * sell
+    return 0.0, 0.0, 0.0, 0.0
 
 
 def load_raw_plan() -> dict | None:
@@ -444,7 +474,6 @@ def group_by_hour(schedule: list) -> list:
                 "slots": [],
                 "import_kwh": 0.0, "export_kwh": 0.0,
                 "import_cost": 0.0, "export_rev": 0.0,
-                "idle_imp_cost": 0.0, "idle_exp_rev": 0.0,
                 "grid_kwh": 0.0, "production_kwh": 0.0, "consumption_kwh": 0.0,
                 "prices": [],
                 "mode_counts": {},
@@ -471,18 +500,16 @@ def group_by_hour(schedule: list) -> list:
                 h["export_kwh"] += exp
             if exp_rev is not None:
                 h["export_rev"] += exp_rev
-        elif is_idle(slot):
-            # IDLE = projected only (Victron decides), kept out of committed net.
-            if g > 0:
-                h["idle_imp_cost"] += g * buy
-            elif g < 0:
-                h["idle_exp_rev"] += -g * sell
-        elif g > 0:
-            h["import_kwh"] += g
-            h["import_cost"] += g * buy
-        elif g < 0:
-            h["export_kwh"] += -g
-            h["export_rev"] += -g * sell
+        else:
+            # Forward slot: project the grid flow that will actually settle. IDLE
+            # PV-surplus into a non-full battery charges it (no grid revenue) — see
+            # _forward_grid_econ — so the forecast doesn't book phantom self-
+            # consumption profit yet still converges to the settled day total.
+            f_imp_kwh, f_imp_cost, f_exp_kwh, f_exp_rev = _forward_grid_econ(slot)
+            h["import_kwh"] += f_imp_kwh
+            h["import_cost"] += f_imp_cost
+            h["export_kwh"] += f_exp_kwh
+            h["export_rev"] += f_exp_rev
         h["prices"].append(buy)
         act = (slot.get("control_action") or "").upper()
         h["mode_counts"][act] = h["mode_counts"].get(act, 0) + 1
@@ -508,7 +535,6 @@ def group_by_hour(schedule: list) -> list:
             "grid_kwh": round(h["grid_kwh"], 2),
             "production_kwh": round(h["production_kwh"], 2),
             "consumption_kwh": round(h["consumption_kwh"], 2),
-            "projected_idle_net": round(h["idle_exp_rev"] - h["idle_imp_cost"], 3),
             "net_kwh": round(h["import_kwh"] - h["export_kwh"], 2),
             "net_cost": round(h["import_cost"] - h["export_rev"], 3),
             "soc_start": h["slots"][0].get("soc_start"),
@@ -530,28 +556,21 @@ def day_summary(schedule: list, today_actuals: dict | None) -> dict:
         if d not in days:
             days[d] = {"date": d, "label": dt.strftime("%a %d %b"),
                        "import_kwh": 0.0, "import_cost": 0.0,
-                       "export_kwh": 0.0, "export_rev": 0.0,
-                       "idle_imp_cost": 0.0, "idle_exp_rev": 0.0}
+                       "export_kwh": 0.0, "export_rev": 0.0}
             order.append(d)
-        g = slot.get("grid_energy", 0.0) or 0.0
-        buy = slot.get("price", 0.0) or 0.0
-        sell = slot.get("sell", buy) or buy
-        if is_idle(slot):
-            if g > 0:
-                days[d]["idle_imp_cost"] += g * buy
-            elif g < 0:
-                days[d]["idle_exp_rev"] += -g * sell
-        elif g > 0:
-            days[d]["import_kwh"] += g
-            days[d]["import_cost"] += g * buy
-        elif g < 0:
-            days[d]["export_kwh"] += -g
-            days[d]["export_rev"] += -g * sell
+        # Project the grid flow that will actually settle. IDLE PV-surplus into a
+        # non-full battery charges it (SoC up / cost basis down, no grid revenue)
+        # rather than exporting — see _forward_grid_econ — so the forecast stays
+        # complete and converges to the settled actuals without phantom profit.
+        f_imp_kwh, f_imp_cost, f_exp_kwh, f_exp_rev = _forward_grid_econ(slot)
+        days[d]["import_kwh"] += f_imp_kwh
+        days[d]["import_cost"] += f_imp_cost
+        days[d]["export_kwh"] += f_exp_kwh
+        days[d]["export_rev"] += f_exp_rev
 
     today = datetime.now().date().isoformat()
     rows = []
-    _keys = ("import_kwh", "import_cost", "export_kwh", "export_rev",
-             "idle_imp_cost", "idle_exp_rev")
+    _keys = ("import_kwh", "import_cost", "export_kwh", "export_rev")
     for d in order:
         row = days[d]
         forecast = {k: round(row[k], 3) for k in _keys}
@@ -571,10 +590,10 @@ def day_summary(schedule: list, today_actuals: dict | None) -> dict:
         rows.append({
             "date": d, "label": row["label"], "is_today": d == today,
             "forecast": forecast, "actual": actual, "combined": combined,
-            # Committed net (Option A): only BUY/RETAIN/SELL flows.
+            # Running net = all projected + settled grid flows (import cost − export
+            # revenue). IDLE self-consumption / PV-surplus is now included so the
+            # projection is complete and converges to the settled day total.
             "net": round(combined["import_cost"] - combined["export_rev"], 3),
-            # IDLE projection (export rev − import cost), shown apart from net.
-            "projected_idle_net": round(combined["idle_exp_rev"] - combined["idle_imp_cost"], 3),
         })
 
     return {

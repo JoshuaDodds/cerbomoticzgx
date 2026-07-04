@@ -235,3 +235,114 @@ def test_monthly_history_adds_projected_today_profit_from_current_plan(monkeypat
     today_row = next(d for d in days if d["is_today"])
     assert today_row["net_eur"] == -2.8
     assert today_row["projected_net_eur"] == 6.2
+
+
+def test_day_summary_idle_surplus_charges_battery_not_grid():
+    # A future IDLE slot with PV surplus but a non-full battery charges the battery
+    # (SoC up / cost basis down); it must NOT book phantom grid-export profit.
+    now = datetime.now().astimezone().replace(hour=13, minute=0, second=0, microsecond=0)
+    schedule = [{
+        "time": now.isoformat(),
+        "control_action": "IDLE",
+        "grid_energy": -1.0,          # DP projects export, but battery isn't full
+        "price": 0.25,
+        "sell": 0.25,
+        "soc_start": 40.0,
+        "soc_end": 42.0,              # not full → surplus stored, no grid revenue
+    }]
+
+    summary = data.day_summary(schedule, None)
+
+    today = next(d for d in summary["days"] if d["is_today"])
+    assert today["forecast"]["export_kwh"] == 0.0
+    assert today["forecast"]["export_rev"] == 0.0
+    assert today["net"] == 0.0
+    assert "projected_idle_net" not in today
+
+
+def test_day_summary_idle_surplus_exports_when_battery_full():
+    # Once the battery is full, IDLE PV surplus genuinely feeds the grid and books
+    # the export revenue.
+    now = datetime.now().astimezone().replace(hour=14, minute=0, second=0, microsecond=0)
+    schedule = [{
+        "time": now.isoformat(),
+        "control_action": "IDLE",
+        "grid_energy": -1.0,
+        "price": 0.25,
+        "sell": 0.25,
+        "soc_start": 100.0,
+        "soc_end": 100.0,            # full → real feed-in
+    }]
+
+    summary = data.day_summary(schedule, None)
+
+    today = next(d for d in summary["days"] if d["is_today"])
+    assert today["forecast"]["export_kwh"] == 1.0
+    assert today["forecast"]["export_rev"] == 0.25
+    assert today["net"] == -0.25      # −cost == €0.25 real projected profit
+
+
+def test_group_by_hour_idle_surplus_charges_battery_not_grid(monkeypatch, tmp_path):
+    monkeypatch.setattr(data, "_env", lambda: {"HISTORY_DIR": str(tmp_path)})
+    now = datetime.now().astimezone().replace(hour=14, minute=0, second=0, microsecond=0)
+    slot = {
+        "time": now.isoformat(),
+        "control_action": "IDLE",     # forward (not settled)
+        "grid_energy": -1.0,
+        "price": 0.25,
+        "sell": 0.25,
+        "pv": 1.5,
+        "load": 0.5,
+        "soc_start": 40.0,
+        "soc_end": 42.0,              # not full → surplus stored, no grid revenue
+    }
+
+    hours = data.group_by_hour([slot])
+
+    hour = hours[0]
+    assert hour["export_kwh"] == 0.0
+    assert hour["net_cost"] == 0.0
+    assert hour["grid_kwh"] == -1.0   # raw projected flow still shown
+    assert "projected_idle_net" not in hour
+
+
+def test_day_totals_uses_last_reading_not_max_across_midnight_rollover(tmp_path):
+    # The first cycle written just after midnight still holds YESTERDAY's cumulative
+    # counters (Tibber resets a moment later). _day_totals must take the FINAL reading,
+    # not the max — otherwise a profitable day (real end: import 5.65 / reward 8.12 =
+    # +2.47) is reported as a loss because max() picks yesterday's stale import 9.10.
+    path = tmp_path / "ess-2026-07-03.ndjson"
+    rows = [
+        {"kind": "cycle", "day_import_cost": 9.10, "day_export_reward": 7.17,
+         "day_import_kwh": 30.0, "day_export_kwh": 25.0},   # stale: yesterday's totals
+        {"kind": "cycle", "day_import_cost": 0.07, "day_export_reward": 0.0,
+         "day_import_kwh": 0.2, "day_export_kwh": 0.0},      # after the midnight reset
+        {"kind": "cycle", "day_import_cost": 5.65, "day_export_reward": 8.12,
+         "day_import_kwh": 18.0, "day_export_kwh": 28.0},    # end of day
+    ]
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+    t = data._day_totals(str(path))
+
+    assert t["import_cost"] == 5.65      # not 9.10 (the stale max)
+    assert t["export_reward"] == 8.12
+    assert t["import_kwh"] == 18.0
+    assert t["export_kwh"] == 28.0
+    assert round(t["export_reward"] - t["import_cost"], 2) == 2.47   # profit, not −0.99
+
+
+def test_day_totals_ignores_trailing_null_counter(tmp_path):
+    # A malformed/partial LAST record (null counter) must fall back to the prior valid
+    # reading, not drop the whole day.
+    path = tmp_path / "ess-2026-07-03.ndjson"
+    rows = [
+        {"kind": "cycle", "day_import_cost": 1.00, "day_export_reward": 2.00},
+        {"kind": "cycle", "day_import_cost": 3.00, "day_export_reward": 4.00},
+        {"kind": "cycle", "day_import_cost": None, "day_export_reward": None},
+    ]
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+    t = data._day_totals(str(path))
+
+    assert t["import_cost"] == 3.00
+    assert t["export_reward"] == 4.00

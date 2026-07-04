@@ -326,7 +326,7 @@ function planWithLiveActuals(plan) {
   const actual = liveTodayActuals();
   if (!plan || !plan.available || !actual || !plan.day_summary) return plan;
 
-  const keys = ["import_kwh", "import_cost", "export_kwh", "export_rev", "idle_imp_cost", "idle_exp_rev"];
+  const keys = ["import_kwh", "import_cost", "export_kwh", "export_rev"];
   let changed = false;
   const days = (plan.day_summary.days || []).map((d) => {
     if (!d.is_today) return d;
@@ -347,7 +347,6 @@ function planWithLiveActuals(plan) {
       actual: cleanActual,
       combined,
       net: combined.import_cost - combined.export_rev,
-      projected_idle_net: combined.idle_exp_rev - combined.idle_imp_cost,
     };
   });
   if (!changed) return plan;
@@ -358,7 +357,6 @@ function planWithLiveActuals(plan) {
     keys.forEach((k) => { total[k] += Number(combined[k] || 0); });
   });
   total.net = total.import_cost - total.export_rev;
-  total.projected_idle_net = total.idle_exp_rev - total.idle_imp_cost;
 
   return { ...plan, day_summary: { ...plan.day_summary, days, total } };
 }
@@ -732,22 +730,28 @@ function makeSlotRow(s) {
   const sell = Number(s.sell != null ? s.sell : s.price);
   const imp = g > 0 ? g : 0;
   const exp = g < 0 ? -g : 0;
-  const idle = isIdle(s);          // IDLE flow is projected, not committed
   const settled = !!s.settled;
+  const socEnd = Number(s.soc_end);
+  // IDLE PV-surplus into a non-full battery charges it (SoC up / cost basis down)
+  // rather than exporting, so it books no grid revenue — mirrors _forward_grid_econ
+  // on the server. Real feed-in (battery full) and SELL discharges still count.
+  const idleStore = !settled && isIdle(s) && g < 0
+    && !(Number.isFinite(socEnd) && socEnd >= 99);
+  const projExp = idleStore ? 0 : exp;
   const slotNet = settled
     ? Number(s.actual_cost || 0) - Number(s.actual_reward || 0)
-    : imp * Number(s.price) - exp * sell;
-  const muted = (v) => `<span class='muted'>${v}</span>`;
+    : imp * Number(s.price) - projExp * sell;
   const gridStr = fmtGrid(g);
+  const gridCell = idleStore ? `<span class='muted'>${gridStr}</span>` : gridStr;
   sr.innerHTML =
     `<span><span class="slot-dot" style="background:var(--${slotColorVar(s)})"></span>${s.time.slice(11, 16)}</span>` +
     `<span>${caOf(s)}</span>` +
     `<span class="col-num">€${Number(s.price || 0).toFixed(3)}</span>` +
-    `<span class="col-num">${idle && !settled ? muted(gridStr) : gridStr}</span>` +
+    `<span class="col-num">${gridCell}</span>` +
     `<span class="col-num">${prodCell(s.pv)}</span>` +
     `<span class="col-num">${consCell(s.load)}</span>` +
     `<span class="col-num">${socPair(s.soc_start, s.soc_end)}</span>` +
-    `<span class="col-num">${idle && !settled ? muted("projected") : netHtml(slotNet)}</span>`;
+    `<span class="col-num">${netHtml(slotNet)}</span>`;
   const detail = slotDetail(s);
   detail.style.display = "none";
   sr.addEventListener("click", (e) => {
