@@ -395,7 +395,7 @@ def test_weather_charts_include_interactive_tooltips():
     assert "weather-now-line" in charts
     assert "weather-impact-today-line" in charts
     assert "Weather forecast" in charts
-    assert "HVAC shadow" in charts
+    assert "HVAC Load" in charts
     assert "GTI irradiance" in charts
     assert "mousemove" in charts
     assert "touchstart" in charts

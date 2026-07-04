@@ -387,6 +387,9 @@
     if (!pts.length) { box.innerHTML = '<span class="muted">no weather forecast yet…</span>'; return; }
     const showTemp = box.dataset.showTemp !== "0";
     const showCloud = box.dataset.showCloud !== "0";
+    const showGti = box.dataset.showGti !== "0";
+    const showRain = box.dataset.showRain !== "0";
+    const showWind = box.dataset.showWind !== "0";
 
     const W = 940, H = 300, m = { l: 50, r: 42, t: 16, b: 34 };
     const pw = W - m.l - m.r, ph = H - m.t - m.b;
@@ -397,6 +400,13 @@
     const X = (i) => m.l + (pts.length <= 1 ? pw / 2 : (pw * i) / (pts.length - 1));
     const Yt = (v) => m.t + ph - (ph * (v - tLo)) / (tHi - tLo);
     const Yc = (v) => m.t + ph - (ph * Math.max(0, Math.min(100, v))) / 100;
+    // Irradiance (W/m²), rain (mm) and wind (km/h) each auto-scale to their own max
+    // over the plot height — like temp/cloud, exact values are read from the tooltip.
+    const seriesMax = (k) => Math.max(1, ...pts.map((p) => Number(p[k])).filter(isFinite));
+    const gtiMax = seriesMax("gti_wm2"), rainMax = seriesMax("precip_mm"), windMax = seriesMax("wind_kmh");
+    const Yg = (v) => m.t + ph - (ph * Math.max(0, v)) / gtiMax;
+    const Yr = (v) => m.t + ph - (ph * Math.max(0, v)) / rainMax;
+    const Yw = (v) => m.t + ph - (ph * Math.max(0, v)) / windMax;
     const path = (k, yfn) => pts.map((p, i) => {
       const v = Number(p[k]);
       return isFinite(v) ? `${i ? "L" : "M"}${X(i).toFixed(1)},${yfn(v).toFixed(1)}` : "";
@@ -439,18 +449,27 @@
     const s = (payload && payload.summary) || {};
     box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" width="100%" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Weather forecast">
         ${grid}${xt}${nowMark}
+        <path class="weather-gti-line" d="${path("gti_wm2", Yg)}" fill="none" stroke="#facc15" stroke-width="2" opacity="0.7"${displayStyle(showGti)}/>
+        <path class="weather-rain-line" d="${path("precip_mm", Yr)}" fill="none" stroke="#2dd4bf" stroke-width="2" opacity="0.8" stroke-dasharray="2 3"${displayStyle(showRain)}/>
+        <path class="weather-wind-line" d="${path("wind_kmh", Yw)}" fill="none" stroke="#a78bfa" stroke-width="2" opacity="0.8"${displayStyle(showWind)}/>
         <path class="weather-cloud-line" d="${path("cloud_pct", Yc)}" fill="none" stroke="var(--buy)" stroke-width="2" opacity="0.75" stroke-dasharray="5 4"${displayStyle(showCloud)}/>
         <path class="weather-temp-line" d="${path("temp_c", Yt)}" fill="none" stroke="var(--retain)" stroke-width="2.8"${displayStyle(showTemp)}/>
         <g class="weather-hover" style="display:none; pointer-events:none">
           <line class="weather-hover-line" x1="0" x2="0" y1="${m.t}" y2="${(m.t + ph).toFixed(1)}" stroke="var(--muted)" stroke-width="1" stroke-dasharray="3 3" opacity="0.75"/>
           <circle class="weather-temp-dot" r="4.5" fill="var(--retain)" stroke="#0b0f14" stroke-width="1.5"${displayStyle(showTemp)}/>
           <circle class="weather-cloud-dot" r="3.8" fill="var(--buy)" stroke="#0b0f14" stroke-width="1.3" opacity="0.9"${displayStyle(showCloud)}/>
+          <circle class="weather-gti-dot" r="3.5" fill="#facc15" stroke="#0b0f14" stroke-width="1.3"${displayStyle(showGti)}/>
+          <circle class="weather-rain-dot" r="3.5" fill="#2dd4bf" stroke="#0b0f14" stroke-width="1.3"${displayStyle(showRain)}/>
+          <circle class="weather-wind-dot" r="3.5" fill="#a78bfa" stroke="#0b0f14" stroke-width="1.3"${displayStyle(showWind)}/>
         </g>
         <rect x="${m.l}" y="${m.t}" width="${pw}" height="${ph}" fill="transparent"/>
       </svg>
       <div class="chart-legend muted">
         <span class="legend-toggle${offClass(showTemp)}" data-weather-toggle="temp"><span class="swatch" style="background:var(--retain)"></span> Temperature</span>
         <span class="legend-toggle${offClass(showCloud)}" data-weather-toggle="cloud"><span class="swatch" style="background:var(--buy)"></span> Cloud cover</span>
+        <span class="legend-toggle${offClass(showGti)}" data-weather-toggle="gti"><span class="swatch" style="background:#facc15"></span> Irradiance</span>
+        <span class="legend-toggle${offClass(showRain)}" data-weather-toggle="rain"><span class="swatch" style="background:#2dd4bf"></span> Rain</span>
+        <span class="legend-toggle${offClass(showWind)}" data-weather-toggle="wind"><span class="swatch" style="background:#a78bfa"></span> Wind</span>
         <span>${s.days || 0} days · max ${s.max_temp_c == null ? "—" : Number(s.max_temp_c).toFixed(1) + "°C"}</span>
       </div>`;
 
@@ -460,6 +479,9 @@
     const line = svg.querySelector(".weather-hover-line");
     const tempDot = svg.querySelector(".weather-temp-dot");
     const cloudDot = svg.querySelector(".weather-cloud-dot");
+    const gtiDot = svg.querySelector(".weather-gti-dot");
+    const rainDot = svg.querySelector(".weather-rain-dot");
+    const windDot = svg.querySelector(".weather-wind-dot");
     const idxFromEvent = (point) => {
       const ctm = svg.getScreenCTM();
       if (!ctm) return -1;
@@ -486,6 +508,7 @@
       (i) => {
         const p = pts[i], x = X(i);
         const tc = Number(p.temp_c), cc = Number(p.cloud_pct);
+        const gv = Number(p.gti_wm2), rv = Number(p.precip_mm), wv = Number(p.wind_kmh);
         line.setAttribute("x1", x.toFixed(1)); line.setAttribute("x2", x.toFixed(1));
         if (isFinite(tc)) {
           tempDot.setAttribute("cx", x.toFixed(1));
@@ -495,6 +518,9 @@
           cloudDot.setAttribute("cx", x.toFixed(1));
           cloudDot.setAttribute("cy", Yc(cc).toFixed(1));
         }
+        if (isFinite(gv)) { gtiDot.setAttribute("cx", x.toFixed(1)); gtiDot.setAttribute("cy", Yg(gv).toFixed(1)); }
+        if (isFinite(rv)) { rainDot.setAttribute("cx", x.toFixed(1)); rainDot.setAttribute("cy", Yr(rv).toFixed(1)); }
+        if (isFinite(wv)) { windDot.setAttribute("cx", x.toFixed(1)); windDot.setAttribute("cy", Yw(wv).toFixed(1)); }
         hover.style.display = "";
       },
       () => { hover.style.display = "none"; },
@@ -510,6 +536,9 @@
     if (!box) return;
     if (which === "temp") box.dataset.showTemp = box.dataset.showTemp === "0" ? "1" : "0";
     if (which === "cloud") box.dataset.showCloud = box.dataset.showCloud === "0" ? "1" : "0";
+    if (which === "gti") box.dataset.showGti = box.dataset.showGti === "0" ? "1" : "0";
+    if (which === "rain") box.dataset.showRain = box.dataset.showRain === "0" ? "1" : "0";
+    if (which === "wind") box.dataset.showWind = box.dataset.showWind === "0" ? "1" : "0";
     window.renderWeatherChart(containerId, payload);
   }
   window.toggleWeatherSeries = toggleWeatherSeries;
@@ -563,8 +592,8 @@
         <rect x="${m.l}" y="${m.t}" width="${pw}" height="${ph}" fill="transparent"/>
       </svg>
       <div class="chart-legend muted">
-        <span class="legend-toggle${offClass(showLoad)}" data-weather-impact-toggle="load"><span class="swatch" style="background:var(--retain)"></span> HVAC load shadow kWh</span>
-        <span class="legend-toggle${offClass(showGti)}" data-weather-impact-toggle="gti"><span class="swatch" style="background:var(--sell)"></span> GTI kWh/m²</span>
+        <span class="legend-toggle${offClass(showLoad)}" data-weather-impact-toggle="load"><span class="swatch" style="background:var(--retain)"></span> HVAC load forecast kWh</span>
+        <span class="legend-toggle${offClass(showGti)}" data-weather-impact-toggle="gti"><span class="swatch" style="background:var(--sell)"></span> GTI Irradiance kWh/m²</span>
       </div>`;
 
     const svg = box.querySelector("svg");
@@ -589,7 +618,7 @@
       (i) => {
         const p = pts[i];
         return `<b>${weatherLabel(p.date, { weekday: "short", day: "numeric", month: "short" })}</b>`
-          + (showLoad ? `<span>HVAC shadow ${weatherNum(p.weather_load_adj_kwh, 2, " kWh")}</span>` : "")
+          + (showLoad ? `<span>HVAC Load ${weatherNum(p.weather_load_adj_kwh, 2, " kWh")}</span>` : "")
           + `<span>Cooling degree-days ${weatherNum(p.cdd, 2, "")}</span>`
           + `<span>Heating degree-days ${weatherNum(p.hdd, 2, "")}</span>`
           + (showGti ? `<span>GTI irradiance ${weatherNum(p.gti_kwh_m2, 2, " kWh/m²")}</span>` : "")
