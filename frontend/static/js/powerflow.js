@@ -129,7 +129,7 @@
     const xL = 0.225 * W, xR = 0.775 * W, colW = 0.41 * W;   // small side margins, wider cards
     // Battery + Solar carry extra BMS/string detail rows, so they're taller than the
     // Grid/AC-Loads cards; the whole stack is scaled to fill H below.
-    const ch = 104, batth = 172, mph = 100, evh = 74, solh = 178, gash = 54;
+    const ch = 104, batth = 190, mph = 100, evh = 74, solh = 196, gash = 54;
     // Left column: Grid, Battery. Right column: AC Loads, then EV stacked above a
     // dropped-down-and-right Solar (so its line to Battery can curve). MP-II hub
     // centred; Gas centred at the bottom overflow. Heights are content-fit; the whole
@@ -139,9 +139,9 @@
     const nR2  = nHub + mph / 2 + 26 + batth / 2;          // Battery (left, taller), 26 below hub
     const nEv  = nHub + mph / 2 + 26 + evh / 2;             // EV — top level with the hub cards (26 below hub)
     const nSol = nEv + evh / 2 + 20 + solh / 2;             // Solar just below EV
-    const nGas = nSol + solh / 2 + 20 + gash / 2;           // Gas (centre bottom)
-    // Tallest of the two columns (left ends at Battery, right at Gas) sets the scale.
-    const Tnat = Math.max(nR2 + batth / 2, nGas + gash / 2) + 12;
+    // Gas is tucked into the right column's AC-Loads→EV gap (placed below), so the
+    // stack now ends at Battery (left) / Solar (right); the taller of those scales it.
+    const Tnat = Math.max(nR2 + batth / 2, nSol + solh / 2) + 12;
     const sc = H / Tnat;
     const N = {
       grid:  { x: xL, y: ny1 * sc, w: colW, h: ch * sc },
@@ -151,7 +151,14 @@
       solar: { x: xR + 0.015 * W, y: nSol * sc, w: 0.40 * W, h: solh * sc },   // dropped down + right
     };
     if (hasEV)  N.ev  = { x: xR, y: nEv * sc, w: colW, h: evh * sc };          // stacked above Solar
-    if (hasGas) N.gas = { x: 0.5 * W, y: nGas * sc, w: 0.30 * W, h: gash * sc }; // centred under hub
+    if (hasGas) {
+      // Gas nestled in the AC-Loads→EV gap, right-aligned with that column (right edge
+      // at xR + colW/2) so there's a balanced gap to the hub on its left — matching how
+      // the other cards sit off the centre hub.
+      const nGasY = (ny1 + ch / 2 + (nEv - evh / 2)) / 2;
+      const gasW = 0.22 * W;
+      N.gas = { x: xR + colW / 2 - gasW / 2, y: nGasY * sc, w: gasW, h: gash * sc };
+    }
     return N;
   }
 
@@ -297,12 +304,15 @@
       });
     } else if (key === "batt") {
       s += txt(`pf-batt-temp`, R, y0 + pad + F.title + 1, { size: F.row, fill: "var(--muted)", anchor: "end" }, "");
-      s += txt(`pf-batt-big`, L, y0 + r.h * 0.40, { size: F.big, weight: 700 }, "—");
-      s += txt(`pf-batt-state`, L, y0 + r.h * 0.55, { size: F.row + 1 }, "");
+      // Hero: SoC% (reduced) with the live charge/discharge power tight underneath —
+      // the two headline metrics — then the state word.
+      s += txt(`pf-batt-big`, L, y0 + r.h * 0.33, { size: F.big * 0.82, weight: 700 }, "—");
+      s += txt(`pf-batt-power`, L, y0 + r.h * 0.46, { size: F.big * 0.44, weight: 700, fill: "var(--text)" }, "");
+      s += txt(`pf-batt-state`, L, y0 + r.h * 0.565, { size: F.row, fill: "var(--muted)" }, "");
       // BMS detail rows (label left / value right); min/max cell temps sit top-right.
       [["Voltage", "pf-batt-volt"], ["Current", "pf-batt-curr"], ["Min / Max (V)", "pf-batt-cells"],
        ["Capacity", "pf-batt-cap"], ["Modules Online", "pf-batt-mods"]].forEach(([lab, id], i) => {
-        const y = y0 + r.h * 0.66 + i * (r.h * 0.075);
+        const y = y0 + r.h * 0.665 + i * (r.h * 0.072);
         s += txt(null, L, y, { size: F.row, fill: "var(--muted)" }, lab);
         s += txt(id, R, y, { size: F.row, anchor: "end" }, "—");
       });
@@ -349,27 +359,37 @@
       return s;
     }
 
-    // Header: icon + name (Battery shows charge-state + power instead of the name).
+    // Header: icon + name (Battery's charge state + power now live in the hero below).
     s += `<g id="pf-icon-${key}" transform="translate(${f(x0 + pad + 7)},${f(y0 + pad + 7)}) scale(${iscale.toFixed(2)})" color="var(--muted)">${ICON[key]}</g>`;
-    if (key === "batt") {
-      // Name + live power in the header. The Charging/Discharging word was dropped —
-      // it overflowed at high watts; the SoC value + the power sign convey the same.
-      s += txt(null, x0 + pad + 17, y0 + pad + nameF, { size: nameF, fill: "var(--muted)" }, NODE_LABEL.batt);
-      s += txt(`pf-batt-power`, R, y0 + pad + nameF, { size: nameF, anchor: "end", fill: "var(--muted)" }, "");
-    } else {
-      s += txt(null, x0 + pad + 17, y0 + pad + nameF, { size: nameF, fill: "var(--muted)" }, NODE_LABEL[key]);
-    }
+    s += txt(null, x0 + pad + 17, y0 + pad + nameF, { size: nameF, fill: "var(--muted)" }, NODE_LABEL[key]);
 
-    // Big split value (number large, unit small) as inline tspans.
-    const bigY = y0 + pad + nameF + bigF + 2;
-    s += `<text x="${f(L)}" y="${f(bigY)}" font-size="${bigF.toFixed(1)}" font-weight="700" fill="var(--text)">`
-       + `<tspan id="pf-${key}-bignum">—</tspan> `
-       + `<tspan id="pf-${key}-bigunit" font-size="${unitF.toFixed(1)}" font-weight="600" fill="var(--muted)"></tspan></text>`;
+    // Big value. Battery: SoC% (slightly reduced) with the live charge/discharge power
+    // tight underneath — the two headline metrics — then a small state word. Every
+    // other card keeps the standard big number + small unit.
+    let heroBottom;
+    if (key === "batt") {
+      const bBig = bigF * 0.86;
+      const bY = y0 + pad + nameF + bBig + 1;
+      s += `<text x="${f(L)}" y="${f(bY)}" font-size="${bBig.toFixed(1)}" font-weight="700" fill="var(--text)">`
+         + `<tspan id="pf-batt-bignum">—</tspan> `
+         + `<tspan id="pf-batt-bigunit" font-size="${(bBig * 0.5).toFixed(1)}" font-weight="600" fill="var(--muted)"></tspan></text>`;
+      const pY = bY + rowF + 4;
+      s += txt(`pf-batt-power`, L, pY, { size: Math.max(rowF + 2, bBig * 0.5), weight: 700, fill: "var(--text)" }, "—");
+      const stY = pY + rowF + 1;
+      s += txt(`pf-batt-state`, L, stY, { size: rowF, fill: "var(--muted)" }, "");
+      heroBottom = stY;
+    } else {
+      const bigY = y0 + pad + nameF + bigF + 2;
+      s += `<text x="${f(L)}" y="${f(bigY)}" font-size="${bigF.toFixed(1)}" font-weight="700" fill="var(--text)">`
+         + `<tspan id="pf-${key}-bignum">—</tspan> `
+         + `<tspan id="pf-${key}-bigunit" font-size="${unitF.toFixed(1)}" font-weight="600" fill="var(--muted)"></tspan></text>`;
+      heroBottom = bigY;
+    }
 
     // Compact labelled detail rows.
     const rows = MOBILE_ROWS[key];
     if (rows && rows.length) {
-      const divY = bigY + 5;
+      const divY = heroBottom + 5;
       s += `<line x1="${f(L)}" y1="${f(divY)}" x2="${f(R)}" y2="${f(divY)}" stroke="var(--line)"/>`;
       const startY = divY + rowF + 4, step = rowF + 3;   // tight line spacing
       rows.forEach(([lab, id], i) => {
@@ -489,7 +509,7 @@
     V["pf-batt-vaw"] = vaw;
     V["pf-batt-volt"] = live.batt_voltage != null && isFinite(Number(live.batt_voltage)) ? Number(live.batt_voltage).toFixed(2) + " V" : "—";
     V["pf-batt-curr"] = live.batt_current != null && isFinite(Number(live.batt_current)) ? Number(live.batt_current).toFixed(1) + " A" : "—";
-    V["pf-batt-power"] = isFinite(batt) ? fmtWs(batt) : "";
+    V["pf-batt-power"] = isFinite(batt) ? fmtW(Math.abs(batt)) : "—";
     // Battery pack detail (BMS service 512): cell V/temp extremes, Ah, modules.
     const _pair = (a, b, dp, unit) => (a != null && isFinite(Number(a)) && b != null && isFinite(Number(b)))
       ? Number(a).toFixed(dp) + " / " + Number(b).toFixed(dp) + " " + unit : "—";

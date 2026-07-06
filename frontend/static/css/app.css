@@ -95,6 +95,15 @@ main { padding: 12px 16px 80px; max-width: 1100px; margin: 0 auto; }
    in app.mobile.css. */
 .powerflow { width: 100%; height: clamp(440px, 58vh, 820px); }
 .powerflow svg { width: 100%; height: 100%; display: block; }
+/* iPad Mini / Air in landscape are wide enough to use the desktop card layout, but
+   their landscape height is short — 58vh lands on the 440px floor, so the taller
+   Battery/Solar cards (with their BMS/string detail rows) get squeezed and the text
+   overlaps. Raise the flow-height floor just for that short-landscape band. It
+   excludes phones (min-height), iPad Pro 12.9 + desktops (taller viewports), and
+   mobile portrait (its own layout). Desktop and mobile are untouched. */
+@media (min-width: 700px) and (min-height: 600px) and (max-height: 828px) and (orientation: landscape) {
+  .powerflow { height: clamp(600px, 82vh, 740px); }
+}
 .pf-legend { text-align: center; font-size: 12px; margin-top: 6px; }
 .pf-legend b { color: var(--text); font-weight: 600; }
 .chart { width: 100%; }
