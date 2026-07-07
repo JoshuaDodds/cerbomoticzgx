@@ -306,6 +306,11 @@ function todayRunningNet(plan) {
 }
 
 function todayForecastedNet(plan) {
+  // Same figure as the header "Today" chip: full-day = settled-so-far + forward forecast.
+  // Apply live actuals first so the elapsed portion uses the realized MQTT day counters
+  // (closest to reality) instead of the plan JSON's lagging today_actuals snapshot —
+  // otherwise this row and the header disagree.
+  plan = planWithLiveActuals(plan);
   const days = plan && plan.day_summary && plan.day_summary.days;
   const today = days && days.find((d) => d.is_today);
   return today ? today.net : null;
@@ -363,12 +368,27 @@ function planWithLiveActuals(plan) {
 
 function nextSell(plan) {
   if (!plan.hours) return null;
+  // plan.hours is the merged timeline (settled history + forward schedule), so we must
+  // skip settled/past slots — otherwise an old iteration's predicted SELL (priced at its
+  // buy price and frozen in history) shows as the "next" sell and never updates.
+  const now = Date.now();
   for (const h of plan.hours) {
     for (const s of h.slots) {
-      if (caOf(s) === "SELL" && !s.is_current) return s;
+      if (caOf(s) !== "SELL" || s.settled || s.is_current) continue;
+      const t = Date.parse(s.time);
+      if (isFinite(t) && t < now) continue;   // already elapsed
+      return s;
     }
   }
   return null;
+}
+
+// 24-hour HH:MM. ISO strings take the fast path; anything else goes through Date with
+// hour12:false so it never renders AM/PM regardless of the browser locale.
+function hm24(t) {
+  if (typeof t === "string" && t.length >= 16 && t[10] === "T") return t.slice(11, 16);
+  const d = new Date(t);
+  return isNaN(d) ? String(t || "") : d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
 }
 
 // Current control action: prefer the live feed when connected, else the plan.
@@ -419,11 +439,11 @@ function renderStatus(plan) {
   const price = c.price;
   const kv = (b, s, cls) => {
     const d = el("div", ["kv", cls].filter(Boolean).join(" "));
-    d.innerHTML = `<b>${b}</b><small>${s}</small>`;
+    d.innerHTML = `<b>${b}</b>` + (s ? `<small>${s}</small>` : "");
     return d;
   };
   updateMobileKeyStat(currentCA(c), soc);
-  strip.appendChild(kv(chipFor(currentCA(c)), "action", "status-action"));
+  strip.appendChild(kv(chipFor(currentCA(c)), "", "status-action"));   // action chip is self-explanatory — no label
   strip.appendChild(kv((soc != null ? Number(soc).toFixed(1) : "—") + "%", "battery SoC"));
   strip.appendChild(kv("€" + Number(price || 0).toFixed(3), "price /kWh", "status-price"));
   // Today + Month header chips: signed €, green (+) profit / red (−) loss, no word.
@@ -461,7 +481,7 @@ function renderMetrics(plan) {
   box.appendChild(card("Price now", "€" + Number(price || 0).toFixed(3) + "<small> /kWh</small>"));
   if (tNet != null) box.appendChild(card("Today net", netHtml(tNet)));
   box.appendChild(card("Tomorrow", tomorrow ? netHtml(tomorrow.net) : "<span class='muted'>Pending</span>"));
-  if (ns) box.appendChild(card("Next SELL", ns.time.slice(11, 16) + " <small>€" + Number(ns.price).toFixed(3) + "</small>"));
+  if (ns) box.appendChild(card("Next SELL", hm24(ns.time) + " <small>€" + Number(ns.price).toFixed(3) + "</small>"));
 }
 
 function renderSolar(plan) {

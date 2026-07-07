@@ -208,7 +208,7 @@
       const d = new Date(p.time);
       const label = isNaN(d) ? (p.label || "") : d.toLocaleDateString(undefined, { weekday: "short" });
       if (i % step === 0 || i === n - 1 || label !== lastDay) {
-        const time = isNaN(d) ? (p.label || "").slice(-5) : d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+        const time = isNaN(d) ? (p.label || "").slice(-5) : d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hour12: false });
         xt += `<text x="${X(i).toFixed(1)}" y="${m.t + ph + 16}" text-anchor="middle" font-size="11" fill="var(--muted)">${label} ${time}</text>`;
         lastDay = label;
       }
@@ -284,7 +284,7 @@
     };
     const labelTime = (iso) => {
       const d = new Date(iso);
-      return isNaN(d) ? String(iso || "") : d.toLocaleString(undefined, { weekday: "short", hour: "2-digit", minute: "2-digit" });
+      return isNaN(d) ? String(iso || "") : d.toLocaleString(undefined, { weekday: "short", hour: "2-digit", minute: "2-digit", hour12: false });
     };
     installWeatherTooltip(
       box,
@@ -334,12 +334,22 @@
 
   function weatherLabel(value, options) {
     const d = new Date(value);
-    return isNaN(d) ? String(value || "") : d.toLocaleString(undefined, options);
+    return isNaN(d) ? String(value || "") : d.toLocaleString(undefined, { hour12: false, ...options });
   }
 
   function weatherNum(value, digits, suffix) {
     const n = Number(value);
     return isFinite(n) ? `${n.toFixed(digits)}${suffix || ""}` : "—";
+  }
+
+  // Wind speed (km/h) → Beaufort force (0–12).
+  function beaufort(kmh) {
+    const v = Number(kmh);
+    if (!isFinite(v)) return "—";
+    const lo = [1, 6, 12, 20, 29, 39, 50, 62, 75, 89, 103, 118];   // lower km/h bound of Bft 1..12
+    let n = 0;
+    while (n < lo.length && v >= lo[n]) n++;
+    return String(n);
   }
 
   function installWeatherTooltip(box, svg, idxFromEvent, renderHtml, onShow, onHide, tipClass) {
@@ -425,7 +435,7 @@
     pts.forEach((p, i) => {
       if (i % step === 0 || i === pts.length - 1) {
         const d = new Date(p.time);
-        const label = isNaN(d) ? p.time.slice(11, 16) : d.toLocaleDateString(undefined, { weekday: "short" }) + " " + d.toLocaleTimeString(undefined, { hour: "2-digit" });
+        const label = isNaN(d) ? p.time.slice(11, 16) : d.toLocaleDateString(undefined, { weekday: "short" }) + " " + d.toLocaleTimeString(undefined, { hour: "2-digit", hour12: false });
         xt += `<text x="${X(i).toFixed(1)}" y="${m.t + ph + 16}" text-anchor="middle" font-size="11" fill="var(--muted)">${label}</text>`;
       }
     });
@@ -502,7 +512,7 @@
           + `<span>Feels like ${weatherNum(p.apparent_temp_c, 1, "°C")}</span>`
           + (showCloud ? `<span>Cloud cover ${weatherNum(p.cloud_pct, 0, "%")}</span>` : "")
           + `<span>Rain ${weatherNum(p.precip_mm, 1, " mm")}</span>`
-          + `<span>Wind ${weatherNum(p.wind_kmh, 0, " km/h")}</span>`
+          + `<span>Wind ${beaufort(p.wind_kmh)} Bft</span>`
           + `<span>GTI irradiance ${weatherNum(p.gti_wm2, 0, " W/m²")}</span>`;
       },
       (i) => {
