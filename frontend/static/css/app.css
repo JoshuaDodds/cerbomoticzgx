@@ -88,6 +88,9 @@ main { padding: 12px 16px 80px; max-width: 1100px; margin: 0 auto; }
 .tab-panel { display: none; }
 .tab-panel.active { display: block; }
 
+/* Weather charts mirrored into the Trends view — mobile only (shown in app.mobile.css). */
+.trends-weather-mobile { display: none; }
+
 /* Live power-flow diagram + horizon chart (modular views) */
 /* v2: fill the available width AND a tall, viewport-responsive height so the
    SVG cards use the whole panel (and adapt when embedded on other screens). The

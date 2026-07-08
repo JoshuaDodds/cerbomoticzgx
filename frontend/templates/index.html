@@ -68,6 +68,19 @@
           <h3 style="margin:2px 0 10px">Daily net — month so far</h3>
           <div id="monthly-chart" class="chart"><span class="muted">loading…</span></div>
         </div>
+
+        <!-- Mobile only: the Weather tab isn't in the mobile nav, so surface its charts
+             here in Trends. Hidden on desktop via .trends-weather-mobile. -->
+        <div class="trends-weather-mobile">
+          <div class="card">
+            <h3 style="margin:2px 0 10px">Weather forecast</h3>
+            <div id="weather-chart-m" class="chart"><span class="muted">loading…</span></div>
+          </div>
+          <div class="card">
+            <h3 style="margin:2px 0 10px">Forecast impact</h3>
+            <div id="weather-impact-chart-m" class="chart"><span class="muted">loading…</span></div>
+          </div>
+        </div>
       </section>
 
       <section id="tab-schedule" class="tab-panel active">

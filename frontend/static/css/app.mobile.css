@@ -4,6 +4,9 @@
     -webkit-text-size-adjust: 100%;
   }
 
+  /* Surface the Weather tab's charts inside Trends (Weather isn't in the mobile nav). */
+  .trends-weather-mobile { display: block; }
+
   body {
     overflow-x: hidden;
     padding-bottom: calc(74px + env(safe-area-inset-bottom));

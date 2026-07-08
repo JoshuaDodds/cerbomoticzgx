@@ -1749,6 +1749,14 @@ async function refreshWeather() {
     const r = await fetch("/api/weather").then((x) => x.json());
     if (window.renderWeatherChart) renderWeatherChart("weather-chart", r);
     if (window.renderWeatherImpactChart) renderWeatherImpactChart("weather-impact-chart", r);
+    // Mobile-only duplicates in the Trends view (Weather tab isn't in the mobile nav).
+    // The containers only exist / show on mobile; render defensively when present.
+    if (document.getElementById("weather-chart-m") && window.renderWeatherChart) {
+      renderWeatherChart("weather-chart-m", r);
+    }
+    if (document.getElementById("weather-impact-chart-m") && window.renderWeatherImpactChart) {
+      renderWeatherImpactChart("weather-impact-chart-m", r);
+    }
   } catch (e) { /* leave the placeholder */ }
 }
 
