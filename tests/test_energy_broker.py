@@ -201,6 +201,51 @@ def test_pv_nowcast_dropoff_reduces_uplift_confidence(monkeypatch):
     assert adjusted[slots[0]["start"]] < 0.4
 
 
+def test_pv_nowcast_lowers_near_term_slots_when_gti_confirms_overcast(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    # Baseline forecast is optimistic (1.0 kWh/slot) but the live/recent anchor plus a
+    # matching GTI say only ~0.2 kWh is realistic — the overlay must pull the near-term
+    # slots DOWN toward that evidence, not leave them optimistic.
+    start = datetime(2026, 6, 29, 12, 0, tzinfo=timezone.utc)
+    slots = [{"start": start + timedelta(minutes=15 * i)} for i in range(4)]
+    base = {slot["start"]: 1.0 for slot in slots}
+    weather_context = {
+        "available": True,
+        "slots": {
+            slot["start"].isoformat(): {"gti_forecast_wm2": 500.0}
+            for slot in slots
+        },
+        "summary": {},
+    }
+    monkeypatch.setattr(energy_broker, "_pv_nowcast_anchor_kwh",
+                        lambda slot_h, now=None: {"slot_kwh": 0.2, "source": "test", "drop_ratio": 1.0})
+
+    adjusted = energy_broker._apply_pv_nowcast(base, slots, weather_context, 0.25, now=start)
+
+    assert adjusted[slots[0]["start"]] < base[slots[0]["start"]]   # pulled down
+    assert 0.2 <= adjusted[slots[0]["start"]] < 0.4
+    assert weather_context["summary"]["pv_nowcast_applied"] is True
+
+
+def test_pv_nowcast_does_not_lower_on_missing_gti(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    # No GTI data and beyond 1h ahead -> gti_ratio falls back to 0. With drop_ratio healthy,
+    # the overlay must NOT zero out the slot on absent evidence; the baseline stands.
+    start = datetime(2026, 6, 29, 12, 0, tzinfo=timezone.utc)
+    slots = [{"start": start + timedelta(minutes=15 * i)} for i in range(12)]
+    base = {slot["start"]: 1.0 for slot in slots}
+    weather_context = {"available": True, "slots": {}, "summary": {}}   # no GTI rows
+    monkeypatch.setattr(energy_broker, "_pv_nowcast_anchor_kwh",
+                        lambda slot_h, now=None: {"slot_kwh": 0.2, "source": "test", "drop_ratio": 1.0})
+
+    adjusted = energy_broker._apply_pv_nowcast(base, slots, weather_context, 0.25, now=start)
+
+    far = slots[-1]["start"]   # >1h ahead, no GTI -> must be left at baseline
+    assert adjusted[far] == base[far]
+
+
 def test_pv_intraday_correction_scales_up_on_outperformance(monkeypatch):
     from datetime import datetime
     monkeypatch.setattr(energy_broker, "retrieve_setting", lambda name: None)  # defaults
@@ -212,6 +257,35 @@ def test_pv_intraday_correction_scales_up_on_outperformance(monkeypatch):
     # corrected = 2 + 0.6*(10-2) = 6.8  (scaled UP from VRM's 2 kWh)
     out = energy_broker._pv_intraday_remaining_kwh(shape, 2.0, now=now)
     assert abs(out - 6.8) < 1e-6
+
+
+def test_pv_intraday_correction_scales_down_on_cloudy_underperformance(monkeypatch):
+    from datetime import datetime
+    # Cloudy day: VRM still expects a big total, but production so far is far below the
+    # elapsed share of the curve, so the remaining forecast must be pulled DOWN.
+    monkeypatch.setattr(energy_broker, "retrieve_setting", lambda name: None)  # defaults
+    monkeypatch.setattr(energy_broker, "STATE",
+                        DummyState({"c1_daily_yield": 4.0, "c2_daily_yield": 0.0}))
+    shape = {"06:00": 1.0, "12:00": 1.0, "18:00": 1.0}     # 3 equal daylight slots
+    now = datetime(2026, 6, 18, 12, 30)                    # 2/3 of the curve elapsed
+    # projected_total = 4 / (2/3) = 6; VRM total = 4 + 16 = 20; projected_remaining = 2;
+    # corrected = 16 + 0.6*(2-16) = 7.6  (scaled DOWN from VRM's 16 kWh remaining)
+    out = energy_broker._pv_intraday_remaining_kwh(shape, 16.0, now=now)
+    assert out < 16.0
+    assert abs(out - 7.6) < 1e-6
+
+
+def test_pv_intraday_correction_no_downscale_before_down_min_elapsed(monkeypatch):
+    from datetime import datetime
+    # Underproducing, but too early in the day (past the up-threshold, below the
+    # down-threshold): a morning cloud that could still clear must not collapse the day.
+    monkeypatch.setattr(energy_broker, "retrieve_setting", lambda name: None)
+    monkeypatch.setattr(energy_broker, "STATE",
+                        DummyState({"c1_daily_yield": 0.3, "c2_daily_yield": 0.0}))
+    shape = {"06:00": 0.15, "12:00": 0.85}                 # ~15% elapsed by 06:30
+    now = datetime(2026, 6, 18, 6, 30)
+    # frac 0.15: above ESS_PV_INTRADAY_MIN_ELAPSED (0.10) but below DOWN_MIN_ELAPSED (0.30)
+    assert energy_broker._pv_intraday_remaining_kwh(shape, 8.0, now=now) == 8.0
 
 
 def test_pv_intraday_correction_noop_when_on_track(monkeypatch):

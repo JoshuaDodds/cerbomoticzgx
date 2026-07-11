@@ -224,7 +224,9 @@ def test_mobile_overview_hides_redundant_current_action_card():
     js = APP_JS.read_text(encoding="utf-8")
     css = MOBILE_CSS.read_text(encoding="utf-8")
 
-    assert 'strip.appendChild(kv(chipFor(currentCA(c)), "action", "status-action"))' in js
+    # The action chip carries no text label (removed the redundant "action" caption);
+    # kv() is passed an empty label so it renders the chip alone.
+    assert 'strip.appendChild(kv(chipFor(currentCA(c)), "", "status-action"))' in js
     assert "updateMobileKeyStat(currentCA(c), soc)" in js
     assert 'card("Current action", chipFor(currentCA(c)), "metric-current-action")' in js
     assert "  .status-strip .status-action,\n" in css

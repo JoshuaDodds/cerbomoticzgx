@@ -642,27 +642,39 @@ def _pv_shape_by_slot(days: int = 3) -> dict:
 
 
 def _pv_intraday_remaining_kwh(shape: dict, remaining_vrm_kwh: float, now=None) -> float:
-    """Self-correct the remaining-PV magnitude from today's realised outperformance.
+    """Self-correct the remaining-PV magnitude from today's realised production.
 
-    VRM anchors the forecast to a fixed daily total, so on a better-than-forecast
-    day ``pv_projected_remaining`` (= VRM_total - actual) collapses toward 0 while
-    the panels are still producing strongly — starving the rest-of-day forecast.
+    VRM anchors the forecast to a fixed daily total set overnight, so it drifts from
+    reality in BOTH directions:
+      * on a better-than-forecast day ``pv_projected_remaining`` (= VRM_total - actual)
+        collapses toward 0 while the panels still produce strongly — starving the
+        rest-of-day forecast; and
+      * on a cloudier-than-forecast day VRM's total stays high, so the remaining
+        forecast stays optimistic all day and the optimizer plans (and projects P/L)
+        on PV that never arrives.
     Here we project today's total from the PV produced SO FAR and the share of the
     day's solar curve that should be complete by now (from the learned DAYLIGHT
-    shape), then scale the remaining UP toward that projection — damped and capped,
-    and only ever upward from VRM. On a normal day the projection ≈ VRM so nothing
-    changes. Returns the (possibly increased) remaining-PV kWh for today.
+    shape), then scale the remaining TOWARD that projection — damped and capped. On a
+    normal day the projection ≈ VRM so nothing changes. Upward correction starts as
+    soon as ``ESS_PV_INTRADAY_MIN_ELAPSED`` of the curve has passed; the downward
+    correction waits until ``ESS_PV_INTRADAY_DOWN_MIN_ELAPSED`` so a brief morning
+    cloud that later clears can't collapse the whole day. Returns the (adjusted)
+    remaining-PV kWh for today.
 
     Tunables: ``ESS_PV_INTRADAY_CORRECTION`` (damp 0..1, 0 disables),
     ``ESS_PV_INTRADAY_MAX_RATIO`` (cap projected day total vs VRM),
-    ``ESS_PV_INTRADAY_MIN_ELAPSED`` (min daylight fraction before extrapolating).
+    ``ESS_PV_INTRADAY_MIN_RATIO`` (floor projected day total vs VRM),
+    ``ESS_PV_INTRADAY_MIN_ELAPSED`` (min daylight fraction before scaling up),
+    ``ESS_PV_INTRADAY_DOWN_MIN_ELAPSED`` (min daylight fraction before scaling down).
     """
     try:
         damp = _get_float_setting('ESS_PV_INTRADAY_CORRECTION', 0.6)
         if damp <= 0 or not shape:
             return remaining_vrm_kwh
         max_ratio = _get_float_setting('ESS_PV_INTRADAY_MAX_RATIO', 1.6)
+        min_ratio = _get_float_setting('ESS_PV_INTRADAY_MIN_RATIO', 0.25)
         min_elapsed = _get_float_setting('ESS_PV_INTRADAY_MIN_ELAPSED', 0.10)
+        down_min_elapsed = _get_float_setting('ESS_PV_INTRADAY_DOWN_MIN_ELAPSED', 0.30)
 
         from datetime import datetime as _dt
         now = now or _dt.now().astimezone()
@@ -699,11 +711,20 @@ def _pv_intraday_remaining_kwh(shape: dict, remaining_vrm_kwh: float, now=None) 
         vrm_total = actual + vrm_remaining
         projected_total = actual / frac
         if vrm_total > 0:
-            projected_total = min(projected_total, max_ratio * vrm_total)  # cap runaway
+            projected_total = min(projected_total, max_ratio * vrm_total)  # cap over-projection
+            projected_total = max(projected_total, min_ratio * vrm_total)  # floor under-projection
         projected_remaining = max(0.0, projected_total - actual)
 
-        # Only ever scale UP from VRM's remaining, damped toward the projection.
-        return vrm_remaining + damp * max(0.0, projected_remaining - vrm_remaining)
+        if projected_remaining >= vrm_remaining:
+            # Out-producing VRM (clearer than forecast): scale the remaining UP, damped.
+            return vrm_remaining + damp * (projected_remaining - vrm_remaining)
+
+        # Under-producing VRM (cloudier than forecast): scale the remaining DOWN, but only
+        # once enough of the solar day has elapsed to trust the extrapolation — a brief
+        # morning cloud that later clears must not collapse the whole day. Damped.
+        if frac < down_min_elapsed:
+            return vrm_remaining
+        return vrm_remaining + damp * (projected_remaining - vrm_remaining)
     except Exception as e:
         logging.debug(f"EnergyBroker: PV intraday correction failed: {e}")
         return remaining_vrm_kwh
@@ -890,9 +911,11 @@ def _apply_pv_nowcast(pv_forecast: dict, forecast_slots: list, weather_context: 
                       slot_duration_h: float, now=None) -> dict:
     """Blend live/recent PV evidence into the near-term PV forecast.
 
-    The baseline forecast still owns the full-day shape. This overlay only raises
-    current-day near-term slots when live production and GTI imply the baseline is
-    clearly too low, and fades out over a few hours.
+    The baseline forecast still owns the full-day shape. This overlay nudges current-day
+    near-term slots toward live evidence — raising them when live production and GTI imply
+    the baseline is too low, and lowering them when that evidence implies it's too high —
+    then fades out over a few hours. Lowering requires real evidence (a GTI ratio derived
+    from data, or a confirmed live production drop) so a missing-GTI gap never zeroes a slot.
     """
     if not pv_forecast or not forecast_slots:
         return pv_forecast
@@ -941,7 +964,8 @@ def _apply_pv_nowcast(pv_forecast: dict, forecast_slots: list, weather_context: 
             continue
 
         gti = _gti(start)
-        if anchor_gti > 0 and gti > 0:
+        have_gti = anchor_gti > 0 and gti > 0
+        if have_gti:
             gti_ratio = max(0.0, min(1.15, gti / anchor_gti))
         elif hours_ahead <= 1.0:
             gti_ratio = 1.0
@@ -950,7 +974,12 @@ def _apply_pv_nowcast(pv_forecast: dict, forecast_slots: list, weather_context: 
 
         nowcast = float(anchor["slot_kwh"]) * gti_ratio
         base = max(0.0, float(pv_forecast.get(start, 0.0) or 0.0))
-        if nowcast <= base + 0.01:
+        raising = nowcast > base + 0.01
+        # Lower the baseline only on real evidence it's too high: a GTI ratio derived from
+        # data, or a confirmed live production drop. Never lower on the missing-GTI fallback
+        # (gti_ratio=0), which would zero out slots whenever GTI data is simply absent.
+        lowering = nowcast < base - 0.01 and (have_gti or drop_ratio < 0.75)
+        if not (raising or lowering):
             continue
         adjusted = base * (1.0 - weight) + nowcast * weight
         out[start] = adjusted
