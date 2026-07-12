@@ -306,6 +306,37 @@ def test_group_by_hour_idle_surplus_charges_battery_not_grid(monkeypatch, tmp_pa
     assert "projected_idle_net" not in hour
 
 
+def test_previous_day_summary_uses_cumulative_counters_not_settlement_sum(monkeypatch, tmp_path):
+    # Regression (2026-07-10): the Timeline previous-day total must match the Trends
+    # monthly chart. Both now read the authoritative cumulative day counters, so a
+    # dropped per-slot settlement can't make the two views disagree.
+    monkeypatch.setattr(data, "_env", lambda: {"HISTORY_DIR": str(tmp_path)})
+    day = datetime.now().date() - timedelta(days=1)
+    base = datetime.now().astimezone().replace(
+        year=day.year, month=day.month, day=day.day, hour=10, minute=0, second=0, microsecond=0)
+    recs = [
+        {"kind": "cycle", "ts": base.isoformat(), "day_import_cost": 2.0, "day_export_reward": 1.0},
+        {"kind": "settlement", "slot_start": base.isoformat(),
+         "slot_end": (base + timedelta(minutes=15)).isoformat(),
+         "actual_cost": 0.5, "actual_reward": 1.0, "actual_import_kwh": 1.0, "actual_export_kwh": 3.0},
+        # Cumulative counters jump (a mid-slot re-optimize the per-slot settlement missed):
+        {"kind": "cycle", "ts": (base + timedelta(minutes=15)).isoformat(),
+         "day_import_cost": 5.0, "day_export_reward": 2.0},
+        {"kind": "settlement", "slot_start": (base + timedelta(minutes=15)).isoformat(),
+         "slot_end": (base + timedelta(minutes=30)).isoformat(),
+         "actual_cost": 0.5, "actual_reward": 0.0, "actual_import_kwh": 1.0, "actual_export_kwh": 0.0},
+    ]
+    (tmp_path / f"ess-{day.isoformat()}.ndjson").write_text(
+        "".join(json.dumps(r) + "\n" for r in recs))
+
+    out = data.previous_day_schedule(days_back=1)
+    # Per-slot actual_cost sums to 1.0, but the cumulative counters say 5.0 import / 2.0 export.
+    assert out["summary"]["import_cost"] == 5.0
+    assert out["summary"]["export_rev"] == 2.0
+    assert out["summary"]["net"] == 3.0        # 5.0 - 2.0, NOT the 0.0 the per-slot sum would give
+    assert out["available"] is True
+
+
 def test_day_totals_uses_last_reading_not_max_across_midnight_rollover(tmp_path):
     # The first cycle written just after midnight still holds YESTERDAY's cumulative
     # counters (Tibber resets a moment later). _day_totals must take the FINAL reading,

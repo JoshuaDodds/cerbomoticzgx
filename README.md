@@ -107,6 +107,22 @@ config edits, because the writer uses atomic replace semantics.
 ### Running from CLI
 ```python3 main.py```
 
+### History storage (file-based, daemonless)
+Per-cycle history is stored under `HISTORY_DIR` (default `data/history`). The current
+month is append-only NDJSON (`ess-YYYY-MM-DD.ndjson`); complete past months roll up into
+one immutable ZSTD Parquet each (`ess-YYYY-MM.parquet`) via DuckDB. This keeps the format
+robust on network/hostpath (Gluster) storage — no daemon and no mutable DB file to corrupt
+— and makes cross-zone migration a plain file copy (`history_store.latest_ts` /
+`store_status` identify the freshest zone). All readers go through `lib/history_store.py`,
+which serves either format transparently. Roll up cold months with:
+
+```
+python scripts/compact_history.py --status     # what's stored, in which format
+python scripts/compact_history.py              # compact all complete past months (safe to cron)
+```
+
+Compaction requires the `duckdb` package; without it the store stays pure-NDJSON.
+
 ### Docker Container
 If you will be building and running this from a container you will want to fork this repo and make sure you set up your configuration 
 to match your wishes and your own system.

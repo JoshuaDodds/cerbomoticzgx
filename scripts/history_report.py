@@ -40,6 +40,20 @@ def _env_history_dir():
 
 
 def load_records(history_dir, only_date=None):
+    # Route through the store so both hot NDJSON days and Parquet-compacted cold
+    # months are read. Falls back to a raw NDJSON glob if the store can't be imported.
+    try:
+        from lib import history_store as hs
+    except Exception:
+        hs = None
+    if hs is not None:
+        if only_date:
+            return hs.read_day(only_date, history_dir)
+        records = []
+        for d in hs.available_days(history_dir):
+            records.extend(hs.read_day(d, history_dir))
+        return records
+
     pattern = f"ess-{only_date}.ndjson" if only_date else "ess-*.ndjson"
     records = []
     for path in sorted(glob.glob(os.path.join(history_dir, pattern))):

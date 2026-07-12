@@ -319,8 +319,14 @@
     } else if (key === "inv") {
       s += txt(`pf-inv-big`, L, bigY + 4, { size: F.state, weight: 700 }, "—");
     } else if (key === "ev") {
-      s += txt(`pf-ev-big`, L, y0 + r.h * 0.55, { size: F.big, weight: 700 }, "—");
-      s += txt(`pf-ev-energy`, L, y0 + r.h * 0.82, { size: F.row, fill: "var(--muted)" }, "");
+      s += txt(`pf-ev-big`, L, y0 + r.h * 0.26, { size: F.big, weight: 700 }, "—");
+      s += txt(`pf-ev-energy`, L, y0 + r.h * 0.40, { size: F.row, fill: "var(--muted)" }, "");
+      // Tesla detail: SoC / charge limit / measured amps / ETA-to-limit (label left, value right).
+      [["SoC", "pf-ev-soc"], ["Limit", "pf-ev-limit"], ["Amps", "pf-ev-amps"], ["ETA", "pf-ev-eta"]].forEach(([lab, id], i) => {
+        const y = y0 + r.h * 0.55 + i * (r.h * 0.10);
+        s += txt(null, L, y, { size: F.row, fill: "var(--muted)" }, lab);
+        s += txt(id, R, y, { size: F.row, anchor: "end" }, "—");
+      });
     } else if (key === "gas") {
       s += txt(`pf-gas-big`, L, y0 + r.h * 0.58, { size: F.big, weight: 700 }, "—");
     }
@@ -337,7 +343,8 @@
             ["Temps", "pf-batt-temps"], ["Capacity", "pf-batt-cap"], ["Modules", "pf-batt-mods"]],
     solar: [["Today", "pf-solar-kwh"], ["Forecast", "pf-solar-forecast"], ["A", "pf-solar-a"],
             ["B", "pf-solar-b"], ["C", "pf-solar-c"], ["Amps", "pf-solar-amps"], ["Surplus", "pf-solar-surplus"]],
-    ev:    [["Total", "pf-ev-energy"]],
+    ev:    [["SoC", "pf-ev-soc"], ["Limit", "pf-ev-limit"], ["Amps", "pf-ev-amps"],
+            ["ETA", "pf-ev-eta"], ["Total", "pf-ev-energy"]],
   };
   function buildCardMobile(key, N) {
     const r = N[key]; if (!r) return "";
@@ -538,6 +545,14 @@
     if (ev != null) {
       big("ev", fmtW(ev));
       V["pf-ev-energy"] = fmtEnergy(num(live.ev_energy_kwh));
+      // Tesla vehicle detail (from MQTT; no API cost). "—" when a field hasn't published.
+      const _pct = (v) => (v != null && isFinite(Number(v))) ? Number(v).toFixed(0) + "%" : "—";
+      const _amps = (v) => (v != null && isFinite(Number(v))) ? Number(v).toFixed(0) + " A" : "—";
+      const _charging = live.veh_is_charging === true || String(live.veh_is_charging) === "True";
+      V["pf-ev-soc"] = _pct(live.veh_soc);
+      V["pf-ev-limit"] = _pct(live.veh_soc_limit);
+      V["pf-ev-amps"] = _amps(live.veh_amps);
+      V["pf-ev-eta"] = (_charging && live.veh_eta && live.veh_eta !== "N/A") ? String(live.veh_eta) : "—";
     }
     if (gasM3 != null) big("gas", gasM3.toFixed(2) + " m³");
 

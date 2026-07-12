@@ -1,8 +1,6 @@
 urllib3~=2.2.2
 paho-mqtt~=1.6.1
 pytz~=2022.2.1
-TeslaPy==2.9.0
-oauthlib~=3.2.2
 python-dotenv~=0.21.0
 setuptools>=70,<81
 tibber.py==0.6.0
@@ -20,3 +18,4 @@ aiohttp>=3.9,<4
 boto3==1.34.78
 watchdog==6.0.0
 anthropic>=0.40            # AI advisor (ANTHROPIC_API_KEY path)
+duckdb>=1.0                # history_store: read/query + write Parquet cold-month rollups (embedded, no daemon)

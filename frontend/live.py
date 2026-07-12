@@ -93,6 +93,21 @@ class MqttLive:
             # from the Victron evcharger service (instance 42; matches lib/constants.py).
             "ev_energy_kwh": f"N/{sid}/evcharger/42/Ac/Energy/Forward",
             "ev_charge_time": f"N/{sid}/evcharger/42/ChargingTime",
+            # Tesla vehicle status (published by tesla_api / ev_charge_controller as
+            # {"value": ...}). Read-only in the UI — no Fleet API cost. Absent topics
+            # simply leave the field None and the Vehicle tab hides that row.
+            "veh_name": "Tesla/vehicle0/vehicle_name",
+            "veh_soc": "Tesla/vehicle0/battery_soc",
+            "veh_soc_limit": "Tesla/vehicle0/battery_soc_setpoint",
+            "veh_charging_status": "Tesla/vehicle0/charging_status",
+            "veh_plugged_status": "Tesla/vehicle0/plugged_status",
+            "veh_is_home": "Tesla/vehicle0/is_home",
+            "veh_is_charging": "Tesla/vehicle0/is_charging",
+            "veh_is_supercharging": "Tesla/vehicle0/is_supercharging",
+            "veh_eta": "Tesla/vehicle0/time_until_full",
+            "veh_amps": "Tesla/vehicle0/charging_amps",
+            "veh_surplus_amps": "Tesla/vehicle0/solar/surplus_amps",
+            "veh_last_update": "Tesla/vehicle0/last_update_at",
             "setpoint_w": f"N/{sid}/settings/0/Settings/CGwacs/AcPowerSetPoint",
             "mode": "Cerbomoticzgx/GlobalState/ai_mode",
             "control_action": "Cerbomoticzgx/GlobalState/ai_control_action",
@@ -228,6 +243,19 @@ class MqttLive:
         out["ev_w"] = _num("ev_w")
         out["ev_energy_kwh"] = _num("ev_energy_kwh")  # lifetime forward energy (kWh)
         out["ev_charge_time"] = _num("ev_charge_time")  # present session time (s)
+        # Tesla vehicle status (read-only mirror of the MQTT bus; no Fleet API cost).
+        out["veh_soc"] = _num("veh_soc")
+        out["veh_soc_limit"] = _num("veh_soc_limit")
+        out["veh_amps"] = _num("veh_amps")                 # measured charge current (A)
+        out["veh_surplus_amps"] = _num("veh_surplus_amps")
+        out["veh_name"] = vals.get("veh_name")
+        out["veh_charging_status"] = vals.get("veh_charging_status")
+        out["veh_plugged_status"] = vals.get("veh_plugged_status")
+        out["veh_is_home"] = vals.get("veh_is_home")
+        out["veh_is_charging"] = vals.get("veh_is_charging")
+        out["veh_is_supercharging"] = vals.get("veh_is_supercharging")
+        out["veh_eta"] = vals.get("veh_eta")               # time-to-limit while charging
+        out["veh_last_update"] = vals.get("veh_last_update")
         out["setpoint_w"] = _num("setpoint_w")
         out["mode"] = vals.get("mode")
         out["control_action"] = vals.get("control_action")

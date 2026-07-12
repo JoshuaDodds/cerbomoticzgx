@@ -17,6 +17,8 @@ from dotenv import dotenv_values
 
 from frontend.config_schema import CONFIG_SCHEMA
 from lib.config_paths import env_path as runtime_env_path
+from lib import history_store as _hist
+from lib import tesla_budget as _tesla_budget
 
 DEFAULT_PLAN_PATH = "/dev/shm/cerbo_ai_plan.json"
 
@@ -41,7 +43,28 @@ def _f(v):
         return None
 
 
-def _day_totals(path: str):
+def _records_from_path(path: str) -> list:
+    """Parse an NDJSON history file into records, tolerant of blank/torn lines.
+
+    Retained for the path-based ``_day_totals`` API; day-oriented reads elsewhere go
+    through ``history_store.read_day`` so Parquet-compacted months are served too."""
+    recs = []
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    recs.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except (FileNotFoundError, OSError):
+        return []
+    return recs
+
+
+def _day_totals_from_records(records):
     """A day's cumulative grid cost/reward/kWh, taken as the LAST valid reading of each
     daily counter across the day's cycle records.
 
@@ -60,28 +83,22 @@ def _day_totals(path: str):
         v = _f(v)
         return v if v is not None else cur
 
-    try:
-        with open(path) as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    r = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if r.get("kind") not in (None, "cycle"):
-                    continue
-                imp_cost = _last(imp_cost, r.get("day_import_cost"))
-                exp_rev = _last(exp_rev, r.get("day_export_reward"))
-                imp_kwh = _last(imp_kwh, r.get("day_import_kwh"))
-                exp_kwh = _last(exp_kwh, r.get("day_export_kwh"))
-    except (FileNotFoundError, OSError):
-        return None
+    for r in records:
+        if r.get("kind") not in (None, "cycle"):
+            continue
+        imp_cost = _last(imp_cost, r.get("day_import_cost"))
+        exp_rev = _last(exp_rev, r.get("day_export_reward"))
+        imp_kwh = _last(imp_kwh, r.get("day_import_kwh"))
+        exp_kwh = _last(exp_kwh, r.get("day_export_kwh"))
     if imp_cost is None and exp_rev is None:
         return None
     return {"import_cost": imp_cost, "export_reward": exp_rev,
             "import_kwh": imp_kwh, "export_kwh": exp_kwh}
+
+
+def _day_totals(path: str):
+    """Back-compat path-based wrapper around :func:`_day_totals_from_records`."""
+    return _day_totals_from_records(_records_from_path(path))
 
 
 def monthly_history() -> list:
@@ -93,7 +110,7 @@ def monthly_history() -> list:
     out = []
     today_projection = projected_today_net_eur()
     while d <= today:
-        t = _day_totals(os.path.join(history_dir(), f"ess-{d.strftime('%Y-%m-%d')}.ndjson"))
+        t = _day_totals_from_records(_hist.read_day(d, history_dir()))
         if t is not None:
             imp_cost = t["import_cost"] or 0.0
             exp_rev = t["export_reward"] or 0.0
@@ -145,53 +162,41 @@ def forecast_accuracy(days: int = 3) -> dict:
     slots = []
     for offset in range(days - 1, -1, -1):
         day = today - timedelta(days=offset)
-        path = os.path.join(history_dir(), f"ess-{day.isoformat()}.ndjson")
         load_map = None
-        try:
-            with open(path) as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if rec.get("kind") != "settlement" or rec.get("incomplete"):
-                        continue
-                    start = _parse_time(rec.get("slot_start"))
-                    if start is None:
-                        continue
+        for rec in _hist.read_day(day, history_dir()):
+            if rec.get("kind") != "settlement" or rec.get("incomplete"):
+                continue
+            start = _parse_time(rec.get("slot_start"))
+            if start is None:
+                continue
 
-                    predicted_load = _f(rec.get("predicted_load_kwh"))
-                    actual_load = _f(rec.get("actual_load_kwh"))
-                    if actual_load is None:
-                        if load_map is None:
-                            load_map = _actual_load_by_slot(day)
-                        actual_load = load_map.get(_slot_key(start))
+            predicted_load = _f(rec.get("predicted_load_kwh"))
+            actual_load = _f(rec.get("actual_load_kwh"))
+            if actual_load is None:
+                if load_map is None:
+                    load_map = _actual_load_by_slot(day)
+                actual_load = load_map.get(_slot_key(start))
 
-                    predicted_pv = _f(rec.get("predicted_pv_kwh"))
-                    actual_pv = _f(rec.get("actual_pv_kwh"))
-                    if (predicted_load is None or actual_load is None) and (
-                        predicted_pv is None or actual_pv is None
-                    ):
-                        continue
+            predicted_pv = _f(rec.get("predicted_pv_kwh"))
+            actual_pv = _f(rec.get("actual_pv_kwh"))
+            if (predicted_load is None or actual_load is None) and (
+                predicted_pv is None or actual_pv is None
+            ):
+                continue
 
-                    row = {
-                        "time": start.isoformat(),
-                        "label": start.strftime("%a %H:%M"),
-                        "predicted_load_kwh": predicted_load,
-                        "actual_load_kwh": actual_load,
-                        "predicted_pv_kwh": predicted_pv,
-                        "actual_pv_kwh": actual_pv,
-                    }
-                    if predicted_load is not None and actual_load is not None:
-                        row["load_error_kwh"] = round(actual_load - predicted_load, 3)
-                    if predicted_pv is not None and actual_pv is not None:
-                        row["pv_error_kwh"] = round(actual_pv - predicted_pv, 3)
-                    slots.append(row)
-        except (FileNotFoundError, OSError):
-            continue
+            row = {
+                "time": start.isoformat(),
+                "label": start.strftime("%a %H:%M"),
+                "predicted_load_kwh": predicted_load,
+                "actual_load_kwh": actual_load,
+                "predicted_pv_kwh": predicted_pv,
+                "actual_pv_kwh": actual_pv,
+            }
+            if predicted_load is not None and actual_load is not None:
+                row["load_error_kwh"] = round(actual_load - predicted_load, 3)
+            if predicted_pv is not None and actual_pv is not None:
+                row["pv_error_kwh"] = round(actual_pv - predicted_pv, 3)
+            slots.append(row)
 
     slots.sort(key=lambda s: s["time"])
 
@@ -310,26 +315,14 @@ def _actual_load_by_slot(day) -> dict:
     load_actual_today_wh counter in the CYCLE records. This is available for ALL days —
     the counter predates the per-slot actual_load_kwh settlement field — so previous
     days can show real consumption too. Keyed by the slot's start 'HH:MM'."""
-    path = os.path.join(history_dir(), f"ess-{day.isoformat()}.ndjson")
     cycles = []
-    try:
-        with open(path) as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    r = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if r.get("kind") not in (None, "cycle"):
-                    continue
-                ts = _parse_time(r.get("ts"))
-                lw = _f(r.get("load_actual_today_wh"))
-                if ts is not None and lw is not None:
-                    cycles.append((ts, lw))
-    except (FileNotFoundError, OSError):
-        return {}
+    for r in _hist.read_day(day, history_dir()):
+        if r.get("kind") not in (None, "cycle"):
+            continue
+        ts = _parse_time(r.get("ts"))
+        lw = _f(r.get("load_actual_today_wh"))
+        if ts is not None and lw is not None:
+            cycles.append((ts, lw))
     cycles.sort(key=lambda x: x[0])
     out = {}
     for i in range(1, len(cycles)):
@@ -349,7 +342,6 @@ def _settled_slots_for_day(day, cutoff=None) -> list:
     start. ``cutoff`` (a datetime) drops rows at/after it — used for today so the
     live forward plan owns the active and future slots.
     """
-    path = os.path.join(history_dir(), f"ess-{day.isoformat()}.ndjson")
     slots = []
     load_map = _actual_load_by_slot(day)   # per-slot consumption (works for old days too)
 
@@ -359,57 +351,46 @@ def _settled_slots_for_day(day, cutoff=None) -> list:
         except (TypeError, ValueError):
             return None
 
-    try:
-        with open(path) as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if rec.get("kind") != "settlement":
-                    continue
-                start = _parse_time(rec.get("slot_start"))
-                if start is None or start.date() != day:
-                    continue
-                if cutoff is not None and start >= cutoff:
-                    continue
+    for rec in _hist.read_day(day, history_dir()):
+        if rec.get("kind") != "settlement":
+            continue
+        start = _parse_time(rec.get("slot_start"))
+        if start is None or start.date() != day:
+            continue
+        if cutoff is not None and start >= cutoff:
+            continue
 
-                imp_f = _num(rec.get("actual_import_kwh"))
-                exp_f = _num(rec.get("actual_export_kwh"))
-                grid = None
-                if imp_f is not None or exp_f is not None:
-                    grid = (imp_f or 0.0) - (exp_f or 0.0)
+        imp_f = _num(rec.get("actual_import_kwh"))
+        exp_f = _num(rec.get("actual_export_kwh"))
+        grid = None
+        if imp_f is not None or exp_f is not None:
+            grid = (imp_f or 0.0) - (exp_f or 0.0)
 
-                load_val = _num(rec.get("actual_load_kwh"))     # stored from today on
-                if load_val is None:
-                    load_val = load_map.get(_slot_key(start))   # derived for older days
+        load_val = _num(rec.get("actual_load_kwh"))     # stored from today on
+        if load_val is None:
+            load_val = load_map.get(_slot_key(start))   # derived for older days
 
-                slots.append({
-                    "time": start.isoformat(),
-                    "settled": True,
-                    "closed_at": rec.get("slot_end"),
-                    "control_action": rec.get("predicted_control_action") or "IDLE",
-                    "reason": "Settled actuals from history",
-                    "reason_code": "SETTLED_ACTUAL",
-                    "grid_energy": grid,
-                    "price": _num(rec.get("price_buy")) or 0.0,
-                    "sell": _num(rec.get("price_sell")) or _num(rec.get("price_buy")) or 0.0,
-                    "pv": _num(rec.get("actual_pv_kwh")),
-                    "load": load_val,
-                    "soc_start": _num(rec.get("soc_start")),
-                    "soc_end": _num(rec.get("soc_end")),
-                    "actual_import_kwh": imp_f,
-                    "actual_export_kwh": exp_f,
-                    "actual_cost": _num(rec.get("actual_cost")),
-                    "actual_reward": _num(rec.get("actual_reward")),
-                    "actual_net_eur": _num(rec.get("actual_net_eur")),
-                    "incomplete": bool(rec.get("incomplete")),
-                })
-    except (FileNotFoundError, OSError):
-        return []
+        slots.append({
+            "time": start.isoformat(),
+            "settled": True,
+            "closed_at": rec.get("slot_end"),
+            "control_action": rec.get("predicted_control_action") or "IDLE",
+            "reason": "Settled actuals from history",
+            "reason_code": "SETTLED_ACTUAL",
+            "grid_energy": grid,
+            "price": _num(rec.get("price_buy")) or 0.0,
+            "sell": _num(rec.get("price_sell")) or _num(rec.get("price_buy")) or 0.0,
+            "pv": _num(rec.get("actual_pv_kwh")),
+            "load": load_val,
+            "soc_start": _num(rec.get("soc_start")),
+            "soc_end": _num(rec.get("soc_end")),
+            "actual_import_kwh": imp_f,
+            "actual_export_kwh": exp_f,
+            "actual_cost": _num(rec.get("actual_cost")),
+            "actual_reward": _num(rec.get("actual_reward")),
+            "actual_net_eur": _num(rec.get("actual_net_eur")),
+            "incomplete": bool(rec.get("incomplete")),
+        })
 
     slots.sort(key=lambda s: s["time"])
     return slots
@@ -427,10 +408,16 @@ def previous_day_schedule(days_back: int = 1) -> dict:
     day = datetime.now().date() - timedelta(days=days_back)
     slots = _settled_slots_for_day(day)
     hours = group_by_hour(slots) if slots else []
-    imp_cost = sum((s.get("actual_cost") or 0.0) for s in slots)
-    exp_rev = sum((s.get("actual_reward") or 0.0) for s in slots)
-    imp_kwh = sum((s.get("actual_import_kwh") or 0.0) for s in slots)
-    exp_kwh = sum((s.get("actual_export_kwh") or 0.0) for s in slots)
+    # Headline totals come from the cumulative day counters (same authoritative source
+    # as the Trends monthly chart), NOT the sum of per-slot settlements: if a slot's
+    # settlement was ever dropped (e.g. a mid-slot re-optimize), the per-slot sum drifts
+    # from the meter, but the cumulative counter is always right. Keeps the two views in
+    # agreement. Per-slot rows (hours) are still shown for detail.
+    totals = _day_totals_from_records(_hist.read_day(day, history_dir())) or {}
+    imp_cost = totals.get("import_cost") or 0.0
+    exp_rev = totals.get("export_reward") or 0.0
+    imp_kwh = totals.get("import_kwh") or 0.0
+    exp_kwh = totals.get("export_kwh") or 0.0
     return {
         "date": day.isoformat(),
         "label": day.strftime("%a %d %b"),
@@ -642,6 +629,12 @@ def get_plan() -> dict:
         "day_summary": day_summary(schedule, raw.get("today_actuals")),
         "mtd_net": mtd_net_eur(),
     }
+
+
+def tesla_usage() -> dict:
+    """Today's Tesla Fleet API spend (counts + $ per category + total) for the Vehicle tab."""
+    path = _env().get("TESLA_BUDGET_STATE_PATH") or _tesla_budget.DEFAULT_STATE_PATH
+    return _tesla_budget.usage_snapshot(path)
 
 
 def get_config() -> list:

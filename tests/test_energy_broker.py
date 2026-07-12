@@ -329,6 +329,50 @@ def test_pv_intraday_correction_disabled_by_setting(monkeypatch):
     assert energy_broker._pv_intraday_remaining_kwh(shape, 2.0, now=now) == 2.0
 
 
+def test_history_compaction_job_runs_backfill_when_enabled(monkeypatch):
+    calls = {}
+    monkeypatch.setattr(energy_broker, "retrieve_setting",
+                        lambda name: {"HISTORY_DIR": "data/history"}.get(name))  # ENABLED unset -> default True
+    monkeypatch.setattr(energy_broker._hist, "duckdb_available", lambda: True)
+
+    def fake_backfill(hist_dir, remove_ndjson=True):
+        calls["args"] = (hist_dir, remove_ndjson)
+        return []
+
+    monkeypatch.setattr(energy_broker._hist, "backfill_cold_months", fake_backfill)
+    energy_broker._run_history_compaction()
+    assert calls["args"] == ("data/history", True)
+
+
+def test_history_compaction_job_skipped_when_disabled(monkeypatch):
+    called = {"n": 0}
+    monkeypatch.setattr(energy_broker, "retrieve_setting",
+                        lambda name: "0" if name == "HISTORY_COMPACTION_ENABLED" else None)
+    monkeypatch.setattr(energy_broker._hist, "duckdb_available", lambda: True)
+
+    def boom(*a, **k):
+        called["n"] += 1
+        return []
+
+    monkeypatch.setattr(energy_broker._hist, "backfill_cold_months", boom)
+    energy_broker._run_history_compaction()
+    assert called["n"] == 0
+
+
+def test_history_compaction_job_skips_without_duckdb(monkeypatch):
+    called = {"n": 0}
+    monkeypatch.setattr(energy_broker, "retrieve_setting", lambda name: None)   # enabled by default
+    monkeypatch.setattr(energy_broker._hist, "duckdb_available", lambda: False)
+
+    def boom(*a, **k):
+        called["n"] += 1
+        return []
+
+    monkeypatch.setattr(energy_broker._hist, "backfill_cold_months", boom)
+    energy_broker._run_history_compaction()
+    assert called["n"] == 0
+
+
 def test_load_forecast_prefers_historical_average(monkeypatch):
     from datetime import datetime
     # Realised 0.8 kW for the 06:00 quarter-hours over the last few days.
@@ -564,20 +608,24 @@ def test_settlement_writes_predicted_vs_actual(monkeypatch, tmp_path):
     import lib.ess_cost_basis as _cb
     monkeypatch.setattr(_cb, "_path", lambda: str(tmp_path / "cost_basis.json"))
 
+    from datetime import datetime, timezone, timedelta
     res = {"control_action": "SELL", "slot_duration_h": 0.25,
            "schedule": [{"grid_energy": -2.0, "price": 0.30, "sell": 0.30}]}
+
+    t1 = datetime(2026, 7, 10, 10, 0, tzinfo=timezone.utc)
+    t2 = t1 + timedelta(minutes=15)   # next slot -> the prior slot settles
 
     # Cycle 1: counters at import 1.0 kWh (€0.20), no export; SoC 80%.
     energy_broker._settle_prior_slot(
         res, batt_soc=80.0,
-        today_actuals={"imp_kwh": 1.0, "imp_cost": 0.20, "exp_kwh": 0.0, "exp_rev": 0.0})
+        today_actuals={"imp_kwh": 1.0, "imp_cost": 0.20, "exp_kwh": 0.0, "exp_rev": 0.0}, now=t1)
     assert (tmp_path / "last_slot.json").exists()
     assert not list(tmp_path.glob("ess-*.ndjson"))  # nothing settled yet
 
-    # Cycle 2: +2.0 kWh exported (+€0.60), SoC fell to 72%.
+    # Cycle 2 (next slot): +2.0 kWh exported (+€0.60), SoC fell to 72%.
     energy_broker._settle_prior_slot(
         res, batt_soc=72.0,
-        today_actuals={"imp_kwh": 1.0, "imp_cost": 0.20, "exp_kwh": 2.0, "exp_rev": 0.60})
+        today_actuals={"imp_kwh": 1.0, "imp_cost": 0.20, "exp_kwh": 2.0, "exp_rev": 0.60}, now=t2)
 
     files = list(tmp_path.glob("ess-*.ndjson"))
     assert files
@@ -593,6 +641,49 @@ def test_settlement_writes_predicted_vs_actual(monkeypatch, tmp_path):
     assert abs(s["soc_delta"] - (-8.0)) < 1e-6
     # Cost-basis field is recorded (discharge slot -> basis present, may be 0).
     assert "cost_basis_eur_per_kwh" in s
+
+
+def test_settlement_ignores_extra_cycle_within_same_slot(monkeypatch, tmp_path):
+    # Regression: a mid-slot re-optimize (2nd cycle in the same 15-min slot) must NOT
+    # emit a second settlement or advance the snapshot, or the slot's cost gets split /
+    # dropped from the per-slot ledger (observed 2026-07-10: a €2.70 import slot booked 0).
+    from datetime import datetime, timezone, timedelta
+    monkeypatch.setattr(energy_broker, "retrieve_setting",
+                        lambda name: str(tmp_path) if name == "HISTORY_DIR" else None)
+    monkeypatch.setattr(energy_broker, "STATE",
+                        DummyState({"c1_daily_yield": 0.0, "c2_daily_yield": 0.0}))
+    monkeypatch.setattr(energy_broker, "_LAST_SLOT_PATH", str(tmp_path / "last_slot.json"))
+    import lib.ess_cost_basis as _cb
+    monkeypatch.setattr(_cb, "_path", lambda: str(tmp_path / "cost_basis.json"))
+
+    res = {"control_action": "BUY", "slot_duration_h": 0.25,
+           "schedule": [{"grid_energy": 9.0, "price": 0.30, "sell": 0.30}]}
+    t0 = datetime(2026, 7, 10, 9, 15, tzinfo=timezone.utc)
+
+    def settle(now, imp_cost, soc):
+        energy_broker._settle_prior_slot(
+            res, batt_soc=soc,
+            today_actuals={"imp_kwh": 0.0, "imp_cost": imp_cost, "exp_kwh": 0.0, "exp_rev": 0.0},
+            now=now)
+
+    def settlements():
+        files = list(tmp_path.glob("ess-*.ndjson"))
+        if not files:
+            return []
+        return [json.loads(l) for l in files[0].read_text().splitlines()
+                if l.strip() and json.loads(l).get("kind") == "settlement"]
+
+    settle(t0, 3.21, 50.0)                          # slot-start snapshot (import @ 3.21)
+    settle(t0 + timedelta(minutes=5), 5.91, 50.0)   # 2nd cycle SAME slot (counter jumped +2.70)
+    assert settlements() == []                       # nothing settled yet, no partial/0 record
+
+    settle(t0 + timedelta(minutes=15), 6.20, 40.0)  # next slot boundary -> settle the FULL slot
+    recs = settlements()
+    assert len(recs) == 1
+    # Full slot delta from the slot-START snapshot (3.21) to the boundary (6.20) = 2.99,
+    # i.e. it INCLUDES the mid-slot jump the old per-cycle logic dropped.
+    assert abs(recs[0]["actual_cost"] - 2.99) < 1e-6
+    assert recs[0]["slot_start"] == t0.isoformat()
 
 
 def _patch_common_dependencies(monkeypatch, state_values=None, settings=None):

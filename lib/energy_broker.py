@@ -13,6 +13,7 @@ from lib.tibber_api import publish_pricing_data, get_all_price_points
 from lib.global_state import GlobalStateClient
 from lib.victron_integration import ac_power_setpoint, limit_grid_feed_in, set_minimum_ess_soc
 from lib.ai_powered_ess import optimize_schedule
+from lib import history_store as _hist
 
 STATE = GlobalStateClient()
 
@@ -250,6 +251,35 @@ def schedule_tasks():
         schedule_type='48h',
         charge_context='nightly',
     )
+
+    # History maintenance: roll complete past months of NDJSON into immutable Parquet.
+    # Runs in the small hours; idempotent and self-healing, so most days it's a no-op
+    # (only the just-completed month, on the 1st, has anything to do).
+    scheduler.every().day.at("03:20").do(_run_history_compaction)
+
+
+def _run_history_compaction():
+    """Compact complete past months of history NDJSON into per-month Parquet.
+
+    Only past months are touched (the current month stays hot NDJSON), the write is
+    atomic, and source NDJSON is removed only after a verified rename — so a pod restart
+    mid-run can't lose data. Gated by ``HISTORY_COMPACTION_ENABLED`` (default on) and a
+    working DuckDB; any failure is logged and never affects control.
+    """
+    import os
+    try:
+        if not _is_truthy(retrieve_setting('HISTORY_COMPACTION_ENABLED'), True):
+            return
+        if not _hist.duckdb_available():
+            logging.info("EnergyBroker: history compaction skipped — duckdb not installed.")
+            return
+        history_dir = retrieve_setting('HISTORY_DIR') or 'data/history'
+        done = _hist.backfill_cold_months(history_dir, remove_ndjson=True)
+        if done:
+            logging.info("EnergyBroker: history compaction wrote %d Parquet file(s): %s",
+                         len(done), ", ".join(os.path.basename(p) for p in done))
+    except Exception as e:
+        logging.warning("EnergyBroker: history compaction failed: %s", e)
 
 
 def _publish_domoticz_aux():
@@ -610,31 +640,20 @@ def _pv_shape_by_slot(days: int = 3) -> dict:
         today = _dt.now().date()
         for i in range(max(1, days)):
             d = today - _td(days=i)
-            path = os.path.join(history_dir, f"ess-{d.strftime('%Y-%m-%d')}.ndjson")
-            if not os.path.exists(path):
-                continue
-            with open(path) as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        r = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if r.get('kind') == 'settlement':
-                        continue
-                    pv, ts = r.get('pv_w'), r.get('ts')
-                    if pv is None or ts is None:
-                        continue
-                    try:
-                        when = _dt.fromisoformat(ts)
-                        if not (PV_DAYLIGHT_START_H <= when.hour < PV_DAYLIGHT_END_H):
-                            continue   # daylight only — exclude night/evening
-                        key = f"{when.hour:02d}:{(when.minute // 15) * 15:02d}"
-                        buckets.setdefault(key, []).append(max(0.0, float(pv)) / 1000.0)
-                    except (TypeError, ValueError):
-                        continue
+            for r in _hist.read_day(d, history_dir):   # NDJSON hot + Parquet cold
+                if r.get('kind') == 'settlement':
+                    continue
+                pv, ts = r.get('pv_w'), r.get('ts')
+                if pv is None or ts is None:
+                    continue
+                try:
+                    when = _dt.fromisoformat(ts)
+                    if not (PV_DAYLIGHT_START_H <= when.hour < PV_DAYLIGHT_END_H):
+                        continue   # daylight only — exclude night/evening
+                    key = f"{when.hour:02d}:{(when.minute // 15) * 15:02d}"
+                    buckets.setdefault(key, []).append(max(0.0, float(pv)) / 1000.0)
+                except (TypeError, ValueError):
+                    continue
         return {k: sum(v) / len(v) for k, v in buckets.items() if v}
     except Exception as e:
         logging.debug(f"EnergyBroker: PV shape read failed: {e}")
@@ -1359,31 +1378,20 @@ def _historical_load_by_slot(days: int = 3) -> dict:
         today = _dt.now().date()
         for i in range(max(1, days)):
             d = today - _td(days=i)
-            path = os.path.join(history_dir, f"ess-{d.strftime('%Y-%m-%d')}.ndjson")
-            if not os.path.exists(path):
-                continue
-            with open(path) as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
+            for r in _hist.read_day(d, history_dir):   # NDJSON hot + Parquet cold
+                if r.get('kind') == 'settlement':
+                    continue
+                load, batt, ts = r.get('load_w'), r.get('batt_w'), r.get('ts')
+                if load is None or ts is None:
+                    continue
+                try:
+                    if batt is not None and abs(float(batt)) > 4000:
                         continue
-                    try:
-                        r = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if r.get('kind') == 'settlement':
-                        continue
-                    load, batt, ts = r.get('load_w'), r.get('batt_w'), r.get('ts')
-                    if load is None or ts is None:
-                        continue
-                    try:
-                        if batt is not None and abs(float(batt)) > 4000:
-                            continue
-                        when = _dt.fromisoformat(ts)
-                        key = f"{when.hour:02d}:{(when.minute // 15) * 15:02d}"
-                        buckets.setdefault(key, []).append(float(load) / 1000.0)
-                    except (TypeError, ValueError):
-                        continue
+                    when = _dt.fromisoformat(ts)
+                    key = f"{when.hour:02d}:{(when.minute // 15) * 15:02d}"
+                    buckets.setdefault(key, []).append(float(load) / 1000.0)
+                except (TypeError, ValueError):
+                    continue
         return {k: sum(v) / len(v) for k, v in buckets.items() if v}
     except Exception as e:
         logging.debug(f"EnergyBroker: historical load read failed: {e}")
@@ -1783,12 +1791,18 @@ def _append_history(result, *, batt_soc, applied_setpoint, today_actuals, realiz
 _LAST_SLOT_PATH = '/dev/shm/cerbo_ai_last_slot.json'
 
 
-def _settle_prior_slot(result, *, batt_soc, today_actuals) -> None:
+def _settle_prior_slot(result, *, batt_soc, today_actuals, now=None) -> None:
     """At each quarter-hour boundary, write one ``kind: "settlement"`` record to
     the same daily NDJSON pairing the prediction we made for the slot that just
     closed with what ACTUALLY happened (derived by diffing the cumulative daily
-    counters). Handles the midnight counter reset and service gaps. Best-effort —
-    any failure is logged and never affects ESS control.
+    counters). Handles the midnight counter reset and service gaps.
+
+    Exactly ONE settlement is emitted per closed 15-min slot: if a second optimizer
+    cycle fires within the same slot (a manual replan or the daily price re-optimize),
+    it does not write another settlement or advance the snapshot. This keeps the
+    summed per-slot ledger reconciled to the cumulative counters — otherwise a
+    mid-slot counter jump gets split across sub-intervals or dropped entirely.
+    Best-effort — any failure is logged and never affects ESS control.
     """
     import os
     import json
@@ -1797,7 +1811,8 @@ def _settle_prior_slot(result, *, batt_soc, today_actuals) -> None:
     try:
         history_dir = retrieve_setting('HISTORY_DIR') or 'data/history'
         os.makedirs(history_dir, exist_ok=True)
-        now = _dt.now().astimezone()
+        now = now or _dt.now().astimezone()
+        cur_slot = f"{now.strftime('%Y-%m-%d %H')}:{(now.minute // 15) * 15:02d}"
         act = today_actuals or {}
 
         def _f(v):
@@ -1819,6 +1834,7 @@ def _settle_prior_slot(result, *, batt_soc, today_actuals) -> None:
             # Read from STATE here (this function has no cycle-record locals); _diff
             # turns a midnight counter reset into None, same as the other counters.
             'load_actual_wh': _f(STATE.get('consumption_total_cumulative')),
+            'slot_key': cur_slot,
         }
         sched0 = (result.get('schedule') or [{}])[0]
         weather_slots = (result.get('weather_context') or {}).get('slots') or {}
@@ -1853,6 +1869,11 @@ def _settle_prior_slot(result, *, batt_soc, today_actuals) -> None:
                 prev = json.load(fh)
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             prev = None
+
+        # A second cycle within the SAME slot: leave the slot-start snapshot in place so
+        # the eventual settlement diffs the FULL slot, and emit nothing now.
+        if prev is not None and prev.get('slot_key') == cur_slot:
+            return
 
         if prev:
             def _diff(key):

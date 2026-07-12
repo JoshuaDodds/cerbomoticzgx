@@ -87,6 +87,8 @@ CONFIG_SCHEMA = [
              "desc": "Fraction of the solar day that must elapse before the DOWNWARD correction kicks in — held higher than the up threshold so a brief morning cloud that later clears doesn't collapse the day."},
             {"key": "NEGATIVE_PRICE_FEED_IN_LIMIT_ENABLED", "label": "Negative-price feed-in limit", "type": "bool",
              "desc": "Limit grid feed-in to 0W while the price is negative (auto-reverts when it recovers)."},
+            {"key": "HISTORY_COMPACTION_ENABLED", "label": "History Parquet compaction", "type": "bool",
+             "desc": "Daily (03:20) roll-up of complete past months of history NDJSON into immutable Parquet. Idempotent and safe; needs the duckdb package. Off = keep everything as NDJSON."},
         ],
     },
     {

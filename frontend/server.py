@@ -67,6 +67,12 @@ def api_weather():
     return jsonify(data.weather_dashboard())
 
 
+@app.route("/api/tesla/usage")
+def api_tesla_usage():
+    """Today's Tesla Fleet API spend (counts + cost per category + total)."""
+    return jsonify(data.tesla_usage())
+
+
 @app.route("/api/history/day")
 def api_history_day():
     """Settled hour-tree for a prior day (default yesterday), lazy-loaded when the

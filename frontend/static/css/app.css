@@ -91,6 +91,13 @@ main { padding: 12px 16px 80px; max-width: 1100px; margin: 0 auto; }
 /* Weather charts mirrored into the Trends view — mobile only (shown in app.mobile.css). */
 .trends-weather-mobile { display: none; }
 
+/* Tesla API usage table (Vehicle tab). */
+.usage-table { display: flex; flex-direction: column; }
+.usage-row { display: flex; align-items: center; justify-content: space-between; padding: 9px 2px; border-bottom: 1px solid var(--line); }
+.usage-row span:first-child { font-weight: 600; }
+.usage-row span:nth-child(2) { flex: 1; text-align: center; color: var(--muted); }
+.usage-row.usage-total { border-bottom: none; font-weight: 700; padding-top: 12px; }
+
 /* Live power-flow diagram + horizon chart (modular views) */
 /* v2: fill the available width AND a tall, viewport-responsive height so the
    SVG cards use the whole panel (and adapt when embedded on other screens). The

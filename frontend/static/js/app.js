@@ -1111,12 +1111,45 @@ async function refreshPlan() {
   }
 }
 
+// Vehicle tab — a read-only mirror of the Tesla/vehicle0/* MQTT topics (no API cost).
+function renderVehicle() {
+  const box = document.getElementById("vehicle");
+  if (!box) return;
+  const L = lastLive || {};
+  const has = (v) => v !== null && v !== undefined && v !== "" && v !== "None";
+  const bool = (v) => v === true || String(v) === "True";
+  const pct = (v) => has(v) ? Number(v).toFixed(0) + "%" : null;
+  const amps = (v) => has(v) ? Number(v).toFixed(0) + " A" : null;
+  const yesno = (v) => has(v) ? (bool(v) ? "Yes" : "No") : null;
+
+  const cards = [];
+  const card = (label, val) => { if (has(val)) cards.push(`<div class="metric"><div class="label">${label}</div><div class="value">${val}</div></div>`); };
+
+  card("Car SoC", pct(L.veh_soc));
+  card("Charge limit", pct(L.veh_soc_limit));
+  card("Status", L.veh_charging_status);
+  card("Plugged in", L.veh_plugged_status);
+  card("Charge current", amps(L.veh_amps));
+  card("PV surplus", amps(L.veh_surplus_amps));
+  card("ETA to limit", (bool(L.veh_is_charging) && has(L.veh_eta) && L.veh_eta !== "N/A") ? L.veh_eta : null);
+  card("At home", yesno(L.veh_is_home));
+  card("Supercharging", yesno(L.veh_is_supercharging));
+  card("Updated", L.veh_last_update);
+
+  box.innerHTML = cards.length
+    ? `<div class="metrics-grid">${cards.join("")}</div>`
+    : `<span class="muted">waiting for vehicle status…</span>`;
+  const title = document.querySelector("#tab-vehicle h3");
+  if (title && has(L.veh_name)) title.textContent = L.veh_name;
+}
+
 function applyLive(data) {
   lastLive = data;
   renderOverview();             // overlay live values onto the plan
   if (lastPlan) renderDaySummary(lastPlan);
   updateControlButtons();
   safeRenderPowerFlow();
+  renderVehicle();
   if (lastPlan) renderMeta(lastPlan);
 }
 
@@ -1744,6 +1777,29 @@ async function refreshForecastAccuracy() {
   } catch (e) { /* leave the placeholder */ }
 }
 
+// Tesla API usage table on the Vehicle tab (today's Fleet API spend vs the credit).
+async function refreshVehicleUsage() {
+  const box = document.getElementById("vehicle-usage");
+  if (!box) return;
+  try {
+    const u = await fetch("/api/tesla/usage").then((x) => x.json());
+    const cats = u.categories || {};
+    const cur = { EUR: "€", USD: "$" }[u.currency] || "";
+    const money = (v) => cur + Number(v || 0).toFixed(2);
+    const row = (label, key) => cats[key]
+      ? `<div class="usage-row"><span>${label}</span><span>${cats[key].count}</span><span>${money(cats[key].cost)}</span></div>`
+      : "";
+    box.innerHTML =
+      `<div class="usage-table">` +
+      row("Commands", "command") +
+      row("Data", "data") +
+      row("Wakes", "wake") +
+      `<div class="usage-row usage-total"><span>Total this month</span><span></span>` +
+      `<span>${money(u.total)} <span class="muted" style="font-weight:400">of ${money(u.monthly_credit)}</span></span></div>` +
+      `</div>`;
+  } catch (e) { /* leave the placeholder */ }
+}
+
 async function refreshWeather() {
   try {
     const r = await fetch("/api/weather").then((x) => x.json());
@@ -1766,6 +1822,7 @@ loadAdvisorLatest();
 refreshForecastAccuracy();
 refreshWeather();
 refreshMonthly();
+refreshVehicleUsage();
 renderHeaderClock();
 startLiveStream();              // instant live updates via SSE
 // Plan refreshes slowly (changes only when the optimizer runs). Live values now
@@ -1776,3 +1833,4 @@ setInterval(renderHeaderClock, 1000);
 setInterval(refreshForecastAccuracy, 120000);
 setInterval(refreshWeather, 1800000);
 setInterval(refreshMonthly, 120000);   // month chart changes slowly
+setInterval(refreshVehicleUsage, 60000);   // Tesla API usage tally

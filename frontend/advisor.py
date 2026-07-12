@@ -26,6 +26,7 @@ from dotenv import dotenv_values
 from frontend.config_schema import CONFIG_SCHEMA
 from lib.config_paths import env_path, secrets_path
 from frontend import data as _data
+from lib import history_store as _hist
 
 # Current Claude models (override via ADVISOR_MODEL). Sonnet is the sensible
 # default for this analysis; Haiku is cheaper/faster for lighter use.
@@ -317,20 +318,8 @@ _SETTLE_FIELDS = ("ts", "predicted_control_action", "predicted_grid_kwh",
 
 
 def _read_day(day) -> list[dict]:
-    path = os.path.join(_data.history_dir(), f"ess-{day.strftime('%Y-%m-%d')}.ndjson")
-    recs = []
-    try:
-        with open(path) as fh:
-            for line in fh:
-                line = line.strip()
-                if line:
-                    try:
-                        recs.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        continue
-    except (FileNotFoundError, OSError):
-        pass
-    return recs
+    # Serves NDJSON hot days and Parquet-compacted cold days transparently.
+    return _hist.read_day(day, _data.history_dir())
 
 
 def _hm(ts):
@@ -443,15 +432,11 @@ _PROMPT_DATA_RE = re.compile(
 def _history_manifest() -> dict:
     """List every day available in data/history/ plus the record schema, so the model
     knows exactly what it can ask for (it only ever sees the recent few days inline)."""
-    days = []
+    # available_days spans both hot NDJSON and Parquet-compacted cold months.
     try:
-        for p in glob.glob(os.path.join(_data.history_dir(), "ess-*.ndjson")):
-            m = re.search(r"ess-(\d{4}-\d{2}-\d{2})\.ndjson$", os.path.basename(p))
-            if m:
-                days.append(m.group(1))
+        days = _hist.available_days(_data.history_dir())
     except OSError:
-        pass
-    days.sort()
+        days = []
     return {
         "dir": "data/history",
         "available_days": days,
