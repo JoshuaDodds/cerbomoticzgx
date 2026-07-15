@@ -632,9 +632,24 @@ def get_plan() -> dict:
 
 
 def tesla_usage() -> dict:
-    """Today's Tesla Fleet API spend (counts + $ per category + total) for the Vehicle tab."""
+    """Current billing cycle's Tesla Fleet API spend (counts + € per category + total) for the
+    Vehicle tab, plus an approximate Streaming Signals line from the telemetry bridge counter."""
     path = _env().get("TESLA_BUDGET_STATE_PATH") or _tesla_budget.DEFAULT_STATE_PATH
-    return _tesla_budget.usage_snapshot(path)
+    snap = _tesla_budget.usage_snapshot(path)
+    # Streaming Signals are pushed by the car (not requests we make), so they live outside the
+    # budget guard. Display them approximately from the bridge's monthly counter; Tesla bills
+    # ~$1 per 150,000 signals, so this is effectively free but worth showing.
+    try:
+        from lib.global_state import GlobalStateClient
+        month = datetime.utcnow().strftime("%Y-%m")
+        state = GlobalStateClient()
+        sig = 0
+        if state.get("tesla_stream_month") == month:
+            sig = int(state.get("tesla_stream_signals") or 0)
+        snap["streaming"] = {"count": sig, "cost": round(sig / 150000.0, 4), "approx": True}
+    except Exception:
+        snap["streaming"] = {"count": 0, "cost": 0.0, "approx": True}
+    return snap
 
 
 def get_config() -> list:

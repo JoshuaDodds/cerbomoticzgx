@@ -1,8 +1,10 @@
 """Safety tests for the Tesla Fleet API spend guard.
 
-The headline guarantee: the worst-case monthly spend from the enforced caps can never
-exceed Tesla's $10 credit. These tests fail loudly if anyone raises a cap past the
-ceiling — the whole point is that a config or code change can't produce a surprise bill.
+The headline guarantee: the enforced MONTHLY ceiling means the billing cycle's spend can
+never exceed the safety ceiling (below Tesla's $10 credit), while safety-critical calls (a
+charge_stop and the wake to deliver it) are never blocked. A per-day cap is only a runaway
+circuit-breaker. Charging is bursty (a couple of days a week), so a monthly guard fits it —
+a daily "worst case every day" model would wrongly block a legitimate charge day.
 """
 from datetime import datetime, timezone
 
@@ -15,25 +17,43 @@ def _budget(tmp_path, caps=None, clock=None):
 
 # --- the money-safety guarantee -------------------------------------------
 
-def test_default_caps_stay_under_the_monthly_credit():
-    cost = tb.projected_monthly_cost_usd(tb.DEFAULT_DAILY_CAPS)
-    assert cost <= tb.MONTHLY_SAFETY_CEILING_USD, (
-        f"Default Tesla caps project ${cost:.2f}/mo — over the ${tb.MONTHLY_SAFETY_CEILING_USD} "
-        f"safety ceiling. Lower the caps in tesla_budget.DEFAULT_DAILY_CAPS.")
-    assert cost < tb.MONTHLY_CREDIT_USD
-
-
 def test_ceiling_is_below_the_credit():
     # There must be real margin between what we allow and what Tesla starts billing.
     assert tb.MONTHLY_SAFETY_CEILING_USD < tb.MONTHLY_CREDIT_USD
 
 
-def test_guard_clamps_unsafe_caps_below_ceiling(tmp_path):
-    # Even a wildly unsafe config cannot make the guard allow overspend: caps are clamped.
+def test_default_caps_under_daily_runaway_ceiling():
+    # The daily caps are a per-day runaway breaker; their worst-case DAILY cost stays under the
+    # daily ceiling. (The monthly bill is guarded separately, per-spend.)
+    assert tb.projected_daily_cost_usd(tb.DEFAULT_DAILY_CAPS) <= tb.DAILY_SAFETY_CEILING_USD
+
+
+def test_guard_clamps_caps_below_daily_ceiling(tmp_path):
+    # A wildly unsafe config is clamped so no single day can burn more than the daily ceiling.
     insane = {"command": 1_000_000, "data": 1_000_000, "wake": 1_000_000}
     b = _budget(tmp_path, caps=insane)
-    assert tb.projected_monthly_cost_usd(b.caps) <= tb.MONTHLY_SAFETY_CEILING_USD
-    assert b.snapshot()["projected_month_usd"] <= tb.MONTHLY_SAFETY_CEILING_USD
+    assert tb.projected_daily_cost_usd(b.caps) <= tb.DAILY_SAFETY_CEILING_USD
+
+
+def test_monthly_ceiling_is_the_hard_guard_and_stops_bypass_it(tmp_path):
+    # Seed the billing cycle right at the ceiling. A normal call is then blocked, but a
+    # safety-critical call (a charge_stop / its wake) is NEVER blocked.
+    path = str(tmp_path / "budget.json")
+    wakes_to_ceiling = int(tb.MONTHLY_SAFETY_CEILING_USD / tb.UNIT_COST_USD["wake"])   # 450
+    tb.seed_month_usage({"command": 0, "data": 0, "wake": wakes_to_ceiling}, path)
+    b = tb.TeslaBudget(caps=tb.DEFAULT_DAILY_CAPS, state_path=path)
+    assert b.spend("command") is False                    # normal call blocked at the ceiling
+    assert b.spend("command", critical=True) is True      # safety-critical stop always goes through
+    assert b.spend("wake", critical=True) is True         # ...and the wake to deliver it
+
+
+def test_daily_runaway_breaker_caps_a_stuck_loop(tmp_path):
+    # Even well under the monthly ceiling, a stuck loop can't exceed the per-day cap.
+    b = _budget(tmp_path, caps=tb.DEFAULT_DAILY_CAPS)
+    n = 0
+    while b.spend("command") and n <= 100_000:
+        n += 1
+    assert n == tb.DEFAULT_DAILY_CAPS["command"]           # blocked at the daily cap (monthly still tiny)
 
 
 def test_projected_cost_math():
@@ -53,6 +73,17 @@ def test_spend_blocks_once_cap_reached(tmp_path):
     assert b.allow("data") is False
     # A category with a zero cap is always blocked.
     assert b.spend("wake") is False
+
+
+def test_refund_reverses_a_non_billable_spend_and_floors_at_zero(tmp_path):
+    path = str(tmp_path / "budget.json")
+    b = tb.TeslaBudget(caps={"command": 10, "data": 10, "wake": 10}, state_path=path)
+    b.spend("command"); b.spend("command")
+    assert tb.usage_snapshot(path)["categories"]["command"]["count"] == 2
+    b.refund("command")                                    # a 5xx/network call reversed
+    assert tb.usage_snapshot(path)["categories"]["command"]["count"] == 1
+    b.refund("command"); b.refund("command")               # never goes negative
+    assert tb.usage_snapshot(path)["categories"]["command"]["count"] == 0
 
 
 def test_blocked_call_records_nothing(tmp_path):

@@ -21,6 +21,9 @@ class FakeTesla:
         self.vehicle_soc = 50
         self.vehicle_soc_setpoint = 80
         self.time_until_full = "N/A"
+        # Fresh by default so existing is_charging=False assertions keep behaving as "confirmed
+        # off"; tests exercising staleness override this explicitly.
+        self.last_update_ts = kw.get("last_update_ts", time.time())
         self.calls = []
 
     def start_tesla_charge(self):
@@ -46,6 +49,7 @@ class FakeState(dict):
 
 def _charger(monkeypatch, tesla, state=None, **attrs):
     monkeypatch.setattr(ecc, "publish_message", lambda *a, **k: None)
+    monkeypatch.setattr(ecc, "pushover_notification", lambda *a, **k: None)
     monkeypatch.setattr(ecc, "pushover_notification_critical", lambda *a, **k: None)
     monkeypatch.setattr(ecc.EvCharger, "is_the_sun_shining", staticmethod(lambda: attrs.get("sun", True)))
     c = ecc.EvCharger.__new__(ecc.EvCharger)
@@ -53,12 +57,15 @@ def _charger(monkeypatch, tesla, state=None, **attrs):
     c.global_state = state if state is not None else FakeState()
     c.minimum_ess_soc = 90
     c._last_command_ts = 0.0
+    c._last_commanded_amps = None
     c._low_surplus_since = None
     c._intent_off_edge = False
     c._intent_was_on = False
     c._charge_mode = attrs.get("charge_mode", None)
     c._stop_backoff_until = 0.0
     c._last_stop_alert_ts = 0.0
+    c._stop_attempt_count = 0
+    c._stop_escalated = False
     c.ess_soc = attrs.get("ess_soc", 95)
     c.surplus_amps = attrs.get("surplus_amps", 6)
     c.charging_amps = attrs.get("charging_amps", 0)
@@ -161,10 +168,33 @@ def test_discovery_wake_is_rate_limited(monkeypatch):
     assert c._should_discovery_wake() is False
 
 
-def test_grid_assist_charges_full_and_ignores_surplus(monkeypatch):
-    # Grid-assist ON with NO surplus is an express override: start charging from grid and do
-    # NOT try to match the current to surplus.
-    state = FakeState({"grid_charging_enabled": "True"})
+def test_intent_follows_dedicated_flag_not_grid_assist(monkeypatch):
+    # Regression (decoupling): intent must follow the DEDICATED ev_charge_requested flag only.
+    # Grid-assist (grid_charging_enabled) controls the house battery and must NOT touch the car;
+    # our own tesla_charge_requested latch must also be ignored.
+    state = FakeState({"grid_charging_enabled": "True", "tesla_charge_requested": "True",
+                       "ev_charge_requested": "False"})
+    c = _charger(monkeypatch, FakeTesla(is_charging=False), state=state, surplus_amps=0, charging_amps=0)
+    assert c._intent_on() is False
+    assert c._local_engagement_signal() is False        # grid-assist on does NOT engage the car
+    state["ev_charge_requested"] = "True"
+    assert c._intent_on() is True
+
+
+def test_grid_assist_toggle_never_commands_the_car(monkeypatch):
+    # Toggling grid-assist on with a home+plugged car and no surplus must issue NO commands:
+    # EV charging is fully decoupled from grid-assist.
+    state = FakeState({"grid_charging_enabled": "True", "ev_charge_requested": "False"})
+    tesla = FakeTesla(is_charging=False)
+    c = _charger(monkeypatch, tesla, state=state, surplus_amps=0, charging_amps=0)
+    assert c._control_charging() is False
+    assert tesla.calls == []
+
+
+def test_ev_charge_request_charges_full_and_ignores_surplus(monkeypatch):
+    # The dedicated EV-charge request ON with NO surplus is an express override: start charging
+    # at the car's own rate and do NOT try to match the current to surplus.
+    state = FakeState({"ev_charge_requested": "True"})
     tesla = FakeTesla(is_charging=False)
     c = _charger(monkeypatch, tesla, state=state, surplus_amps=0, charging_amps=0)
     assert c._control_charging() is True
@@ -172,9 +202,10 @@ def test_grid_assist_charges_full_and_ignores_surplus(monkeypatch):
     assert not any(isinstance(x, tuple) and x[0] == "amps" for x in tesla.calls)
 
 
-def test_grid_assist_does_not_stop_on_low_surplus(monkeypatch):
-    # Charging under grid-assist while surplus is negative must NOT trigger a surplus-loss stop.
-    state = FakeState({"grid_charging_enabled": "True"})
+def test_ev_charge_request_does_not_stop_on_low_surplus(monkeypatch):
+    # Charging under an EV-charge request while surplus is negative must NOT trigger a
+    # surplus-loss stop.
+    state = FakeState({"ev_charge_requested": "True"})
     tesla = FakeTesla(is_charging=True)
     c = _charger(monkeypatch, tesla, state=state, surplus_amps=0, charging_amps=16)
     assert c._control_charging() is True
@@ -187,7 +218,7 @@ def test_rejected_stop_backs_off_alerts_and_does_not_loop(monkeypatch):
     tesla.stop_tesla_charge = lambda: (tesla.calls.append("stop"), "network")[1]   # network failure
     c = _charger(monkeypatch, tesla, charge_mode="grid", surplus_amps=0, charging_amps=16)
     alerts = []
-    monkeypatch.setattr(ecc, "pushover_notification_critical", lambda *a, **k: alerts.append(a))
+    monkeypatch.setattr(ecc, "pushover_notification", lambda *a, **k: alerts.append(a))
     c._intent_off_edge = True
     c._control_charging()
     assert tesla.calls.count("stop") == 1
@@ -197,11 +228,97 @@ def test_rejected_stop_backs_off_alerts_and_does_not_loop(monkeypatch):
     assert tesla.calls.count("stop") == 1
 
 
+def test_stop_skipped_when_nothing_is_drawing(monkeypatch):
+    # Local meter ~0 and not charging -> nothing to stop; never command or wake the car.
+    tesla = FakeTesla(is_charging=False)
+    c = _charger(monkeypatch, tesla, charging_amps=0)
+    c._intent_off_edge = True
+    c._stop_charge("nothing to stop", force=True)
+    assert tesla.calls == []
+
+
+def test_failed_stop_does_not_lie_about_meter(monkeypatch):
+    # A 'network'/failed stop must NOT zero the meter or clear the charging flag, so the next
+    # tick still sees the car drawing and re-issues the stop (car draining is the risk).
+    tesla = FakeTesla(is_charging=True)
+    tesla.stop_tesla_charge = lambda: (tesla.calls.append("stop"), "network")[1]
+    monkeypatch.setattr(ecc, "pushover_notification", lambda *a, **k: None)
+    c = _charger(monkeypatch, tesla, charging_amps=12)
+    zeroed = {"n": 0}
+    c.update_charging_amp_totals = lambda v=None: zeroed.__setitem__("n", zeroed["n"] + 1)
+    c._stop_charge("stop it", force=True)
+    assert tesla.calls.count("stop") == 1
+    assert zeroed["n"] == 0                     # meter NOT forced to 0 on a failed stop
+    assert tesla.is_charging is True            # still flagged charging -> re-stop next tick
+
+
+def test_stale_not_charging_status_does_not_skip_the_stop(monkeypatch):
+    # Regression: a stale/unconfirmed tesla.is_charging=False (e.g. the last forced refresh
+    # failed) must NOT be trusted as "confirmed not charging" — even with the under-reading
+    # local meter also below 1A, the stop must still be attempted, not silently skipped.
+    tesla = FakeTesla(is_charging=False, last_update_ts=time.time() - (ecc.STALE_STATUS_MAX_AGE_S + 60))
+    c = _charger(monkeypatch, tesla, charging_amps=0)
+    c._intent_off_edge = True
+    c._stop_charge("nothing to stop?", force=True)
+    assert "stop" in tesla.calls
+
+
+def test_fresh_not_charging_status_still_skips_the_stop(monkeypatch):
+    # Sanity check the freshness gate doesn't break the original M1/H1 behavior: a genuinely
+    # fresh confirmation of "not charging" plus a near-zero meter is still treated as nothing
+    # to stop, so we don't wake the car for no reason.
+    tesla = FakeTesla(is_charging=False, last_update_ts=time.time())
+    c = _charger(monkeypatch, tesla, charging_amps=0)
+    c._intent_off_edge = True
+    c._stop_charge("nothing to stop", force=True)
+    assert tesla.calls == []
+
+
+def test_stop_retries_are_bounded_then_escalates_critical(monkeypatch):
+    # A persistently-failing stop must retry at most STOP_MAX_RETRIES times, then send a
+    # CRITICAL Pushover alert and stop auto-retrying (bounds the budget-bypassing spend).
+    tesla = FakeTesla(is_charging=True)
+    tesla.stop_tesla_charge = lambda: (tesla.calls.append("stop"), "network")[1]
+    c = _charger(monkeypatch, tesla, charging_amps=16)
+    critical_alerts = []
+    monkeypatch.setattr(ecc, "pushover_notification_critical", lambda *a, **k: critical_alerts.append(a))
+
+    for _ in range(ecc.STOP_MAX_RETRIES):
+        c._stop_charge("EV-charge request turned off", force=True)
+        c._stop_backoff_until = 0.0   # skip the real backoff wait between attempts in the test
+
+    assert tesla.calls.count("stop") == ecc.STOP_MAX_RETRIES
+    assert c._stop_escalated is True
+    assert len(critical_alerts) == 1
+
+    # Further attempts must NOT call stop_tesla_charge again — escalated, waiting on a human.
+    c._stop_charge("EV-charge request turned off", force=True)
+    assert tesla.calls.count("stop") == ecc.STOP_MAX_RETRIES
+
+
+def test_fresh_intent_off_edge_resets_escalation(monkeypatch):
+    # A brand-new, deliberate stop request (a fresh intent-off edge) gets its own bounded
+    # attempts rather than staying silently suppressed by a prior escalation.
+    tesla = FakeTesla(is_charging=True)
+    tesla.stop_tesla_charge = lambda: (tesla.calls.append("stop"), "network")[1]
+    c = _charger(monkeypatch, tesla, charge_mode="grid", charging_amps=16)
+    c._stop_attempt_count = ecc.STOP_MAX_RETRIES
+    c._stop_escalated = True
+    c._intent_off_edge = True
+    c._control_charging()
+    assert "stop" in tesla.calls
+    assert c._stop_attempt_count == 1
+    assert c._stop_escalated is False
+
+
 def test_engagement_signal_dormant_when_idle(monkeypatch):
     tesla = FakeTesla(is_charging=False)
     c = _charger(monkeypatch, tesla, ess_soc=95, surplus_amps=0, charging_amps=0, sun=True)
     # No intent, no surplus (0A), not charging locally -> nothing should engage the API.
     assert c._local_engagement_signal() is False
-    # Intent flips it on.
+    # Grid-assist must NOT engage the car (decoupled).
     c.global_state.set("grid_charging_enabled", "True")
+    assert c._local_engagement_signal() is False
+    # The dedicated EV-charge flag flips it on.
+    c.global_state.set("ev_charge_requested", "True")
     assert c._local_engagement_signal() is True

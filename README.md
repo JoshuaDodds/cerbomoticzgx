@@ -32,8 +32,14 @@ Current Features include:
 a Domoticz server via its REST API for monitoring and historic tracking
 - Modular - Individual modules can be enabled or disabled in the ```.env``` file    
 - Included a custom module which can be installed on a cerbo gx to read out ABB B2x kWh meters
-- EV Charge Controller - Tesla vehicle charging at lowest rates or using only excess solar energy
-- Grid Assisted vehicle charging mode for when you need to just charge at full rate regardless of cost
+- EV Charge Controller - Tesla vehicle charging at lowest rates or using only excess solar energy,
+  with a dedicated manual **Start/Stop** control decoupled from the house-battery grid-assist toggle
+  (toggling grid-assist never starts or stops the car)
+- **Tesla Fleet Telemetry** (`TESLA_TELEMETRY_ENABLED`, off by default): an optional streaming push
+  mode where the car reports state via Tesla's Fleet Telemetry instead of REST polling, eliminating
+  billable `vehicle_data` reads/wakes for status. `lib/tesla_telemetry_bridge.py` translates the
+  stream to the same internal topics/state the REST path uses, so the rest of the system is
+  unaffected; falls back to the REST polling path when disabled
 - Energy Broker module which attempts to buy energy at the lowest possible rate in a 48 hour period and store this in your home battery
 - Tibber graphing module to generate visuals of the upcoming electricity prices (Thanks to [Tibberios](https://github.com/Lef-F/tibberios))
 - Tibber API integration to constantly monitor current energy rates, daily consumption and production, forecasted pricing, etc (Thanks to [Tibber.py](https://github.com/BeatsuDev/tibber.py))

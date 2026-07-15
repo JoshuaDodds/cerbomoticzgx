@@ -81,7 +81,7 @@ Topics = dict({
             "tesla_plug_status":            f"Tesla/vehicle0/plugged_status",
             "tesla_is_home":                f"Tesla/vehicle0/is_home",
             "tesla_is_charging":            f"Tesla/vehicle0/is_charging",
-            "tesla_charge_requested":       f"Tesla/vehicle0/control/charge_requested",
+            "ev_charge_requested":          f"Tesla/vehicle0/control/charge_requested",
             "tesla_battery_soc":            f"Tesla/vehicle0/battery_soc",
             "tesla_battery_soc_setpoint":   f"Tesla/vehicle0/battery_soc_setpoint",
 

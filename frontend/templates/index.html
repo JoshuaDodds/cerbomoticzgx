@@ -137,6 +137,16 @@
             The controller only contacts the car when it needs to act (see the Tesla cost controls).</p>
         </div>
         <div class="card">
+          <h3 style="margin:2px 0 10px">Charge control</h3>
+          <div class="ev-controls">
+            <button id="ev-start" type="button" class="btn" data-ev-charge="start">Start charge</button>
+            <button id="ev-stop" type="button" class="btn" data-ev-charge="stop">Stop charge</button>
+          </div>
+          <p class="cfg-note">Manually request or stop an EV charge. This sets the dedicated
+            EV-charge intent (independent of grid assist); the controller then starts/stops the car
+            with its safety checks (only acts when the car is home and plugged in).</p>
+        </div>
+        <div class="card">
           <h3 style="margin:2px 0 10px">Tesla API usage — this billing cycle (local estimate)</h3>
           <div id="vehicle-usage"><span class="muted">loading…</span></div>
           <p class="cfg-note">Counted locally to <em>enforce</em> a hard spend cap (Tesla has no

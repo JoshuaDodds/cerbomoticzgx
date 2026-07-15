@@ -798,6 +798,25 @@ def test_manual_grid_charge_on_reads_toggle(monkeypatch):
     assert energy_broker._manual_grid_charge_on() is False
 
 
+def test_grid_assist_stands_down_during_ai_buy_slot(monkeypatch):
+    # Regression: with manual grid-assist on under AI control, a retain "cover the load"
+    # setpoint during an AI BUY slot clobbered the optimizer's (larger) charge setpoint and
+    # improperly interfered with the buy. During BUY we must NOT apply a retain setpoint.
+    monkeypatch.setattr(energy_broker, "_ai_optimizer_active_and_healthy", lambda: True)
+    monkeypatch.setattr(energy_broker, "_manual_grid_charge_on", lambda: True)
+    applied = []
+    monkeypatch.setattr(energy_broker, "_apply_grid_assist_setpoint",
+                        lambda *a, **k: applied.append((a, k)))
+
+    monkeypatch.setattr(energy_broker, "STATE", DummyState({"ai_control_action": "BUY"}))
+    energy_broker.manage_grid_usage_based_on_current_price(price=0.30, power=1500)
+    assert applied == []                       # stood down during BUY
+
+    monkeypatch.setattr(energy_broker, "STATE", DummyState({"ai_control_action": "RETAIN"}))
+    energy_broker.manage_grid_usage_based_on_current_price(price=0.30, power=1500)
+    assert len(applied) == 1                    # retain setpoint applied outside a BUY
+
+
 def test_ai_ess_override_stands_optimizer_down(monkeypatch):
     monkeypatch.setattr(energy_broker, "retrieve_setting",
                         lambda name: "1" if name == "AI_POWERED_ESS_ALGORITHM" else None)

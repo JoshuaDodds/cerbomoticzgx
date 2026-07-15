@@ -440,6 +440,13 @@ def manage_grid_usage_based_on_current_price(price: float = None, power: any = N
     if _ai_optimizer_active_and_healthy():
         manual_grid_assist = _manual_grid_charge_on()
         if STATE.get('ai_grid_assist') == 'on' or manual_grid_assist:
+            # During an AI BUY slot the optimizer is ALREADY importing from grid to
+            # charge the battery (its own, larger, charge setpoint + Victron schedule).
+            # A retain "cover the load" setpoint here would clobber that BUY charge and
+            # improperly interfere with the buy slot, so stand down: a charging battery
+            # is by definition retained (not draining), so retain mode is already met.
+            if str(STATE.get('ai_control_action') or '').upper() == 'BUY':
+                return
             # Retain mode (AI plan OR manual grid-charge override): import only what
             # PV can't cover; stay at 0 when PV covers the load so surplus PV charges
             # the battery / exports. The manual override keeps the setpoint tracking

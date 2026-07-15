@@ -226,7 +226,12 @@ reuses `MOSQUITTO_IP` and `VRM_PORTAL_ID`.
 - `POST /api/control/ai-override` — toggle AI ESS override; enabling idles Victron once
   and makes the optimizer stand down until toggled off.
 - `POST /api/control/grid-assist` — toggle the existing manual grid-assist/retain mode
-  (`grid_charging_enabled`) so grid covers loads and the battery is held.
+  (`grid_charging_enabled`) so grid covers loads and the battery is held. This is the
+  house-battery hold only — it no longer starts/stops the car.
+- `POST /api/control/ev-charge` — manual EV **Start/Stop** (Vehicle tab). Sets the dedicated
+  `ev_charge_requested` intent (decoupled from grid-assist); the EV controller then starts/stops
+  the car with its safety checks (home + plugged + non-supercharging, wake escalation,
+  local-meter stop verification).
 - `POST /api/victron/clear-schedule` — clear the five Victron scheduled-charge slots.
 - `GET /healthz` — liveness.
 

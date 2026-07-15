@@ -93,9 +93,13 @@ main { padding: 12px 16px 80px; max-width: 1100px; margin: 0 auto; }
 
 /* Tesla API usage table (Vehicle tab). */
 .usage-table { display: flex; flex-direction: column; }
-.usage-row { display: flex; align-items: center; justify-content: space-between; padding: 9px 2px; border-bottom: 1px solid var(--line); }
+/* label takes the slack; count + cost sit in tidy right-aligned columns with tabular figures
+   so the numbers line up cleanly instead of floating centred in a ragged gap. */
+.usage-row { display: grid; grid-template-columns: 1fr auto auto; align-items: baseline;
+  column-gap: 16px; padding: 9px 2px; border-bottom: 1px solid var(--line); }
 .usage-row span:first-child { font-weight: 600; }
-.usage-row span:nth-child(2) { flex: 1; text-align: center; color: var(--muted); }
+.usage-row span:nth-child(2) { text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+.usage-row span:nth-child(3) { text-align: right; font-variant-numeric: tabular-nums; }
 .usage-row.usage-total { border-bottom: none; font-weight: 700; padding-top: 12px; }
 
 /* Live power-flow diagram + horizon chart (modular views) */

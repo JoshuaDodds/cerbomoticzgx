@@ -94,7 +94,7 @@ def post_startup():
     restore_and_publish('ai_ess_override_enabled', default=False)
     restore_and_publish('grid_charging_enabled', default=False)
     restore_and_publish('grid_charging_enabled_by_price', default=False)
-    restore_and_publish('tesla_charge_requested', default=False)
+    restore_and_publish('ev_charge_requested', default=False)
 
     # Start the read-only dashboard EARLY (if enabled), BEFORE any network-bound
     # pricing/forecast work, so the web server is available immediately and can
@@ -129,6 +129,17 @@ def post_startup():
         logging.info("post_startup(): warm-up complete.")
 
     threading.Thread(target=_startup_warm_up, name="startup-warmup", daemon=True).start()
+
+    # Start the Tesla Fleet Telemetry bridge if enabled. It subscribes to the in-cluster
+    # fleet-telemetry MQTT firehose and republishes normalized Tesla/vehicle0/* state +
+    # tesla_* GlobalState keys, so the EV controller/GUI read PUSHED data instead of polling
+    # vehicle_data. Fully inert (returns None) when TESLA_TELEMETRY_ENABLED is off.
+    try:
+        from lib.tesla_telemetry_bridge import start_bridge_if_enabled
+        if start_bridge_if_enabled(retrieve_setting):
+            logging.info("Tesla Fleet Telemetry bridge started (TESLA_TELEMETRY_ENABLED).")
+    except Exception as e:
+        logging.warning("Tesla telemetry bridge failed to start; continuing without it: %s", e)
 
     # Start service scheduled tasks + the .env config watcher (independent of the
     # warm-up above, so they come up immediately).

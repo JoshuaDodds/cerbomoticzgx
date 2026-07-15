@@ -27,6 +27,9 @@ VEHICLE_DATA_ENDPOINTS = "charge_state;drive_state;vehicle_state;location_data"
 DEFAULT_POLL_INTERVAL_MIN = 15
 DEFAULT_POLL_INTERVAL_CHARGING_MIN = 10
 DEFAULT_POLL_INTERVAL_ASLEEP_MIN = 30
+# In telemetry mode, a refresh within this window is treated as proof the car is online (it's
+# actively streaming), so the pre-command billable state read can be skipped entirely (audit M3).
+TELEMETRY_ONLINE_MAX_AGE_S = 300
 
 logging.getLogger('urllib3').setLevel(logging.WARNING)
 
@@ -94,15 +97,64 @@ class TeslaApi:
             minutes = _setting_int('TESLA_POLL_INTERVAL_MIN', DEFAULT_POLL_INTERVAL_MIN)
         return max(60, minutes * 60)
 
+    def _telemetry_on(self) -> bool:
+        """Fleet Telemetry (push) mode. Read dynamically so toggling the .env flag takes effect
+        on the next tick without a restart."""
+        return lib.helpers.is_truthy(retrieve_setting("TESLA_TELEMETRY_ENABLED"), False)
+
+    def _refresh_from_telemetry(self):
+        """Telemetry mode: the fleet-telemetry bridge pushes fresh state onto the tesla_* STATE
+        keys, so we read those instead of making a billable vehicle_data call. NO REST, NO wake,
+        zero cost. Commands (start/stop/set amps) still go via the Fleet API."""
+        def _f(key):
+            try:
+                return float(STATE.get(key))
+            except (TypeError, ValueError):
+                return None
+
+        soc, setp = _f("tesla_soc"), _f("tesla_soc_setpoint")
+        if soc is not None:
+            self.vehicle_soc = soc
+        if setp is not None:
+            self.vehicle_soc_setpoint = setp
+        if soc is not None and setp is not None:
+            self.is_full = soc >= setp
+        amp_req = _f("tesla_charge_current_request")
+        if amp_req is not None:
+            self.charging_amp_limit = amp_req
+
+        self.is_charging = lib.helpers.is_truthy(STATE.get("tesla_is_charging"), False)
+        self.is_plugged = lib.helpers.is_truthy(STATE.get("tesla_is_plugged"), False)
+        self.is_supercharging = lib.helpers.is_truthy(STATE.get("tesla_is_supercharging"), False)
+        # is_home may be genuinely unknown until the car streams a Location; keep None so the
+        # controller stays conservative rather than assuming home.
+        home = STATE.get("tesla_is_home")
+        self.is_home = None if home in (None, "", "None") else lib.helpers.is_truthy(home, False)
+        ttf = STATE.get("tesla_time_to_full")
+        if ttf:
+            self.time_until_full = ttf
+
+        self.plugged_status = "Plugged" if self.is_plugged else "Unplugged"
+        self.charging_status = "Charging" if self.is_charging else "Idle"
+        self.is_online = True                      # an actively-streaming car is by definition online
+        self._asleep = False
+        self.last_update_ts = time.time()
+        self.last_update_ts_hr = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self.last_update_ts))
+
     def update_vehicle_status(self, force=False, allow_wake=False):
         """Refresh cached vehicle state from ONE cheap data read.
 
-        Throttled on the last ATTEMPT (not just the last success), so an asleep car — which
-        returns no data — still backs off to the long asleep interval instead of re-polling
-        every loop. By default we never wake the car to read; ``allow_wake`` is set only when
-        there is explicit intent to charge (the caller wants to check + act), and even then
-        the wake is budget-capped.
+        In telemetry (push) mode we read the bridge-maintained STATE keys and skip the REST
+        call entirely (no billable request, no wake). Otherwise we fall back to the throttled
+        vehicle_data poll: throttled on the last ATTEMPT (not just the last success), so an
+        asleep car — which returns no data — still backs off to the long asleep interval instead
+        of re-polling every loop. By default we never wake the car to read; ``allow_wake`` is set
+        only when there is explicit intent to charge, and even then the wake is budget-capped.
         """
+        if self._telemetry_on():
+            self._refresh_from_telemetry()
+            return
+
         last = self._last_read_attempt_ts
         due = (not last) or (time.time() - last >= self._poll_interval_seconds())
         if not (force or due):
@@ -132,6 +184,17 @@ class TeslaApi:
         self.update_mqtt_and_domoticz()
 
     def update_mqtt_and_domoticz(self):
+        # In telemetry (push) mode the fleet-telemetry bridge OWNS the Tesla/vehicle0/* topics
+        # (fresher + retained). Re-publishing them here from our last cached snapshot would fight
+        # the bridge and can flap stale values (plugged/home/soc), so skip the MQTT writes and
+        # only update Domoticz. In legacy polling mode we remain the sole publisher.
+        if self._telemetry_on():
+            self._domoticz_vehicle_status()
+            return
+        self._publish_vehicle_topics()
+        self._domoticz_vehicle_status()
+
+    def _publish_vehicle_topics(self):
         publish_message("Tesla/vehicle0/vehicle_name", payload=f"{{\"value\": \"{self.vehicle_name}\"}}", qos=0, retain=True)
         publish_message("Tesla/vehicle0/charging_status", payload=f"{{\"value\": \"{self.charging_status}\"}}", qos=0, retain=True)
         publish_message("Tesla/vehicle0/battery_soc", payload=f"{{\"value\": \"{self.vehicle_soc}\"}}", qos=0, retain=True)
@@ -143,6 +206,7 @@ class TeslaApi:
         publish_message("Tesla/vehicle0/is_charging", payload=f"{{\"value\": \"{self.is_charging}\"}}", qos=0, retain=True)
         publish_message("Tesla/vehicle0/last_update_at", payload=f"{{\"value\": \"{self.last_update_ts_hr}\"}}", qos=0, retain=True)
 
+    def _domoticz_vehicle_status(self):
         # send selected metrics to domoticz for tracking and display
         _msg = f"{self.charging_status} @ {self.charging_amp_limit}A, {self.vehicle_soc}% of {self.vehicle_soc_setpoint}%, {self.plugged_status}"
         domoticz_update('vehicle_status', _msg, "received vehicle metrics update from EvCharger and sent to domoticz")
@@ -207,15 +271,25 @@ class TeslaApi:
         # Billable "data" request (vehicle list/state). Gate it; return None if capped.
         if not self._budget.spend("data"):
             return None
-        response = self._request("GET", f"/api/1/vehicles/{self._vehicle_id}")
+        try:
+            response = self._request("GET", f"/api/1/vehicles/{self._vehicle_id}")
+        except requests.exceptions.RequestException:
+            self._budget.refund("data")        # no HTTP response -> not billed
+            return None
+        if response.status_code >= 500:
+            self._budget.refund("data")        # Tesla does not bill responses >= 500
+            return None
         return (response.json().get("response") or {}).get("state")
 
     def _command(self, name, error_msg, json_body=None):
         ok, _cat = self._command_ex(name, json_body=json_body, error_msg=error_msg)
         return ok
 
-    def _command_ex(self, name, json_body=None, error_msg=""):
+    def _command_ex(self, name, json_body=None, error_msg="", critical=False):
         """Send a command and classify the outcome so callers can react appropriately.
+
+        ``critical=True`` (e.g. charge_stop) bypasses the spend guard — a safety-essential
+        command must never be blocked by the budget.
 
         Returns (success, category) where category is one of:
           'ok'       — command accepted;
@@ -224,8 +298,8 @@ class TeslaApi:
           'network'  — transport failure or 5xx (waking won't help; may need manual action);
           'error'    — some other rejection.
         """
-        if not self._budget.spend("command"):
-            logging.info(f"tesla_api: command '{name}' blocked by budget guard (daily cap reached). {error_msg}")
+        if not self._budget.spend("command", critical=critical):
+            logging.info(f"tesla_api: command '{name}' blocked by budget guard (monthly ceiling reached). {error_msg}")
             return False, 'budget'
         try:
             response = self._request(
@@ -233,6 +307,7 @@ class TeslaApi:
             )
         except requests.exceptions.RequestException as e:
             logging.info(f"tesla_api: command '{name}' network error: {e}. {error_msg}")
+            self._budget.refund("command")     # no HTTP response -> Tesla did not bill it
             return False, 'network'
         try:
             data = response.json()
@@ -242,11 +317,14 @@ class TeslaApi:
         if response.status_code == 200 and result.get("result"):
             return True, 'ok'
         reason = str(result.get('reason') or data.get('error') or '').lower()
-        logging.info(f"tesla_api: command '{name}' failed: {reason or response.status_code}. {error_msg}")
+        # Not "failed" per se — the command wasn't delivered. Whether that matters depends on the
+        # caller (e.g. an asleep bus on charge_stop just means the car isn't charging).
+        logging.info(f"tesla_api: command '{name}' not delivered ({reason or response.status_code}). {error_msg}")
         if response.status_code == 408 or any(k in reason for k in
                 ('could_not_wake', 'asleep', 'unavailable', 'offline', 'timed out')):
             return False, 'asleep'
         if response.status_code >= 500:
+            self._budget.refund("command")     # Tesla does not bill responses >= 500
             return False, 'network'
         return False, 'error'
 
@@ -277,23 +355,39 @@ class TeslaApi:
 
         return success
 
-    def wake_vehicle(self, skip_online_check=False):
+    def _telemetry_considers_online(self) -> bool:
+        """In telemetry mode an actively-streaming car is online by definition — a recent
+        telemetry refresh is proof enough, so the billable pre-command state read is skipped
+        entirely (audit M3). Falls through to the real check if telemetry hasn't refreshed
+        recently (e.g. the bridge/MQTT connection dropped), so this never masks a genuinely
+        stale/disconnected stream."""
+        if not self._telemetry_on():
+            return False
+        return (time.time() - (self.last_update_ts or 0)) <= TELEMETRY_ONLINE_MAX_AGE_S
+
+    def wake_vehicle(self, skip_online_check=False, critical=False):
         """Wake the car — used before a command, never just to read status.
 
         A wake is the most expensive call ($0.02), so it is budget-gated and the confirm
         polls are bounded. ``skip_online_check`` forces a wake_up even when the car reports
         'online' — needed when a command was rejected with could_not_wake_buses (the car is
-        online but its command bus is asleep).
+        online but its command bus is asleep). ``critical=True`` (a wake to deliver a
+        charge_stop) bypasses the budget guard so a stop can always be delivered.
         """
         try:
-            if not skip_online_check and self._get_vehicle_state() == "online":
-                return True
+            if not skip_online_check:
+                if self._telemetry_considers_online():
+                    return True
+                if self._get_vehicle_state() == "online":
+                    return True
 
-            if not self._budget.spend("wake"):
-                logging.info("tesla_api: wake blocked by budget guard (daily cap reached).")
+            if not self._budget.spend("wake", critical=critical):
+                logging.info("tesla_api: wake blocked by budget guard (monthly ceiling reached).")
                 return False
 
-            self._request("POST", f"/api/1/vehicles/{self._vehicle_id}/wake_up")
+            resp = self._request("POST", f"/api/1/vehicles/{self._vehicle_id}/wake_up")
+            if getattr(resp, "status_code", 0) >= 500:
+                self._budget.refund("wake")        # Tesla does not bill responses >= 500
 
             for _ in range(3):   # bounded confirm-polls (each a gated data call)
                 time.sleep(3)
@@ -304,6 +398,7 @@ class TeslaApi:
 
         except requests.exceptions.RequestException as e:
             logging.info(f"tesla_api: HTTPError: {e}")
+            self._budget.refund("wake")        # wake_up POST failed -> not billed
             return False
 
     def _on_charge_stopped(self):
@@ -317,32 +412,68 @@ class TeslaApi:
     def stop_charge_robust(self):
         """Stop charging with escalation. Returns 'ok' | 'network' | 'failed'.
 
-        A charging car can pull a lot of energy quickly, so if the first stop is rejected
-        because the command bus is asleep, we FORCE a wake and retry immediately. A genuine
-        network/transport failure is reported back ('network') so the caller can alert for
-        manual intervention rather than silently leaving the car charging.
+        A car can report 'could_not_wake_buses' even while it IS charging (the command bus is
+        asleep but the charge continues), so we must NOT assume asleep == stopped. We FORCE a
+        wake and retry. Only a confirmed result ('ok') means stopped — the CONTROLLER additionally
+        verifies against the local charge meter and re-issues if the car is still drawing.
         """
-        ok, cat = self._command_ex('charge_stop', error_msg="stop charge")
+        # A stop is safety-essential: bypass the spend guard for the command AND the wake needed
+        # to deliver it, so the budget can never leave the car charging.
+        ok, cat = self._command_ex('charge_stop', error_msg="stop charge", critical=True)
         if ok:
             self._on_charge_stopped()
             return 'ok'
         if cat == 'asleep':
-            if self.wake_vehicle(skip_online_check=True):
-                ok, cat = self._command_ex('charge_stop', error_msg="stop charge (after wake)")
+            if self.wake_vehicle(skip_online_check=True, critical=True):
+                ok, cat = self._command_ex('charge_stop', error_msg="stop charge (after wake)", critical=True)
                 if ok:
                     self._on_charge_stopped()
                     return 'ok'
             return 'network' if cat == 'network' else 'failed'
         return 'network' if cat == 'network' else 'failed'
 
+    def _on_charge_started(self):
+        self.is_charging = True
+        self.charging_status = "Charging"
+        self.update_mqtt_and_domoticz()
+
+    def start_charge_robust(self):
+        """Start charging with the same asleep-bus escalation as stop. Returns 'ok'|'network'|'failed'."""
+        ok, cat = self._command_ex('charge_start', error_msg="start charge")
+        if ok:
+            self._on_charge_started()
+            return 'ok'
+        if cat == 'asleep':
+            if self.wake_vehicle(skip_online_check=True):
+                ok, cat = self._command_ex('charge_start', error_msg="start charge (after wake)")
+                if ok:
+                    self._on_charge_started()
+                    return 'ok'
+            return 'network' if cat == 'network' else 'failed'
+        return 'network' if cat == 'network' else 'failed'
+
     # Commands
     def stop_tesla_charge(self):
-        STATE.set('tesla_charge_requested', "False")
+        # NOTE: does NOT touch 'tesla_charge_requested'. That flag is meant to be the USER's
+        # request; our own start/stop must not mutate it, or the controller's intent latches
+        # "on" forever (our start set it True -> grid-assist-off never registered).
         return self.stop_charge_robust()
 
     def start_tesla_charge(self):
-        STATE.set('tesla_charge_requested', "True")
-        return self.send_command('START_CHARGE', "Error starting Tesla charge")
+        return self.start_charge_robust()
+
+    def set_fleet_telemetry_config(self, config: dict):
+        """Push a Fleet Telemetry config to the vehicle(s) so they stream to our receiver.
+        One-off setup call (billable as a command); returns the parsed response or None."""
+        if not self._budget.spend("command"):
+            logging.info("tesla_api: fleet_telemetry_config blocked by budget guard (daily cap reached).")
+            return None
+        try:
+            resp = self._request("POST", "/api/1/vehicles/fleet_telemetry_config", json=config)
+            return resp.json()
+        except Exception as e:
+            logging.error(f"tesla_api: fleet_telemetry_config error: {e}")
+            return None
 
     def set_tesla_charge_amps(self, amps):
         amps = 0 if amps < 0 else amps
@@ -366,37 +497,44 @@ class TeslaApi:
         no wake-to-read: a sleeping car returns HTTP 408, which we treat as "no fresh data"
         unless ``allow_wake`` is set (only command flows do that). Budget-gated.
         """
-        try:
+        # Up to two attempts: a first read, then (only with allow_wake) a wake + one retry if the
+        # car is asleep (408). Each read is budget-gated up front and REFUNDED if the response is
+        # non-billable (network error or >= 500), so the displayed usage matches Tesla's (which
+        # bills only responses < 500; 408 asleep IS billable).
+        for attempt in range(2):
             if not self._budget.spend("data"):
-                logging.info("tesla_api: vehicle_data read blocked by budget guard (daily cap reached).")
+                logging.info("tesla_api: vehicle_data read blocked by budget guard (ceiling reached).")
                 return None
-
-            response = self._request(
-                "GET", f"/api/1/vehicles/{self._vehicle_id}/vehicle_data",
-                params={"endpoints": VEHICLE_DATA_ENDPOINTS},
-            )
-
-            if response.status_code == 408:   # vehicle asleep / offline
-                if not (allow_wake and self.wake_vehicle()):
-                    logging.debug("tesla_api: vehicle asleep; not waking just to read status.")
-                    return None
-                if not self._budget.spend("data"):
-                    return None
+            try:
                 response = self._request(
                     "GET", f"/api/1/vehicles/{self._vehicle_id}/vehicle_data",
                     params={"endpoints": VEHICLE_DATA_ENDPOINTS},
                 )
+            except requests.exceptions.RequestException as e:
+                logging.error(f"tesla_api: get_vehicle_data() network error: {e}")
+                self._budget.refund("data")        # no HTTP response -> not billed
+                return None
 
-            data = response.json()
+            if response.status_code >= 500:
+                self._budget.refund("data")        # Tesla does not bill responses >= 500
+                return None
+
+            if response.status_code == 408:        # vehicle asleep / offline (billable)
+                if attempt == 0 and allow_wake and self.wake_vehicle():
+                    continue                       # woke it -> retry the read once
+                logging.debug("tesla_api: vehicle asleep; not waking just to read status.")
+                return None
+
+            try:
+                data = response.json()
+            except ValueError:
+                logging.error("tesla_api: get_vehicle_data() returned non-JSON.")
+                return None
             if not data.get("response"):
                 logging.error(f"tesla_api: get_vehicle_data() error: {data.get('error')}")
                 return None
-
             return data["response"]
-
-        except Exception as e:
-            logging.error(f"tesla_api: get_vehicle_data() error: {e}")
-            return None
+        return None
 
     def minutes_to_full_charge(self, vehicle_data) -> str:
         minutes_until_full = vehicle_data['charge_state']['minutes_to_full_charge'] if self.is_charging else "N/A"

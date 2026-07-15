@@ -1,0 +1,233 @@
+# Tesla Fleet Telemetry receiver for cerbomoticzGx.
+#
+# The CAR is the client: it connects OUT to fleet.hs.mfis.net:6443 over mTLS. fleet-telemetry
+# terminates TLS itself and its MQTT dispatcher publishes decoded fields to the in-cluster
+# Mosquitto; lib/tesla_telemetry_bridge (in the cerbomoticzgx pod) translates them to
+# Tesla/vehicle0/*. NOTE: this is telemetry only (car -> us). Fleet API COMMANDS (start/stop
+# charge) still go via Tesla's cloud REST API — not the LAN.
+#
+# NETWORK — prefer LAN-direct (no public exposure): the car connects while on home WiFi, so
+# use split-horizon DNS to resolve fleet.hs.mfis.net to this Service's MetalLB IP on the home
+# LAN. The car then reaches the receiver directly (same subnet, no NAT/hairpin, not exposed to
+# the internet), and away-on-LTE simply can't reach it — which gives "home-only telemetry" for
+# free. Keep the endpoint a HOSTNAME (TLS validates the name, not the IP). CAVEAT: Tesla may
+# probe reachability from its cloud when you POST fleet_telemetry_config — if so, open the
+# EdgeRouter forward to this IP:6443 during that one-time setup, then close it and run LAN-only.
+#
+# This is a template for the `homestack` repo. Verify against the fleet-telemetry release you
+# pin — config.json field names can drift. Per the official README the `tls` block takes ONLY
+# server_cert/server_key; fleet-telemetry terminates mTLS and validates the vehicle client cert
+# with Tesla's CA that is BUILT INTO the binary — you do NOT supply a vehicle CA. Confirm before
+# enabling: (1) a free MetalLB IP; (2) the wildcard cert secret name (server_cert/_key);
+# (3) split-horizon DNS for fleet.hs.mfis.net; (4) the `mqtt` dispatcher payload shape against
+# datastore/mqtt/README of the pinned release (our bridge parses whatever it publishes).
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tesla-fleet-telemetry-config
+  namespace: home-automation
+  labels:
+    app.kubernetes.io/name: tesla-fleet-telemetry
+data:
+  config.json: |
+    {
+      "host": "0.0.0.0",
+      "port": 6443,
+      "status_port": 8080,
+      "log_level": "info",
+      "json_log_enable": true,
+      "namespace": "tesla_telemetry",
+      "reliable_ack": false,
+      "transmit_decoded_records": true,
+      "vins_signal_tracking_enabled": true,
+      "monitoring": {
+        "prometheus_metrics_port": 9273
+      },
+      "records": {
+        "V": ["mqtt"],
+        "alerts": ["mqtt"],
+        "errors": ["mqtt"],
+        "connectivity": ["mqtt"]
+      },
+      "mqtt": {
+        "broker": "tcp://mosquitto.home-automation.svc.cluster.local:1883",
+        "client_id": "fleet-telemetry",
+        "topic_base": "telemetry",
+        "qos": 0,
+        "retained": true,
+        "connect_timeout_ms": 30000,
+        "publish_timeout_ms": 2000,
+        "disconnect_timeout_ms": 5000,
+        "connect_retry_interval_ms": 10000
+      },
+      "tls": {
+        "server_cert": "/etc/certs/tls.crt",
+        "server_key": "/etc/certs/tls.key"
+      }
+    }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tesla-fleet-telemetry
+  namespace: home-automation
+  labels:
+    app.kubernetes.io/name: tesla-fleet-telemetry
+  annotations:
+    metallb.universe.tf/allow-shared-ip: 'allow-shared'
+spec:
+  type: LoadBalancer
+  loadBalancerIP: 192.168.1.33
+  ports:
+    - name: telemetry
+      port: 6443
+      targetPort: telemetry
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: tesla-fleet-telemetry
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tesla-fleet-telemetry
+  namespace: home-automation
+  labels:
+    app.kubernetes.io/name: tesla-fleet-telemetry
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tesla-fleet-telemetry
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: tesla-fleet-telemetry
+    spec:
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: fleet-telemetry
+          image: "tesla/fleet-telemetry:v0.9.3"   # official image on Docker Hub (latest stable, 2026-06-22)
+          imagePullPolicy: IfNotPresent
+          command: ["/fleet-telemetry", "-config=/etc/fleet-telemetry/config.json"]
+          env:
+            # The mTLS listener logs every incomplete handshake at info level. Health probes
+            # and port scans open+close the socket without doing TLS, spamming
+            # "TLS handshake error ... EOF". Suppress that noise (documented env var).
+            - name: SUPPRESS_TLS_HANDSHAKE_ERROR_LOGGING
+              value: "true"
+          ports:
+            - name: telemetry
+              containerPort: 6443
+              protocol: TCP
+            - name: status
+              containerPort: 8080
+              protocol: TCP
+            - name: metrics            # Prometheus signal-count metrics (authoritative billing proxy)
+              containerPort: 9273
+              protocol: TCP
+          readinessProbe:
+            # Probe the plain-HTTP status port, NOT the mTLS telemetry port — a TCP probe on
+            # 6443 never completes TLS and shows up as a handshake error every periodSeconds.
+            tcpSocket: { port: status }
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          volumeMounts:
+            - name: config
+              mountPath: /etc/fleet-telemetry
+            - name: server-cert       # the *.hs.mfis.net wildcard (same secret as ess/venus)
+              mountPath: /etc/certs
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: tesla-fleet-telemetry-config
+        - name: server-cert
+          secret:
+            secretName: hs-mfis-net-lego-cert   # provides tls.crt + tls.key
+---
+# --- Partner-domain verification endpoint -----------------------------------
+# Serves your Tesla partner PUBLIC key at
+#   https://fleet.hs.mfis.net/.well-known/appspecific/com.tesla.3p.public-key.pem
+# so Tesla can verify domain ownership when you register fleet.hs.mfis.net as a partner
+# domain. The telemetry receiver's hostname must live under a registered partner domain;
+# the existing registered domain (joshuadodds.github.io) can't host the receiver, so we
+# register fleet.hs.mfis.net instead — this endpoint makes that possible.
+#
+# The public key is supplied out-of-band as a ConfigMap (NOT baked into this file):
+#   kubectl -n home-automation create configmap tesla-wellknown \
+#     --from-file=com.tesla.3p.public-key.pem=secrets/tesla-fleet/public-key.pem
+#
+# Assumes nginx-ingress serves *.hs.mfis.net on 443 with the wildcard secret
+# hs-mfis-net-lego-cert, and that WAN:443 is forwarded to the ingress controller.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tesla-wellknown
+  namespace: home-automation
+  labels:
+    app.kubernetes.io/name: tesla-wellknown
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tesla-wellknown
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: tesla-wellknown
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.27-alpine
+          ports:
+            - containerPort: 80
+          volumeMounts:
+            - name: key
+              mountPath: /usr/share/nginx/html/.well-known/appspecific
+              readOnly: true
+      volumes:
+        - name: key
+          configMap:
+            name: tesla-wellknown
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tesla-wellknown
+  namespace: home-automation
+  labels:
+    app.kubernetes.io/name: tesla-wellknown
+spec:
+  selector:
+    app.kubernetes.io/name: tesla-wellknown
+  ports:
+    - port: 80
+      targetPort: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: tesla-wellknown
+  namespace: home-automation
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - fleet.hs.mfis.net
+      secretName: hs-mfis-net-lego-cert
+  rules:
+    - host: fleet.hs.mfis.net
+      http:
+        paths:
+          - path: /.well-known/appspecific/com.tesla.3p.public-key.pem
+            pathType: Exact
+            backend:
+              service:
+                name: tesla-wellknown
+                port:
+                  number: 80

@@ -253,6 +253,32 @@ def api_control_grid_assist():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+def _set_ev_charge_requested(enabled: bool):
+    """Manual EV Start/Stop. Sets the DEDICATED ev_charge_requested intent flag the EV controller
+    reads (fully decoupled from grid-assist). The controller then starts/stops the car with its
+    full safety logic — home+plugged+non-supercharging checks, wake escalation, and local-meter
+    stop verification. A direct one-shot command would just be undone by the controller's next
+    tick, so we drive its intent flag instead. Publishing the retained control topic keeps it in
+    sync + survives a restart via the state restore."""
+    from lib.global_state import GlobalStateClient
+    GlobalStateClient().set("ev_charge_requested", bool(enabled))
+    publish_message("Tesla/vehicle0/control/charge_requested",
+                    message="True" if enabled else "False", retain=True)
+    logging.info("Manual EV charge %s.", "START requested" if enabled else "STOP requested")
+
+
+@app.route("/api/control/ev-charge", methods=["POST"])
+def api_control_ev_charge():
+    body = request.get_json(silent=True) or {}
+    enabled = _boolish(body.get("enabled"), False)
+    try:
+        _set_ev_charge_requested(enabled)
+        return jsonify({"ok": True, "enabled": enabled})
+    except Exception as e:
+        logging.warning("EV charge request failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/api/advisor", methods=["POST"])
 def api_advisor():
     """Run the read-only AI advisor — a default daily review, or answer an open

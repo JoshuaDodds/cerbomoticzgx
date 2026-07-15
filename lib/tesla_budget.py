@@ -24,33 +24,42 @@ from lib.constants import logging
 UNIT_COST_USD = {"command": 0.001, "data": 0.002, "wake": 0.02}
 
 MONTHLY_CREDIT_USD = 10.0          # Tesla's monthly discount
-MONTHLY_SAFETY_CEILING_USD = 9.0   # keep worst-case spend below this (margin under the credit)
-DAYS_PER_MONTH = 31                # bill against the longest possible month
+MONTHLY_SAFETY_CEILING_USD = 9.0   # HARD guard: the billing cycle's spend never exceeds this
+DAILY_SAFETY_CEILING_USD = 2.0     # per-day runaway breaker (a loop can't burn more than this/day)
+DAYS_PER_MONTH = 31                # for the informational worst-case projection only
 
-# Conservative default daily caps → worst case ≈ $8.06/month
-# (31 × (40·0.001 commands + 50·0.002 data + 6·0.02 wakes) = 31 × $0.26). Extra data + wake
-# headroom lets the controller spend a few purposeful surplus-discovery wakes; still < $10
-# and under the $9 safety ceiling (caps above it are auto-clamped).
-DEFAULT_DAILY_CAPS = {"command": 40, "data": 50, "wake": 6}
+# The REAL guard is the monthly ceiling (enforced per-spend). Charging is bursty and infrequent
+# (often only a couple of days a WEEK), so sizing a daily cap as "worst case every single day"
+# was far too tight — it clamped the caps down and then blocked a legitimate charge day (even a
+# safety-critical charge_stop) while the month was nowhere near the $10 credit. These daily caps
+# are now only a runaway circuit-breaker (~$1/day worst case); real charge days spend ~$0.30.
+DEFAULT_DAILY_CAPS = {"command": 300, "data": 150, "wake": 20}
 
 DEFAULT_STATE_PATH = "data/tesla_budget.json"
 
 
+def projected_daily_cost_usd(caps: dict) -> float:
+    return sum(UNIT_COST_USD[c] * float(caps.get(c, 0)) for c in UNIT_COST_USD)
+
+
 def projected_monthly_cost_usd(caps: dict) -> float:
-    """Worst-case monthly $ if every daily cap is hit every day of the longest month."""
-    return DAYS_PER_MONTH * sum(UNIT_COST_USD[c] * float(caps.get(c, 0)) for c in UNIT_COST_USD)
+    """Informational worst-case month $ (every daily cap hit every day). NOT the guard — the
+    enforced MONTHLY_SAFETY_CEILING is the real bound, so this can exceed the credit for caps
+    that are only a per-day runaway breaker."""
+    return DAYS_PER_MONTH * projected_daily_cost_usd(caps)
 
 
-def clamp_caps_to_ceiling(caps: dict, ceiling: float = MONTHLY_SAFETY_CEILING_USD) -> dict:
-    """Return caps whose worst-case monthly cost is <= ceiling, scaling down if needed."""
+def clamp_caps_to_ceiling(caps: dict, ceiling: float = DAILY_SAFETY_CEILING_USD) -> dict:
+    """Clamp caps so the worst-case DAILY cost stays under the per-day runaway ceiling. (The
+    monthly bill is guarded separately, per-spend, against MONTHLY_SAFETY_CEILING_USD.)"""
     out = {c: max(0, int(caps.get(c, 0))) for c in UNIT_COST_USD}
-    cost = projected_monthly_cost_usd(out)
+    cost = projected_daily_cost_usd(out)
     if cost <= ceiling or cost <= 0:
         return out
     factor = ceiling / cost
     clamped = {c: int(out[c] * factor) for c in out}
-    logging.warning("tesla_budget: caps %s project $%.2f/mo (> $%.2f ceiling); clamped to %s ($%.2f/mo).",
-                    out, cost, ceiling, clamped, projected_monthly_cost_usd(clamped))
+    logging.warning("tesla_budget: caps %s project $%.2f/day (> $%.2f daily ceiling); clamped to %s.",
+                    out, cost, ceiling, clamped)
     return clamped
 
 
@@ -106,25 +115,54 @@ class TeslaBudget:
             d = self._load()
             return (d["counts"].get(category, 0) + n) <= self._caps.get(category, 0)
 
-    def spend(self, category: str, n: int = 1) -> bool:
-        """Atomic check-and-record. Returns False and records nothing if it would exceed the cap.
+    def spend(self, category: str, n: int = 1, critical: bool = False) -> bool:
+        """Atomic check-and-record. Returns False and records nothing if it would breach a guard.
 
         Every billable Fleet API call MUST gate on this: ``if not budget.spend('data'): return``.
+
+        ``critical=True`` marks a safety-essential call (e.g. a charge_stop and the wake needed
+        to deliver it) that must NEVER be blocked — leaving the car charging is worse than a
+        fraction of a cent of overage. It is still recorded so the accounting stays honest.
+
+        Two guards for non-critical calls:
+          * HARD monthly ceiling — the billing cycle's spend never exceeds MONTHLY_SAFETY_CEILING
+            (this is the real bound; charging is bursty so a monthly guard fits it, not a daily one);
+          * per-day runaway breaker — a stuck loop can't burn more than ~a dollar in a single day.
         """
         with self._lock:
             d = self._load()
-            used = d["counts"].get(category, 0)
-            if (used + n) > self._caps.get(category, 0):
-                logging.info("tesla_budget: BLOCKED %s call — daily cap %d reached (spent $%.3f today).",
-                             category, self._caps.get(category, 0), self._spent_usd(d))
-                return False
-            d["counts"][category] = used + n
+            if not critical:
+                if self._spent_usd_month(d) + UNIT_COST_USD[category] * n > MONTHLY_SAFETY_CEILING_USD:
+                    logging.warning("tesla_budget: BLOCKED %s — monthly ceiling $%.2f reached "
+                                    "(spent $%.2f this cycle).", category, MONTHLY_SAFETY_CEILING_USD,
+                                    self._spent_usd_month(d))
+                    return False
+                if (d["counts"].get(category, 0) + n) > self._caps.get(category, 0):
+                    logging.info("tesla_budget: BLOCKED %s — daily runaway cap %d reached (spent $%.3f today).",
+                                 category, self._caps.get(category, 0), self._spent_usd(d))
+                    return False
+            d["counts"][category] = d["counts"].get(category, 0) + n
             d["month_counts"][category] = d["month_counts"].get(category, 0) + n
             self._save(d)
             return True
 
+    def refund(self, category: str, n: int = 1) -> None:
+        """Reverse a previously-recorded spend that turned out NON-billable. Tesla only bills
+        responses < 500 (a 5xx or a network exception is not billed), but we spend up-front to
+        enforce the cap — so when the call comes back non-billable we refund it to keep the
+        displayed usage in line with the portal. Floors at 0."""
+        with self._lock:
+            d = self._load()
+            d["counts"][category] = max(0, d["counts"].get(category, 0) - n)
+            d["month_counts"][category] = max(0, d["month_counts"].get(category, 0) - n)
+            self._save(d)
+
     def _spent_usd(self, d: dict) -> float:
         return sum(UNIT_COST_USD[c] * d["counts"].get(c, 0) for c in UNIT_COST_USD)
+
+    def _spent_usd_month(self, d: dict) -> float:
+        mc = d.get("month_counts", {}) or {}
+        return sum(UNIT_COST_USD[c] * mc.get(c, 0) for c in UNIT_COST_USD)
 
     def spent_today_usd(self) -> float:
         with self._lock:
@@ -238,6 +276,7 @@ def default_budget() -> TeslaBudget:
             from lib.config_retrieval import retrieve_setting
             path = retrieve_setting("TESLA_BUDGET_STATE_PATH") or DEFAULT_STATE_PATH
             _DEFAULT_BUDGET = TeslaBudget(caps=caps_from_settings(), state_path=path)
-            logging.info("tesla_budget: guard active — caps %s (~$%.2f/mo worst case).",
-                         _DEFAULT_BUDGET.caps, projected_monthly_cost_usd(_DEFAULT_BUDGET.caps))
+            logging.info("tesla_budget: guard active — hard monthly ceiling $%.2f (of $%.0f credit); "
+                         "per-day runaway caps %s. Charge-stops bypass the guard.",
+                         MONTHLY_SAFETY_CEILING_USD, MONTHLY_CREDIT_USD, _DEFAULT_BUDGET.caps)
     return _DEFAULT_BUDGET

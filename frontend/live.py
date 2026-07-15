@@ -88,7 +88,7 @@ class MqttLive:
             "system_state": f"N/{sid}/system/0/SystemState/State",
             # EV charging power (Watts) — the main service reads it from Domoticz
             # and publishes it here. Absent => the EV node stays hidden.
-            "ev_w": "Cerbomoticzgx/GlobalState/ev_power",
+            "ev_w": "Tesla/vehicle0/charging_watts",   # local evcharger meter: fast + accurate (was the laggy domoticz-derived ev_power, which flapped)
             # EV charger lifetime forward energy (kWh) + present session time (s),
             # from the Victron evcharger service (instance 42; matches lib/constants.py).
             "ev_energy_kwh": f"N/{sid}/evcharger/42/Ac/Energy/Forward",

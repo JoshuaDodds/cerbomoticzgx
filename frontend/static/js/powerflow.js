@@ -129,7 +129,10 @@
     const xL = 0.225 * W, xR = 0.775 * W, colW = 0.41 * W;   // small side margins, wider cards
     // Battery + Solar carry extra BMS/string detail rows, so they're taller than the
     // Grid/AC-Loads cards; the whole stack is scaled to fill H below.
-    const ch = 104, batth = 190, mph = 100, evh = 74, solh = 196, gash = 54;
+    // evh sized for the EV card's 5 detail rows (SoC/Limit/Amps/ETA/Total) + header + hero,
+    // at the same per-row density as Solar (196/7 rows) / Battery (190/6) so fonts stay
+    // consistent and the rows don't overflow into the Solar card below.
+    const ch = 104, batth = 190, mph = 100, evh = 162, solh = 196, gash = 54;
     // Left column: Grid, Battery. Right column: AC Loads, then EV stacked above a
     // dropped-down-and-right Solar (so its line to Battery can curve). MP-II hub
     // centred; Gas centred at the bottom overflow. Heights are content-fit; the whole

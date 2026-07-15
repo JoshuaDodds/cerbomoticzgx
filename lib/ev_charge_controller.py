@@ -8,8 +8,8 @@ from lib.config_retrieval import retrieve_setting
 from lib.constants import logging
 from lib.tesla_api import TeslaApi
 from lib.global_state import GlobalStateClient
-from lib.helpers import publish_message
-from lib.notifications import pushover_notification_critical
+from lib.helpers import publish_message, is_truthy
+from lib.notifications import pushover_notification, pushover_notification_critical
 
 
 # Charge-control tuning.
@@ -19,6 +19,13 @@ COMMAND_COOLDOWN_S = 90       # min spacing between start/stop/amp commands (ant
 AMP_ADJUST_MIN_DELTA = 1      # only re-issue a set-amps command when it moves by >= this
 STOP_RETRY_BACKOFF_S = 120    # after a network-rejected stop, wait before retrying
 STOP_ALERT_INTERVAL_S = 900   # min spacing between "could not stop the car" Pushover alerts
+STOP_MAX_RETRIES = 5          # bounded auto-retry attempts before escalating to a human (audit
+                               # finding: an uncapped critical-bypass retry loop can blow past
+                               # the Tesla budget guard entirely if the car stays unreachable)
+STALE_STATUS_MAX_AGE_S = 300  # a cached tesla.is_charging older than this is UNKNOWN, not
+                               # authoritative "not charging" (audit finding: a stale cache +
+                               # the under-reading local meter can agree on "nothing to stop"
+                               # while the car is still actually drawing)
 # Surplus-driven "is the car here?" discovery wakes are rate-limited so an away/asleep car
 # can't drain the wake budget; the tesla_budget guard is the hard backstop on top.
 DISCOVERY_WAKE_INTERVAL_S = 3600     # at most one surplus-discovery wake per hour
@@ -32,6 +39,14 @@ def _num(value, default=0.0):
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+# Dedicated EV-charge intent flag. This is DELIBERATELY separate from the ESS grid-assist
+# toggle ('grid_charging_enabled'): grid-assist controls the house battery only and must
+# never start or stop the car. A future dedicated "charge the car now" button will set this
+# key (and could source from grid OR battery — e.g. draining the pack for transport). Until
+# that button exists it stays unset, so only PV-surplus charging can engage the car.
+EV_CHARGE_INTENT_KEY = "ev_charge_requested"
 
 
 PROPERTY_MAPPING = {
@@ -84,22 +99,25 @@ class EvCharger:
         for property_name, key in PROPERTY_MAPPING.items():
             create_property(property_name, key)
 
-        self.grid_charging_enabled = self.global_state.get('grid_charging_enabled')
-        self.load_reservation = int(retrieve_setting("LOAD_RESERVATION"))  # see example .env.example file
+        # int(float(...)) tolerates a float-formatted .env value (e.g. "95.0" from the Config editor).
+        self.load_reservation = int(float(retrieve_setting("LOAD_RESERVATION") or 0))
         self.load_reservation_is_reduced = False
-        self.load_reservation_reduction_factor = float(retrieve_setting("LOAD_REDUCTION_FACTOR"))
-        self.minimum_ess_soc = int(retrieve_setting("MINIMUM_ESS_SOC"))  # see example .env.example file
+        self.load_reservation_reduction_factor = float(retrieve_setting("LOAD_REDUCTION_FACTOR") or 0) or 1
+        self.minimum_ess_soc = int(float(retrieve_setting("MINIMUM_ESS_SOC") or 0))
 
         self.tesla = TeslaApi()
 
         # Charge-control state.
         self._last_command_ts = 0.0        # for the command cooldown
+        self._last_commanded_amps = None   # last amps we SET (not the meter) — see audit M1
         self._low_surplus_since = None     # start of the current surplus-loss grace window
         self._intent_was_on = False        # to detect the grid-assist / charge-request transition
         self._intent_off_edge = False      # set the tick intent switches OFF -> stop the charge now
         self._charge_mode = None           # 'grid' (express override) | 'surplus' | None
         self._stop_backoff_until = 0.0     # don't retry a rejected stop command every tick
         self._last_stop_alert_ts = 0.0     # rate-limit the "could not stop" Pushover alert
+        self._stop_attempt_count = 0       # consecutive failed stop attempts (bounded retry)
+        self._stop_escalated = False       # STOP_MAX_RETRIES exhausted -> paused, human alerted
         self._last_discovery_wake_ts = 0.0 # rate-limit surplus-driven discovery wakes
         self._discovery_backoff_until = 0.0  # longer backoff after finding the car away
         self._last_status_state = None       # last logged state, so we only log on change
@@ -125,22 +143,21 @@ class EvCharger:
         car — so we never spend a Tesla Fleet API call while there is no reason to.
 
         Preconditions (any of):
-          * explicit intent: grid-assist or a Tesla charge request is toggled on; or
+          * explicit intent: the dedicated EV-charge request is on (NOT grid-assist); or
           * PV surplus: the sun is up, the house battery is already at/above its target
             SoC, and there is >= 2 A of exportable surplus (i.e. PV is spilling to grid); or
           * the car is already drawing power locally (measured charger amps) — we may need
             to adjust the rate or stop.
         This is the primary cost-avoidance layer; the tesla_budget guard is the backstop.
         """
-        gs = self.global_state
-        if gs.get('tesla_charge_requested') or gs.get('grid_charging_enabled'):
+        if self._intent_on():                 # dedicated EV-charge intent (decoupled from grid-assist)
             return True
         if (self.is_the_sun_shining()
                 and _num(self.ess_soc) >= self.minimum_ess_soc
                 and _num(self.surplus_amps) >= SURPLUS_MIN_AMPS):
             return True
         # Stay engaged whenever we believe the car is charging (local amps OR cached Tesla
-        # state) so we can still manage/stop it — e.g. when grid-assist is switched off.
+        # state) so we can still manage/stop it — e.g. when the EV-charge request is switched off.
         if self._charging_now():
             return True
         return False
@@ -176,12 +193,16 @@ class EvCharger:
             if intent_on_edge or self._intent_off_edge:
                 force = wake = True
                 if intent_on_edge:
-                    logging.info("EvCharger: charge request / grid-assist toggled on — checking vehicle now.")
+                    logging.info("EvCharger: EV-charge request toggled on — checking vehicle now.")
             elif (intent or surplus) and self._should_discovery_wake():
                 force = wake = True
                 self._last_discovery_wake_ts = time.time()
                 why = "charge intent on" if intent else f"PV surplus {int(_num(self.surplus_amps))}A"
-                logging.info(f"EvCharger: {why} — waking vehicle to check home/plugged state.")
+                # In telemetry mode update_vehicle_status() short-circuits to the pushed state
+                # and never actually wakes the car (audit L1) — say so instead of claiming a
+                # wake that doesn't happen.
+                what = "refreshing telemetry state" if self._telemetry_on() else "waking vehicle to check home/plugged state"
+                logging.info(f"EvCharger: {why} — {what}.")
 
             self.tesla.update_vehicle_status(force=force, allow_wake=wake)
 
@@ -221,10 +242,17 @@ class EvCharger:
         self.main_thread.start()
 
     # --- charge decision helpers (all read-only / free) --------------------
+    def _telemetry_on(self) -> bool:
+        return is_truthy(retrieve_setting("TESLA_TELEMETRY_ENABLED"), False)
+
     def _intent_on(self) -> bool:
-        """Explicit intent to charge: grid-assist or a Tesla charge request is toggled on."""
-        gs = self.global_state
-        return bool(gs.get('tesla_charge_requested') or gs.get('grid_charging_enabled'))
+        """Explicit intent to charge the car, read from the DEDICATED EV-charge flag
+        (EV_CHARGE_INTENT_KEY). Fully decoupled from the ESS grid-assist toggle
+        ('grid_charging_enabled'): toggling grid-assist must never start or stop the car.
+        We also do NOT read 'tesla_charge_requested' (our own start/stop set it, which latched
+        intent permanently on). Until a dedicated EV-charge button sets this key it stays off,
+        so only PV-surplus charging can engage the car."""
+        return is_truthy(self.global_state.get(EV_CHARGE_INTENT_KEY), False)
 
     def _surplus_available(self) -> bool:
         """Exportable PV surplus exists (sun up, house battery at/above target, >= min amps)."""
@@ -256,9 +284,9 @@ class EvCharger:
         """Decide and act on the car's charge. Returns True while actively charging.
 
         Two mutually-exclusive modes, never intermixed:
-          * GRID-ASSIST (intent on) is an express override: charge from grid at the car's
-            own rate and IGNORE all PV-surplus logic. Stops only when intent is switched off
-            or the car is full.
+          * EV-CHARGE REQUEST (intent on) is an express override: charge at the car's own
+            rate and IGNORE all PV-surplus logic. Stops only when the request is switched off
+            or the car is full. Driven by the dedicated EV-charge flag, NOT grid-assist.
           * SURPLUS (intent off) charges only from genuine exportable PV surplus, matches the
             current to it, and stops when the surplus is gone (after a short cloud grace).
         Only home + plugged + non-supercharging cars are ever commanded.
@@ -272,9 +300,13 @@ class EvCharger:
                 self.update_charging_amp_totals(0)
             return False
 
-        # 1) Express OFF: grid-assist / charge request just switched off -> HARD stop now.
+        # 1) Express OFF: the EV-charge request just switched off -> HARD stop now. A fresh,
+        #    deliberate off-edge is a new stop request, so it gets its own bounded attempts
+        #    rather than staying silently suppressed by a stale escalation.
         if self._intent_off_edge:
-            self._stop_charge("grid-assist / charge request turned off", force=True)
+            self._stop_attempt_count = 0
+            self._stop_escalated = False
+            self._stop_charge("EV-charge request turned off", force=True)
             return False
 
         # 2) Car reached its SoC limit -> stop.
@@ -285,12 +317,13 @@ class EvCharger:
             self._charge_mode = None
             return False
 
-        # 3) GRID-ASSIST ON = express override: charge from grid; ignore PV surplus entirely.
+        # 3) EV-CHARGE REQUEST ON = express override: charge at the car's own rate; ignore
+        #    PV surplus entirely. Driven by the dedicated flag, NOT grid-assist.
         if self._intent_on():
             self._low_surplus_since = None
             self._charge_mode = 'grid'
             if not self._charging_now() and self._cooldown_ok():
-                logging.info("EvCharger: grid-assist on — starting charge (grid, car's own rate).")
+                logging.info("EvCharger: EV-charge request on — starting charge (car's own rate).")
                 self.tesla.start_tesla_charge()
                 self._mark_command()
             return True
@@ -313,29 +346,82 @@ class EvCharger:
         self._charge_mode = None
         return False
 
+    def _status_confirmed_not_charging(self) -> bool:
+        """True only when tesla.is_charging says False AND that reading is reasonably fresh.
+
+        A stale/never-refreshed cache (e.g. a failed forced read right before this call, or the
+        False default before the first status read completes) must NOT be trusted as proof the
+        car isn't charging — only that we don't currently know. Paired with the local meter
+        (which under-reads, audit M1, but never over-reads), this is what decides whether there's
+        genuinely nothing to stop.
+        """
+        if self.tesla.is_charging:
+            return False
+        last_update_ts = getattr(self.tesla, "last_update_ts", 0) or 0
+        return (time.time() - last_update_ts) <= STALE_STATUS_MAX_AGE_S
+
     def _stop_charge(self, reason: str, force: bool = False) -> None:
-        """Attempt to stop the charge. ``force`` bypasses the command cooldown (deliberate
-        stops). tesla stop escalates internally: an asleep car is woken and retried at once
-        (a charging car draws fast). A genuine network failure backs off AND alerts the user
-        via Pushover, since the car may still be pulling power and needs manual intervention."""
+        """Stop the charge, with the LOCAL meter as the arbiter of success.
+
+        If nothing is actually drawing (local meter ~0 and a FRESH confirmation that it's not
+        flagged charging), there's nothing to stop, so we never wake/command the car ($0.02
+        saved). Otherwise we issue the stop (which escalates with a wake+retry internally). We
+        ONLY clear our charging state / zero the meter on a CONFIRMED 'ok'. On failure we
+        deliberately leave the meter reading reality, so the next tick still sees the car drawing
+        and re-issues; we back off to avoid hammering. ``force`` bypasses the command cooldown
+        (deliberate stops).
+
+        Retries are bounded to STOP_MAX_RETRIES: a stop is safety-critical and bypasses the
+        Tesla spend budget entirely (``critical=True`` at the API layer), so an unreachable car
+        stuck retrying forever could otherwise spend without limit. Once exhausted we stop
+        auto-retrying and send a CRITICAL Pushover alert asking for manual intervention (Tesla
+        app or physically unplugging the car) — see ``_notify_stop_escalation``.
+        """
         now = time.time()
         if now < self._stop_backoff_until:
             return
         if not force and not self._cooldown_ok():
             return
-        logging.info(f"EvCharger: {reason} — stopping charge.")
+        if self._stop_escalated:
+            # Already exhausted STOP_MAX_RETRIES and alerted for manual intervention. Don't keep
+            # spending critical (budget-bypassing) API calls on a car we've told the user about.
+            return
+        # Nothing is drawing and we have a FRESH confirmation it's not charging -> nothing to
+        # stop (no wake cost). A stale/unknown status is never treated as confirmation.
+        if _num(self.charging_amps) < 1 and self._status_confirmed_not_charging():
+            self._low_surplus_since = None
+            self._charge_mode = None
+            self._stop_attempt_count = 0
+            self._stop_escalated = False
+            return
+        attempt = self._stop_attempt_count + 1
+        logging.info(f"EvCharger: {reason} — stopping charge (attempt {attempt}/{STOP_MAX_RETRIES}).")
         status = self.tesla.stop_tesla_charge()   # 'ok' | 'network' | 'failed'
-        self.update_charging_amp_totals(0)
         self._low_surplus_since = None
         self._mark_command()
         if status == 'ok':
+            self.update_charging_amp_totals(0)     # confirmed stopped -> reflect zero draw
             self._charge_mode = None
+            self._last_commanded_amps = None       # a fresh session re-commands from scratch
             self._stop_backoff_until = 0.0
+            self._stop_attempt_count = 0
+            self._stop_escalated = False
             return
-        # Could NOT stop the car (network/transport). It may still be charging.
+        # NOT confirmed stopped. Do NOT zero the meter — leave it showing the real draw so the
+        # next tick detects the car is still charging and re-issues the stop.
+        self._stop_attempt_count = attempt
+        # 'network' is the only category stop_charge_robust() returns for a non-billable failure
+        # (transport exception or a >=500 response — both refunded by tesla_budget). Anything
+        # else ('failed') means Tesla accepted and billed the request but rejected the command.
+        billable = "non-billable (<500 not reached; refunded)" if status == 'network' else "billable"
+        logging.warning(f"EvCharger: stop attempt {attempt}/{STOP_MAX_RETRIES} not confirmed "
+                        f"(reason={status}, {billable}); car may still be drawing.")
+        if attempt >= STOP_MAX_RETRIES:
+            self._stop_escalated = True
+            self._notify_stop_escalation(status)
+            return
         self._stop_backoff_until = now + STOP_RETRY_BACKOFF_S
-        logging.warning(f"EvCharger: FAILED to stop the car charge ({status}); "
-                        f"retrying in ~{int(STOP_RETRY_BACKOFF_S / 60)}m.")
+        logging.warning(f"EvCharger: retrying in ~{int(STOP_RETRY_BACKOFF_S / 60)}m.")
         self._notify_stop_failed(status)
 
     def _notify_stop_failed(self, status: str) -> None:
@@ -344,12 +430,29 @@ class EvCharger:
             return
         self._last_stop_alert_ts = now
         try:
-            pushover_notification_critical(
-                "EV charge STOP failed",
-                f"Could not stop the Tesla charge ({status}). The car may still be drawing power — "
-                f"please stop it manually in the Tesla app.")
+            # Normal severity (not critical): a stop is now un-blockable by the budget, so this
+            # only fires on a genuine transient network/transport failure — informational, and
+            # the controller keeps retrying on its own (bounded — see STOP_MAX_RETRIES).
+            pushover_notification(
+                "EV charge stop not confirmed",
+                f"Could not confirm the Tesla charge stopped ({status}). The car may still be "
+                f"drawing power — it will keep retrying; stop it in the Tesla app if it persists.")
         except Exception as e:
             logging.info(f"EvCharger: could not send stop-failure alert: {e}")
+
+    def _notify_stop_escalation(self, status: str) -> None:
+        """CRITICAL alert once STOP_MAX_RETRIES automatic attempts have all failed. Automatic
+        retrying stops here (see the ``_stop_escalated`` check in ``_stop_charge``) — bounding
+        the safety-critical bypass so an unreachable car can't retry (and spend) forever. From
+        this point the car needs manual intervention."""
+        try:
+            pushover_notification_critical(
+                "EV charge stop FAILED — manual action needed",
+                f"Could not stop the Tesla after {STOP_MAX_RETRIES} attempts (last reason: "
+                f"{status}). Automatic retrying has stopped to avoid runaway API spend. Please "
+                f"stop the charge manually — unplug the car or use the Tesla app.")
+        except Exception as e:
+            logging.info(f"EvCharger: could not send stop-escalation alert: {e}")
 
     def _start_surplus_charge(self) -> bool:
         if not self._cooldown_ok():
@@ -359,6 +462,7 @@ class EvCharger:
         self.set_surplus_amps(target)
         self.tesla.set_tesla_charge_amps(target)
         self.tesla.start_tesla_charge()
+        self._last_commanded_amps = target
         self._charge_mode = 'surplus'
         self._mark_command()
         return True
@@ -366,11 +470,16 @@ class EvCharger:
     def _adjust_surplus_amps(self) -> bool:
         self._charge_mode = 'surplus'
         target = int(_num(self.surplus_amps))
-        measured = round(_num(self.charging_amps))
-        if abs(target - measured) >= AMP_ADJUST_MIN_DELTA and self._cooldown_ok():
-            logging.info(f"EvCharger: adjusting charge {measured} A -> {target} A to match surplus.")
+        # Compare to what we LAST COMMANDED, not the local meter: the Victron evcharger meter
+        # under-reads (audit M1), so comparing to `measured` would re-issue set_charging_amps
+        # every cooldown forever and burn a billable read each time. Re-issue only when the
+        # surplus-derived target actually moves.
+        last = self._last_commanded_amps
+        if (last is None or abs(target - last) >= AMP_ADJUST_MIN_DELTA) and self._cooldown_ok():
+            logging.info(f"EvCharger: adjusting charge {last} A -> {target} A to match surplus.")
             self.set_surplus_amps(target)
             self.tesla.set_tesla_charge_amps(target)
+            self._last_commanded_amps = target
             self.update_charging_amp_totals(target)
             self._mark_command()
         self._low_surplus_since = None
@@ -428,15 +537,21 @@ class EvCharger:
         publish_message("Tesla/vehicle0/solar/load_reservation", payload=f"{{\"value\": \"{self.load_reservation}\"}}", qos=0, retain=True)
 
     def update_charging_amp_totals(self, charging_amp_totals=None):
-        # None => derive from the measured per-phase currents; an explicit 0 must set 0
-        # (the old `if not charging_amp_totals` wrongly re-derived when stopping).
+        # None => derive PER-PHASE (average) from the measured per-phase currents; an explicit 0
+        # sets 0. STATE stays PER-PHASE for the surplus rate-matching math (watts/230/3).
         if charging_amp_totals is None:
             charging_amp_totals = (_num(self.l1_charging_amps)
                                    + _num(self.l2_charging_amps)
                                    + _num(self.l3_charging_amps)) / 3
 
-        self.global_state.set("tesla_charging_amps_total", round(_num(charging_amp_totals), 2))
-        publish_message("Tesla/vehicle0/charging_amps", payload=f"{{\"value\": \"{self.charging_amps}\"}}", qos=0, retain=True)
+        per_phase = round(_num(charging_amp_totals), 2)
+        self.global_state.set("tesla_charging_amps_total", per_phase)
+        # DISPLAY: in telemetry mode the fleet-telemetry bridge owns Tesla/vehicle0/charging_amps
+        # with the car's OWN accurate per-phase current (the local Victron meter under-reads ~3x),
+        # so we must NOT overwrite it here. Only publish in legacy polling mode.
+        if not self._telemetry_on():
+            publish_message("Tesla/vehicle0/charging_amps",
+                            payload=f"{{\"value\": \"{per_phase}\"}}", qos=0, retain=True)
 
     @staticmethod
     def is_the_sun_shining():

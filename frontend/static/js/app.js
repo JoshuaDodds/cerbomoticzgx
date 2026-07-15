@@ -1132,7 +1132,10 @@ function renderVehicle() {
   card("Charge current", amps(L.veh_amps));
   card("PV surplus", amps(L.veh_surplus_amps));
   card("ETA to limit", (bool(L.veh_is_charging) && has(L.veh_eta) && L.veh_eta !== "N/A") ? L.veh_eta : null);
-  card("At home", yesno(L.veh_is_home));
+  // is_home stays unpublished in telemetry mode until the car streams its first Location
+  // (audit M4) — show "Unknown" rather than silently hiding the row once we otherwise have
+  // vehicle data, so a no-op manual Start press is explained instead of looking broken.
+  card("At home", has(L.veh_is_home) ? yesno(L.veh_is_home) : (has(L.veh_soc) ? "Unknown" : null));
   card("Supercharging", yesno(L.veh_is_supercharging));
   card("Updated", L.veh_last_update);
 
@@ -1789,11 +1792,17 @@ async function refreshVehicleUsage() {
     const row = (label, key) => cats[key]
       ? `<div class="usage-row"><span>${label}</span><span>${cats[key].count}</span><span>${money(cats[key].cost)}</span></div>`
       : "";
+    // Streaming Signals are pushed by the car (outside the request budget); shown approximately.
+    const s = u.streaming;
+    const streamRow = s
+      ? `<div class="usage-row"><span>Streaming signals <span class="muted" style="font-weight:400">≈</span></span><span>${s.count}</span><span>${money(s.cost)}</span></div>`
+      : "";
     box.innerHTML =
       `<div class="usage-table">` +
       row("Commands", "command") +
       row("Data", "data") +
       row("Wakes", "wake") +
+      streamRow +
       `<div class="usage-row usage-total"><span>Total this month</span><span></span>` +
       `<span>${money(u.total)} <span class="muted" style="font-weight:400">of ${money(u.monthly_credit)}</span></span></div>` +
       `</div>`;
@@ -1815,6 +1824,23 @@ async function refreshWeather() {
     }
   } catch (e) { /* leave the placeholder */ }
 }
+
+// EV manual Start/Stop charge: sets the dedicated ev_charge_requested intent (independent of
+// grid assist); the controller then starts/stops the car with its safety checks.
+document.querySelectorAll("[data-ev-charge]").forEach((btn) => {
+  btn.addEventListener("click", async () => {
+    const enabled = btn.getAttribute("data-ev-charge") === "start";
+    btn.disabled = true;
+    try {
+      await fetch("/api/control/ev-charge", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled }),
+      });
+    } catch (e) { /* ignore; controller acts on its next tick */ }
+    setTimeout(() => { btn.disabled = false; }, 1500);
+  });
+});
 
 initMobileChrome();
 load();

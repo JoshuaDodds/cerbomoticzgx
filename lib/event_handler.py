@@ -19,9 +19,11 @@ from lib.energy_broker import (
 )
 
 
-LOAD_RESERVATION = int(retrieve_setting("LOAD_RESERVATION")) or 0
-LOAD_RESERVATION_REDUCTION_FACTOR = float(retrieve_setting("LOAD_REDUCTION_FACTOR")) or 1
-MINIMUM_ESS_SOC = int(retrieve_setting("MINIMUM_ESS_SOC")) or 100
+# int(float(...)) so a float-formatted .env value (e.g. "95.0" written by the Config editor)
+# doesn't crash int() at import — which would take down the whole MQTT client thread.
+LOAD_RESERVATION = int(float(retrieve_setting("LOAD_RESERVATION") or 0)) or 0
+LOAD_RESERVATION_REDUCTION_FACTOR = float(retrieve_setting("LOAD_REDUCTION_FACTOR") or 0) or 1
+MINIMUM_ESS_SOC = int(float(retrieve_setting("MINIMUM_ESS_SOC") or 0)) or 100
 HOME_CONNECT_APPLIANCE_SCHEDULING = is_truthy(retrieve_setting("HOME_CONNECT_APPLIANCE_SCHEDULING"))
 
 class Event:
@@ -259,8 +261,13 @@ class Event:
 
         charging_amps = round(charging_amp_totals, 2)
 
+        # STATE stays per-phase for the surplus control math. But in telemetry mode the
+        # fleet-telemetry bridge OWNS Tesla/vehicle0/charging_amps with the car's own accurate
+        # per-phase current (the local Victron meter under-reads ~3x) — publishing here too would
+        # fight it and flap the value. So only publish in legacy polling mode.
         self.gs_client.set("tesla_charging_amps_total", charging_amps)
-        publish_message("Tesla/vehicle0/charging_amps", message=f"{charging_amps}", retain=True)
+        if not is_truthy(retrieve_setting("TESLA_TELEMETRY_ENABLED"), False):
+            publish_message("Tesla/vehicle0/charging_amps", message=f"{charging_amps}", retain=True)
 
     def set_surplus_amps(self, surplus_amps):
         self.gs_client.set("surplus_amps", surplus_amps)
