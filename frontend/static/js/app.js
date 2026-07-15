@@ -67,6 +67,19 @@ let lastCurrentHourKey = null;
 const MOBILE_MQ = window.matchMedia("(max-width: 680px)");
 const isMobileLayout = () => MOBILE_MQ.matches;
 
+// Logs tab state — declared here (not down near the Logs functions below) because
+// activateTab() calls disconnectLogsStream() on EVERY tab switch, including the very first
+// one fired by setAppView(appViewFromHash()) during initial script execution. A `let` further
+// down the file is hoisted but stays in the temporal dead zone until its declaration line
+// actually runs, so referencing it from a call this early threw "Cannot access before
+// initialization" on cold page load (activateTab -> disconnectLogsStream -> _logsES) — this
+// never showed up in dev testing because those runs opened the page with a `#ess` URL hash,
+// which skips the `view === "overview"` branch that calls activateTab("live") on load.
+let _logsES = null;
+let _logsLines = [];
+let _logsFilterTerm = "";
+let _logsFilterDebounce = null;
+
 const liveOn = () => !!(lastLive && lastLive.connected);
 const truthy = (v) => v === true || v === 1 || String(v || "").trim().toLowerCase() === "true" ||
   String(v || "").trim() === "1" || String(v || "").trim().toLowerCase() === "on";
@@ -1811,10 +1824,8 @@ async function refreshVehicleUsage() {
 }
 
 // ---- Logs tab: live tail via SSE, connected lazily while the tab is open ----
-let _logsES = null;
-let _logsLines = [];           // raw buffered lines (bounded), independent of what's filtered/shown
-let _logsFilterTerm = "";
-let _logsFilterDebounce = null;
+// (_logsES/_logsLines/_logsFilterTerm/_logsFilterDebounce are declared near the top of this
+// file, not here — see the comment there for why.)
 const LOGS_MAX_RENDERED = 2000;
 
 function _escapeHtml(s) {
