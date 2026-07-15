@@ -1,3 +1,10 @@
+import warnings
+
+# This runs as a fresh subprocess every hour (see entrypoint.sh), so the warning fires anew
+# each time rather than once per long-lived process. Must be registered before the tibberios
+# import below, which is what pulls in graphql_subscription_manager -> pkg_resources.
+warnings.filterwarnings("ignore", message="pkg_resources is deprecated", category=UserWarning)
+
 import boto3
 
 from lib.tibberios.core import Database, TibberConnector
