@@ -35,8 +35,8 @@ class FakeTesla:
     def set_tesla_charge_amps(self, amps):
         self.calls.append(("amps", amps)); return True
 
-    def update_vehicle_status(self, force=False):
-        pass
+    def update_vehicle_status(self, force=False, allow_wake=False):
+        self.calls.append(("update_vehicle_status", force, allow_wake))
 
 
 class FakeState(dict):
@@ -68,7 +68,13 @@ def _charger(monkeypatch, tesla, state=None, **attrs):
     c._stop_escalated = False
     c.ess_soc = attrs.get("ess_soc", 95)
     c.surplus_amps = attrs.get("surplus_amps", 6)
+    c.surplus_watts = attrs.get("surplus_watts", 0)
     c.charging_amps = attrs.get("charging_amps", 0)
+    # Only exercised by main() (dynamic_load_reservation_adjustment) — most tests call the
+    # smaller helpers directly and never touch these, but main() needs them set.
+    c.load_reservation = attrs.get("load_reservation", 1000)
+    c.load_reservation_is_reduced = False
+    c.load_reservation_reduction_factor = 2
     return c
 
 
@@ -322,3 +328,43 @@ def test_engagement_signal_dormant_when_idle(monkeypatch):
     # The dedicated EV-charge flag flips it on.
     c.global_state.set("ev_charge_requested", "True")
     assert c._local_engagement_signal() is True
+
+
+def test_refresh_requested_reads_dedicated_flag(monkeypatch):
+    tesla = FakeTesla(is_charging=False)
+    c = _charger(monkeypatch, tesla)
+    assert c._refresh_requested() is False
+    c.global_state.set("vehicle_refresh_requested", "True")
+    assert c._refresh_requested() is True
+
+
+def test_refresh_request_forces_wake_and_clears_itself(monkeypatch):
+    # A full main() tick with a pending refresh request, and NO other engagement signal
+    # (no intent, no surplus, not charging) must: stay engaged rather than take the dormant
+    # early-return (proven by update_vehicle_status being reached at all), force a wake+refresh
+    # read, and clear the one-shot flag so it doesn't re-trigger next tick.
+    tesla = FakeTesla(is_charging=False)
+    c = _charger(monkeypatch, tesla, ess_soc=95, surplus_amps=0, charging_amps=0, sun=False)
+    c.global_state.set("vehicle_refresh_requested", "True")
+    monkeypatch.setattr(c, "_reschedule", lambda *a, **k: None)  # no real Timer/thread in tests
+    monkeypatch.setattr(c, "_control_charging", lambda: False)
+
+    c.main()
+
+    assert ("update_vehicle_status", True, True) in tesla.calls
+    assert c.global_state.get("vehicle_refresh_requested") is False
+
+
+def test_refresh_request_does_not_recur_on_next_tick(monkeypatch):
+    # After being consumed, a stale True lingering anywhere must not force a wake every tick.
+    tesla = FakeTesla(is_charging=False)
+    c = _charger(monkeypatch, tesla, ess_soc=95, surplus_amps=0, charging_amps=0, sun=False)
+    monkeypatch.setattr(c, "_reschedule", lambda *a, **k: None)
+    monkeypatch.setattr(c, "_control_charging", lambda: False)
+    c.global_state.set("vehicle_refresh_requested", "True")
+
+    c.main()   # consumes + clears the flag
+    tesla.calls.clear()
+    c.main()   # nothing should re-engage the controller this time
+
+    assert tesla.calls == []
