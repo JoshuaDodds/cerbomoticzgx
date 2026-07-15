@@ -81,7 +81,10 @@ def test_removed_grid_charge_price_caps_are_not_user_tunable():
 
     assert not (removed & keys)
     for path in (".env", ".env.example"):
-        text = Path(path).read_text()
+        p = Path(path)
+        if not p.exists():   # .env is gitignored/local-only; CI checkouts only have .env.example
+            continue
+        text = p.read_text()
         for key in removed:
             assert key not in text
 
