@@ -6,8 +6,12 @@ counter is a forward-only estimate whose real job is to ENFORCE the hard spend c
 with the portal's current Billing & Usage numbers (e.g. at the start of a billing cycle) so
 the dashboard total matches; the guard then accumulates new calls from that baseline.
 
+Only the categories you pass are touched — e.g. `--signals 1334` alone leaves command/data/wake
+exactly as they were (and vice versa), so you can reconcile one category at a time.
+
 Usage:
     python scripts/tesla_seed_usage.py --commands 13 --data 30 --wakes 2
+    python scripts/tesla_seed_usage.py --signals 1334
 """
 import os
 import sys
@@ -29,18 +33,35 @@ def _env_path():
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--commands", type=int, default=0)
-    ap.add_argument("--data", type=int, default=0)
-    ap.add_argument("--wakes", type=int, default=0)
+    ap.add_argument("--commands", type=int, default=None)
+    ap.add_argument("--data", type=int, default=None)
+    ap.add_argument("--wakes", type=int, default=None)
+    ap.add_argument("--signals", type=int, default=None,
+                    help="set (not add to) this cycle's Streaming Signals count")
     ap.add_argument("--dir", default=None, help="budget state file (default: TESLA_BUDGET_STATE_PATH)")
     args = ap.parse_args()
 
     path = args.dir or _env_path()
-    snap = tb.seed_month_usage(
-        {"command": args.commands, "data": args.data, "wake": args.wakes}, path)
+    counts = {}
+    if args.commands is not None:
+        counts["command"] = args.commands
+    if args.data is not None:
+        counts["data"] = args.data
+    if args.wakes is not None:
+        counts["wake"] = args.wakes
+    if counts:
+        tb.seed_month_usage(counts, path)
+    if args.signals is not None:
+        tb.seed_signal_count(args.signals, path)
+    if not counts and args.signals is None:
+        ap.error("nothing to seed — pass at least one of --commands/--data/--wakes/--signals")
+
+    snap = tb.usage_snapshot(path)
     print(f"Seeded {path} for {snap['month']}:")
     for cat, v in snap["categories"].items():
         print(f"  {cat:<8} {v['count']:>5}   €{v['cost']:.3f}")
+    sig = snap["streaming"]
+    print(f"  {'signals':<8} {sig['count']:>5}   €{sig['cost']:.3f}  (~, not billed against the cap)")
     print(f"  total this cycle: €{snap['total']:.2f} of €{snap['monthly_credit']:.0f}")
     return 0
 

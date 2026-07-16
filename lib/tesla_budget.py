@@ -23,6 +23,10 @@ from lib.constants import logging
 # Tesla Fleet API unit prices, USD (2026): commands 1000/$1, data 500/$1, wakes 50/$1.
 UNIT_COST_USD = {"command": 0.001, "data": 0.002, "wake": 0.02}
 
+# Fleet Telemetry "Streaming Signals" - pushed by the car, not requests we make, so this is
+# display-only and never gated by the spend guard below. Tesla bills ~$1 per 150,000 signals.
+STREAMING_SIGNAL_COST_USD = 1.0 / 150000
+
 MONTHLY_CREDIT_USD = 10.0          # Tesla's monthly discount
 MONTHLY_SAFETY_CEILING_USD = 9.0   # HARD guard: the billing cycle's spend never exceeds this
 DAILY_SAFETY_CEILING_USD = 2.0     # per-day runaway breaker (a loop can't burn more than this/day)
@@ -36,6 +40,30 @@ DAYS_PER_MONTH = 31                # for the informational worst-case projection
 DEFAULT_DAILY_CAPS = {"command": 300, "data": 150, "wake": 20}
 
 DEFAULT_STATE_PATH = "data/tesla_budget.json"
+
+_FILE_LOCKS = {}
+_FILE_LOCKS_GUARD = threading.Lock()
+
+
+def _lock_for(path: str) -> threading.RLock:
+    """One process-wide RLock per resolved state-file path.
+
+    Multiple writers share this file: TeslaBudget.spend()/refund() (the EV controller's
+    thread) and the module-level seed_month_usage()/bump_signal_count()/seed_signal_count()
+    below (the telemetry bridge's own MQTT thread calls bump_signal_count() every ~20
+    messages when TESLA_TELEMETRY_ENABLED is on, and scripts/tesla_seed_usage.py can run
+    while the service is live). Without a SHARED lock, a read-modify-write from one caller
+    can interleave with another's and silently revert it -- the write itself is atomic
+    (write-to-.tmp then os.replace), so this isn't file corruption, just a lost update. Keyed
+    by path (not a single global lock) so independent TeslaBudget instances in tests
+    (different tmp_path files) never contend with each other or with the real
+    DEFAULT_STATE_PATH.
+    """
+    key = os.path.abspath(path)
+    with _FILE_LOCKS_GUARD:
+        if key not in _FILE_LOCKS:
+            _FILE_LOCKS[key] = threading.RLock()
+        return _FILE_LOCKS[key]
 
 
 def projected_daily_cost_usd(caps: dict) -> float:
@@ -70,7 +98,10 @@ class TeslaBudget:
         self._caps = clamp_caps_to_ceiling(caps or DEFAULT_DAILY_CAPS)
         self._path = state_path or DEFAULT_STATE_PATH
         self._clock = clock or (lambda: datetime.now(timezone.utc))
-        self._lock = threading.RLock()
+        # Shared per-path lock (see _lock_for) -- not a private RLock -- so this instance's
+        # spend()/refund() serialize against the module-level seed_month_usage()/
+        # bump_signal_count()/seed_signal_count() below when they target the same file.
+        self._lock = _lock_for(self._path)
 
     @property
     def caps(self) -> dict:
@@ -180,6 +211,39 @@ class TeslaBudget:
             }
 
 
+def _load_month_state(path: str) -> dict:
+    """Load state and roll month_counts at the UTC month boundary. Shared by the
+    free-function seed/bump helpers below, which don't need TeslaBudget's daily-cap rolling
+    (streaming signals aren't gated/capped, only counted for display)."""
+    try:
+        with open(path) as f:
+            d = json.load(f)
+        if not isinstance(d, dict):
+            d = {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        d = {}
+    now = datetime.now(timezone.utc)
+    month = now.strftime("%Y-%m")
+    if d.get("month") != month:
+        d["month"] = month
+        d["month_counts"] = {}
+    d.setdefault("month_counts", {})
+    d.setdefault("date", now.strftime("%Y-%m-%d"))
+    d.setdefault("counts", {})
+    return d
+
+
+def _save_state(path: str, d: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(d, f)
+        os.replace(tmp, path)
+    except OSError as e:                        # pragma: no cover - disk failure
+        logging.warning("tesla_budget: could not persist state to %s: %s", path, e)
+
+
 def usage_snapshot(state_path=None) -> dict:
     """Read the CURRENT billing cycle's spend counters for DISPLAY (no live guard needed).
     Returns per-category counts + $ and the month-to-date total, so the dashboard can show
@@ -201,9 +265,15 @@ def usage_snapshot(state_path=None) -> dict:
         cost = round(UNIT_COST_USD[c] * n, 4)
         cats[c] = {"count": n, "cost": cost}
         total += cost
+    sig_count = int(counts.get("signals", 0) or 0)
     return {
         "month": month,
         "categories": cats,                      # command/data/wake -> {count, cost}
+        # Streaming Signals: same durable file/month-roll as the categories above, but priced
+        # and totalled separately (kept OUT of total/remaining) since it's never gated by the
+        # spend guard -- see STREAMING_SIGNAL_COST_USD.
+        "streaming": {"count": sig_count, "cost": round(sig_count * STREAMING_SIGNAL_COST_USD, 4),
+                     "approx": True},
         "total": round(total, 4),
         "unit_cost": dict(UNIT_COST_USD),
         "monthly_credit": MONTHLY_CREDIT_USD,
@@ -215,31 +285,50 @@ def usage_snapshot(state_path=None) -> dict:
 
 
 def seed_month_usage(counts: dict, state_path=None) -> dict:
-    """Set the current billing cycle's DISPLAY counters (e.g. to reconcile with the Tesla
-    developer portal, which is the only authoritative source). Daily cap counters are left
-    untouched; the guard then accumulates from this baseline. Returns the new snapshot."""
+    """Set the current billing cycle's DISPLAY counters for the given categories (e.g. to
+    reconcile with the Tesla developer portal, which is the only authoritative source).
+    Daily cap counters are left untouched; the guard then accumulates from this baseline.
+    Only touches keys present in ``counts`` -- e.g. seeding just "wake" leaves "command",
+    "data", and "signals" (see seed_signal_count) exactly as they were. Returns the new
+    snapshot."""
     path = state_path or DEFAULT_STATE_PATH
-    try:
-        with open(path) as f:
-            d = json.load(f)
-        if not isinstance(d, dict):
-            d = {}
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        d = {}
-    now = datetime.now(timezone.utc)
-    d["month"] = now.strftime("%Y-%m")
-    d["month_counts"] = {c: max(0, int(counts.get(c, 0) or 0)) for c in UNIT_COST_USD}
-    d.setdefault("date", now.strftime("%Y-%m-%d"))
-    d.setdefault("counts", {})
-    try:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(d, f)
-        os.replace(tmp, path)
-    except OSError as e:                        # pragma: no cover
-        logging.warning("tesla_budget: could not seed usage to %s: %s", path, e)
-    return usage_snapshot(path)
+    with _lock_for(path):     # serialize against TeslaBudget.spend()/refund() on the same file
+        d = _load_month_state(path)
+        for c, v in counts.items():
+            if c in UNIT_COST_USD:
+                d["month_counts"][c] = max(0, int(v or 0))
+        _save_state(path, d)
+        return usage_snapshot(path)   # read-back inside the same (reentrant) lock -- no
+                                       # window for another writer to sneak in before we return
+
+
+def bump_signal_count(n: int, state_path=None) -> int:
+    """Durably ADD n to this billing cycle's streaming-signal count. Called by the telemetry
+    bridge as signals arrive (from its own MQTT thread); rolls at the UTC month boundary like
+    the other counters. Kept in the SAME file as command/data/wake so a pod restart can't lose
+    the running total the way the old GlobalState-backed tracking did (GlobalState lives in a
+    SQLite file on tmpfs that main.py explicitly recreates -- DROP TABLE IF EXISTS -- on every
+    process start). Returns the new month-to-date signal count."""
+    path = state_path or DEFAULT_STATE_PATH
+    with _lock_for(path):     # serialize against TeslaBudget.spend()/refund() on the same file
+        d = _load_month_state(path)
+        new_total = max(0, int(d["month_counts"].get("signals", 0) or 0) + int(n))
+        d["month_counts"]["signals"] = new_total
+        _save_state(path, d)
+    return new_total
+
+
+def seed_signal_count(count: int, state_path=None) -> int:
+    """SET (not add to) this billing cycle's streaming-signal count -- e.g. to reconcile with
+    the number shown on the Tesla developer portal's Billing & Usage page, the only
+    authoritative source (mirrors seed_month_usage's role for command/data/wake). Returns the
+    new month-to-date signal count."""
+    path = state_path or DEFAULT_STATE_PATH
+    with _lock_for(path):     # serialize against TeslaBudget.spend()/refund() on the same file
+        d = _load_month_state(path)
+        d["month_counts"]["signals"] = max(0, int(count))
+        _save_state(path, d)
+        return d["month_counts"]["signals"]
 
 
 def caps_from_settings(getter=None) -> dict:
