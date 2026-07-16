@@ -10,18 +10,22 @@ templates/JS stay thin and this stays unit-testable.
 import os
 import json
 import time
+import logging
 from datetime import datetime, timedelta
 
 from dotenv import dotenv_values
 
 from frontend.config_schema import CONFIG_SCHEMA
+from lib.config_paths import env_path as runtime_env_path
+from lib import history_store as _hist
+from lib import tesla_budget as _tesla_budget
 
 DEFAULT_PLAN_PATH = "/dev/shm/cerbo_ai_plan.json"
 
 
 def _env():
     # Read fresh each call so config edits show up without a restart.
-    return dotenv_values(".env")
+    return dotenv_values(runtime_env_path())
 
 
 def plan_path() -> str:
@@ -39,20 +43,12 @@ def _f(v):
         return None
 
 
-def _day_totals(path: str):
-    """A day's cumulative grid cost/reward/kWh as the MAX of each counter across the
-    day's cycle records. The daily counters only increase within a day, so the max is
-    the end-of-day total — and unlike reading just the final record, this is robust to
-    a malformed or partial last record (one written with e.g. day_export_reward=null
-    previously dropped the WHOLE day out of the month total)."""
-    imp_cost = exp_rev = imp_kwh = exp_kwh = None
+def _records_from_path(path: str) -> list:
+    """Parse an NDJSON history file into records, tolerant of blank/torn lines.
 
-    def _mx(cur, v):
-        v = _f(v)
-        if v is None:
-            return cur
-        return v if (cur is None or v > cur) else cur
-
+    Retained for the path-based ``_day_totals`` API; day-oriented reads elsewhere go
+    through ``history_store.read_day`` so Parquet-compacted months are served too."""
+    recs = []
     try:
         with open(path) as fh:
             for line in fh:
@@ -60,21 +56,49 @@ def _day_totals(path: str):
                 if not line:
                     continue
                 try:
-                    r = json.loads(line)
+                    recs.append(json.loads(line))
                 except json.JSONDecodeError:
                     continue
-                if r.get("kind") not in (None, "cycle"):
-                    continue
-                imp_cost = _mx(imp_cost, r.get("day_import_cost"))
-                exp_rev = _mx(exp_rev, r.get("day_export_reward"))
-                imp_kwh = _mx(imp_kwh, r.get("day_import_kwh"))
-                exp_kwh = _mx(exp_kwh, r.get("day_export_kwh"))
     except (FileNotFoundError, OSError):
-        return None
+        return []
+    return recs
+
+
+def _day_totals_from_records(records):
+    """A day's cumulative grid cost/reward/kWh, taken as the LAST valid reading of each
+    daily counter across the day's cycle records.
+
+    Tibber resets these counters at midnight and they climb monotonically through the
+    day, so the final reading IS the day total. We deliberately do NOT take the MAX:
+    the first cycle written just after midnight still holds the PREVIOUS day's
+    cumulative total (Tibber resets a moment later), so a MAX picks up yesterday's
+    higher value and corrupts the day — e.g. reporting a loss on a day that was
+    actually profitable, and skewing the month total. Taking the last non-null reading
+    skips that stale opening record and stays robust to a malformed/partial LAST
+    record: a trailing null is ignored and the prior valid reading is used instead of
+    dropping the whole day."""
+    imp_cost = exp_rev = imp_kwh = exp_kwh = None
+
+    def _last(cur, v):
+        v = _f(v)
+        return v if v is not None else cur
+
+    for r in records:
+        if r.get("kind") not in (None, "cycle"):
+            continue
+        imp_cost = _last(imp_cost, r.get("day_import_cost"))
+        exp_rev = _last(exp_rev, r.get("day_export_reward"))
+        imp_kwh = _last(imp_kwh, r.get("day_import_kwh"))
+        exp_kwh = _last(exp_kwh, r.get("day_export_kwh"))
     if imp_cost is None and exp_rev is None:
         return None
     return {"import_cost": imp_cost, "export_reward": exp_rev,
             "import_kwh": imp_kwh, "export_kwh": exp_kwh}
+
+
+def _day_totals(path: str):
+    """Back-compat path-based wrapper around :func:`_day_totals_from_records`."""
+    return _day_totals_from_records(_records_from_path(path))
 
 
 def monthly_history() -> list:
@@ -84,12 +108,13 @@ def monthly_history() -> list:
     today = datetime.now().date()
     d = today.replace(day=1)
     out = []
+    today_projection = projected_today_net_eur()
     while d <= today:
-        t = _day_totals(os.path.join(history_dir(), f"ess-{d.strftime('%Y-%m-%d')}.ndjson"))
+        t = _day_totals_from_records(_hist.read_day(d, history_dir()))
         if t is not None:
             imp_cost = t["import_cost"] or 0.0
             exp_rev = t["export_reward"] or 0.0
-            out.append({
+            row = {
                 "date": d.strftime("%Y-%m-%d"),
                 "day": d.day,
                 "net_eur": round(exp_rev - imp_cost, 2),   # profit positive
@@ -98,9 +123,111 @@ def monthly_history() -> list:
                 "import_kwh": t["import_kwh"],
                 "export_kwh": t["export_kwh"],
                 "is_today": d == today,
-            })
+            }
+            if d == today and today_projection is not None:
+                row["projected_net_eur"] = today_projection
+            out.append(row)
         d += timedelta(days=1)
     return out
+
+
+def projected_today_net_eur() -> float | None:
+    """Projected full-day profit-positive net from the current plan JSON."""
+    raw = load_raw_plan()
+    if not raw:
+        return None
+    schedule = raw.get("schedule") or []
+    if not schedule:
+        return None
+    try:
+        today = datetime.now().date().isoformat()
+        summary = day_summary(schedule, raw.get("today_actuals"))
+        row = next((d for d in summary.get("days", []) if d.get("date") == today), None)
+        if not row or row.get("net") is None:
+            return None
+        return round(-float(row["net"]), 2)  # day_summary net is cost-positive.
+    except Exception as exc:
+        logging.debug("Projected today net unavailable: %s", exc)
+        return None
+
+
+def forecast_accuracy(days: int = 3) -> dict:
+    """Recent actual-vs-forecast PV/load settlement rows for the Trends overlay."""
+    try:
+        days = max(1, min(14, int(days)))
+    except (TypeError, ValueError):
+        days = 3
+
+    today = datetime.now().date()
+    slots = []
+    for offset in range(days - 1, -1, -1):
+        day = today - timedelta(days=offset)
+        load_map = None
+        for rec in _hist.read_day(day, history_dir()):
+            if rec.get("kind") != "settlement" or rec.get("incomplete"):
+                continue
+            start = _parse_time(rec.get("slot_start"))
+            if start is None:
+                continue
+
+            predicted_load = _f(rec.get("predicted_load_kwh"))
+            actual_load = _f(rec.get("actual_load_kwh"))
+            if actual_load is None:
+                if load_map is None:
+                    load_map = _actual_load_by_slot(day)
+                actual_load = load_map.get(_slot_key(start))
+
+            predicted_pv = _f(rec.get("predicted_pv_kwh"))
+            actual_pv = _f(rec.get("actual_pv_kwh"))
+            if (predicted_load is None or actual_load is None) and (
+                predicted_pv is None or actual_pv is None
+            ):
+                continue
+
+            row = {
+                "time": start.isoformat(),
+                "label": start.strftime("%a %H:%M"),
+                "predicted_load_kwh": predicted_load,
+                "actual_load_kwh": actual_load,
+                "predicted_pv_kwh": predicted_pv,
+                "actual_pv_kwh": actual_pv,
+            }
+            if predicted_load is not None and actual_load is not None:
+                row["load_error_kwh"] = round(actual_load - predicted_load, 3)
+            if predicted_pv is not None and actual_pv is not None:
+                row["pv_error_kwh"] = round(actual_pv - predicted_pv, 3)
+            slots.append(row)
+
+    slots.sort(key=lambda s: s["time"])
+
+    def _metric_summary(prefix):
+        pairs = [
+            (s.get(f"predicted_{prefix}_kwh"), s.get(f"actual_{prefix}_kwh"))
+            for s in slots
+        ]
+        pairs = [(p, a) for p, a in pairs if p is not None and a is not None]
+        if not pairs:
+            return {f"{prefix}_points": 0, f"{prefix}_mae_kwh": None, f"{prefix}_bias_kwh": None}
+        errors = [a - p for p, a in pairs]
+        return {
+            f"{prefix}_points": len(pairs),
+            f"{prefix}_mae_kwh": round(sum(abs(e) for e in errors) / len(errors), 3),
+            f"{prefix}_bias_kwh": round(sum(errors), 3),
+        }
+
+    summary = {"slots": len(slots), "days": days}
+    summary.update(_metric_summary("load"))
+    summary.update(_metric_summary("pv"))
+    return {"available": bool(slots), "slots": slots, "summary": summary}
+
+
+def weather_dashboard() -> dict:
+    """Weather summary for the desktop Weather tab."""
+    try:
+        from lib import weather
+        return weather.weather_snapshot()
+    except Exception as e:
+        return {"available": False, "reason": str(e)}
 
 
 def mtd_net_eur() -> dict:
@@ -129,13 +256,38 @@ def _parse_time(s):
 
 
 def is_idle(slot) -> bool:
-    """True when a slot is IDLE (Victron-managed, neutral setpoint).
-
-    IDLE flow (self-consumption, surplus PV) is not a commanded action — it's a
-    projection that settles retroactively — so it's kept OUT of the committed net
-    (Option A) and shown separately as projected.
-    """
+    """True when a slot is IDLE (Victron-managed, neutral setpoint)."""
     return str(slot.get("control_action") or "").upper() == "IDLE"
+
+
+# At/above this SoC the battery is treated as full, so PV surplus feeds the grid.
+# Below it, an IDLE slot's surplus stores into the battery instead of exporting.
+PV_SURPLUS_FULL_SOC = 99.0
+
+
+def _forward_grid_econ(slot):
+    """Projected grid economics ``(import_kwh, import_cost, export_kwh, export_rev)``
+    for an unsettled slot, matched to what will actually settle at the meter.
+
+    A commanded import (BUY / RETAIN) or a SELL battery discharge crosses the meter
+    as planned. But an IDLE slot's PV surplus only reaches the grid when the battery
+    is full; below that the neutral setpoint stores it in the battery — raising SoC
+    and lowering the stored-energy cost basis — so it books NO grid revenue here.
+    That stored value is realised later (a SELL slot, or an avoided future import),
+    so the running projection still converges to the settled day total without
+    booking phantom self-consumption "profit".
+    """
+    g = slot.get("grid_energy", 0.0) or 0.0
+    buy = slot.get("price", 0.0) or 0.0
+    sell = slot.get("sell", buy) or buy
+    if g > 0:
+        return g, g * buy, 0.0, 0.0
+    if g < 0:
+        soc_end = slot.get("soc_end")
+        battery_full = soc_end is not None and soc_end >= PV_SURPLUS_FULL_SOC
+        if not is_idle(slot) or battery_full:
+            return 0.0, 0.0, -g, -g * sell
+    return 0.0, 0.0, 0.0, 0.0
 
 
 def load_raw_plan() -> dict | None:
@@ -163,26 +315,14 @@ def _actual_load_by_slot(day) -> dict:
     load_actual_today_wh counter in the CYCLE records. This is available for ALL days —
     the counter predates the per-slot actual_load_kwh settlement field — so previous
     days can show real consumption too. Keyed by the slot's start 'HH:MM'."""
-    path = os.path.join(history_dir(), f"ess-{day.isoformat()}.ndjson")
     cycles = []
-    try:
-        with open(path) as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    r = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if r.get("kind") not in (None, "cycle"):
-                    continue
-                ts = _parse_time(r.get("ts"))
-                lw = _f(r.get("load_actual_today_wh"))
-                if ts is not None and lw is not None:
-                    cycles.append((ts, lw))
-    except (FileNotFoundError, OSError):
-        return {}
+    for r in _hist.read_day(day, history_dir()):
+        if r.get("kind") not in (None, "cycle"):
+            continue
+        ts = _parse_time(r.get("ts"))
+        lw = _f(r.get("load_actual_today_wh"))
+        if ts is not None and lw is not None:
+            cycles.append((ts, lw))
     cycles.sort(key=lambda x: x[0])
     out = {}
     for i in range(1, len(cycles)):
@@ -202,7 +342,6 @@ def _settled_slots_for_day(day, cutoff=None) -> list:
     start. ``cutoff`` (a datetime) drops rows at/after it — used for today so the
     live forward plan owns the active and future slots.
     """
-    path = os.path.join(history_dir(), f"ess-{day.isoformat()}.ndjson")
     slots = []
     load_map = _actual_load_by_slot(day)   # per-slot consumption (works for old days too)
 
@@ -212,57 +351,46 @@ def _settled_slots_for_day(day, cutoff=None) -> list:
         except (TypeError, ValueError):
             return None
 
-    try:
-        with open(path) as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if rec.get("kind") != "settlement":
-                    continue
-                start = _parse_time(rec.get("slot_start"))
-                if start is None or start.date() != day:
-                    continue
-                if cutoff is not None and start >= cutoff:
-                    continue
+    for rec in _hist.read_day(day, history_dir()):
+        if rec.get("kind") != "settlement":
+            continue
+        start = _parse_time(rec.get("slot_start"))
+        if start is None or start.date() != day:
+            continue
+        if cutoff is not None and start >= cutoff:
+            continue
 
-                imp_f = _num(rec.get("actual_import_kwh"))
-                exp_f = _num(rec.get("actual_export_kwh"))
-                grid = None
-                if imp_f is not None or exp_f is not None:
-                    grid = (imp_f or 0.0) - (exp_f or 0.0)
+        imp_f = _num(rec.get("actual_import_kwh"))
+        exp_f = _num(rec.get("actual_export_kwh"))
+        grid = None
+        if imp_f is not None or exp_f is not None:
+            grid = (imp_f or 0.0) - (exp_f or 0.0)
 
-                load_val = _num(rec.get("actual_load_kwh"))     # stored from today on
-                if load_val is None:
-                    load_val = load_map.get(_slot_key(start))   # derived for older days
+        load_val = _num(rec.get("actual_load_kwh"))     # stored from today on
+        if load_val is None:
+            load_val = load_map.get(_slot_key(start))   # derived for older days
 
-                slots.append({
-                    "time": start.isoformat(),
-                    "settled": True,
-                    "closed_at": rec.get("slot_end"),
-                    "control_action": rec.get("predicted_control_action") or "IDLE",
-                    "reason": "Settled actuals from history",
-                    "reason_code": "SETTLED_ACTUAL",
-                    "grid_energy": grid,
-                    "price": _num(rec.get("price_buy")) or 0.0,
-                    "sell": _num(rec.get("price_sell")) or _num(rec.get("price_buy")) or 0.0,
-                    "pv": _num(rec.get("actual_pv_kwh")),
-                    "load": load_val,
-                    "soc_start": _num(rec.get("soc_start")),
-                    "soc_end": _num(rec.get("soc_end")),
-                    "actual_import_kwh": imp_f,
-                    "actual_export_kwh": exp_f,
-                    "actual_cost": _num(rec.get("actual_cost")),
-                    "actual_reward": _num(rec.get("actual_reward")),
-                    "actual_net_eur": _num(rec.get("actual_net_eur")),
-                    "incomplete": bool(rec.get("incomplete")),
-                })
-    except (FileNotFoundError, OSError):
-        return []
+        slots.append({
+            "time": start.isoformat(),
+            "settled": True,
+            "closed_at": rec.get("slot_end"),
+            "control_action": rec.get("predicted_control_action") or "IDLE",
+            "reason": "Settled actuals from history",
+            "reason_code": "SETTLED_ACTUAL",
+            "grid_energy": grid,
+            "price": _num(rec.get("price_buy")) or 0.0,
+            "sell": _num(rec.get("price_sell")) or _num(rec.get("price_buy")) or 0.0,
+            "pv": _num(rec.get("actual_pv_kwh")),
+            "load": load_val,
+            "soc_start": _num(rec.get("soc_start")),
+            "soc_end": _num(rec.get("soc_end")),
+            "actual_import_kwh": imp_f,
+            "actual_export_kwh": exp_f,
+            "actual_cost": _num(rec.get("actual_cost")),
+            "actual_reward": _num(rec.get("actual_reward")),
+            "actual_net_eur": _num(rec.get("actual_net_eur")),
+            "incomplete": bool(rec.get("incomplete")),
+        })
 
     slots.sort(key=lambda s: s["time"])
     return slots
@@ -280,10 +408,16 @@ def previous_day_schedule(days_back: int = 1) -> dict:
     day = datetime.now().date() - timedelta(days=days_back)
     slots = _settled_slots_for_day(day)
     hours = group_by_hour(slots) if slots else []
-    imp_cost = sum((s.get("actual_cost") or 0.0) for s in slots)
-    exp_rev = sum((s.get("actual_reward") or 0.0) for s in slots)
-    imp_kwh = sum((s.get("actual_import_kwh") or 0.0) for s in slots)
-    exp_kwh = sum((s.get("actual_export_kwh") or 0.0) for s in slots)
+    # Headline totals come from the cumulative day counters (same authoritative source
+    # as the Trends monthly chart), NOT the sum of per-slot settlements: if a slot's
+    # settlement was ever dropped (e.g. a mid-slot re-optimize), the per-slot sum drifts
+    # from the meter, but the cumulative counter is always right. Keeps the two views in
+    # agreement. Per-slot rows (hours) are still shown for detail.
+    totals = _day_totals_from_records(_hist.read_day(day, history_dir())) or {}
+    imp_cost = totals.get("import_cost") or 0.0
+    exp_rev = totals.get("export_reward") or 0.0
+    imp_kwh = totals.get("import_kwh") or 0.0
+    exp_kwh = totals.get("export_kwh") or 0.0
     return {
         "date": day.isoformat(),
         "label": day.strftime("%a %d %b"),
@@ -327,7 +461,6 @@ def group_by_hour(schedule: list) -> list:
                 "slots": [],
                 "import_kwh": 0.0, "export_kwh": 0.0,
                 "import_cost": 0.0, "export_rev": 0.0,
-                "idle_imp_cost": 0.0, "idle_exp_rev": 0.0,
                 "grid_kwh": 0.0, "production_kwh": 0.0, "consumption_kwh": 0.0,
                 "prices": [],
                 "mode_counts": {},
@@ -354,18 +487,16 @@ def group_by_hour(schedule: list) -> list:
                 h["export_kwh"] += exp
             if exp_rev is not None:
                 h["export_rev"] += exp_rev
-        elif is_idle(slot):
-            # IDLE = projected only (Victron decides), kept out of committed net.
-            if g > 0:
-                h["idle_imp_cost"] += g * buy
-            elif g < 0:
-                h["idle_exp_rev"] += -g * sell
-        elif g > 0:
-            h["import_kwh"] += g
-            h["import_cost"] += g * buy
-        elif g < 0:
-            h["export_kwh"] += -g
-            h["export_rev"] += -g * sell
+        else:
+            # Forward slot: project the grid flow that will actually settle. IDLE
+            # PV-surplus into a non-full battery charges it (no grid revenue) — see
+            # _forward_grid_econ — so the forecast doesn't book phantom self-
+            # consumption profit yet still converges to the settled day total.
+            f_imp_kwh, f_imp_cost, f_exp_kwh, f_exp_rev = _forward_grid_econ(slot)
+            h["import_kwh"] += f_imp_kwh
+            h["import_cost"] += f_imp_cost
+            h["export_kwh"] += f_exp_kwh
+            h["export_rev"] += f_exp_rev
         h["prices"].append(buy)
         act = (slot.get("control_action") or "").upper()
         h["mode_counts"][act] = h["mode_counts"].get(act, 0) + 1
@@ -380,6 +511,7 @@ def group_by_hour(schedule: list) -> list:
         result.append({
             "key": h["key"],
             "label": h["label"],
+            "hour_start": h["hour_start"],
             "is_current": (h["key"] == current_hour_key),
             "dominant_action": dominant,
             "mixed": len(modes) > 1,
@@ -390,7 +522,6 @@ def group_by_hour(schedule: list) -> list:
             "grid_kwh": round(h["grid_kwh"], 2),
             "production_kwh": round(h["production_kwh"], 2),
             "consumption_kwh": round(h["consumption_kwh"], 2),
-            "projected_idle_net": round(h["idle_exp_rev"] - h["idle_imp_cost"], 3),
             "net_kwh": round(h["import_kwh"] - h["export_kwh"], 2),
             "net_cost": round(h["import_cost"] - h["export_rev"], 3),
             "soc_start": h["slots"][0].get("soc_start"),
@@ -412,29 +543,21 @@ def day_summary(schedule: list, today_actuals: dict | None) -> dict:
         if d not in days:
             days[d] = {"date": d, "label": dt.strftime("%a %d %b"),
                        "import_kwh": 0.0, "import_cost": 0.0,
-                       "export_kwh": 0.0, "export_rev": 0.0,
-                       "idle_imp_cost": 0.0, "idle_exp_rev": 0.0}
+                       "export_kwh": 0.0, "export_rev": 0.0}
             order.append(d)
-        g = slot.get("grid_energy", 0.0) or 0.0
-        buy = slot.get("price", 0.0) or 0.0
-        sell = slot.get("sell", buy) or buy
-        if is_idle(slot):
-            if g > 0:
-                days[d]["idle_imp_cost"] += g * buy
-            elif g < 0:
-                days[d]["idle_exp_rev"] += -g * sell
-        elif g > 0:
-            days[d]["import_kwh"] += g
-            days[d]["import_cost"] += g * buy
-        elif g < 0:
-            days[d]["export_kwh"] += -g
-            days[d]["export_rev"] += -g * sell
+        # Project the grid flow that will actually settle. IDLE PV-surplus into a
+        # non-full battery charges it (SoC up / cost basis down, no grid revenue)
+        # rather than exporting — see _forward_grid_econ — so the forecast stays
+        # complete and converges to the settled actuals without phantom profit.
+        f_imp_kwh, f_imp_cost, f_exp_kwh, f_exp_rev = _forward_grid_econ(slot)
+        days[d]["import_kwh"] += f_imp_kwh
+        days[d]["import_cost"] += f_imp_cost
+        days[d]["export_kwh"] += f_exp_kwh
+        days[d]["export_rev"] += f_exp_rev
 
     today = datetime.now().date().isoformat()
     rows = []
-    _keys = ("import_kwh", "import_cost", "export_kwh", "export_rev",
-             "idle_imp_cost", "idle_exp_rev")
-    tot = {k: 0.0 for k in _keys}
+    _keys = ("import_kwh", "import_cost", "export_kwh", "export_rev")
     for d in order:
         row = days[d]
         forecast = {k: round(row[k], 3) for k in _keys}
@@ -451,22 +574,17 @@ def day_summary(schedule: list, today_actuals: dict | None) -> dict:
         if actual:
             for k in combined:
                 combined[k] = round(combined[k] + actual.get(k, 0.0), 3)
-        for k in tot:
-            tot[k] += combined[k]
         rows.append({
             "date": d, "label": row["label"], "is_today": d == today,
             "forecast": forecast, "actual": actual, "combined": combined,
-            # Committed net (Option A): only BUY/RETAIN/SELL flows.
+            # Running net = all projected + settled grid flows (import cost − export
+            # revenue). IDLE self-consumption / PV-surplus is now included so the
+            # projection is complete and converges to the settled day total.
             "net": round(combined["import_cost"] - combined["export_rev"], 3),
-            # IDLE projection (export rev − import cost), shown apart from net.
-            "projected_idle_net": round(combined["idle_exp_rev"] - combined["idle_imp_cost"], 3),
         })
 
     return {
         "days": rows,
-        "total": {**{k: round(v, 3) for k, v in tot.items()},
-                  "net": round(tot["import_cost"] - tot["export_rev"], 3),
-                  "projected_idle_net": round(tot["idle_exp_rev"] - tot["idle_imp_cost"], 3)},
     }
 
 
@@ -495,6 +613,11 @@ def get_plan() -> dict:
         "stale": (age_s is not None and age_s > 1800),  # >30 min old
         "battery_soc": raw.get("battery_soc"),
         "pv_remaining_wh": raw.get("pv_remaining_wh"),
+        "pv_remaining_raw_wh": raw.get("pv_remaining_raw_wh"),
+        "pv_remaining_raw_source": raw.get("pv_remaining_raw_source"),
+        "pv_adjusted_remaining_wh": raw.get("pv_adjusted_remaining_wh"),
+        "pv_adjusted_remaining_source": raw.get("pv_adjusted_remaining_source"),
+        "pv_adjustment_kwh": raw.get("pv_adjustment_kwh"),
         "pv_today_total_kwh": raw.get("pv_today_total_kwh"),
         "pv_tomorrow_wh": raw.get("pv_tomorrow_wh"),
         "price_points": raw.get("price_points"),
@@ -506,6 +629,27 @@ def get_plan() -> dict:
         "day_summary": day_summary(schedule, raw.get("today_actuals")),
         "mtd_net": mtd_net_eur(),
     }
+
+
+def tesla_usage() -> dict:
+    """Current billing cycle's Tesla Fleet API spend (counts + € per category + total) for the
+    Vehicle tab, plus an approximate Streaming Signals line from the telemetry bridge counter."""
+    path = _env().get("TESLA_BUDGET_STATE_PATH") or _tesla_budget.DEFAULT_STATE_PATH
+    snap = _tesla_budget.usage_snapshot(path)
+    # Streaming Signals are pushed by the car (not requests we make), so they live outside the
+    # budget guard. Display them approximately from the bridge's monthly counter; Tesla bills
+    # ~$1 per 150,000 signals, so this is effectively free but worth showing.
+    try:
+        from lib.global_state import GlobalStateClient
+        month = datetime.utcnow().strftime("%Y-%m")
+        state = GlobalStateClient()
+        sig = 0
+        if state.get("tesla_stream_month") == month:
+            sig = int(state.get("tesla_stream_signals") or 0)
+        snap["streaming"] = {"count": sig, "cost": round(sig / 150000.0, 4), "approx": True}
+    except Exception:
+        snap["streaming"] = {"count": 0, "cost": 0.0, "approx": True}
+    return snap
 
 
 def get_config() -> list:
@@ -529,6 +673,28 @@ def _schema_index():
     return idx
 
 
+def _format_bound(value):
+    try:
+        return f"{float(value):g}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _validate_bounds(spec, value):
+    minimum = spec.get("min")
+    maximum = spec.get("max")
+    if minimum is not None and value < minimum or maximum is not None and value > maximum:
+        label = spec.get("key", "value")
+        if minimum is not None and maximum is not None:
+            raise ValueError(
+                f"{label} must be between {_format_bound(minimum)} and {_format_bound(maximum)}"
+            )
+        if minimum is not None:
+            raise ValueError(f"{label} must be >= {_format_bound(minimum)}")
+        raise ValueError(f"{label} must be <= {_format_bound(maximum)}")
+    return value
+
+
 def _coerce_value(spec, raw):
     """Validate/normalise a value for a setting, returning the string to persist.
 
@@ -544,16 +710,16 @@ def _coerce_value(spec, raw):
             return "False"
         raise ValueError("expected true/false")
     if t == "int":
-        return str(int(float(raw)))
+        return str(_validate_bounds(spec, int(float(raw))))
     if t == "float":
-        return str(float(raw))
+        return str(_validate_bounds(spec, float(raw)))
     # str / enum
     if "options" in spec and raw not in spec["options"]:
         raise ValueError(f"must be one of {spec['options']}")
     return raw
 
 
-def update_env_setting(key: str, value, env_path: str = ".env") -> dict:
+def update_env_setting(key: str, value, env_path: str | None = None) -> dict:
     """Persist a single allow-listed setting to .env (durable source of truth).
 
     The main service's retrieve_setting() re-reads .env on every call (so the
@@ -562,6 +728,7 @@ def update_env_setting(key: str, value, env_path: str = ".env") -> dict:
     change. Only keys present in CONFIG_SCHEMA can be written. The write is
     atomic and preserves comments/formatting.
     """
+    env_path = env_path or runtime_env_path()
     spec = _schema_index().get(key)
     if spec is None:
         raise KeyError(f"Unknown or non-writable setting: {key}")

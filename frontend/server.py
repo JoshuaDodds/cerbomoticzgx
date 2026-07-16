@@ -7,11 +7,18 @@ import os
 import json
 import logging
 import threading
+import time
 
-from flask import Flask, jsonify, render_template, request, Response
+from flask import Flask, jsonify, render_template, request, Response, redirect, url_for
 
 from frontend import data
 from frontend.live import live
+from lib.helpers import publish_message
+from lib.log_buffer import install as _install_log_buffer
+
+# Attach the Logs tab's ring-buffer handler as early as possible (module import time) so it
+# captures startup log lines too, not just what's logged after the first /api/logs request.
+_install_log_buffer()
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 # Don't let browsers cache the dashboard's JS/CSS — it's edited often and served
@@ -29,6 +36,11 @@ def index():
     return render_template("index.html")
 
 
+@app.route("/favicon.ico")
+def favicon():
+    return redirect(url_for("static", filename="img/logo.svg"), code=302)
+
+
 @app.route("/api/plan")
 def api_plan():
     return jsonify(data.get_plan())
@@ -43,6 +55,28 @@ def api_config():
 def api_history_month():
     """Per-day net totals for the current month (Trends monthly chart)."""
     return jsonify({"days": data.monthly_history()})
+
+
+@app.route("/api/history/accuracy")
+def api_history_accuracy():
+    """Recent actual-vs-forecast PV/load settlements for the Trends overlay."""
+    try:
+        days = max(1, min(14, int(request.args.get("days", 3))))
+    except (TypeError, ValueError):
+        days = 3
+    return jsonify(data.forecast_accuracy(days))
+
+
+@app.route("/api/weather")
+def api_weather():
+    """Cached weather forecast and shadow adjustment summary."""
+    return jsonify(data.weather_dashboard())
+
+
+@app.route("/api/tesla/usage")
+def api_tesla_usage():
+    """Today's Tesla Fleet API spend (counts + cost per category + total)."""
+    return jsonify(data.tesla_usage())
 
 
 @app.route("/api/history/day")
@@ -100,7 +134,13 @@ def api_replan():
     synchronously and republishes the plan, so the caller can reload immediately."""
     try:
         from lib.energy_broker import run_ai_optimizer
-        run_ai_optimizer()
+        ran = run_ai_optimizer()
+        if ran is False:
+            return jsonify({
+                "ok": False,
+                "skipped": True,
+                "message": "optimizer already running",
+            }), 409
         return jsonify({"ok": True})
     except Exception as e:
         logging.warning("Replan failed: %s", e)
@@ -112,6 +152,62 @@ def _clear_import_schedule():
     clear_victron_schedules()
 
 
+def _request_service_restart():
+    publish_message("Cerbomoticzgx/system/shutdown", message="True", retain=True)
+
+
+def _boolish(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _set_ai_ess_override(enabled: bool):
+    """Persist the runtime AI ESS override and idle Victron once when enabling.
+
+    The optimizer reads this state and stands down while it is on; it does not keep
+    writing setpoints, so external/Victron changes remain undisturbed afterwards.
+    """
+    from lib.global_state import GlobalStateClient
+    from lib.victron_integration import ac_power_setpoint
+
+    state = GlobalStateClient()
+    state.set("ai_ess_override_enabled", bool(enabled))
+    publish_message("Cerbomoticzgx/system/ai_ess_override_enabled", message="True" if enabled else "False", retain=True)
+    if enabled:
+        state.set("ai_grid_assist", "off")
+        ac_power_setpoint(watts="0.0", override_ess_net_mettering=False, silent=False)
+
+
+def _set_grid_assist_toggle(enabled: bool):
+    """Reuse the existing manual grid-charge/retain toggle."""
+    from lib.global_state import GlobalStateClient
+    from lib.energy_broker import _apply_grid_assist_setpoint
+    from lib.victron_integration import ac_power_setpoint
+
+    state = GlobalStateClient()
+    state.set("grid_charging_enabled", bool(enabled))
+    publish_message("Cerbomoticzgx/system/grid_charging_enabled", message="True" if enabled else "False", retain=True)
+    if enabled:
+        load_watts = state.get("ac_out_power")
+        state.set("ai_grid_assist", "on")
+        _apply_grid_assist_setpoint(
+            load_watts=load_watts,
+            cover_all_load=True,
+        )
+        try:
+            load_label = f"{int(round(float(load_watts or 0)))}W"
+        except (TypeError, ValueError):
+            load_label = "unknown load"
+        logging.info("Grid assist enabled: matching grid setpoint to current AC load %s.", load_label)
+    else:
+        state.set("ai_grid_assist", "off")
+        ac_power_setpoint(watts="0.0", override_ess_net_mettering=False, silent=False)
+        logging.info("Grid assist disabled: returned AC setpoint to 0W.")
+
+
 @app.route("/api/victron/clear-schedule", methods=["POST"])
 def api_victron_clear_schedule():
     """Clear all five Victron scheduled-charge slots."""
@@ -120,6 +216,88 @@ def api_victron_clear_schedule():
         return jsonify({"ok": True})
     except Exception as e:
         logging.exception("Clear Victron import schedule failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/restart", methods=["POST"])
+def api_restart():
+    """Request the existing supervised restart path via MQTT.
+
+    The service already subscribes to Cerbomoticzgx/system/shutdown, kills its own
+    process when it sees True, and the outer loop handles the restart. Do not add a
+    second restart mechanism here.
+    """
+    try:
+        _request_service_restart()
+        return jsonify({"ok": True})
+    except Exception as e:
+        logging.warning("Restart request failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/control/ai-override", methods=["POST"])
+def api_control_ai_override():
+    body = request.get_json(silent=True) or {}
+    enabled = _boolish(body.get("enabled"), False)
+    try:
+        _set_ai_ess_override(enabled)
+        return jsonify({"ok": True, "enabled": enabled})
+    except Exception as e:
+        logging.warning("AI ESS override request failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/control/grid-assist", methods=["POST"])
+def api_control_grid_assist():
+    body = request.get_json(silent=True) or {}
+    enabled = _boolish(body.get("enabled"), False)
+    try:
+        _set_grid_assist_toggle(enabled)
+        return jsonify({"ok": True, "enabled": enabled})
+    except Exception as e:
+        logging.warning("Grid assist request failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+def _set_ev_charge_requested(enabled: bool):
+    """Manual EV Start/Stop. Sets the DEDICATED ev_charge_requested intent flag the EV controller
+    reads (fully decoupled from grid-assist). The controller then starts/stops the car with its
+    full safety logic — home+plugged+non-supercharging checks, wake escalation, and local-meter
+    stop verification. A direct one-shot command would just be undone by the controller's next
+    tick, so we drive its intent flag instead. Publishing the retained control topic keeps it in
+    sync + survives a restart via the state restore."""
+    from lib.global_state import GlobalStateClient
+    GlobalStateClient().set("ev_charge_requested", bool(enabled))
+    publish_message("Tesla/vehicle0/control/charge_requested",
+                    message="True" if enabled else "False", retain=True)
+    logging.info("Manual EV charge %s.", "START requested" if enabled else "STOP requested")
+
+
+@app.route("/api/control/ev-charge", methods=["POST"])
+def api_control_ev_charge():
+    body = request.get_json(silent=True) or {}
+    enabled = _boolish(body.get("enabled"), False)
+    try:
+        _set_ev_charge_requested(enabled)
+        return jsonify({"ok": True, "enabled": enabled})
+    except Exception as e:
+        logging.warning("EV charge request failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/control/refresh-vehicle", methods=["POST"])
+def api_control_refresh_vehicle():
+    """Manual 'Refresh Data' button (Vehicle tab). Sets a one-shot flag the EV controller
+    consumes on its next tick, forcing an immediate wake + status refresh outside the normal
+    engagement gating — a direct API call from here would race the controller's own state
+    machine, so we drive it through the same intent-flag pattern as Start/Stop."""
+    try:
+        from lib.global_state import GlobalStateClient
+        GlobalStateClient().set("vehicle_refresh_requested", True)
+        logging.info("Manual vehicle data refresh requested.")
+        return jsonify({"ok": True})
+    except Exception as e:
+        logging.warning("Vehicle refresh request failed: %s", e)
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
@@ -192,6 +370,55 @@ def api_advisor_delete_exchange():
     except OSError as e:
         logging.warning("Advisor exchange delete failed: %s", e)
         return jsonify({"ok": False, "error": f"delete failed: {e}"}), 500
+
+
+@app.route("/api/logs")
+def api_logs():
+    """Recent buffered log lines (oldest first). Captures this process's own log output —
+    when the dashboard runs in-process (FRONTEND_ENABLED=True) that's the whole service;
+    standalone, it's just the dashboard's own (sparse) log activity."""
+    from lib.log_buffer import get_handler
+    items = get_handler().snapshot()
+    return jsonify({"lines": [line for _, line in items]})
+
+
+LOGS_STREAM_MAX_SECONDS = 600  # bound a single SSE connection's lifetime (see gen() below)
+
+
+@app.route("/api/logs/stream")
+def api_logs_stream():
+    """Server-Sent Events: push new log lines as they're emitted.
+
+    Runs on the Flask dev server (thread-per-connection, no reverse proxy in front of it here),
+    which only notices a dropped client on its next write — a client that vanishes without a
+    clean close (phone loses signal mid-tab) can pin a thread for a long time. Rather than
+    tracking liveness directly, cap the connection's own lifetime: EventSource auto-reconnects
+    by default (we never call .close() client-side), so ending the generator periodically just
+    recycles the underlying connection/thread instead of holding either open indefinitely.
+    """
+    from lib.log_buffer import get_handler
+    handler = get_handler()
+
+    def gen():
+        started = time.time()
+        items = handler.snapshot()
+        last_seq = items[-1][0] if items else 0
+        # "snapshot" (full buffer, replaces whatever the client has rendered) vs "append"
+        # (incremental) — every new connection, including the auto-reconnect once
+        # LOGS_STREAM_MAX_SECONDS elapses, starts with a snapshot; the client must not treat
+        # a reconnect's snapshot as more lines to append or the visible log duplicates.
+        yield f"data: {json.dumps({'type': 'snapshot', 'lines': [line for _, line in items]})}\n\n"
+        while time.time() - started < LOGS_STREAM_MAX_SECONDS:
+            new_items = handler.wait_for_more(last_seq, timeout=15)
+            if new_items:
+                last_seq = new_items[-1][0]
+                yield f"data: {json.dumps({'type': 'append', 'lines': [line for _, line in new_items]})}\n\n"
+            else:
+                yield ": keepalive\n\n"
+
+    return Response(gen(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                             "Connection": "keep-alive"})
 
 
 @app.route("/healthz")

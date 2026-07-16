@@ -4,6 +4,9 @@
     -webkit-text-size-adjust: 100%;
   }
 
+  /* Surface the Weather tab's charts inside Trends (Weather isn't in the mobile nav). */
+  .trends-weather-mobile { display: block; }
+
   body {
     overflow-x: hidden;
     padding-bottom: calc(74px + env(safe-area-inset-bottom));
@@ -187,6 +190,18 @@
     line-height: 1.2;
   }
 
+  /* Vehicle tab: smaller cards, 3 per row instead of 2, without shrinking the label/value
+     text set above (those rules still apply — only the card box/grid gets tighter here). */
+  #tab-vehicle .metrics-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 6px;
+  }
+
+  #tab-vehicle .metric {
+    min-height: 60px;
+    padding: 7px 6px;
+  }
+
   .overview-row {
     grid-template-columns: 1fr;
     gap: 10px;
@@ -222,6 +237,32 @@
     border: 1px solid var(--line);
     border-radius: 8px;
     background: var(--panel);
+  }
+
+  .running-ledger-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 6px 10px;
+    padding: 10px;
+    border-radius: 8px;
+    border: 1px solid var(--accent);
+    margin: 8px 0;
+  }
+
+  .running-ledger-row .col-bar {
+    grid-column: 1;
+    grid-row: 2;
+  }
+
+  .running-ledger-row .col-num {
+    display: none;
+  }
+
+  .running-ledger-row .col-num:last-child {
+    display: block;
+    grid-column: 2;
+    grid-row: 1 / span 2;
+    align-self: center;
+    text-align: right;
   }
 
   .hour-row[data-mobile-action]::after {
@@ -535,7 +576,10 @@
     white-space: nowrap;
   }
 
-  .foot #replan {
+  .foot #replan,
+  .foot #restart,
+  .foot #override,
+  .foot #grid-assist {
     display: none;
   }
 

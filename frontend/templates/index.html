@@ -4,6 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>cerbomoticzGx · ESS Dashboard</title>
+  <link rel="icon" href="{{ url_for('static', filename='img/logo.svg') }}" type="image/svg+xml" />
   <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}" />
   <link rel="stylesheet" href="{{ url_for('static', filename='css/app.mobile.css') }}" />
 </head>
@@ -39,10 +40,13 @@
     <nav class="tabs">
       <button class="tab" data-tab="live">Power Flow</button>
       <button class="tab" data-tab="trends">Trends</button>
-      <button class="tab active" data-tab="schedule">Schedule</button>
-      <button class="tab" data-tab="victron">Import Schedule</button>
+      <button class="tab active" data-tab="schedule">Timeline</button>
+      <button class="tab" data-tab="victron">Victron Schedule</button>
+      <button class="tab" data-tab="weather">Weather</button>
+      <button class="tab" data-tab="vehicle">Vehicle</button>
       <button class="tab" data-tab="advisor">Advisor</button>
       <button class="tab" data-tab="config">Configuration</button>
+      <button class="tab" data-tab="logs">Logs</button>
     </nav>
 
     <main>
@@ -59,8 +63,25 @@
           <div id="horizon-chart" class="chart"><span class="muted">no plan yet…</span></div>
         </div>
         <div class="card">
+          <h3 style="margin:2px 0 10px">Forecast accuracy</h3>
+          <div id="forecast-accuracy-chart" class="chart"><span class="muted">loading…</span></div>
+        </div>
+        <div class="card">
           <h3 style="margin:2px 0 10px">Daily net — month so far</h3>
           <div id="monthly-chart" class="chart"><span class="muted">loading…</span></div>
+        </div>
+
+        <!-- Mobile only: the Weather tab isn't in the mobile nav, so surface its charts
+             here in Trends. Hidden on desktop via .trends-weather-mobile. -->
+        <div class="trends-weather-mobile">
+          <div class="card">
+            <h3 style="margin:2px 0 10px">Weather forecast</h3>
+            <div id="weather-chart-m" class="chart"><span class="muted">loading…</span></div>
+          </div>
+          <div class="card">
+            <h3 style="margin:2px 0 10px">Forecast impact</h3>
+            <div id="weather-impact-chart-m" class="chart"><span class="muted">loading…</span></div>
+          </div>
         </div>
       </section>
 
@@ -98,6 +119,51 @@
         <div id="victron-schedules" class="card"></div>
       </section>
 
+      <section id="tab-weather" class="tab-panel">
+        <div class="card">
+          <h3 style="margin:2px 0 10px">Weather forecast</h3>
+          <div id="weather-chart" class="chart"><span class="muted">loading…</span></div>
+        </div>
+        <div class="card">
+          <h3 style="margin:2px 0 10px">Forecast impact</h3>
+          <div id="weather-impact-chart" class="chart"><span class="muted">loading…</span></div>
+        </div>
+      </section>
+
+      <section id="tab-vehicle" class="tab-panel">
+        <div class="card">
+          <div class="vehicle-card-head">
+            <h3 style="margin:2px 0 10px">Vehicle</h3>
+            <button id="vehicle-refresh" type="button" class="btn-secondary" data-vehicle-refresh
+                    title="Force an on-demand status check now (wakes the car and costs API budget in REST polling mode; free in Fleet Telemetry mode)">Refresh data</button>
+          </div>
+          <div id="vehicle"><span class="muted">waiting for vehicle status…</span></div>
+          <p class="cfg-note">Live status mirrored from the MQTT bus — read-only, no Tesla API cost.
+            The controller only contacts the car when it needs to act (see the Tesla cost controls).
+            <strong>Refresh data</strong> forces an on-demand status check now — in REST polling
+            mode this wakes the car (billable, budget-capped); in Fleet Telemetry mode it just
+            re-reads the already-streamed state (free).</p>
+        </div>
+        <div class="card">
+          <h3 style="margin:2px 0 10px">Charge control</h3>
+          <div class="ev-controls">
+            <button id="ev-start" type="button" class="btn" data-ev-charge="start">Start charge</button>
+            <button id="ev-stop" type="button" class="btn" data-ev-charge="stop">Stop charge</button>
+          </div>
+          <p class="cfg-note">Manually request or stop an EV charge. This sets the dedicated
+            EV-charge intent (independent of grid assist); the controller then starts/stops the car
+            with its safety checks (only acts when the car is home and plugged in).</p>
+        </div>
+        <div class="card">
+          <h3 style="margin:2px 0 10px">Tesla API usage — this billing cycle (local estimate)</h3>
+          <div id="vehicle-usage"><span class="muted">loading…</span></div>
+          <p class="cfg-note">Counted locally to <em>enforce</em> a hard spend cap (Tesla has no
+            usage API — the portal's Billing &amp; Usage page is authoritative). This is a
+            forward-only estimate since the counter started, so it can read lower than the portal;
+            regardless, the cap makes exceeding the $10 credit impossible.</p>
+        </div>
+      </section>
+
       <section id="tab-advisor" class="tab-panel">
         <div class="card advisor">
           <p class="cfg-note">A read-only AI review of recent optimizer behaviour. Run the daily
@@ -122,11 +188,28 @@
       <section id="tab-config" class="tab-panel">
         <div id="config"></div>
       </section>
+
+      <section id="tab-logs" class="tab-panel">
+        <div class="card logs-card">
+          <div class="logs-card-head">
+            <h3 style="margin:2px 0 10px">Logs</h3>
+            <input id="logs-search" type="search" class="logs-search" placeholder="Filter…"
+                   autocomplete="off" spellcheck="false" aria-label="Filter log lines" />
+          </div>
+          <p class="cfg-note">Live tail of this service's own log output (capped buffer, most
+            recent lines). Streams while this tab is open. Filter is case-insensitive and
+            matches update live as new lines arrive.</p>
+          <div id="logs-output" class="logs-output"><span class="muted">waiting for logs…</span></div>
+        </div>
+      </section>
     </main>
 
     <footer class="foot">
       <span id="meta" class="muted"></span>
       <button id="replan" class="btn" data-replan title="Re-run the optimizer now on current data">Replan</button>
+      <button id="restart" class="btn" data-restart title="Request a supervised service restart">Restart</button>
+      <button id="override" class="btn btn-toggle" data-ai-override title="Disable AI ESS control until toggled off">Override</button>
+      <button id="grid-assist" class="btn btn-toggle" data-grid-assist title="Force retain/grid assist until toggled off">Grid assist</button>
     </footer>
   </div>
 
@@ -153,7 +236,7 @@
     </button>
     <button type="button" class="mobile-nav-item" data-mobile-tab="schedule">
       <span class="mobile-nav-icon mobile-nav-schedule" aria-hidden="true"></span>
-      <span>Schedule</span>
+      <span>Timeline</span>
     </button>
     <button type="button" class="mobile-nav-item" data-mobile-tab="trends">
       <span class="mobile-nav-icon mobile-nav-trends" aria-hidden="true"></span>
@@ -173,12 +256,17 @@
       </div>
       <div class="mobile-menu-group" aria-label="Application sections">
         <button type="button" data-mobile-app-view="battery">Battery</button>
-        <button type="button" data-mobile-app-view="live">Venus</button>
+        <button type="button" data-mobile-app-view="live">Victron</button>
       </div>
       <div class="mobile-menu-group" aria-label="Dashboard tabs">
-        <button type="button" data-mobile-tab="victron">Import Schedule</button>
+        <button type="button" data-mobile-tab="victron">Victron Schedule</button>
+        <button type="button" data-mobile-tab="vehicle">Vehicle</button>
         <button type="button" data-mobile-tab="config">Configuration</button>
+        <button type="button" data-mobile-tab="logs">Logs</button>
         <button id="mobile-replan" type="button" data-replan>Replan</button>
+        <button id="mobile-restart" type="button" data-restart>Restart</button>
+        <button id="mobile-override" type="button" data-ai-override>Override</button>
+        <button id="mobile-grid-assist" type="button" data-grid-assist>Grid assist</button>
       </div>
     </div>
   </div>

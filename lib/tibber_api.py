@@ -244,6 +244,31 @@ def _normalise_price_points(points: list) -> list:
     return normalised
 
 
+def _local_now():
+    zone = tz.gettz(str(retrieve_setting('TIMEZONE') or '').strip("'\"")) or tz.tzlocal()
+    return datetime.now(zone)
+
+
+def _has_next_day_prices(points: list, now=None) -> bool:
+    now = now or _local_now()
+    today = now.date()
+    for point in _normalise_price_points(points):
+        try:
+            start = _parse_price_start(point["start"])
+            if start.tzinfo and now.tzinfo:
+                start = start.astimezone(now.tzinfo)
+            if start.date() > today:
+                return True
+        except (KeyError, TypeError, ValueError):
+            continue
+    return False
+
+
+def _next_day_prices_expected(now=None) -> bool:
+    now = now or _local_now()
+    return (now.hour, now.minute) >= (13, 5)
+
+
 def _cache_price_points(resolution: str, points: list) -> None:
     """Persist the last good price horizon in memory and /dev/shm.
 
@@ -422,6 +447,29 @@ def get_all_price_points():
 
     points = _fetch_price_points_graphql(resolution)
     if points:
+        if (
+            resolution == 'QUARTER_HOURLY'
+            and _next_day_prices_expected()
+            and not _has_next_day_prices(points)
+        ):
+            hourly_points = _fetch_price_points_graphql('HOURLY')
+            if hourly_points and _has_next_day_prices(hourly_points):
+                logging.warning(
+                    "Tibber: next-day quarter-hour prices unavailable after 13:05; using hourly prices for the 48h horizon."
+                )
+                return hourly_points
+
+            cached = _cached_price_points('QUARTER_HOURLY')
+            if cached and _has_next_day_prices(cached):
+                logging.warning(
+                    "Tibber: next-day quarter-hour prices unavailable after 13:05; using cached 48h quarter-hour prices."
+                )
+                return cached
+
+            logging.warning(
+                "Tibber: next-day quarter-hourly prices still unavailable after 13:05; using today-only quarter-hour horizon (%s points).",
+                len(points),
+            )
         return points
 
     if resolution == 'QUARTER_HOURLY':

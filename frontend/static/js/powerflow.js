@@ -127,28 +127,41 @@
   //          EV    Gas(small)
   function layoutMobile(W, H, hasEV, hasGas) {
     const xL = 0.225 * W, xR = 0.775 * W, colW = 0.41 * W;   // small side margins, wider cards
-    const ch = 104, mph = 100, evh = 74, solh = 68, gash = 54;
+    // Battery + Solar carry extra BMS/string detail rows, so they're taller than the
+    // Grid/AC-Loads cards; the whole stack is scaled to fill H below.
+    // evh sized for the EV card's 5 detail rows (SoC/Limit/Amps/ETA/Total) + header + hero,
+    // at the same per-row density as Solar (196/7 rows) / Battery (190/6) so fonts stay
+    // consistent and the rows don't overflow into the Solar card below.
+    const ch = 104, batth = 190, mph = 100, evh = 162, solh = 196, gash = 54;
     // Left column: Grid, Battery. Right column: AC Loads, then EV stacked above a
     // dropped-down-and-right Solar (so its line to Battery can curve). MP-II hub
     // centred; Gas centred at the bottom overflow. Heights are content-fit; the whole
     // stack is scaled to fill H.
     const ny1  = 12 + ch / 2;                               // top row (Grid / AC Loads)
     const nHub = ny1 + ch / 2 + 26 + mph / 2;               // hub
-    const nR2  = nHub + mph / 2 + 26 + ch / 2;              // Battery (left), 26 below hub
+    const nR2  = nHub + mph / 2 + 26 + batth / 2;          // Battery (left, taller), 26 below hub
     const nEv  = nHub + mph / 2 + 26 + evh / 2;             // EV — top level with the hub cards (26 below hub)
     const nSol = nEv + evh / 2 + 20 + solh / 2;             // Solar just below EV
-    const nGas = nSol + solh / 2 + 20 + gash / 2;           // Gas (centre bottom)
-    const Tnat = nGas + gash / 2 + 12;
+    // Gas is tucked into the right column's AC-Loads→EV gap (placed below), so the
+    // stack now ends at Battery (left) / Solar (right); the taller of those scales it.
+    const Tnat = Math.max(nR2 + batth / 2, nSol + solh / 2) + 12;
     const sc = H / Tnat;
     const N = {
       grid:  { x: xL, y: ny1 * sc, w: colW, h: ch * sc },
       house: { x: xR, y: ny1 * sc, w: colW, h: ch * sc },
       inv:   { x: 0.5 * W, y: nHub * sc, w: 0.36 * W, h: mph * sc },
-      batt:  { x: xL, y: nR2 * sc, w: colW, h: ch * sc },
+      batt:  { x: xL, y: nR2 * sc, w: colW, h: batth * sc },
       solar: { x: xR + 0.015 * W, y: nSol * sc, w: 0.40 * W, h: solh * sc },   // dropped down + right
     };
     if (hasEV)  N.ev  = { x: xR, y: nEv * sc, w: colW, h: evh * sc };          // stacked above Solar
-    if (hasGas) N.gas = { x: 0.5 * W, y: nGas * sc, w: 0.30 * W, h: gash * sc }; // centred under hub
+    if (hasGas) {
+      // Gas nestled in the AC-Loads→EV gap, right-aligned with that column (right edge
+      // at xR + colW/2) so there's a balanced gap to the hub on its left — matching how
+      // the other cards sit off the centre hub.
+      const nGasY = (ny1 + ch / 2 + (nEv - evh / 2)) / 2;
+      const gasW = 0.22 * W;
+      N.gas = { x: xR + colW / 2 - gasW / 2, y: nGasY * sc, w: gasW, h: gash * sc };
+    }
     return N;
   }
 
@@ -284,18 +297,39 @@
         s += txt(`pf-${key}-l${i + 1}`, R, y, { size: F.row, anchor: "end" }, "—");
       });
     } else if (key === "solar") {
-      s += txt(`pf-solar-big`, L, bigY, { size: F.big, weight: 700 }, "—");
-      s += txt(`pf-solar-sub`, L, y0 + r.h * 0.66, { size: F.row, fill: "var(--muted)" }, "");
+      s += txt(`pf-solar-big`, L, y0 + r.h * 0.40, { size: F.big, weight: 700 }, "—");
+      s += txt(`pf-solar-sub`, L, y0 + r.h * 0.53, { size: F.row, fill: "var(--muted)" }, "");
+      [["Forecast", "pf-solar-forecast"], ["A", "pf-solar-a"], ["B", "pf-solar-b"], ["C", "pf-solar-c"],
+       ["Amps", "pf-solar-amps"], ["Surplus", "pf-solar-surplus"]].forEach(([lab, id], i) => {
+        const y = y0 + r.h * 0.62 + i * (r.h * 0.062);
+        s += txt(null, L, y, { size: F.row, fill: "var(--muted)" }, lab);
+        s += txt(id, R, y, { size: F.row, anchor: "end" }, "—");
+      });
     } else if (key === "batt") {
       s += txt(`pf-batt-temp`, R, y0 + pad + F.title + 1, { size: F.row, fill: "var(--muted)", anchor: "end" }, "");
-      s += txt(`pf-batt-big`, L, bigY, { size: F.big, weight: 700 }, "—");
-      s += txt(`pf-batt-state`, L, y0 + r.h * 0.66, { size: F.row + 1 }, "");
-      s += txt(`pf-batt-vaw`, L, y0 + r.h * 0.82, { size: F.row, fill: "var(--muted)" }, "");
+      // Hero: SoC% (reduced) with the live charge/discharge power tight underneath —
+      // the two headline metrics — then the state word.
+      s += txt(`pf-batt-big`, L, y0 + r.h * 0.33, { size: F.big * 0.82, weight: 700 }, "—");
+      s += txt(`pf-batt-power`, L, y0 + r.h * 0.46, { size: F.big * 0.44, weight: 700, fill: "var(--text)" }, "");
+      s += txt(`pf-batt-state`, L, y0 + r.h * 0.565, { size: F.row, fill: "var(--muted)" }, "");
+      // BMS detail rows (label left / value right); min/max cell temps sit top-right.
+      [["Voltage", "pf-batt-volt"], ["Current", "pf-batt-curr"], ["Min / Max (V)", "pf-batt-cells"],
+       ["Capacity", "pf-batt-cap"], ["Modules Online", "pf-batt-mods"]].forEach(([lab, id], i) => {
+        const y = y0 + r.h * 0.665 + i * (r.h * 0.072);
+        s += txt(null, L, y, { size: F.row, fill: "var(--muted)" }, lab);
+        s += txt(id, R, y, { size: F.row, anchor: "end" }, "—");
+      });
     } else if (key === "inv") {
       s += txt(`pf-inv-big`, L, bigY + 4, { size: F.state, weight: 700 }, "—");
     } else if (key === "ev") {
-      s += txt(`pf-ev-big`, L, y0 + r.h * 0.55, { size: F.big, weight: 700 }, "—");
-      s += txt(`pf-ev-energy`, L, y0 + r.h * 0.82, { size: F.row, fill: "var(--muted)" }, "");
+      s += txt(`pf-ev-big`, L, y0 + r.h * 0.26, { size: F.big, weight: 700 }, "—");
+      s += txt(`pf-ev-energy`, L, y0 + r.h * 0.40, { size: F.row, fill: "var(--muted)" }, "");
+      // Tesla detail: SoC / charge limit / measured amps / ETA-to-limit (label left, value right).
+      [["SoC", "pf-ev-soc"], ["Limit", "pf-ev-limit"], ["Amps", "pf-ev-amps"], ["ETA", "pf-ev-eta"]].forEach(([lab, id], i) => {
+        const y = y0 + r.h * 0.55 + i * (r.h * 0.10);
+        s += txt(null, L, y, { size: F.row, fill: "var(--muted)" }, lab);
+        s += txt(id, R, y, { size: F.row, anchor: "end" }, "—");
+      });
     } else if (key === "gas") {
       s += txt(`pf-gas-big`, L, y0 + r.h * 0.58, { size: F.big, weight: 700 }, "—");
     }
@@ -308,9 +342,12 @@
   const MOBILE_ROWS = {
     grid:  [["L1", "pf-grid-l1"], ["L2", "pf-grid-l2"], ["L3", "pf-grid-l3"]],
     house: [["L1", "pf-house-l1"], ["L2", "pf-house-l2"], ["L3", "pf-house-l3"]],
-    batt:  [["Voltage", "pf-batt-volt"], ["Current", "pf-batt-curr"], ["Temp", "pf-batt-temp"]],
-    solar: [["Yield today", "pf-solar-kwh"]],
-    ev:    [["Total", "pf-ev-energy"]],
+    batt:  [["Voltage", "pf-batt-volt"], ["Current", "pf-batt-curr"], ["Cells", "pf-batt-cells"],
+            ["Temps", "pf-batt-temps"], ["Capacity", "pf-batt-cap"], ["Modules", "pf-batt-mods"]],
+    solar: [["Today", "pf-solar-kwh"], ["Forecast", "pf-solar-forecast"], ["A", "pf-solar-a"],
+            ["B", "pf-solar-b"], ["C", "pf-solar-c"], ["Amps", "pf-solar-amps"], ["Surplus", "pf-solar-surplus"]],
+    ev:    [["SoC", "pf-ev-soc"], ["Limit", "pf-ev-limit"], ["Amps", "pf-ev-amps"],
+            ["ETA", "pf-ev-eta"], ["Total", "pf-ev-energy"]],
   };
   function buildCardMobile(key, N) {
     const r = N[key]; if (!r) return "";
@@ -332,25 +369,37 @@
       return s;
     }
 
-    // Header: icon + name (Battery shows charge-state + power instead of the name).
+    // Header: icon + name (Battery's charge state + power now live in the hero below).
     s += `<g id="pf-icon-${key}" transform="translate(${f(x0 + pad + 7)},${f(y0 + pad + 7)}) scale(${iscale.toFixed(2)})" color="var(--muted)">${ICON[key]}</g>`;
-    if (key === "batt") {
-      s += txt(`pf-batt-charge`, x0 + pad + 17, y0 + pad + nameF, { size: nameF, fill: "var(--muted)" }, "—");
-      s += txt(`pf-batt-power`, R, y0 + pad + nameF, { size: nameF, anchor: "end", fill: "var(--muted)" }, "");
-    } else {
-      s += txt(null, x0 + pad + 17, y0 + pad + nameF, { size: nameF, fill: "var(--muted)" }, NODE_LABEL[key]);
-    }
+    s += txt(null, x0 + pad + 17, y0 + pad + nameF, { size: nameF, fill: "var(--muted)" }, NODE_LABEL[key]);
 
-    // Big split value (number large, unit small) as inline tspans.
-    const bigY = y0 + pad + nameF + bigF + 2;
-    s += `<text x="${f(L)}" y="${f(bigY)}" font-size="${bigF.toFixed(1)}" font-weight="700" fill="var(--text)">`
-       + `<tspan id="pf-${key}-bignum">—</tspan> `
-       + `<tspan id="pf-${key}-bigunit" font-size="${unitF.toFixed(1)}" font-weight="600" fill="var(--muted)"></tspan></text>`;
+    // Big value. Battery: SoC% (slightly reduced) with the live charge/discharge power
+    // tight underneath — the two headline metrics — then a small state word. Every
+    // other card keeps the standard big number + small unit.
+    let heroBottom;
+    if (key === "batt") {
+      const bBig = bigF * 0.86;
+      const bY = y0 + pad + nameF + bBig + 1;
+      s += `<text x="${f(L)}" y="${f(bY)}" font-size="${bBig.toFixed(1)}" font-weight="700" fill="var(--text)">`
+         + `<tspan id="pf-batt-bignum">—</tspan> `
+         + `<tspan id="pf-batt-bigunit" font-size="${(bBig * 0.5).toFixed(1)}" font-weight="600" fill="var(--muted)"></tspan></text>`;
+      const pY = bY + rowF + 4;
+      s += txt(`pf-batt-power`, L, pY, { size: Math.max(rowF + 2, bBig * 0.5), weight: 700, fill: "var(--text)" }, "—");
+      const stY = pY + rowF + 1;
+      s += txt(`pf-batt-state`, L, stY, { size: rowF, fill: "var(--muted)" }, "");
+      heroBottom = stY;
+    } else {
+      const bigY = y0 + pad + nameF + bigF + 2;
+      s += `<text x="${f(L)}" y="${f(bigY)}" font-size="${bigF.toFixed(1)}" font-weight="700" fill="var(--text)">`
+         + `<tspan id="pf-${key}-bignum">—</tspan> `
+         + `<tspan id="pf-${key}-bigunit" font-size="${unitF.toFixed(1)}" font-weight="600" fill="var(--muted)"></tspan></text>`;
+      heroBottom = bigY;
+    }
 
     // Compact labelled detail rows.
     const rows = MOBILE_ROWS[key];
     if (rows && rows.length) {
-      const divY = bigY + 5;
+      const divY = heroBottom + 5;
       s += `<line x1="${f(L)}" y1="${f(divY)}" x2="${f(R)}" y2="${f(divY)}" stroke="var(--line)"/>`;
       const startY = divY + rowF + 4, step = rowF + 3;   // tight line spacing
       rows.forEach(([lab, id], i) => {
@@ -470,11 +519,43 @@
     V["pf-batt-vaw"] = vaw;
     V["pf-batt-volt"] = live.batt_voltage != null && isFinite(Number(live.batt_voltage)) ? Number(live.batt_voltage).toFixed(2) + " V" : "—";
     V["pf-batt-curr"] = live.batt_current != null && isFinite(Number(live.batt_current)) ? Number(live.batt_current).toFixed(1) + " A" : "—";
-    V["pf-batt-power"] = isFinite(batt) ? fmtWs(batt) : "";
+    V["pf-batt-power"] = isFinite(batt) ? fmtW(Math.abs(batt)) : "—";
+    // Battery pack detail (BMS service 512): cell V/temp extremes, Ah, modules.
+    const _pair = (a, b, dp, unit) => (a != null && isFinite(Number(a)) && b != null && isFinite(Number(b)))
+      ? Number(a).toFixed(dp) + " / " + Number(b).toFixed(dp) + " " + unit : "—";
+    const cellTemps = _pair(live.batt_min_cell_t, live.batt_max_cell_t, 0, "°C");
+    V["pf-batt-cells"] = _pair(live.batt_min_cell_v, live.batt_max_cell_v, 2, "V");
+    V["pf-batt-temps"] = cellTemps;
+    V["pf-batt-temp"] = cellTemps;   // repurpose the desktop top-right temp to min/max
+    V["pf-batt-cap"] = _pair(live.batt_capacity, live.batt_installed_capacity, 0, "Ah");
+    V["pf-batt-mods"] = live.batt_modules_online != null && isFinite(Number(live.batt_modules_online))
+      ? String(Math.round(Number(live.batt_modules_online))) : "—";
+    // Solar detail: per-string V·kW (A/B/C), total DC amps, day forecast, surplus.
+    const _strn = (v, p) => {
+      const vv = (v != null && isFinite(Number(v))) ? Math.round(Number(v)) + " V" : "—";
+      const pp = (p != null && isFinite(Number(p)))
+        ? (Math.abs(Number(p)) >= 100 ? (Number(p) / 1000).toFixed(2) + " kW" : Math.round(Number(p)) + " W") : "—";
+      return vv + " · " + pp;
+    };
+    V["pf-solar-a"] = _strn(live.pv_a_v, live.pv_a_p);
+    V["pf-solar-b"] = _strn(live.pv_b_v, live.pv_b_p);
+    V["pf-solar-c"] = _strn(live.pv_c_v, live.pv_c_p);
+    V["pf-solar-amps"] = live.pv_current != null && isFinite(Number(live.pv_current)) ? Number(live.pv_current).toFixed(1) + " A" : "—";
+    // pv_projected_today is published in Wh (a known mislabel), so ÷1000 for kWh.
+    V["pf-solar-forecast"] = live.pv_forecast_today != null && isFinite(Number(live.pv_forecast_today)) ? (Number(live.pv_forecast_today) / 1000).toFixed(1) + " kWh" : "—";
+    V["pf-solar-surplus"] = live.pv_surplus_w != null && isFinite(Number(live.pv_surplus_w)) ? fmtW(Number(live.pv_surplus_w)) : "—";
     V["pf-inv-big"] = sysWord; V["pf-inv-bignum"] = sysWord; V["pf-inv-bigunit"] = "";
     if (ev != null) {
       big("ev", fmtW(ev));
       V["pf-ev-energy"] = fmtEnergy(num(live.ev_energy_kwh));
+      // Tesla vehicle detail (from MQTT; no API cost). "—" when a field hasn't published.
+      const _pct = (v) => (v != null && isFinite(Number(v))) ? Number(v).toFixed(0) + "%" : "—";
+      const _amps = (v) => (v != null && isFinite(Number(v))) ? Number(v).toFixed(0) + " A" : "—";
+      const _charging = live.veh_is_charging === true || String(live.veh_is_charging) === "True";
+      V["pf-ev-soc"] = _pct(live.veh_soc);
+      V["pf-ev-limit"] = _pct(live.veh_soc_limit);
+      V["pf-ev-amps"] = _amps(live.veh_amps);
+      V["pf-ev-eta"] = (_charging && live.veh_eta && live.veh_eta !== "N/A") ? String(live.veh_eta) : "—";
     }
     if (gasM3 != null) big("gas", gasM3.toFixed(2) + " m³");
 

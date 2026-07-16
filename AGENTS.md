@@ -27,7 +27,7 @@ NEVER remove a secret from .secrets - This is imperative. You may add new creden
 ---
 
 ## Testing and validation
-- Run `export DEV=1; pytest -q` before submitting changes. If making a targeted change, run the specific module tests as well as the full suite.
+- Run `export DEV=1; python -m pytest -s -q` before submitting changes. If making a targeted change, run the specific module tests as well as the full suite.
 - If touching shell scripts/systemd, prefer a dry run on a Raspberry Pi or document why that isn’t feasible.
 - When adding features, add tests in `tests/`.  The order in which the tests run will be enforced by a numbered naming structure to force 
 a certain order of how pytest iterates the files in the directory.
@@ -38,6 +38,7 @@ a certain order of how pytest iterates the files in the directory.
 ## Documentation
 - Keep `README.md` and all .env and config files synchronized with code. Add release notes for behavior-changing edits.
 - Document new configuration options inline when adding them and summarize them in `README.md`.
+- The dashboard can write only allow-listed `.env` settings, request replans, request the existing MQTT-supervised restart, and clear Victron scheduled-charge slots. Keep docs precise about which surfaces are observational and which are guarded controls.
 
 ---
 

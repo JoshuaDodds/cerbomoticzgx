@@ -67,10 +67,19 @@ body {
 .solar-prices b { color: var(--text); font-weight: 600; }
 .solar-prices .plt { color: var(--muted); font-size: 11px; }
 
-.tabs { display: flex; gap: 6px; padding: 10px 16px 0; max-width: 1100px; margin: 0 auto; border-bottom: 1px solid var(--line); }
+/* flex-wrap:nowrap + overflow-x:auto: with 9 tabs this row no longer reliably fits above
+   ~1100px (e.g. tablet widths), so it scrolls horizontally instead of silently clipping the
+   last tab(s) — scrollbar hidden (still scrollable via touch/trackpad/wheel) to match the
+   existing .status-strip pattern on mobile. */
+.tabs {
+  display: flex; flex-wrap: nowrap; gap: 6px; padding: 10px 16px 0; max-width: 1100px;
+  margin: 0 auto; border-bottom: 1px solid var(--line);
+  overflow-x: auto; scrollbar-width: none; -webkit-overflow-scrolling: touch;
+}
+.tabs::-webkit-scrollbar { display: none; }
 .tab {
   background: var(--panel-2); color: var(--muted); border: 1px solid var(--line);
-  border-bottom: none; cursor: pointer; padding: 9px 18px;
+  border-bottom: none; cursor: pointer; padding: 9px 18px; flex: 0 0 auto; white-space: nowrap;
   border-radius: 9px 9px 0 0; font-size: 14px; font-weight: 600; position: relative; top: 1px;
 }
 .tab:hover { color: var(--text); }
@@ -88,6 +97,20 @@ main { padding: 12px 16px 80px; max-width: 1100px; margin: 0 auto; }
 .tab-panel { display: none; }
 .tab-panel.active { display: block; }
 
+/* Weather charts mirrored into the Trends view — mobile only (shown in app.mobile.css). */
+.trends-weather-mobile { display: none; }
+
+/* Tesla API usage table (Vehicle tab). */
+.usage-table { display: flex; flex-direction: column; }
+/* label takes the slack; count + cost sit in tidy right-aligned columns with tabular figures
+   so the numbers line up cleanly instead of floating centred in a ragged gap. */
+.usage-row { display: grid; grid-template-columns: 1fr auto auto; align-items: baseline;
+  column-gap: 16px; padding: 9px 2px; border-bottom: 1px solid var(--line); }
+.usage-row span:first-child { font-weight: 600; }
+.usage-row span:nth-child(2) { text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+.usage-row span:nth-child(3) { text-align: right; font-variant-numeric: tabular-nums; }
+.usage-row.usage-total { border-bottom: none; font-weight: 700; padding-top: 12px; }
+
 /* Live power-flow diagram + horizon chart (modular views) */
 /* v2: fill the available width AND a tall, viewport-responsive height so the
    SVG cards use the whole panel (and adapt when embedded on other screens). The
@@ -95,6 +118,15 @@ main { padding: 12px 16px 80px; max-width: 1100px; margin: 0 auto; }
    in app.mobile.css. */
 .powerflow { width: 100%; height: clamp(440px, 58vh, 820px); }
 .powerflow svg { width: 100%; height: 100%; display: block; }
+/* iPad Mini / Air in landscape are wide enough to use the desktop card layout, but
+   their landscape height is short — 58vh lands on the 440px floor, so the taller
+   Battery/Solar cards (with their BMS/string detail rows) get squeezed and the text
+   overlaps. Raise the flow-height floor just for that short-landscape band. It
+   excludes phones (min-height), iPad Pro 12.9 + desktops (taller viewports), and
+   mobile portrait (its own layout). Desktop and mobile are untouched. */
+@media (min-width: 700px) and (min-height: 600px) and (max-height: 828px) and (orientation: landscape) {
+  .powerflow { height: clamp(600px, 82vh, 740px); }
+}
 .pf-legend { text-align: center; font-size: 12px; margin-top: 6px; }
 .pf-legend b { color: var(--text); font-weight: 600; }
 .chart { width: 100%; }
@@ -109,11 +141,28 @@ main { padding: 12px 16px 80px; max-width: 1100px; margin: 0 auto; }
 }
 .chart-tip b { display: block; font-weight: 600; }
 .chart-tip span { color: var(--muted); font-size: 11px; }
+.chart-tip.rich-tip {
+  min-width: 220px; max-width: min(380px, calc(100vw - 36px)); white-space: normal;
+  padding: 9px 12px; font-size: 15px; line-height: 1.42;
+}
+.chart-tip.rich-tip span { display: block; color: var(--muted); font-size: 14px; margin-top: 3px; }
+.chart-tip.rich-tip b { margin-bottom: 4px; font-size: 15px; }
+.chart-tip.weather-tip {
+  min-width: 240px;
+}
+.chart-legend .legend-toggle { cursor: pointer; user-select: none; }
+.chart-legend .legend-toggle.is-off { opacity: 0.42; text-decoration: line-through; }
 
 /* HA-style energy metric cards (Trends tab) */
 .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin-bottom: 14px; }
 .metric-card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; text-align: center; }
 .metric-card .metric-label { color: var(--muted); font-size: 13px; margin-top: 4px; }
+
+/* Vehicle tab cards — smaller footprint than the shared .metrics-grid/.metric default so more
+   fit per row; scoped to #tab-vehicle only (Trends/Overview keep the base sizing). Text size
+   is untouched (.metric .label/.value are unchanged) — only the card's own box shrinks. */
+#tab-vehicle .metrics-grid { grid-template-columns: repeat(auto-fit, minmax(128px, 1fr)); gap: 8px; }
+#tab-vehicle .metric { padding: 8px 10px; }
 .gridbar { display: flex; height: 16px; border-radius: 8px; overflow: hidden; background: var(--line); margin: 4px 0 8px; }
 .gridbar span { display: block; height: 100%; }
 .gridbar-legend { display: flex; gap: 14px; justify-content: center; font-size: 12px; flex-wrap: wrap; }
@@ -147,7 +196,7 @@ main { padding: 12px 16px 80px; max-width: 1100px; margin: 0 auto; }
 
 
 /* hour table — Hour | Timeline | Avg | Grid | Prod | Cons | SoC | Net */
-.table-head, .hour-row, .slot-row {
+.table-head, .hour-row, .slot-row, .running-ledger-row {
   display: grid;
   grid-template-columns: 116px 1fr 82px 74px 64px 64px 88px 100px;
   align-items: center; gap: 8px;
@@ -164,6 +213,20 @@ main { padding: 12px 16px 80px; max-width: 1100px; margin: 0 auto; }
 .hour-row:hover { background: var(--panel-2); }
 .hour-row.open { background: var(--panel-2); border-color: var(--line); }
 .hour-row.current, .slot-row.current { box-shadow: inset 3px 0 0 var(--accent); background: #11202e; }
+.running-ledger-row {
+  margin: 8px 0 6px;
+  padding: 7px 8px;
+  border-top: 1px solid var(--accent);
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  background: rgba(96, 165, 250, .06);
+  font-size: 12px;
+}
+.running-ledger-row .col-time { color: var(--text); font-weight: 700; }
+.forecasted-ledger-row {
+  border-top-style: dashed;
+  background: rgba(148, 163, 184, .05);
+}
 .now-tag { font-size: 10px; font-weight: 700; color: #06121f; background: var(--accent); border-radius: 999px; padding: 1px 6px; margin-left: 8px; }
 .hour-row .col-time { font-weight: 600; }
 .hour-row .col-time .caret { color: var(--muted); margin-right: 6px; display: inline-block; width: 10px; }
@@ -236,6 +299,29 @@ main { padding: 12px 16px 80px; max-width: 1100px; margin: 0 auto; }
 .cfg-edit .cancel { background: var(--line); color: var(--text); }
 .cfg-msg { font-size: 12px; margin-left: 8px; }
 .cfg-note { color: var(--muted); font-size: 12px; margin: 0 0 10px; }
+
+.vehicle-card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.vehicle-card-head h3 { flex: 1 1 auto; min-width: 0; }
+.vehicle-card-head .btn-secondary { flex: 0 0 auto; padding: 6px 12px; font-size: 13px; }
+
+/* Logs tab — scrollable, auto-scrolling terminal-style tail */
+.logs-card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.logs-card-head h3 { flex: 1 1 auto; min-width: 0; }
+.logs-search {
+  flex: 0 0 auto; width: 200px; max-width: 100%;
+  background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+  border-radius: 6px; padding: 6px 10px; font-size: 13px; font-family: ui-monospace, monospace;
+}
+.logs-search::placeholder { color: var(--muted); }
+.logs-output {
+  height: 65vh; min-height: 260px; overflow-y: auto;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px;
+  padding: 8px 10px; font-family: ui-monospace, monospace; font-size: 12px; line-height: 1.5;
+  white-space: pre-wrap; word-break: break-word;
+}
+.log-line { border-bottom: 1px solid var(--line); padding: 1px 0; }
+.log-line:last-child { border-bottom: none; }
+.log-hl { background: var(--accent); color: #06121f; border-radius: 2px; padding: 0 1px; }
 
 /* Victron tab — CerboGX-style schedule list */
 .vic-row { display: flex; align-items: center; padding: 15px 6px; border-bottom: 1px solid var(--line); }
@@ -320,4 +406,8 @@ main { padding: 12px 16px 80px; max-width: 1100px; margin: 0 auto; }
   gap: 12px; padding: 8px 16px; background: var(--panel); border-top: 1px solid var(--line);
 }
 .btn { margin-left: auto; background: var(--accent); color: #06121f; border: none; border-radius: 8px; padding: 7px 14px; font-weight: 600; cursor: pointer; }
+.foot .btn + .btn { margin-left: 0; }
+.btn-toggle { background: var(--panel-2); color: var(--text); border: 1px solid var(--line); }
+.btn-toggle.active { background: var(--retain); color: #06121f; border-color: var(--retain); }
+.btn-toggle[data-ai-override].active { background: #fca5a5; border-color: #fca5a5; color: #2b0b0b; }
 .banner { padding: 10px 12px; border-radius: 8px; background: #3a2a12; border: 1px solid #6b4e1f; color: #f5d99b; margin-bottom: 12px; }

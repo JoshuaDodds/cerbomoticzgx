@@ -1,5 +1,14 @@
 from frontend import server
 from frontend import advisor
+import sys
+import types
+
+
+def test_favicon_route_redirects_to_brand_icon():
+    response = server.app.test_client().get("/favicon.ico")
+
+    assert response.status_code == 302
+    assert response.headers["Location"].endswith("/static/img/logo.svg")
 
 
 def test_clear_import_schedule_route_calls_broker_helper(monkeypatch):
@@ -26,6 +35,227 @@ def test_clear_import_schedule_route_reports_helper_failure(monkeypatch):
     body = response.get_json()
     assert body["ok"] is False
     assert "mqtt publish failed" in body["error"]
+
+
+def test_restart_route_publishes_existing_shutdown_topic(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        server,
+        "_request_service_restart",
+        lambda: calls.append(("Cerbomoticzgx/system/shutdown", "True", True)),
+        raising=False,
+    )
+
+    response = server.app.test_client().post("/api/restart")
+
+    assert response.status_code == 200
+    assert response.get_json() == {"ok": True}
+    assert calls == [("Cerbomoticzgx/system/shutdown", "True", True)]
+
+
+def test_restart_helper_uses_existing_supervised_restart_mqtt_topic(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        server,
+        "publish_message",
+        lambda topic, message, retain: calls.append((topic, message, retain)),
+        raising=False,
+    )
+
+    server._request_service_restart()
+
+    assert calls == [("Cerbomoticzgx/system/shutdown", "True", True)]
+
+
+def test_restart_route_reports_publish_failure(monkeypatch):
+    def fail():
+        raise RuntimeError("mqtt publish failed")
+
+    monkeypatch.setattr(server, "_request_service_restart", fail, raising=False)
+
+    response = server.app.test_client().post("/api/restart")
+
+    assert response.status_code == 500
+    body = response.get_json()
+    assert body["ok"] is False
+    assert "mqtt publish failed" in body["error"]
+
+
+def test_replan_route_reports_optimizer_already_running(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "lib.energy_broker",
+        types.SimpleNamespace(run_ai_optimizer=lambda: False),
+    )
+
+    response = server.app.test_client().post("/api/replan")
+
+    assert response.status_code == 409
+    body = response.get_json()
+    assert body["ok"] is False
+    assert body["skipped"] is True
+
+
+def test_ai_override_route_sets_state_and_idles_once(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(server, "_set_ai_ess_override", lambda enabled: calls.append(("override", enabled)), raising=False)
+
+    response = server.app.test_client().post("/api/control/ai-override", json={"enabled": True})
+
+    assert response.status_code == 200
+    assert response.get_json() == {"ok": True, "enabled": True}
+    assert calls == [("override", True)]
+
+
+def test_grid_assist_route_reuses_existing_grid_charge_toggle(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(server, "_set_grid_assist_toggle", lambda enabled: calls.append(("grid", enabled)), raising=False)
+
+    response = server.app.test_client().post("/api/control/grid-assist", json={"enabled": True})
+
+    assert response.status_code == 200
+    assert response.get_json() == {"ok": True, "enabled": True}
+    assert calls == [("grid", True)]
+
+
+def test_refresh_vehicle_route_sets_one_shot_state_flag(monkeypatch):
+    import lib.global_state as global_state
+
+    calls = []
+
+    class FakeState:
+        def set(self, key, value):
+            calls.append((key, value))
+
+    monkeypatch.setattr(global_state, "GlobalStateClient", FakeState)
+
+    response = server.app.test_client().post("/api/control/refresh-vehicle")
+
+    assert response.status_code == 200
+    assert response.get_json() == {"ok": True}
+    assert calls == [("vehicle_refresh_requested", True)]
+
+
+def test_refresh_vehicle_route_reports_failure(monkeypatch):
+    import lib.global_state as global_state
+
+    class FailingState:
+        def set(self, key, value):
+            raise RuntimeError("db locked")
+
+    monkeypatch.setattr(global_state, "GlobalStateClient", FailingState)
+
+    response = server.app.test_client().post("/api/control/refresh-vehicle")
+
+    assert response.status_code == 500
+    body = response.get_json()
+    assert body["ok"] is False
+    assert "db locked" in body["error"]
+
+
+def test_grid_assist_helper_applies_full_load_immediately(monkeypatch):
+    import lib.global_state as global_state
+
+    calls = []
+
+    class FakeState:
+        def __init__(self):
+            self.values = {"ac_out_power": 4200}
+
+        def set(self, key, value):
+            calls.append(("state", key, value))
+            self.values[key] = value
+
+        def get(self, key):
+            return self.values.get(key)
+
+    monkeypatch.setattr(global_state, "GlobalStateClient", FakeState)
+    monkeypatch.setattr(server, "publish_message", lambda topic, message, retain: calls.append(("mqtt", topic, message, retain)))
+    monkeypatch.setitem(
+        sys.modules,
+        "lib.energy_broker",
+        types.SimpleNamespace(
+            _apply_grid_assist_setpoint=lambda load_watts=None, cover_all_load=False: calls.append(("apply", load_watts, cover_all_load))
+        ),
+    )
+
+    server._set_grid_assist_toggle(True)
+
+    assert ("state", "grid_charging_enabled", True) in calls
+    assert ("state", "ai_grid_assist", "on") in calls
+    assert ("mqtt", "Cerbomoticzgx/system/grid_charging_enabled", "True", True) in calls
+    assert ("apply", 4200, True) in calls
+
+
+def test_grid_assist_helper_logs_on_and_off(monkeypatch, caplog):
+    import lib.global_state as global_state
+
+    class FakeState:
+        def __init__(self):
+            self.values = {"ac_out_power": 4200}
+
+        def set(self, key, value):
+            self.values[key] = value
+
+        def get(self, key):
+            return self.values.get(key)
+
+    monkeypatch.setattr(global_state, "GlobalStateClient", FakeState)
+    monkeypatch.setattr(server, "publish_message", lambda *args, **kwargs: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "lib.energy_broker",
+        types.SimpleNamespace(_apply_grid_assist_setpoint=lambda **kwargs: None),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "lib.victron_integration",
+        types.SimpleNamespace(ac_power_setpoint=lambda **kwargs: None),
+    )
+
+    caplog.set_level("INFO")
+
+    server._set_grid_assist_toggle(True)
+    server._set_grid_assist_toggle(False)
+
+    assert "Grid assist enabled: matching grid setpoint to current AC load 4200W." in caplog.text
+    assert "Grid assist disabled: returned AC setpoint to 0W." in caplog.text
+
+
+def test_history_accuracy_route_returns_forecast_accuracy(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        server.data,
+        "forecast_accuracy",
+        lambda days=3: calls.append(days) or {"available": True, "slots": [], "summary": {"slots": 0}},
+    )
+
+    response = server.app.test_client().get("/api/history/accuracy?days=5")
+
+    assert response.status_code == 200
+    assert response.get_json()["available"] is True
+    assert calls == [5]
+
+
+def test_weather_route_returns_weather_dashboard_data(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        server.data,
+        "weather_dashboard",
+        lambda: calls.append("weather") or {"available": True, "days": [], "hours": []},
+    )
+
+    response = server.app.test_client().get("/api/weather")
+
+    assert response.status_code == 200
+    assert response.get_json()["available"] is True
+    assert calls == ["weather"]
 
 
 def test_advisor_latest_route_returns_saved_report(monkeypatch):
@@ -84,3 +314,18 @@ def test_advisor_delete_exchange_route_rejects_bad_index(monkeypatch):
     assert response.status_code == 400
     assert response.get_json()["ok"] is False
     assert "message index out of range" in response.get_json()["error"]
+
+
+def test_logs_route_returns_buffered_lines(monkeypatch):
+    import lib.log_buffer as log_buffer
+
+    class FakeHandler:
+        def snapshot(self):
+            return [(1, "line one"), (2, "line two")]
+
+    monkeypatch.setattr(log_buffer, "get_handler", lambda: FakeHandler())
+
+    response = server.app.test_client().get("/api/logs")
+
+    assert response.status_code == 200
+    assert response.get_json() == {"lines": ["line one", "line two"]}

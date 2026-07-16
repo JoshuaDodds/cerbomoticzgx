@@ -67,7 +67,22 @@ let lastCurrentHourKey = null;
 const MOBILE_MQ = window.matchMedia("(max-width: 680px)");
 const isMobileLayout = () => MOBILE_MQ.matches;
 
+// Logs tab state — declared here (not down near the Logs functions below) because
+// activateTab() calls disconnectLogsStream() on EVERY tab switch, including the very first
+// one fired by setAppView(appViewFromHash()) during initial script execution. A `let` further
+// down the file is hoisted but stays in the temporal dead zone until its declaration line
+// actually runs, so referencing it from a call this early threw "Cannot access before
+// initialization" on cold page load (activateTab -> disconnectLogsStream -> _logsES) — this
+// never showed up in dev testing because those runs opened the page with a `#ess` URL hash,
+// which skips the `view === "overview"` branch that calls activateTab("live") on load.
+let _logsES = null;
+let _logsLines = [];
+let _logsFilterTerm = "";
+let _logsFilterDebounce = null;
+
 const liveOn = () => !!(lastLive && lastLive.connected);
+const truthy = (v) => v === true || v === 1 || String(v || "").trim().toLowerCase() === "true" ||
+  String(v || "").trim() === "1" || String(v || "").trim().toLowerCase() === "on";
 // Prefer a live MQTT value when the feed is connected and the value is present.
 function pick(planVal, liveVal) {
   return (liveOn() && liveVal != null) ? liveVal : planVal;
@@ -90,6 +105,7 @@ function activateTab(tabName) {
   if (tab) tab.classList.add("active");
   panel.classList.add("active");
   syncMobileNavState();
+  if (tabName === "logs") connectLogsStream(); else disconnectLogsStream();
 }
 
 document.querySelectorAll(".tab").forEach((t) => {
@@ -260,6 +276,18 @@ function initMobileChrome() {
       return;
     }
 
+    if (e.target.closest("button[data-restart]")) {
+      jumpToMobileViewTop();
+      closeMobileMenu();
+      return;
+    }
+
+    if (e.target.closest("button[data-ai-override]") || e.target.closest("button[data-grid-assist]")) {
+      jumpToMobileViewTop();
+      closeMobileMenu();
+      return;
+    }
+
     if (e.target.closest("[data-mobile-home]")) {
       goHome(e);
     }
@@ -280,6 +308,28 @@ function todayNet(plan) {
   return t ? t.net : null;
 }
 
+function todayRunningNet(plan) {
+  const actual = liveTodayActuals();
+  if (actual) return Number(actual.import_cost || 0) - Number(actual.export_rev || 0);
+  const days = plan && plan.day_summary && plan.day_summary.days;
+  const today = days && days.find((d) => d.is_today);
+  if (today && today.actual) {
+    return Number(today.actual.import_cost || 0) - Number(today.actual.export_rev || 0);
+  }
+  return null;
+}
+
+function todayForecastedNet(plan) {
+  // Same figure as the header "Today" chip: full-day = settled-so-far + forward forecast.
+  // Apply live actuals first so the elapsed portion uses the realized MQTT day counters
+  // (closest to reality) instead of the plan JSON's lagging today_actuals snapshot —
+  // otherwise this row and the header disagree.
+  plan = planWithLiveActuals(plan);
+  const days = plan && plan.day_summary && plan.day_summary.days;
+  const today = days && days.find((d) => d.is_today);
+  return today ? today.net : null;
+}
+
 function liveTodayActuals() {
   if (!liveOn()) return null;
   const vals = {
@@ -295,7 +345,7 @@ function planWithLiveActuals(plan) {
   const actual = liveTodayActuals();
   if (!plan || !plan.available || !actual || !plan.day_summary) return plan;
 
-  const keys = ["import_kwh", "import_cost", "export_kwh", "export_rev", "idle_imp_cost", "idle_exp_rev"];
+  const keys = ["import_kwh", "import_cost", "export_kwh", "export_rev"];
   let changed = false;
   const days = (plan.day_summary.days || []).map((d) => {
     if (!d.is_today) return d;
@@ -316,7 +366,6 @@ function planWithLiveActuals(plan) {
       actual: cleanActual,
       combined,
       net: combined.import_cost - combined.export_rev,
-      projected_idle_net: combined.idle_exp_rev - combined.idle_imp_cost,
     };
   });
   if (!changed) return plan;
@@ -327,19 +376,33 @@ function planWithLiveActuals(plan) {
     keys.forEach((k) => { total[k] += Number(combined[k] || 0); });
   });
   total.net = total.import_cost - total.export_rev;
-  total.projected_idle_net = total.idle_exp_rev - total.idle_imp_cost;
 
   return { ...plan, day_summary: { ...plan.day_summary, days, total } };
 }
 
 function nextSell(plan) {
   if (!plan.hours) return null;
+  // plan.hours is the merged timeline (settled history + forward schedule), so we must
+  // skip settled/past slots — otherwise an old iteration's predicted SELL (priced at its
+  // buy price and frozen in history) shows as the "next" sell and never updates.
+  const now = Date.now();
   for (const h of plan.hours) {
     for (const s of h.slots) {
-      if (caOf(s) === "SELL" && !s.is_current) return s;
+      if (caOf(s) !== "SELL" || s.settled || s.is_current) continue;
+      const t = Date.parse(s.time);
+      if (isFinite(t) && t < now) continue;   // already elapsed
+      return s;
     }
   }
   return null;
+}
+
+// 24-hour HH:MM. ISO strings take the fast path; anything else goes through Date with
+// hour12:false so it never renders AM/PM regardless of the browser locale.
+function hm24(t) {
+  if (typeof t === "string" && t.length >= 16 && t[10] === "T") return t.slice(11, 16);
+  const d = new Date(t);
+  return isNaN(d) ? String(t || "") : d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
 }
 
 // Current control action: prefer the live feed when connected, else the plan.
@@ -355,6 +418,21 @@ function updateMobileKeyStat(cact, soc, message) {
   }
   const socText = soc != null ? `${Number(soc).toFixed(1)}%` : "SoC --";
   stat.innerHTML = `${chipFor(cact || "IDLE")}<span>${socText}</span>`;
+}
+
+function setToggleButtons(selector, active, baseLabel) {
+  document.querySelectorAll(selector).forEach((btn) => {
+    btn.classList.toggle("active", active);
+    btn.setAttribute("aria-pressed", active ? "true" : "false");
+    btn.textContent = active ? `${baseLabel} on` : baseLabel;
+  });
+}
+
+function updateControlButtons() {
+  const overrideOn = truthy(lastLive && lastLive.ai_ess_override_enabled);
+  const gridAssistOn = truthy(lastLive && lastLive.grid_charging_enabled);
+  setToggleButtons("[data-ai-override]", overrideOn, "Override");
+  setToggleButtons("[data-grid-assist]", gridAssistOn, "Grid assist");
 }
 
 // ---- Render: overview (status, metrics, solar, decision) ----
@@ -375,11 +453,11 @@ function renderStatus(plan) {
   const price = c.price;
   const kv = (b, s, cls) => {
     const d = el("div", ["kv", cls].filter(Boolean).join(" "));
-    d.innerHTML = `<b>${b}</b><small>${s}</small>`;
+    d.innerHTML = `<b>${b}</b>` + (s ? `<small>${s}</small>` : "");
     return d;
   };
   updateMobileKeyStat(currentCA(c), soc);
-  strip.appendChild(kv(chipFor(currentCA(c)), "action", "status-action"));
+  strip.appendChild(kv(chipFor(currentCA(c)), "", "status-action"));   // action chip is self-explanatory — no label
   strip.appendChild(kv((soc != null ? Number(soc).toFixed(1) : "—") + "%", "battery SoC"));
   strip.appendChild(kv("€" + Number(price || 0).toFixed(3), "price /kWh", "status-price"));
   // Today + Month header chips: signed €, green (+) profit / red (−) loss, no word.
@@ -417,15 +495,25 @@ function renderMetrics(plan) {
   box.appendChild(card("Price now", "€" + Number(price || 0).toFixed(3) + "<small> /kWh</small>"));
   if (tNet != null) box.appendChild(card("Today net", netHtml(tNet)));
   box.appendChild(card("Tomorrow", tomorrow ? netHtml(tomorrow.net) : "<span class='muted'>Pending</span>"));
-  if (ns) box.appendChild(card("Next SELL", ns.time.slice(11, 16) + " <small>€" + Number(ns.price).toFixed(3) + "</small>"));
+  if (ns) box.appendChild(card("Next SELL", hm24(ns.time) + " <small>€" + Number(ns.price).toFixed(3) + "</small>"));
 }
 
 function renderSolar(plan) {
   const box = $("#solar");
   if (!plan.available) { box.innerHTML = `<div class="label">Solar forecast</div><div class="big">—</div>`; return; }
-  // "Remaining today" can go negative when actual production already exceeded
-  // the day's forecast — clamp to 0 (forecast met).
-  const today = plan.pv_remaining_wh != null ? Math.max(0, plan.pv_remaining_wh / 1000).toFixed(1) : "—";
+  // Show the optimizer-adjusted remaining PV as the main value, while preserving
+  // the original VRM forecast as explicit source context underneath.
+  const adjustedWh = plan.pv_adjusted_remaining_wh;
+  const rawWh = plan.pv_remaining_raw_wh != null ? plan.pv_remaining_raw_wh : plan.pv_remaining_wh;
+  const mainWh = adjustedWh != null ? adjustedWh : rawWh;
+  const today = mainWh != null ? Math.max(0, mainWh / 1000).toFixed(1) : "—";
+  const rawToday = rawWh != null ? Math.max(0, rawWh / 1000).toFixed(1) : "—";
+  const rawSource = plan.pv_remaining_raw_source || "VRM forecast";
+  const adjSource = plan.pv_adjusted_remaining_source || "optimizer forecast";
+  const adjustment = plan.pv_adjustment_kwh != null ? Number(plan.pv_adjustment_kwh) : null;
+  const adjustmentText = adjustment != null && Math.abs(adjustment) >= 0.05
+    ? ` &nbsp;·&nbsp; ${adjSource} ${adjustment >= 0 ? "+" : "−"}${Math.abs(adjustment).toFixed(1)} kWh`
+    : "";
   const totalToday = plan.pv_today_total_kwh != null ? Number(plan.pv_today_total_kwh).toFixed(1) : null;
   const tom = plan.pv_tomorrow_wh != null ? (plan.pv_tomorrow_wh / 1000).toFixed(1) : "—";
   const pvnow = (liveOn() && lastLive.pv_w != null) ? fmtPower(lastLive.pv_w) : null;
@@ -445,8 +533,9 @@ function renderSolar(plan) {
     + priceRow("Tomorrow", L.price_tom_low, L.price_tom_low_at, L.price_tom_high, L.price_tom_high_at);
 
   box.innerHTML = `<div class="label">Solar forecast</div>
-    <div class="big">${today}<small style="font-size:13px;color:var(--muted)"> kWh${totalToday ? ` (of ${totalToday})` : ""} remaining.</small></div>
-    <div class="sub">${tom} kWh forecast tomorrow${pvnow ? ` &nbsp;·&nbsp; producing ${pvnow} now` : ""}</div>
+    <div class="big">${today}<small style="font-size:13px;color:var(--muted)"> kWh adjusted remaining.</small></div>
+    <div class="sub">${rawSource}: ${rawToday} kWh remaining${totalToday ? ` (${totalToday} kWh day)` : ""}${adjustmentText}</div>
+    <div class="sub">VRM forecast tomorrow: ${tom} kWh${pvnow ? ` &nbsp;·&nbsp; producing ${pvnow} now` : ""}</div>
     ${pricesHtml ? `<div class="solar-prices">${pricesHtml}</div>` : ""}`;
 }
 
@@ -639,28 +728,64 @@ function hourRowInner(h) {
   );
 }
 
+function makeRunningLedgerRow(plan) {
+  const net = todayRunningNet(plan);
+  const row = el("div", "running-ledger-row");
+  row.innerHTML =
+    `<span class="col-time">Today so far</span>` +
+    `<span class="col-bar">midnight → now</span>` +
+    `<span class="col-num muted">—</span>` +
+    `<span class="col-num muted">—</span>` +
+    `<span class="col-num muted">—</span>` +
+    `<span class="col-num muted">—</span>` +
+    `<span class="col-num muted">—</span>` +
+    `<span class="col-num">${net == null ? "—" : netHtml(net)}</span>`;
+  return row;
+}
+
+function makeForecastedLedgerRow(plan) {
+  const net = todayForecastedNet(plan);
+  const row = el("div", "running-ledger-row forecasted-ledger-row");
+  row.innerHTML =
+    `<span class="col-time">Forecasted</span>` +
+    `<span class="col-bar">full day total</span>` +
+    `<span class="col-num muted">—</span>` +
+    `<span class="col-num muted">—</span>` +
+    `<span class="col-num muted">—</span>` +
+    `<span class="col-num muted">—</span>` +
+    `<span class="col-num muted">—</span>` +
+    `<span class="col-num">${net == null ? "—" : netHtml(net)}</span>`;
+  return row;
+}
+
 function makeSlotRow(s) {
   const sr = el("div", "slot-row" + (s.is_current ? " current" : ""));
   const g = Number(s.grid_energy);
   const sell = Number(s.sell != null ? s.sell : s.price);
   const imp = g > 0 ? g : 0;
   const exp = g < 0 ? -g : 0;
-  const idle = isIdle(s);          // IDLE flow is projected, not committed
   const settled = !!s.settled;
+  const socEnd = Number(s.soc_end);
+  // IDLE PV-surplus into a non-full battery charges it (SoC up / cost basis down)
+  // rather than exporting, so it books no grid revenue — mirrors _forward_grid_econ
+  // on the server. Real feed-in (battery full) and SELL discharges still count.
+  const idleStore = !settled && isIdle(s) && g < 0
+    && !(Number.isFinite(socEnd) && socEnd >= 99);
+  const projExp = idleStore ? 0 : exp;
   const slotNet = settled
     ? Number(s.actual_cost || 0) - Number(s.actual_reward || 0)
-    : imp * Number(s.price) - exp * sell;
-  const muted = (v) => `<span class='muted'>${v}</span>`;
+    : imp * Number(s.price) - projExp * sell;
   const gridStr = fmtGrid(g);
+  const gridCell = idleStore ? `<span class='muted'>${gridStr}</span>` : gridStr;
   sr.innerHTML =
     `<span><span class="slot-dot" style="background:var(--${slotColorVar(s)})"></span>${s.time.slice(11, 16)}</span>` +
     `<span>${caOf(s)}</span>` +
     `<span class="col-num">€${Number(s.price || 0).toFixed(3)}</span>` +
-    `<span class="col-num">${idle && !settled ? muted(gridStr) : gridStr}</span>` +
+    `<span class="col-num">${gridCell}</span>` +
     `<span class="col-num">${prodCell(s.pv)}</span>` +
     `<span class="col-num">${consCell(s.load)}</span>` +
     `<span class="col-num">${socPair(s.soc_start, s.soc_end)}</span>` +
-    `<span class="col-num">${idle && !settled ? muted("projected") : netHtml(slotNet)}</span>`;
+    `<span class="col-num">${netHtml(slotNet)}</span>`;
   const detail = slotDetail(s);
   detail.style.display = "none";
   sr.addEventListener("click", (e) => {
@@ -675,14 +800,28 @@ function renderHours(plan) {
   box.innerHTML = "";
   if (!plan.available) return;
   let currentRow = null;
-  const currentHour = (plan.hours || []).find((h) => h.is_current);
+  const hours = plan.hours || [];
+  const hourDayKey = (h) => {
+    const start = h && h.hour_start ? String(h.hour_start).slice(0, 10) : "";
+    if (start) return start;
+    const key = h && h.key ? String(h.key) : "";
+    return /^\d{4}-\d{2}-\d{2}/.test(key) ? key.slice(0, 10) : "";
+  };
+  const currentHour = hours.find((h) => h.is_current);
   const currentKey = currentHour && currentHour.key;
+  const currentDayKey = plan.current && plan.current.time
+    ? String(plan.current.time).slice(0, 10)
+    : hourDayKey(currentHour);
+  const firstDayKey = hourDayKey(hours[0]);
+  const todayKey = currentDayKey || firstDayKey;
+  const todayHours = hours.filter((h) => hourDayKey(h) === todayKey);
+  const lastTodayHourKey = todayHours.length ? todayHours[todayHours.length - 1].key : null;
   if ((firstRender || currentKey !== lastCurrentHourKey) && currentKey) {
     if (lastCurrentHourKey) expandedHours.delete(lastCurrentHourKey);
     expandedHours.add(currentKey);
     lastCurrentHourKey = currentKey;
   }
-  plan.hours.forEach((h) => {
+  hours.forEach((h) => {
     const row = el("div", "hour-row" + (h.is_current ? " current" : ""));
     if (h.is_current) currentRow = row;
     decorateHourRowForMobile(row, h);
@@ -715,8 +854,12 @@ function renderHours(plan) {
       row.querySelector(".caret").textContent = "▾";
     }
 
+    if (h.is_current) box.appendChild(makeRunningLedgerRow(plan));
     box.appendChild(row);
     box.appendChild(slotsWrap);
+    if (h.key === lastTodayHourKey) {
+      box.appendChild(makeForecastedLedgerRow(plan));
+    }
   });
 
   // On first load, jump to the current slot.
@@ -839,7 +982,10 @@ function startEdit(item, s) {
   } else {
     input = el("input");
     input.type = (s.type === "int" || s.type === "float") ? "number" : "text";
+    if (s.min !== undefined) input.min = s.min;
+    if (s.max !== undefined) input.max = s.max;
     if (s.type === "float") input.step = "0.01";
+    if (s.type === "int") input.step = "1";
     input.value = s.value;
     input.style.width = "110px";
   }
@@ -852,8 +998,6 @@ function startEdit(item, s) {
 
   cancel.addEventListener("click", () => loadConfig());
   save.addEventListener("click", async () => {
-    // Deliberate confirm step before changing a setting on a live 16kW system.
-    if (!confirm(`Set ${s.key} = ${input.value}?\nThis applies on the next optimization cycle.`)) return;
     const ok = await saveSetting(s.key, input.value, msg);
     if (ok) setTimeout(loadConfig, 700);
   });
@@ -981,11 +1125,48 @@ async function refreshPlan() {
   }
 }
 
+// Vehicle tab — a read-only mirror of the Tesla/vehicle0/* MQTT topics (no API cost).
+function renderVehicle() {
+  const box = document.getElementById("vehicle");
+  if (!box) return;
+  const L = lastLive || {};
+  const has = (v) => v !== null && v !== undefined && v !== "" && v !== "None";
+  const bool = (v) => v === true || String(v) === "True";
+  const pct = (v) => has(v) ? Number(v).toFixed(0) + "%" : null;
+  const amps = (v) => has(v) ? Number(v).toFixed(0) + " A" : null;
+  const yesno = (v) => has(v) ? (bool(v) ? "Yes" : "No") : null;
+
+  const cards = [];
+  const card = (label, val) => { if (has(val)) cards.push(`<div class="metric"><div class="label">${label}</div><div class="value">${val}</div></div>`); };
+
+  card("Car SoC", pct(L.veh_soc));
+  card("Charge limit", pct(L.veh_soc_limit));
+  card("Status", L.veh_charging_status);
+  card("Plugged in", L.veh_plugged_status);
+  card("Charge current", amps(L.veh_amps));
+  card("PV surplus", amps(L.veh_surplus_amps));
+  card("ETA to limit", (bool(L.veh_is_charging) && has(L.veh_eta) && L.veh_eta !== "N/A") ? L.veh_eta : null);
+  // is_home stays unpublished in telemetry mode until the car streams its first Location
+  // (audit M4) — show "Unknown" rather than silently hiding the row once we otherwise have
+  // vehicle data, so a no-op manual Start press is explained instead of looking broken.
+  card("At home", has(L.veh_is_home) ? yesno(L.veh_is_home) : (has(L.veh_soc) ? "Unknown" : null));
+  card("Supercharging", yesno(L.veh_is_supercharging));
+  card("Updated", L.veh_last_update);
+
+  box.innerHTML = cards.length
+    ? `<div class="metrics-grid">${cards.join("")}</div>`
+    : `<span class="muted">waiting for vehicle status…</span>`;
+  const title = document.querySelector("#tab-vehicle h3");
+  if (title && has(L.veh_name)) title.textContent = L.veh_name;
+}
+
 function applyLive(data) {
   lastLive = data;
   renderOverview();             // overlay live values onto the plan
   if (lastPlan) renderDaySummary(lastPlan);
+  updateControlButtons();
   safeRenderPowerFlow();
+  renderVehicle();
   if (lastPlan) renderMeta(lastPlan);
 }
 
@@ -1053,10 +1234,63 @@ async function replan(e) {
 }
 document.querySelectorAll("[data-replan]").forEach((btn) => btn.addEventListener("click", replan));
 
+async function restartService(e) {
+  const btn = e && e.currentTarget ? e.currentTarget : $("#restart");
+  const buttons = Array.from(document.querySelectorAll("[data-restart]"));
+  buttons.forEach((x) => { x.disabled = true; });
+  if (btn) btn.textContent = "Restarting...";
+  try {
+    const r = await fetch("/api/restart", { method: "POST" }).then((x) => x.json());
+    if (!r.ok) throw new Error(r.error || "restart failed");
+    buttons.forEach((x) => { x.textContent = "Restart requested"; });
+  } catch (e) {
+    buttons.forEach((x) => { x.title = "Restart failed - is the service running?"; });
+  } finally {
+    setTimeout(() => {
+      buttons.forEach((x) => {
+        x.disabled = false;
+        x.textContent = "Restart";
+      });
+    }, 3000);
+  }
+}
+document.querySelectorAll("[data-restart]").forEach((btn) => btn.addEventListener("click", restartService));
+
+async function toggleControl(selector, endpoint, currentValue, baseLabel) {
+  const buttons = Array.from(document.querySelectorAll(selector));
+  const desired = !truthy(currentValue);
+  buttons.forEach((x) => { x.disabled = true; });
+  try {
+    const r = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: desired }),
+    }).then((x) => x.json());
+    if (!r.ok) throw new Error(r.error || "control failed");
+    if (!lastLive) lastLive = {};
+    if (selector === "[data-ai-override]") lastLive.ai_ess_override_enabled = desired;
+    if (selector === "[data-grid-assist]") lastLive.grid_charging_enabled = desired;
+    updateControlButtons();
+  } catch (e) {
+    buttons.forEach((x) => { x.title = `${baseLabel} failed - is the service running?`; });
+  } finally {
+    buttons.forEach((x) => { x.disabled = false; });
+  }
+}
+
+function toggleAiOverride() {
+  return toggleControl("[data-ai-override]", "/api/control/ai-override", lastLive && lastLive.ai_ess_override_enabled, "Override");
+}
+document.querySelectorAll("[data-ai-override]").forEach((btn) => btn.addEventListener("click", toggleAiOverride));
+
+function toggleGridAssist() {
+  return toggleControl("[data-grid-assist]", "/api/control/grid-assist", lastLive && lastLive.grid_charging_enabled, "Grid assist");
+}
+document.querySelectorAll("[data-grid-assist]").forEach((btn) => btn.addEventListener("click", toggleGridAssist));
+
 async function clearImportSchedule() {
   const btn = $("#clear-import-schedule");
   if (!btn || btn.disabled) return;
-  if (!confirm("Clear Import Schedule?\nThis disables all five Victron scheduled-charge slots.")) return;
 
   const label = btn.textContent;
   btn.disabled = true;
@@ -1553,10 +1787,206 @@ async function refreshMonthly() {
   } catch (e) { /* leave the placeholder */ }
 }
 
+async function refreshForecastAccuracy() {
+  try {
+    const r = await fetch("/api/history/accuracy").then((x) => x.json());
+    if (window.renderForecastAccuracyChart) renderForecastAccuracyChart("forecast-accuracy-chart", r);
+  } catch (e) { /* leave the placeholder */ }
+}
+
+// Tesla API usage table on the Vehicle tab (today's Fleet API spend vs the credit).
+async function refreshVehicleUsage() {
+  const box = document.getElementById("vehicle-usage");
+  if (!box) return;
+  try {
+    const u = await fetch("/api/tesla/usage").then((x) => x.json());
+    const cats = u.categories || {};
+    const cur = { EUR: "€", USD: "$" }[u.currency] || "";
+    const money = (v) => cur + Number(v || 0).toFixed(2);
+    const row = (label, key) => cats[key]
+      ? `<div class="usage-row"><span>${label}</span><span>${cats[key].count}</span><span>${money(cats[key].cost)}</span></div>`
+      : "";
+    // Streaming Signals are pushed by the car (outside the request budget); shown approximately.
+    const s = u.streaming;
+    const streamRow = s
+      ? `<div class="usage-row"><span>Streaming signals <span class="muted" style="font-weight:400">≈</span></span><span>${s.count}</span><span>${money(s.cost)}</span></div>`
+      : "";
+    box.innerHTML =
+      `<div class="usage-table">` +
+      row("Commands", "command") +
+      row("Data", "data") +
+      row("Wakes", "wake") +
+      streamRow +
+      `<div class="usage-row usage-total"><span>Total this month</span><span></span>` +
+      `<span>${money(u.total)} <span class="muted" style="font-weight:400">of ${money(u.monthly_credit)}</span></span></div>` +
+      `</div>`;
+  } catch (e) { /* leave the placeholder */ }
+}
+
+// ---- Logs tab: live tail via SSE, connected lazily while the tab is open ----
+// (_logsES/_logsLines/_logsFilterTerm/_logsFilterDebounce are declared near the top of this
+// file, not here — see the comment there for why.)
+const LOGS_MAX_RENDERED = 2000;
+
+function _escapeHtml(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+// Finds matches against the RAW line (case-insensitive) and escapes each resulting segment
+// independently, THEN wraps matched segments in a highlight span. Escaping only whole,
+// un-split segments of the original text — never a match found by re-scanning already-escaped
+// output — means an entity like "&amp;" can never get a <mark> boundary spliced into the
+// middle of it (a term like "amp" would otherwise match inside "&amp;"'s own escaped form and
+// corrupt the entity, even though nothing here is exploitable as XSS: the <mark> wrapper is a
+// fixed literal and its content is always pre-escaped).
+function _highlightMatches(line, term) {
+  if (!term) return _escapeHtml(line);
+  const lower = line.toLowerCase();
+  const termLower = term.toLowerCase();
+  if (!termLower) return _escapeHtml(line);
+  let out = "";
+  let i = 0;
+  while (i < line.length) {
+    const idx = lower.indexOf(termLower, i);
+    if (idx === -1) {
+      out += _escapeHtml(line.slice(i));
+      break;
+    }
+    out += _escapeHtml(line.slice(i, idx));
+    out += `<mark class="log-hl">${_escapeHtml(line.slice(idx, idx + term.length))}</mark>`;
+    i = idx + term.length;
+  }
+  return out;
+}
+
+function _pushLogLines(lines, replace) {
+  if (replace) _logsLines = [];
+  if (lines && lines.length) _logsLines = _logsLines.concat(lines);
+  if (_logsLines.length > LOGS_MAX_RENDERED) {
+    _logsLines = _logsLines.slice(_logsLines.length - LOGS_MAX_RENDERED);
+  }
+}
+
+function _renderLogsView() {
+  const el = $("#logs-output");
+  if (!el) return;
+  const wasNearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+  const term = _logsFilterTerm.trim();
+  const filtered = term
+    ? _logsLines.filter((line) => line.toLowerCase().includes(term.toLowerCase()))
+    : _logsLines;
+  if (!filtered.length) {
+    el.innerHTML = `<span class="muted">${term ? "no matching lines" : "waiting for logs…"}</span>`;
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  filtered.forEach((line) => {
+    const d = document.createElement("div");
+    d.className = "log-line";
+    d.innerHTML = _highlightMatches(line, term);
+    frag.appendChild(d);
+  });
+  el.innerHTML = "";
+  el.appendChild(frag);
+  if (wasNearBottom) el.scrollTop = el.scrollHeight;
+}
+
+function connectLogsStream() {
+  if (_logsES || !window.EventSource) return;
+  const el = $("#logs-output");
+  if (el) el.innerHTML = '<span class="muted">waiting for logs…</span>';
+  try {
+    _logsES = new EventSource("/api/logs/stream");
+  } catch (e) {
+    if (el) el.innerHTML = '<span class="muted">could not open the log stream.</span>';
+    return;
+  }
+  _logsES.onmessage = (e) => {
+    let ev;
+    try { ev = JSON.parse(e.data); } catch (_) { return; }
+    if (!ev.lines) return;
+    // "snapshot" replaces the buffer (sent on every new connection, including the server's
+    // periodic self-recycle — see LOGS_STREAM_MAX_SECONDS server-side); "append" adds
+    // incrementally. Without this distinction a reconnect would duplicate the whole buffer.
+    _pushLogLines(ev.lines, ev.type === "snapshot");
+    _renderLogsView();
+  };
+}
+
+function disconnectLogsStream() {
+  if (_logsES) { _logsES.close(); _logsES = null; }
+}
+
+const logsSearchInput = document.getElementById("logs-search");
+if (logsSearchInput) {
+  logsSearchInput.addEventListener("input", () => {
+    const value = logsSearchInput.value;
+    clearTimeout(_logsFilterDebounce);
+    // Short debounce so re-filtering 2000 lines on every keystroke of a fast typer doesn't
+    // visibly lag; still reads as instant/live filtering to the user.
+    _logsFilterDebounce = setTimeout(() => {
+      _logsFilterTerm = value;
+      _renderLogsView();
+    }, 120);
+  });
+}
+
+async function refreshWeather() {
+  try {
+    const r = await fetch("/api/weather").then((x) => x.json());
+    if (window.renderWeatherChart) renderWeatherChart("weather-chart", r);
+    if (window.renderWeatherImpactChart) renderWeatherImpactChart("weather-impact-chart", r);
+    // Mobile-only duplicates in the Trends view (Weather tab isn't in the mobile nav).
+    // The containers only exist / show on mobile; render defensively when present.
+    if (document.getElementById("weather-chart-m") && window.renderWeatherChart) {
+      renderWeatherChart("weather-chart-m", r);
+    }
+    if (document.getElementById("weather-impact-chart-m") && window.renderWeatherImpactChart) {
+      renderWeatherImpactChart("weather-impact-chart-m", r);
+    }
+  } catch (e) { /* leave the placeholder */ }
+}
+
+// EV manual Start/Stop charge: sets the dedicated ev_charge_requested intent (independent of
+// grid assist); the controller then starts/stops the car with its safety checks.
+document.querySelectorAll("[data-ev-charge]").forEach((btn) => {
+  btn.addEventListener("click", async () => {
+    const enabled = btn.getAttribute("data-ev-charge") === "start";
+    btn.disabled = true;
+    try {
+      await fetch("/api/control/ev-charge", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled }),
+      });
+    } catch (e) { /* ignore; controller acts on its next tick */ }
+    setTimeout(() => { btn.disabled = false; }, 1500);
+  });
+});
+
+// Manual "Refresh data" (Vehicle tab): one-shot flag that wakes the car on the controller's
+// next tick (up to ~30s), then normal live updates pick up the fresh state — no separate
+// polling needed here.
+document.querySelectorAll("[data-vehicle-refresh]").forEach((btn) => {
+  btn.addEventListener("click", async () => {
+    const original = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = "Refreshing…";
+    try {
+      await fetch("/api/control/refresh-vehicle", { method: "POST" });
+    } catch (e) { /* ignore; controller picks it up on its next tick regardless */ }
+    setTimeout(() => { btn.disabled = false; btn.textContent = original; }, 4000);
+  });
+});
+
 initMobileChrome();
 load();
 loadAdvisorLatest();
+refreshForecastAccuracy();
+refreshWeather();
 refreshMonthly();
+refreshVehicleUsage();
 renderHeaderClock();
 startLiveStream();              // instant live updates via SSE
 // Plan refreshes slowly (changes only when the optimizer runs). Live values now
@@ -1564,4 +1994,7 @@ startLiveStream();              // instant live updates via SSE
 setInterval(refreshPlan, 30000);
 setInterval(pollLive, 20000);
 setInterval(renderHeaderClock, 1000);
+setInterval(refreshForecastAccuracy, 120000);
+setInterval(refreshWeather, 1800000);
 setInterval(refreshMonthly, 120000);   // month chart changes slowly
+setInterval(refreshVehicleUsage, 60000);   // Tesla API usage tally
