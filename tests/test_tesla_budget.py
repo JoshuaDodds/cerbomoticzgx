@@ -169,3 +169,96 @@ def test_caps_from_settings_defaults_and_overrides():
     got = tb.caps_from_settings({"TESLA_BUDGET_MAX_DATA_PER_DAY": "25"}.get)
     assert got["data"] == 25
     assert got["wake"] == tb.DEFAULT_DAILY_CAPS["wake"]     # unset falls back
+
+
+# --- Streaming Signals: durable (survives restarts), never gated ----------
+
+def test_bump_signal_count_accumulates_and_persists(tmp_path):
+    path = str(tmp_path / "budget.json")
+    assert tb.bump_signal_count(20, path) == 20
+    assert tb.bump_signal_count(5, path) == 25
+    # "Restart" = a fresh read of the same file -- nothing kept in memory to lose.
+    assert tb.usage_snapshot(path)["streaming"]["count"] == 25
+
+
+def test_seed_signal_count_sets_absolute_value(tmp_path):
+    path = str(tmp_path / "budget.json")
+    tb.bump_signal_count(20, path)
+    tb.seed_signal_count(1334, path)                       # reconcile against the Tesla portal
+    assert tb.usage_snapshot(path)["streaming"]["count"] == 1334
+    tb.bump_signal_count(6, path)                           # guard keeps counting from baseline
+    assert tb.usage_snapshot(path)["streaming"]["count"] == 1340
+
+
+def test_signal_count_never_affects_gated_total_or_remaining(tmp_path):
+    path = str(tmp_path / "budget.json")
+    tb.seed_month_usage({"command": 10, "data": 10, "wake": 1}, path)
+    before = tb.usage_snapshot(path)
+    tb.seed_signal_count(50000, path)                       # a lot of signals, still ~free
+    after = tb.usage_snapshot(path)
+    assert after["total"] == before["total"]
+    assert after["remaining"] == before["remaining"]
+    assert after["streaming"]["count"] == 50000
+    assert after["streaming"]["cost"] == round(50000 * tb.STREAMING_SIGNAL_COST_USD, 4)
+
+
+def test_seeding_one_category_does_not_wipe_the_others(tmp_path):
+    # Regression: seed_month_usage used to REPLACE the whole month_counts dict, so seeding just
+    # one category -- or seeding signals via the separate seed_signal_count call -- would
+    # silently wipe out whatever else was already recorded there.
+    path = str(tmp_path / "budget.json")
+    tb.seed_month_usage({"command": 13, "data": 30, "wake": 2}, path)
+    tb.seed_signal_count(1334, path)
+
+    tb.seed_month_usage({"wake": 5}, path)                  # only reconcile wake this time
+
+    snap = tb.usage_snapshot(path)
+    assert snap["categories"]["wake"]["count"] == 5         # updated
+    assert snap["categories"]["command"]["count"] == 13     # untouched
+    assert snap["categories"]["data"]["count"] == 30        # untouched
+    assert snap["streaming"]["count"] == 1334               # untouched by either seed call
+
+
+def test_signal_count_rolls_over_at_month_boundary(tmp_path):
+    import json as _json
+    path = str(tmp_path / "budget.json")
+    d = {"month": "2026-06", "date": "2026-06-30", "counts": {}, "month_counts": {"signals": 999}}
+    with open(path, "w") as f:
+        _json.dump(d, f)
+    # bump_signal_count/seed_signal_count use the real UTC clock (no injectable clock, unlike
+    # TeslaBudget) -- so this only proves the roll logic fires when the stored month differs
+    # from "now"; it can't pin an exact expected month without being a tautology of today's date.
+    new_total = tb.bump_signal_count(10, path)
+    assert new_total == 10                                  # rolled, not 1009
+
+
+def test_concurrent_spend_and_signal_bump_do_not_lose_updates(tmp_path):
+    # Regression: TeslaBudget.spend()/refund() and the module-level seed_month_usage()/
+    # bump_signal_count()/seed_signal_count() read-modify-write the SAME file. In production,
+    # the telemetry bridge's own MQTT thread calls bump_signal_count() every ~20 messages while
+    # the EV controller's timer thread concurrently calls spend() through the shared budget
+    # singleton -- without a lock shared between both call paths, one thread's read-modify-write
+    # can silently revert the other's update (the write itself is atomic, so this is a lost
+    # update, not file corruption).
+    import threading
+
+    path = str(tmp_path / "budget.json")
+    budget = tb.TeslaBudget(caps={"command": 0, "data": 10000, "wake": 0}, state_path=path)
+    n_spends, n_bumps = 200, 200
+
+    def spend_worker():
+        for _ in range(n_spends):
+            assert budget.spend("data") is True
+
+    def bump_worker():
+        for _ in range(n_bumps):
+            tb.bump_signal_count(1, path)
+
+    t1 = threading.Thread(target=spend_worker)
+    t2 = threading.Thread(target=bump_worker)
+    t1.start(); t2.start()
+    t1.join(); t2.join()
+
+    snap = tb.usage_snapshot(path)
+    assert snap["categories"]["data"]["count"] == n_spends
+    assert snap["streaming"]["count"] == n_bumps
