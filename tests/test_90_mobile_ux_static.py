@@ -253,8 +253,14 @@ def test_external_frames_hide_scrollbars_in_desktop_and_mobile():
     assert "--frame-scrollbar-mask: 48px" in css
     assert "width: calc(100% + var(--frame-scrollbar-mask))" in css
     assert "margin-right: calc(-1 * var(--frame-scrollbar-mask))" in css
-    assert "scrollbar-width: none" not in css
-    assert "-ms-overflow-style: none" not in css
+    # The external Battery/Live iframes specifically must use the mask technique above, not
+    # scrollbar-width/-ms-overflow-style (those only affect same-origin content and can't reach
+    # into a cross-origin iframe's own scrollbar). Scoped to the frame rule itself — other,
+    # same-origin elements (e.g. the tabs bar) may legitimately use scrollbar-width elsewhere.
+    frame_rule_start = css.index(".battery-frame, .live-frame")
+    frame_rule = css[frame_rule_start:css.index("}", frame_rule_start)]
+    assert "scrollbar-width: none" not in frame_rule
+    assert "-ms-overflow-style: none" not in frame_rule
     assert ".battery-frame::-webkit-scrollbar" not in css
     assert "--frame-scrollbar-mask: 48px" in mobile_css
     assert "width: calc(var(--mobile-frame-fit) + var(--frame-scrollbar-mask))" in mobile_css

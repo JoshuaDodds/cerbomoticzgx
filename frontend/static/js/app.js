@@ -67,6 +67,19 @@ let lastCurrentHourKey = null;
 const MOBILE_MQ = window.matchMedia("(max-width: 680px)");
 const isMobileLayout = () => MOBILE_MQ.matches;
 
+// Logs tab state — declared here (not down near the Logs functions below) because
+// activateTab() calls disconnectLogsStream() on EVERY tab switch, including the very first
+// one fired by setAppView(appViewFromHash()) during initial script execution. A `let` further
+// down the file is hoisted but stays in the temporal dead zone until its declaration line
+// actually runs, so referencing it from a call this early threw "Cannot access before
+// initialization" on cold page load (activateTab -> disconnectLogsStream -> _logsES) — this
+// never showed up in dev testing because those runs opened the page with a `#ess` URL hash,
+// which skips the `view === "overview"` branch that calls activateTab("live") on load.
+let _logsES = null;
+let _logsLines = [];
+let _logsFilterTerm = "";
+let _logsFilterDebounce = null;
+
 const liveOn = () => !!(lastLive && lastLive.connected);
 const truthy = (v) => v === true || v === 1 || String(v || "").trim().toLowerCase() === "true" ||
   String(v || "").trim() === "1" || String(v || "").trim().toLowerCase() === "on";
@@ -92,6 +105,7 @@ function activateTab(tabName) {
   if (tab) tab.classList.add("active");
   panel.classList.add("active");
   syncMobileNavState();
+  if (tabName === "logs") connectLogsStream(); else disconnectLogsStream();
 }
 
 document.querySelectorAll(".tab").forEach((t) => {
@@ -1809,6 +1823,115 @@ async function refreshVehicleUsage() {
   } catch (e) { /* leave the placeholder */ }
 }
 
+// ---- Logs tab: live tail via SSE, connected lazily while the tab is open ----
+// (_logsES/_logsLines/_logsFilterTerm/_logsFilterDebounce are declared near the top of this
+// file, not here — see the comment there for why.)
+const LOGS_MAX_RENDERED = 2000;
+
+function _escapeHtml(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+// Finds matches against the RAW line (case-insensitive) and escapes each resulting segment
+// independently, THEN wraps matched segments in a highlight span. Escaping only whole,
+// un-split segments of the original text — never a match found by re-scanning already-escaped
+// output — means an entity like "&amp;" can never get a <mark> boundary spliced into the
+// middle of it (a term like "amp" would otherwise match inside "&amp;"'s own escaped form and
+// corrupt the entity, even though nothing here is exploitable as XSS: the <mark> wrapper is a
+// fixed literal and its content is always pre-escaped).
+function _highlightMatches(line, term) {
+  if (!term) return _escapeHtml(line);
+  const lower = line.toLowerCase();
+  const termLower = term.toLowerCase();
+  if (!termLower) return _escapeHtml(line);
+  let out = "";
+  let i = 0;
+  while (i < line.length) {
+    const idx = lower.indexOf(termLower, i);
+    if (idx === -1) {
+      out += _escapeHtml(line.slice(i));
+      break;
+    }
+    out += _escapeHtml(line.slice(i, idx));
+    out += `<mark class="log-hl">${_escapeHtml(line.slice(idx, idx + term.length))}</mark>`;
+    i = idx + term.length;
+  }
+  return out;
+}
+
+function _pushLogLines(lines, replace) {
+  if (replace) _logsLines = [];
+  if (lines && lines.length) _logsLines = _logsLines.concat(lines);
+  if (_logsLines.length > LOGS_MAX_RENDERED) {
+    _logsLines = _logsLines.slice(_logsLines.length - LOGS_MAX_RENDERED);
+  }
+}
+
+function _renderLogsView() {
+  const el = $("#logs-output");
+  if (!el) return;
+  const wasNearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+  const term = _logsFilterTerm.trim();
+  const filtered = term
+    ? _logsLines.filter((line) => line.toLowerCase().includes(term.toLowerCase()))
+    : _logsLines;
+  if (!filtered.length) {
+    el.innerHTML = `<span class="muted">${term ? "no matching lines" : "waiting for logs…"}</span>`;
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  filtered.forEach((line) => {
+    const d = document.createElement("div");
+    d.className = "log-line";
+    d.innerHTML = _highlightMatches(line, term);
+    frag.appendChild(d);
+  });
+  el.innerHTML = "";
+  el.appendChild(frag);
+  if (wasNearBottom) el.scrollTop = el.scrollHeight;
+}
+
+function connectLogsStream() {
+  if (_logsES || !window.EventSource) return;
+  const el = $("#logs-output");
+  if (el) el.innerHTML = '<span class="muted">waiting for logs…</span>';
+  try {
+    _logsES = new EventSource("/api/logs/stream");
+  } catch (e) {
+    if (el) el.innerHTML = '<span class="muted">could not open the log stream.</span>';
+    return;
+  }
+  _logsES.onmessage = (e) => {
+    let ev;
+    try { ev = JSON.parse(e.data); } catch (_) { return; }
+    if (!ev.lines) return;
+    // "snapshot" replaces the buffer (sent on every new connection, including the server's
+    // periodic self-recycle — see LOGS_STREAM_MAX_SECONDS server-side); "append" adds
+    // incrementally. Without this distinction a reconnect would duplicate the whole buffer.
+    _pushLogLines(ev.lines, ev.type === "snapshot");
+    _renderLogsView();
+  };
+}
+
+function disconnectLogsStream() {
+  if (_logsES) { _logsES.close(); _logsES = null; }
+}
+
+const logsSearchInput = document.getElementById("logs-search");
+if (logsSearchInput) {
+  logsSearchInput.addEventListener("input", () => {
+    const value = logsSearchInput.value;
+    clearTimeout(_logsFilterDebounce);
+    // Short debounce so re-filtering 2000 lines on every keystroke of a fast typer doesn't
+    // visibly lag; still reads as instant/live filtering to the user.
+    _logsFilterDebounce = setTimeout(() => {
+      _logsFilterTerm = value;
+      _renderLogsView();
+    }, 120);
+  });
+}
+
 async function refreshWeather() {
   try {
     const r = await fetch("/api/weather").then((x) => x.json());
@@ -1839,6 +1962,21 @@ document.querySelectorAll("[data-ev-charge]").forEach((btn) => {
       });
     } catch (e) { /* ignore; controller acts on its next tick */ }
     setTimeout(() => { btn.disabled = false; }, 1500);
+  });
+});
+
+// Manual "Refresh data" (Vehicle tab): one-shot flag that wakes the car on the controller's
+// next tick (up to ~30s), then normal live updates pick up the fresh state — no separate
+// polling needed here.
+document.querySelectorAll("[data-vehicle-refresh]").forEach((btn) => {
+  btn.addEventListener("click", async () => {
+    const original = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = "Refreshing…";
+    try {
+      await fetch("/api/control/refresh-vehicle", { method: "POST" });
+    } catch (e) { /* ignore; controller picks it up on its next tick regardless */ }
+    setTimeout(() => { btn.disabled = false; btn.textContent = original; }, 4000);
   });
 });
 

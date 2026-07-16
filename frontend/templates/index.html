@@ -46,6 +46,7 @@
       <button class="tab" data-tab="vehicle">Vehicle</button>
       <button class="tab" data-tab="advisor">Advisor</button>
       <button class="tab" data-tab="config">Configuration</button>
+      <button class="tab" data-tab="logs">Logs</button>
     </nav>
 
     <main>
@@ -131,10 +132,17 @@
 
       <section id="tab-vehicle" class="tab-panel">
         <div class="card">
-          <h3 style="margin:2px 0 10px">Vehicle</h3>
+          <div class="vehicle-card-head">
+            <h3 style="margin:2px 0 10px">Vehicle</h3>
+            <button id="vehicle-refresh" type="button" class="btn-secondary" data-vehicle-refresh
+                    title="Force an on-demand status check now (wakes the car and costs API budget in REST polling mode; free in Fleet Telemetry mode)">Refresh data</button>
+          </div>
           <div id="vehicle"><span class="muted">waiting for vehicle status…</span></div>
           <p class="cfg-note">Live status mirrored from the MQTT bus — read-only, no Tesla API cost.
-            The controller only contacts the car when it needs to act (see the Tesla cost controls).</p>
+            The controller only contacts the car when it needs to act (see the Tesla cost controls).
+            <strong>Refresh data</strong> forces an on-demand status check now — in REST polling
+            mode this wakes the car (billable, budget-capped); in Fleet Telemetry mode it just
+            re-reads the already-streamed state (free).</p>
         </div>
         <div class="card">
           <h3 style="margin:2px 0 10px">Charge control</h3>
@@ -179,6 +187,20 @@
 
       <section id="tab-config" class="tab-panel">
         <div id="config"></div>
+      </section>
+
+      <section id="tab-logs" class="tab-panel">
+        <div class="card logs-card">
+          <div class="logs-card-head">
+            <h3 style="margin:2px 0 10px">Logs</h3>
+            <input id="logs-search" type="search" class="logs-search" placeholder="Filter…"
+                   autocomplete="off" spellcheck="false" aria-label="Filter log lines" />
+          </div>
+          <p class="cfg-note">Live tail of this service's own log output (capped buffer, most
+            recent lines). Streams while this tab is open. Filter is case-insensitive and
+            matches update live as new lines arrive.</p>
+          <div id="logs-output" class="logs-output"><span class="muted">waiting for logs…</span></div>
+        </div>
       </section>
     </main>
 
@@ -240,6 +262,7 @@
         <button type="button" data-mobile-tab="victron">Victron Schedule</button>
         <button type="button" data-mobile-tab="vehicle">Vehicle</button>
         <button type="button" data-mobile-tab="config">Configuration</button>
+        <button type="button" data-mobile-tab="logs">Logs</button>
         <button id="mobile-replan" type="button" data-replan>Replan</button>
         <button id="mobile-restart" type="button" data-restart>Restart</button>
         <button id="mobile-override" type="button" data-ai-override>Override</button>

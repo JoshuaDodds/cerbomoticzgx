@@ -48,6 +48,11 @@ def _num(value, default=0.0):
 # that button exists it stays unset, so only PV-surplus charging can engage the car.
 EV_CHARGE_INTENT_KEY = "ev_charge_requested"
 
+# One-shot "Refresh Data" button (Vehicle tab). Setting this to True wakes the car and forces
+# an immediate status refresh outside the normal engagement gating, then main() clears it back
+# to False so it fires exactly once per press rather than on every subsequent tick.
+REFRESH_REQUEST_KEY = "vehicle_refresh_requested"
+
 
 PROPERTY_MAPPING = {
     "charging_watts": "tesla_power",
@@ -149,6 +154,14 @@ class EvCharger:
           * the car is already drawing power locally (measured charger amps) — we may need
             to adjust the rate or stop.
         This is the primary cost-avoidance layer; the tesla_budget guard is the backstop.
+
+        Deliberately does NOT re-check the manual "Refresh Data" flag (REFRESH_REQUEST_KEY)
+        here — main() reads and clears that flag exactly once per tick and ORs the captured
+        value into its own dormancy check. A second independent read here would race that
+        read-then-clear (a fresh request landing between the two reads would see this method
+        return True on a since-cleared flag, while main()'s stale local copy still read False
+        and skipped both the wake and the clear — delaying, not losing, the request by one
+        tick, but needlessly). Single source of truth avoids that.
         """
         if self._intent_on():                 # dedicated EV-charge intent (decoupled from grid-assist)
             return True
@@ -175,9 +188,16 @@ class EvCharger:
             self._intent_off_edge = self._intent_was_on and not intent  # ...or OFF
             self._intent_was_on = intent
 
+            # Manual "Refresh Data" button — one-shot, so consume (clear) it now regardless of
+            # what happens later this tick; a stuck True would otherwise force a wake every tick.
+            refresh_requested = self._refresh_requested()
+            if refresh_requested:
+                self.global_state.set(REFRESH_REQUEST_KEY, False)
+
             # Engage if something wants a charge OR the user just switched intent off (so we can
-            # stop the car). Otherwise stay dormant and make zero Tesla API calls.
-            if not (self._local_engagement_signal() or self._intent_off_edge):
+            # stop the car) OR a refresh was requested. Otherwise stay dormant and make zero
+            # Tesla API calls.
+            if not (self._local_engagement_signal() or self._intent_off_edge or refresh_requested):
                 self._log_status("dormant", self._dormant_reason())
                 self._reschedule(30.0)
                 return
@@ -186,14 +206,20 @@ class EvCharger:
 
             # Decide whether this tick may WAKE the car (the expensive call). Justified by:
             #  * a fresh intent toggle (on OR off) -> check/act now; or
+            #  * a manual refresh request -> check now; or
             #  * ongoing intent / enough PV surplus -> a rate-limited discovery wake.
             # All wakes remain hard-capped by the tesla_budget guard.
             surplus = self._surplus_available()
             force = wake = False
-            if intent_on_edge or self._intent_off_edge:
+            if intent_on_edge or self._intent_off_edge or refresh_requested:
                 force = wake = True
                 if intent_on_edge:
                     logging.info("EvCharger: EV-charge request toggled on — checking vehicle now.")
+                elif refresh_requested:
+                    # Same telemetry-mode distinction as the discovery-wake log below (L1): in
+                    # telemetry mode update_vehicle_status() never actually wakes the car.
+                    what = "refreshing telemetry state" if self._telemetry_on() else "waking vehicle to refresh status"
+                    logging.info(f"EvCharger: manual refresh requested — {what}.")
             elif (intent or surplus) and self._should_discovery_wake():
                 force = wake = True
                 self._last_discovery_wake_ts = time.time()
@@ -253,6 +279,12 @@ class EvCharger:
         intent permanently on). Until a dedicated EV-charge button sets this key it stays off,
         so only PV-surplus charging can engage the car."""
         return is_truthy(self.global_state.get(EV_CHARGE_INTENT_KEY), False)
+
+    def _refresh_requested(self) -> bool:
+        """Manual 'Refresh Data' button (Vehicle tab). One-shot: main() clears this back to
+        False after consuming it, so it forces exactly one wake+refresh per press rather than
+        re-triggering on every subsequent tick."""
+        return is_truthy(self.global_state.get(REFRESH_REQUEST_KEY), False)
 
     def _surplus_available(self) -> bool:
         """Exportable PV surplus exists (sun up, house battery at/above target, >= min amps)."""

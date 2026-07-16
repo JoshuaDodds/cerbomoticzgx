@@ -7,12 +7,18 @@ import os
 import json
 import logging
 import threading
+import time
 
 from flask import Flask, jsonify, render_template, request, Response, redirect, url_for
 
 from frontend import data
 from frontend.live import live
 from lib.helpers import publish_message
+from lib.log_buffer import install as _install_log_buffer
+
+# Attach the Logs tab's ring-buffer handler as early as possible (module import time) so it
+# captures startup log lines too, not just what's logged after the first /api/logs request.
+_install_log_buffer()
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 # Don't let browsers cache the dashboard's JS/CSS — it's edited often and served
@@ -279,6 +285,22 @@ def api_control_ev_charge():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.route("/api/control/refresh-vehicle", methods=["POST"])
+def api_control_refresh_vehicle():
+    """Manual 'Refresh Data' button (Vehicle tab). Sets a one-shot flag the EV controller
+    consumes on its next tick, forcing an immediate wake + status refresh outside the normal
+    engagement gating — a direct API call from here would race the controller's own state
+    machine, so we drive it through the same intent-flag pattern as Start/Stop."""
+    try:
+        from lib.global_state import GlobalStateClient
+        GlobalStateClient().set("vehicle_refresh_requested", True)
+        logging.info("Manual vehicle data refresh requested.")
+        return jsonify({"ok": True})
+    except Exception as e:
+        logging.warning("Vehicle refresh request failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/api/advisor", methods=["POST"])
 def api_advisor():
     """Run the read-only AI advisor — a default daily review, or answer an open
@@ -348,6 +370,55 @@ def api_advisor_delete_exchange():
     except OSError as e:
         logging.warning("Advisor exchange delete failed: %s", e)
         return jsonify({"ok": False, "error": f"delete failed: {e}"}), 500
+
+
+@app.route("/api/logs")
+def api_logs():
+    """Recent buffered log lines (oldest first). Captures this process's own log output —
+    when the dashboard runs in-process (FRONTEND_ENABLED=True) that's the whole service;
+    standalone, it's just the dashboard's own (sparse) log activity."""
+    from lib.log_buffer import get_handler
+    items = get_handler().snapshot()
+    return jsonify({"lines": [line for _, line in items]})
+
+
+LOGS_STREAM_MAX_SECONDS = 600  # bound a single SSE connection's lifetime (see gen() below)
+
+
+@app.route("/api/logs/stream")
+def api_logs_stream():
+    """Server-Sent Events: push new log lines as they're emitted.
+
+    Runs on the Flask dev server (thread-per-connection, no reverse proxy in front of it here),
+    which only notices a dropped client on its next write — a client that vanishes without a
+    clean close (phone loses signal mid-tab) can pin a thread for a long time. Rather than
+    tracking liveness directly, cap the connection's own lifetime: EventSource auto-reconnects
+    by default (we never call .close() client-side), so ending the generator periodically just
+    recycles the underlying connection/thread instead of holding either open indefinitely.
+    """
+    from lib.log_buffer import get_handler
+    handler = get_handler()
+
+    def gen():
+        started = time.time()
+        items = handler.snapshot()
+        last_seq = items[-1][0] if items else 0
+        # "snapshot" (full buffer, replaces whatever the client has rendered) vs "append"
+        # (incremental) — every new connection, including the auto-reconnect once
+        # LOGS_STREAM_MAX_SECONDS elapses, starts with a snapshot; the client must not treat
+        # a reconnect's snapshot as more lines to append or the visible log duplicates.
+        yield f"data: {json.dumps({'type': 'snapshot', 'lines': [line for _, line in items]})}\n\n"
+        while time.time() - started < LOGS_STREAM_MAX_SECONDS:
+            new_items = handler.wait_for_more(last_seq, timeout=15)
+            if new_items:
+                last_seq = new_items[-1][0]
+                yield f"data: {json.dumps({'type': 'append', 'lines': [line for _, line in new_items]})}\n\n"
+            else:
+                yield ": keepalive\n\n"
+
+    return Response(gen(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                             "Connection": "keep-alive"})
 
 
 @app.route("/healthz")

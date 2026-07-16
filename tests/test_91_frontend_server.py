@@ -122,6 +122,41 @@ def test_grid_assist_route_reuses_existing_grid_charge_toggle(monkeypatch):
     assert calls == [("grid", True)]
 
 
+def test_refresh_vehicle_route_sets_one_shot_state_flag(monkeypatch):
+    import lib.global_state as global_state
+
+    calls = []
+
+    class FakeState:
+        def set(self, key, value):
+            calls.append((key, value))
+
+    monkeypatch.setattr(global_state, "GlobalStateClient", FakeState)
+
+    response = server.app.test_client().post("/api/control/refresh-vehicle")
+
+    assert response.status_code == 200
+    assert response.get_json() == {"ok": True}
+    assert calls == [("vehicle_refresh_requested", True)]
+
+
+def test_refresh_vehicle_route_reports_failure(monkeypatch):
+    import lib.global_state as global_state
+
+    class FailingState:
+        def set(self, key, value):
+            raise RuntimeError("db locked")
+
+    monkeypatch.setattr(global_state, "GlobalStateClient", FailingState)
+
+    response = server.app.test_client().post("/api/control/refresh-vehicle")
+
+    assert response.status_code == 500
+    body = response.get_json()
+    assert body["ok"] is False
+    assert "db locked" in body["error"]
+
+
 def test_grid_assist_helper_applies_full_load_immediately(monkeypatch):
     import lib.global_state as global_state
 
@@ -279,3 +314,18 @@ def test_advisor_delete_exchange_route_rejects_bad_index(monkeypatch):
     assert response.status_code == 400
     assert response.get_json()["ok"] is False
     assert "message index out of range" in response.get_json()["error"]
+
+
+def test_logs_route_returns_buffered_lines(monkeypatch):
+    import lib.log_buffer as log_buffer
+
+    class FakeHandler:
+        def snapshot(self):
+            return [(1, "line one"), (2, "line two")]
+
+    monkeypatch.setattr(log_buffer, "get_handler", lambda: FakeHandler())
+
+    response = server.app.test_client().get("/api/logs")
+
+    assert response.status_code == 200
+    assert response.get_json() == {"lines": ["line one", "line two"]}
