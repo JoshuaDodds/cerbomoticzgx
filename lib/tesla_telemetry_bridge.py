@@ -14,7 +14,7 @@ import threading
 
 from lib.constants import logging
 
-_STREAM_FLUSH_EVERY = 20              # batch stream-signal counter writes to GlobalState
+_STREAM_FLUSH_EVERY = 20              # batch stream-signal counter writes to the durable file
 # fleet-telemetry emits non-"V" record types too (connectivity/alerts/errors); those are not
 # billed as vehicle-data SIGNALS, so exclude them from the streaming-signal estimate.
 _NON_SIGNAL_FIELDS = {"connectivity", "alerts", "errors", "status", "V", "v"}
@@ -202,25 +202,21 @@ class TeslaTelemetryBridge:
 
     def _count_stream_signal(self):
         """Approximate Tesla's 'Streaming Signals' billing by counting received telemetry
-        messages (~one signal each). Batched to GlobalState every _STREAM_FLUSH_EVERY messages
-        to avoid write churn; resets at the UTC month boundary. Display-only — streaming isn't
-        something we gate, so it never touches the tesla_budget guard."""
+        messages (~one signal each). Batched to the durable tesla_budget state file every
+        _STREAM_FLUSH_EVERY messages to avoid write churn; rolls at the UTC month boundary.
+        Display-only — streaming isn't something we gate, so it never touches the tesla_budget
+        spend guard's caps, only its persisted month_counts. Durable (same file as
+        command/data/wake) rather than GlobalState, which lives in a SQLite file on tmpfs that
+        main.py explicitly recreates on every process start, so a signal count kept there was
+        silently lost on every restart."""
         self._sig_seen += 1
         if (self._sig_seen - self._sig_flushed) < _STREAM_FLUSH_EVERY:
             return
         try:
-            from datetime import datetime, timezone
-            from lib.global_state import GlobalStateClient
-            state = GlobalStateClient()
-            month = datetime.now(timezone.utc).strftime("%Y-%m")
-            base = 0
-            if state.get("tesla_stream_month") == month:
-                try:
-                    base = int(state.get("tesla_stream_signals") or 0)
-                except (TypeError, ValueError):
-                    base = 0
-            state.set("tesla_stream_month", month)
-            state.set("tesla_stream_signals", base + (self._sig_seen - self._sig_flushed))
+            from lib.config_retrieval import retrieve_setting
+            from lib.tesla_budget import bump_signal_count, DEFAULT_STATE_PATH
+            path = retrieve_setting("TESLA_BUDGET_STATE_PATH") or DEFAULT_STATE_PATH
+            bump_signal_count(self._sig_seen - self._sig_flushed, path)
             self._sig_flushed = self._sig_seen
         except Exception as e:                 # pragma: no cover - counter must never break the loop
             logging.debug("tesla_telemetry_bridge: stream-signal flush failed: %s", e)

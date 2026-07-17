@@ -96,25 +96,23 @@ def test_on_message_counts_only_real_signals(monkeypatch):
     assert counted["n"] == 1                              # real vehicle-data signal counted
 
 
-def test_stream_signal_counter_batches_to_state(monkeypatch):
-    writes = {}
+def test_stream_signal_counter_batches_to_durable_file(tmp_path, monkeypatch):
+    # Durable (tesla_budget state file), not GlobalState (SQLite on tmpfs, wiped every restart
+    # by main.py's GlobalStateDatabase.__init__) -- a pod restart must not lose this count.
+    from lib import tesla_budget as budget_mod
 
-    class FakeState:
-        def get(self, k):
-            return writes.get(k)
-
-        def set(self, k, v):
-            writes[k] = v
-
-    import lib.global_state as gs
-    monkeypatch.setattr(gs, "GlobalStateClient", lambda *a, **k: FakeState())
+    path = str(tmp_path / "budget.json")
+    monkeypatch.setattr("lib.config_retrieval.retrieve_setting", lambda k: path)
 
     b = tb.TeslaTelemetryBridge("broker")
     for _ in range(tb._STREAM_FLUSH_EVERY - 1):
         b._count_stream_signal()
-    assert "tesla_stream_signals" not in writes          # below threshold -> no write yet
-    b._count_stream_signal()                              # hits threshold -> flush
-    assert writes["tesla_stream_signals"] == tb._STREAM_FLUSH_EVERY
+    assert budget_mod.usage_snapshot(path)["streaming"]["count"] == 0   # below threshold -> no write yet
+    b._count_stream_signal()                                            # hits threshold -> flush
+    assert budget_mod.usage_snapshot(path)["streaming"]["count"] == tb._STREAM_FLUSH_EVERY
+
+    # Surviving a "restart" just means re-reading the same file -- nothing in-memory to lose.
+    assert budget_mod.usage_snapshot(path)["streaming"]["count"] == tb._STREAM_FLUSH_EVERY
 
 
 def test_unknown_field_is_ignored():

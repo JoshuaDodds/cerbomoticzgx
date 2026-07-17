@@ -380,3 +380,21 @@ def test_day_totals_ignores_trailing_null_counter(tmp_path):
 
     assert t["import_cost"] == 3.00
     assert t["export_reward"] == 4.00
+
+
+def test_tesla_usage_includes_durable_streaming_signals(monkeypatch, tmp_path):
+    # tesla_usage() now just delegates to tesla_budget.usage_snapshot(), which durably persists
+    # Streaming Signals in the same file as command/data/wake -- no more ephemeral GlobalState
+    # fallback that lost the count on every restart.
+    from lib import tesla_budget as tb
+
+    path = str(tmp_path / "budget.json")
+    monkeypatch.setattr(data, "_env", lambda: {"TESLA_BUDGET_STATE_PATH": path})
+    tb.seed_month_usage({"command": 5, "data": 2, "wake": 1}, path)
+    tb.seed_signal_count(1334, path)
+
+    usage = data.tesla_usage()
+
+    assert usage["categories"]["command"]["count"] == 5
+    assert usage["streaming"]["count"] == 1334
+    assert usage["streaming"]["cost"] == round(1334 * tb.STREAMING_SIGNAL_COST_USD, 4)
