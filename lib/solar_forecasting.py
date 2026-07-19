@@ -162,17 +162,20 @@ def get_victron_solar_forecast():
     if data:
         try:
             # VRM solar forecast data
-            solar_production = actual_solar_generation() * 1000
+            solar_generation_kwh = actual_solar_generation(now=now_tz)
+            solar_production = solar_generation_kwh * 1000
             # Clamp remaining to >= 0: once actual production exceeds the day's
             # forecast, "remaining" would otherwise go negative (meaningless).
             solar_production_left = max(0.0, round(float(data['solar_yield_forecast'][0][1]), 2) - solar_production)
             solar_forecast_kwh = round(solar_production_left + solar_production, 2)
 
             logging.debug(
-                f"Daily pv forecast: Actual:{actual_solar_generation()} Forecasted:{solar_forecast_kwh} kWh ToGo: {solar_production_left}")
+                f"Daily pv forecast: Actual:{solar_generation_kwh} Forecasted:{solar_forecast_kwh} kWh ToGo: {solar_production_left}")
 
             STATE.set('pv_projected_today', solar_forecast_kwh)
             STATE.set('pv_projected_remaining', solar_production_left)
+            STATE.set('pv_projected_today_date', now_tz.date().isoformat())
+            STATE.set('pv_forecast_updated_at', now_tz.isoformat())
 
             # Tomorrow's forecast daily solar total (Wh) for day-2 planning. The
             # 2-day window returns index [1] for tomorrow; guarded so a missing
@@ -180,9 +183,14 @@ def get_victron_solar_forecast():
             try:
                 pv_tomorrow_wh = round(float(data['solar_yield_forecast'][1][1]), 2)
                 STATE.set('pv_projected_tomorrow', pv_tomorrow_wh)
+                STATE.set(
+                    'pv_projected_tomorrow_date',
+                    (now_tz.date() + timedelta(days=1)).isoformat(),
+                )
                 logging.debug(f"Tomorrow pv forecast: {pv_tomorrow_wh} Wh")
             except (ValueError, TypeError, IndexError, KeyError):
                 STATE.set('pv_projected_tomorrow', 0.0)
+                STATE.set('pv_projected_tomorrow_date', '')
 
             # VRM consumption forecast data
             try:
@@ -209,13 +217,44 @@ def get_victron_solar_forecast():
         return None
 
 
-def actual_solar_generation():
-    c1 = STATE.get('c1_daily_yield')
-    c2 = STATE.get('c2_daily_yield')
+def actual_solar_generation(now=None):
+    """Return today's effective MPPT yield in kWh.
 
-    actual_generation = round(c1 + c2, 2)
+    Victron's daily-yield counters can retain yesterday's total for several
+    hours after midnight. Any positive yield before today's sunrise is therefore
+    stale by definition and must not be subtracted from today's VRM forecast.
+    The raw/effective values and quality are retained for diagnostics.
+    """
+    now_tz = now or datetime.now(TIMEZONE)
 
-    return actual_generation
+    def _nonnegative_float(value):
+        try:
+            return max(0.0, float(value or 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    raw_generation = round(
+        _nonnegative_float(STATE.get('c1_daily_yield'))
+        + _nonnegative_float(STATE.get('c2_daily_yield')),
+        2,
+    )
+
+    sunrise_minutes = 5 * 60
+    try:
+        sunrise_text = str(STATE.get('sun_rise') or '')
+        hour_text, minute_text = sunrise_text.split(':', 1)
+        sunrise_minutes = int(hour_text) * 60 + int(minute_text[:2])
+    except (TypeError, ValueError):
+        pass
+
+    before_sunrise = now_tz.hour * 60 + now_tz.minute < sunrise_minutes
+    stale = before_sunrise and raw_generation > 0.0
+    effective_generation = 0.0 if stale else raw_generation
+
+    STATE.set('pv_actual_raw_kwh', raw_generation)
+    STATE.set('pv_actual_effective_kwh', effective_generation)
+    STATE.set('pv_actual_quality', 'stale_previous_day' if stale else 'measured')
+    return effective_generation
 
 
 def main():

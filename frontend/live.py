@@ -93,6 +93,12 @@ class MqttLive:
             # from the Victron evcharger service (instance 42; matches lib/constants.py).
             "ev_energy_kwh": f"N/{sid}/evcharger/42/Ac/Energy/Forward",
             "ev_charge_time": f"N/{sid}/evcharger/42/ChargingTime",
+            # ABB meter phase currents. The power-flow EV card intentionally sums
+            # these three physical measurements to match the Tesla total-current
+            # convention; it must not multiply the car's retained ChargeAmps value.
+            "ev_l1_a": f"N/{sid}/evcharger/42/Ac/L1/Current",
+            "ev_l2_a": f"N/{sid}/evcharger/42/Ac/L2/Current",
+            "ev_l3_a": f"N/{sid}/evcharger/42/Ac/L3/Current",
             # Tesla vehicle status (published by tesla_api / ev_charge_controller as
             # {"value": ...}). Read-only in the UI — no Fleet API cost. Absent topics
             # simply leave the field None and the Vehicle tab hides that row.
@@ -243,6 +249,9 @@ class MqttLive:
         out["ev_w"] = _num("ev_w")
         out["ev_energy_kwh"] = _num("ev_energy_kwh")  # lifetime forward energy (kWh)
         out["ev_charge_time"] = _num("ev_charge_time")  # present session time (s)
+        out["ev_l1_a"] = _num("ev_l1_a")
+        out["ev_l2_a"] = _num("ev_l2_a")
+        out["ev_l3_a"] = _num("ev_l3_a")
         # Tesla vehicle status (read-only mirror of the MQTT bus; no Fleet API cost).
         out["veh_soc"] = _num("veh_soc")
         out["veh_soc_limit"] = _num("veh_soc_limit")

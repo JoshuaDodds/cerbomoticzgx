@@ -455,6 +455,71 @@ class TestAIPoweredESS(unittest.TestCase):
         self.assertFalse(any(s['action'] == 'sell' for s in result['schedule']),
                          "must not actively discharge below the cost-basis floor")
 
+    def test_cost_basis_protects_initial_energy_without_blocking_future_arbitrage(self):
+        # Regression from 2026-07-18: a nearly empty pack acquired a high basis
+        # from a small €0.31/kWh low-SoC charge. Applying that basis to *all future*
+        # energy suppressed a clearly profitable €0.13 -> €0.32 cycle until PV
+        # diluted the persisted basis hours later. Protect the initial 3% tranche,
+        # but allow newly purchased energy above it to charge and discharge.
+        base_time = datetime.now(tz.UTC).replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        prices = [
+            {'start': base_time + timedelta(hours=i),
+             'total': 0.13 if i < 6 else 0.32, 'level': 'NORMAL'}
+            for i in range(12)
+        ]
+        eng = self._arb_engine(min_soc=0.0, max_grid_charge_soc=100.0)
+        eng.set_cost_basis_floor(0.31)  # AC recovery floor ~€0.326 > the €0.32 peak
+
+        result = eng.optimize(
+            3.0, prices,
+            load_forecast=[0.0] * len(prices),
+            pv_forecast=[0.0] * len(prices),
+        )
+
+        buys = [s for s in result['schedule'] if s['action'] == 'buy' and s['grid_energy'] > 1e-6]
+        sells = [s for s in result['schedule'] if s['control_action'] == 'SELL']
+        self.assertTrue(buys, "future cheap energy should still be purchased")
+        self.assertTrue(sells, "newly purchased energy should still be sellable")
+        self.assertGreater(max(s['soc_end'] for s in buys), 90.0)
+        self.assertGreaterEqual(result['schedule'][-1]['soc_end'], 3.0 - 1e-6,
+                                "the expensive initial tranche must remain protected")
+
+    def test_static_min_sell_floor_still_blocks_all_battery_exports(self):
+        # Unlike the dynamic basis, ESS_MIN_SELL_PRICE is an absolute operator
+        # policy and must continue to apply to initial and newly charged energy.
+        base_time = datetime.now(tz.UTC).replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        prices = [
+            {'start': base_time + timedelta(hours=i),
+             'total': 0.13 if i < 6 else 0.32, 'level': 'NORMAL'}
+            for i in range(12)
+        ]
+        eng = self._arb_engine(min_soc=0.0, min_sell_price=0.35)
+        result = eng.optimize(3.0, prices, [0.0] * 12, [0.0] * 12)
+        self.assertFalse(any(s['control_action'] == 'SELL' for s in result['schedule']))
+
+    def test_cost_basis_protected_tranche_can_be_carried_between_plan_segments(self):
+        # The daily-settlement policy optimizes today and tomorrow separately.
+        # Tomorrow may begin at 96% after a cheap charge today, but only the
+        # original 3% carries the old basis; the second segment must not relabel
+        # all 96% as historically expensive energy.
+        base_time = datetime.now(tz.UTC).replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        prices = [
+            {'start': base_time + timedelta(hours=i), 'total': 0.32, 'level': 'NORMAL'}
+            for i in range(6)
+        ]
+        eng = self._arb_engine(min_soc=0.0, max_grid_charge_soc=100.0)
+        eng.set_cost_basis_floor(0.31)
+
+        result = eng.optimize(
+            96.0, prices,
+            load_forecast=[0.0] * len(prices),
+            pv_forecast=[0.0] * len(prices),
+            protected_soc_percent=3.0,
+        )
+
+        self.assertTrue(any(s['control_action'] == 'SELL' for s in result['schedule']))
+        self.assertGreaterEqual(result['schedule'][-1]['soc_end'], 3.0 - 1e-6)
+
     def test_frontload_charging_matches_full_power(self):
         # The DP may plan a gentle trickle on flat-price slots; re-timing should
         # charge at full power to the same target, then hold.

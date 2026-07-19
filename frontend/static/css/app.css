@@ -35,6 +35,16 @@ body {
 .app-nav-link:hover { color: var(--text); background: var(--panel-2); }
 .app-nav-link.active { color: var(--text); background: var(--panel-2); }
 .status-strip { display: flex; gap: 18px; flex-wrap: wrap; margin-left: auto; }
+.server-offline-banner {
+  position: absolute; left: 50%; top: 7px; z-index: 30;
+  transform: translateX(-50%); display: flex; align-items: baseline; gap: 10px;
+  max-width: calc(100% - 32px); padding: 8px 14px;
+  color: #fff; background: rgba(153, 27, 27, .96); border: 1px solid #ef4444;
+  border-radius: 9px; box-shadow: 0 6px 20px rgba(0, 0, 0, .35);
+  white-space: nowrap; pointer-events: none;
+}
+.server-offline-banner[hidden] { display: none; }
+.server-offline-banner span { color: #fecaca; font-size: 12px; }
 
 /* Sticky-header clock + sunrise/sunset (top-right, globally useful) */
 .header-clock { display: flex; flex-direction: column; align-items: flex-end; margin-left: 22px; line-height: 1.1; }
@@ -132,6 +142,18 @@ main { padding: 12px 16px 80px; max-width: 1100px; margin: 0 auto; }
 .chart { width: 100%; }
 .chart-legend { display: flex; gap: 18px; justify-content: center; font-size: 12px; margin-top: 6px; }
 .chart-legend .swatch { display: inline-block; width: 11px; height: 11px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
+.chart-legend .legend-candle {
+  display: inline-block; width: 8px; height: 14px; margin: 0 6px -3px 0;
+  border: 2px solid var(--sell); background: rgba(34, 197, 94, .22); position: relative;
+}
+.chart-legend .legend-candle::before {
+  content: ""; position: absolute; width: 2px; height: 20px; left: 1px; top: -5px;
+  background: var(--sell); z-index: -1;
+}
+.chart-legend .legend-dot {
+  display: inline-block; width: 10px; height: 10px; margin: 0 6px 0 0;
+  border-radius: 50%; background: var(--sell); border: 1px solid #0b0f14;
+}
 /* Hover tooltip for the horizon chart (price at the hovered slot). */
 .chart-tip {
   position: absolute; z-index: 10; pointer-events: none; white-space: nowrap;
@@ -280,6 +302,11 @@ main { padding: 12px 16px 80px; max-width: 1100px; margin: 0 auto; }
 /* per-day section heading (Today / Tomorrow) — clear separation, no grand total */
 .day-head { margin: 16px 0 5px; font-weight: 700; font-size: 12px; letter-spacing: .6px; color: var(--muted); text-transform: uppercase; }
 .day-head:first-of-type { margin-top: 2px; }
+.pl-strategy {
+  margin: -4px 0 14px; padding: 9px 12px; color: #c7d2df;
+  background: rgba(74, 168, 255, .07); border-left: 3px solid var(--accent);
+  border-radius: 0 7px 7px 0; line-height: 1.5;
+}
 @media (max-width: 640px) {
   .day-row, .day-sub { grid-template-columns: 1fr 1fr; }
   .day-row .lbl, .day-sub .lbl { grid-column: 1 / -1; }

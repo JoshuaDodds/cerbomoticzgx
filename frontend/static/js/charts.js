@@ -671,15 +671,16 @@
     if (!pts.length) { box.innerHTML = '<span class="muted">no history this month yet…</span>'; return; }
     const W = 940, H = 280, m = { l: 50, r: 20, t: 16, b: 28 };
     const pw = W - m.l - m.r, ph = H - m.t - m.b;
-    const nets = pts.flatMap((p) => {
-      const vals = [p.net_eur];
-      if (p.is_today && p.projected_net_eur != null) vals.push(p.projected_net_eur);
-      return vals;
-    });
+    const forecastValues = (p) => [p.forecast_low_eur, p.forecast_high_eur,
+      p.forecast_open_eur, p.forecast_close_eur].filter((v) => Number.isFinite(Number(v))).map(Number);
+    const nets = pts.flatMap((p) => [Number(p.net_eur), ...forecastValues(p)]);
     let lo = Math.min(0, ...nets), hi = Math.max(0, ...nets);
     if (lo === hi) hi = lo + 1;
+    const pad = Math.max(0.15, (hi - lo) * 0.08);
+    lo -= pad; hi += pad;
     const span = (hi - lo) || 1, n = pts.length;
-    const X = (i) => m.l + (n <= 1 ? pw / 2 : (pw * i) / (n - 1));
+    const band = pw / Math.max(1, n);
+    const X = (i) => m.l + band * (i + 0.5);
     const Y = (v) => m.t + ph - (ph * (v - lo)) / span;
 
     let grid = "";
@@ -693,28 +694,36 @@
     pts.forEach((p, i) => {
       if (i % step === 0 || i === n - 1) xt += `<text x="${X(i).toFixed(1)}" y="${m.t + ph + 16}" text-anchor="middle" font-size="11" fill="var(--muted)">${p.day}</text>`;
     });
-    const line = pts.map((p, i) => `${i ? "L" : "M"}${X(i).toFixed(1)},${Y(p.net_eur).toFixed(1)}`).join(" ");
-    let dots = "";
-    let projected = "";
+    const candleWidth = Math.max(4, Math.min(18, band * 0.42));
+    let marks = "";
     pts.forEach((p, i) => {
-      const col = p.net_eur >= 0 ? "var(--sell)" : "#f87171";
-      dots += `<circle cx="${X(i).toFixed(1)}" cy="${Y(p.net_eur).toFixed(1)}" r="${p.is_today ? 5 : 4}" fill="${col}" stroke="#0b0f14" stroke-width="1"/>`;
-      if (p.is_today && p.projected_net_eur != null && p.projected_net_eur !== p.net_eur) {
-        const py = Y(p.projected_net_eur), sy = Y(p.net_eur), px = X(i);
-        const pcol = p.projected_net_eur >= 0 ? "var(--sell)" : "#f87171";
-        projected += `<g class="projected-today">
-          <line x1="${px.toFixed(1)}" y1="${sy.toFixed(1)}" x2="${px.toFixed(1)}" y2="${py.toFixed(1)}" stroke="${pcol}" stroke-width="2" stroke-dasharray="5 4" opacity="0.85"/>
-          <circle cx="${px.toFixed(1)}" cy="${py.toFixed(1)}" r="7" fill="none" stroke="${pcol}" stroke-width="2.2"/>
+      const vals = forecastValues(p);
+      if (vals.length === 4) {
+        const open = Number(p.forecast_open_eur), close = Number(p.forecast_close_eur);
+        const low = Number(p.forecast_low_eur), high = Number(p.forecast_high_eur);
+        const col = close >= open ? "var(--sell)" : "#f87171";
+        const top = Math.min(Y(open), Y(close));
+        const bodyHeight = Math.max(3, Math.abs(Y(open) - Y(close)));
+        marks += `<g class="forecast-candle">
+          <line x1="${X(i).toFixed(1)}" y1="${Y(high).toFixed(1)}" x2="${X(i).toFixed(1)}" y2="${Y(low).toFixed(1)}" stroke="${col}" stroke-width="2" opacity=".9"/>
+          <rect x="${(X(i) - candleWidth / 2).toFixed(1)}" y="${top.toFixed(1)}" width="${candleWidth.toFixed(1)}" height="${bodyHeight.toFixed(1)}" fill="${col}" fill-opacity=".28" stroke="${col}" stroke-width="1.7" rx="1"/>
         </g>`;
       }
+      const actual = Number(p.net_eur);
+      const actualCol = actual >= 0 ? "var(--sell)" : "#f87171";
+      const fill = p.settled ? actualCol : "var(--panel)";
+      marks += `<circle class="actual-net-dot" cx="${X(i).toFixed(1)}" cy="${Y(actual).toFixed(1)}" r="${p.is_today ? 5.5 : 4.5}" fill="${fill}" stroke="${actualCol}" stroke-width="2"/>`;
     });
-    box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" width="100%" preserveAspectRatio="xMidYMid meet" role="img" aria-label="daily net, month so far">
+    box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" width="100%" preserveAspectRatio="xMidYMid meet" role="img" aria-label="daily final-net forecast ranges and settled actuals, month so far">
         ${grid}${xt}
-        <path d="${line}" fill="none" stroke="var(--accent)" stroke-width="1.6" opacity="0.45"/>
-        ${dots}${projected}
+        ${marks}
         <rect x="${m.l}" y="${m.t}" width="${pw}" height="${ph}" fill="transparent"/>
       </svg>
-      <div class="chart-legend muted"><span>↑ profit · ↓ net cost — hover a day for detail</span><span>○ Projected full day</span></div>`;
+      <div class="chart-legend muted">
+        <span><i class="legend-candle"></i>Forecast range (first → latest)</span>
+        <span><i class="legend-dot"></i>Settled actual</span>
+        <span>↑ profit · ↓ net cost — hollow dot is today so far</span>
+      </div>`;
 
     const svg = box.querySelector("svg");
     if (!svg) return;
@@ -728,17 +737,20 @@
       const sp = svg.createSVGPoint(); sp.x = e.clientX; sp.y = e.clientY;
       const u = sp.matrixTransform(ctm.inverse());
       if (u.x < m.l - 8 || u.x > m.l + pw + 8) return -1;
-      return Math.max(0, Math.min(n - 1, Math.round((u.x - m.l) / (pw / Math.max(1, n - 1)))));
+      return Math.max(0, Math.min(n - 1, Math.floor((u.x - m.l) / band)));
     };
     svg.addEventListener("mousemove", (e) => {
       const i = idxFromEvent(e);
       if (i < 0) { tip.style.display = "none"; return; }
       const p = pts[i], profit = p.net_eur >= 0;
+      const hasForecast = forecastValues(p).length === 4;
+      const actualLabel = p.settled ? "Settled actual" : "Actual so far";
       tip.innerHTML = `<b>${dname(p.date)}${p.is_today ? " (today)" : ""}</b>`
-        + `<span>${profit ? "€" + p.net_eur.toFixed(2) + " profit" : "€" + Math.abs(p.net_eur).toFixed(2) + " cost"}</span>`
+        + `<span>${actualLabel}: ${profit ? "€" + p.net_eur.toFixed(2) + " profit" : "€" + Math.abs(p.net_eur).toFixed(2) + " cost"}</span>`
+        + `${hasForecast ? `<span>Forecast range: €${Number(p.forecast_low_eur).toFixed(2)} to €${Number(p.forecast_high_eur).toFixed(2)}</span>` : ""}`
+        + `${hasForecast ? `<span>First → latest: €${Number(p.forecast_open_eur).toFixed(2)} → €${Number(p.forecast_close_eur).toFixed(2)} (${p.forecast_samples || "?"} snapshots)</span>` : '<span>Forecast snapshots start with the new data format.</span>'}`
         + `<span>Import ${p.import_kwh != null ? p.import_kwh.toFixed(1) : "?"} kWh</span>`
-        + `<span>Export ${p.export_kwh != null ? p.export_kwh.toFixed(1) : "?"} kWh</span>`
-        + `${p.projected_net_eur != null ? `<span>Projected full day: ${p.projected_net_eur >= 0 ? "€" + p.projected_net_eur.toFixed(2) + " profit" : "€" + Math.abs(p.projected_net_eur).toFixed(2) + " cost"}</span>` : ""}`;
+        + `<span>Export ${p.export_kwh != null ? p.export_kwh.toFixed(1) : "?"} kWh</span>`;
       tip.style.display = "block";
       const br = box.getBoundingClientRect(), tw = tip.offsetWidth, th = tip.offsetHeight;
       let tx = e.clientX - br.left + 14, ty = e.clientY - br.top - th - 10;

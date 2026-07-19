@@ -75,8 +75,12 @@ Topics = dict({
 
             # Tesla specific metrics
             "tesla_power":                  f"N/{systemId0}/evcharger/42/Ac/Power",
-            "tesla_l1_current":             f"N/{systemId0}/evcharger/42/L1/Current",
-            "tesla_l2_current":             f"N/{systemId0}/evcharger/42/L2/Current",
+            # Lifetime cumulative EV-charge energy (kWh) from the ABB B23/B24 meter.
+            # Diffed per-slot at settlement into ev_charge_kwh (the true, restart-safe
+            # measured EV energy — no integration or scaling). See docs/EV_LOAD_DECOMPOSITION.md.
+            "tesla_charge_energy_forward":  f"N/{systemId0}/evcharger/42/Ac/Energy/Forward",
+            "tesla_l1_current":             f"N/{systemId0}/evcharger/42/Ac/L1/Current",
+            "tesla_l2_current":             f"N/{systemId0}/evcharger/42/Ac/L2/Current",
             "tesla_l3_current":             f"N/{systemId0}/evcharger/42/Ac/L3/Current",
             "tesla_plug_status":            f"Tesla/vehicle0/plugged_status",
             "tesla_is_home":                f"Tesla/vehicle0/is_home",

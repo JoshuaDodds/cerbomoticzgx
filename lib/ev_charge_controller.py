@@ -23,9 +23,8 @@ STOP_MAX_RETRIES = 5          # bounded auto-retry attempts before escalating to
                                # finding: an uncapped critical-bypass retry loop can blow past
                                # the Tesla budget guard entirely if the car stays unreachable)
 STALE_STATUS_MAX_AGE_S = 300  # a cached tesla.is_charging older than this is UNKNOWN, not
-                               # authoritative "not charging" (audit finding: a stale cache +
-                               # the under-reading local meter can agree on "nothing to stop"
-                               # while the car is still actually drawing)
+                               # authoritative "not charging"; a stale cache must not suppress
+                               # a necessary stop command
 # Surplus-driven "is the car here?" discovery wakes are rate-limited so an away/asleep car
 # can't drain the wake budget; the tesla_budget guard is the hard backstop on top.
 DISCOVERY_WAKE_INTERVAL_S = 3600     # at most one surplus-discovery wake per hour
@@ -383,9 +382,8 @@ class EvCharger:
 
         A stale/never-refreshed cache (e.g. a failed forced read right before this call, or the
         False default before the first status read completes) must NOT be trusted as proof the
-        car isn't charging — only that we don't currently know. Paired with the local meter
-        (which under-reads, audit M1, but never over-reads), this is what decides whether there's
-        genuinely nothing to stop.
+        car isn't charging — only that we don't currently know. Paired with the local ABB meter,
+        this decides whether there's genuinely nothing to stop.
         """
         if self.tesla.is_charging:
             return False
@@ -502,10 +500,9 @@ class EvCharger:
     def _adjust_surplus_amps(self) -> bool:
         self._charge_mode = 'surplus'
         target = int(_num(self.surplus_amps))
-        # Compare to what we LAST COMMANDED, not the local meter: the Victron evcharger meter
-        # under-reads (audit M1), so comparing to `measured` would re-issue set_charging_amps
-        # every cooldown forever and burn a billable read each time. Re-issue only when the
-        # surplus-derived target actually moves.
+        # Compare to what we LAST COMMANDED, not an asynchronously sampled meter value, to avoid
+        # re-issuing set_charging_amps on measurement lag/noise every cooldown. Re-issue only
+        # when the surplus-derived target actually moves.
         last = self._last_commanded_amps
         if (last is None or abs(target - last) >= AMP_ADJUST_MIN_DELTA) and self._cooldown_ok():
             logging.info(f"EvCharger: adjusting charge {last} A -> {target} A to match surplus.")
@@ -578,12 +575,9 @@ class EvCharger:
 
         per_phase = round(_num(charging_amp_totals), 2)
         self.global_state.set("tesla_charging_amps_total", per_phase)
-        # DISPLAY: in telemetry mode the fleet-telemetry bridge owns Tesla/vehicle0/charging_amps
-        # with the car's OWN accurate per-phase current (the local Victron meter under-reads ~3x),
-        # so we must NOT overwrite it here. Only publish in legacy polling mode.
-        if not self._telemetry_on():
-            publish_message("Tesla/vehicle0/charging_amps",
-                            payload=f"{{\"value\": \"{per_phase}\"}}", qos=0, retain=True)
+        # Do not publish Tesla/vehicle0/charging_amps here: this value can be a
+        # requested target immediately after a command. The ABB event path is the
+        # sole publisher of the shared measured-current topic.
 
     @staticmethod
     def is_the_sun_shining():

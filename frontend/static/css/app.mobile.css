@@ -23,6 +23,14 @@
     z-index: 20;
   }
 
+  .server-offline-banner {
+    top: calc(5px + env(safe-area-inset-top));
+    max-width: calc(100% - 20px); padding: 7px 10px; gap: 7px;
+  }
+
+  .server-offline-banner span { display: none; }
+  body.server-offline .mobile-key-stat { visibility: hidden; }
+
   .brand {
     flex: 0 0 auto;
     min-width: 0;
@@ -392,6 +400,8 @@
     margin-bottom: 8px;
     font-size: 15px;
   }
+
+  .pl-strategy { margin: 0 0 12px; font-size: 13px; }
 
   .day-row,
   .day-sub {
