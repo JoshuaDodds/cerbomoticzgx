@@ -10,7 +10,7 @@ from lib.config_change_handler import ConfigWatcher, handle_env_change
 from lib.victron_mqtt_client import mqtt_start, mqtt_stop
 from lib.ev_charge_controller import EvCharger
 from lib.task_scheduler import TaskScheduler
-from lib.victron_integration import restore_default_battery_max_voltage
+from lib.victron_integration import restore_default_battery_max_voltage, set_minimum_ess_soc
 from lib.tibber_api import live_measurements, publish_pricing_data
 from lib.helpers import publish_message, retrieve_message, is_truthy
 from lib.global_state import GlobalStateDatabase, GlobalStateClient
@@ -72,6 +72,19 @@ def init():
     # set higher than 0 zero cost at startup until actual pricing is retreived or auto sell/auto grid-assist might flap
     publish_message(topic='Tibber/home/price_info/now/total', message="0.35", retain=True)
     STATE.set('tibber_price_now', "0.35")
+
+    # Re-assert the real Victron setting in the unconditional startup path and
+    # before the one-second post-startup delay. GlobalState is recreated at
+    # startup, and a missing key reads as numeric zero; without a forced write a
+    # stale 40% winter limit could masquerade as the desired 0%.
+    try:
+        set_minimum_ess_soc(force=True)
+    except Exception as e:
+        logging.error(
+            "init(): unable to apply Victron hardware minimum SoC; "
+            "the next optimizer cycle will retry: %s",
+            e,
+        )
 
 
 def post_startup():

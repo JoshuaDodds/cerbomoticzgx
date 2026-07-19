@@ -74,10 +74,12 @@ Note: The name of this project is a nod to both Victron Energy & the Domoticz pr
 - Configure the nightly charging skip guardrails if desired: `NIGHT_CHARGE_SKIP_ENABLED` toggles the behaviour and `NIGHT_CHARGE_SKIP_MIN_SOC` / `NIGHT_CHARGE_SKIP_MAX_SOC` bound the state-of-charge window that will skip the 21:30 schedule run.
 - **AI Optimization Configuration**:
   - `AI_POWERED_ESS_ALGORITHM=True`: Enable the new AI optimizer.
+  - `WINTER_MODE=False`: Select the restart-isolated optimizer policy. `False` preserves summer trading behavior; `True` activates winter self-sufficiency behavior after the supervised restart requested by the dashboard/config watcher.
   - `BATTERY_CAPACITY_KWH`: Your battery capacity in kWh (default 42.0).
   - `AC_DC_CHARGE_EFFICIENCY`: Efficiency of charging (e.g. 0.90).
   - `AC_DC_DISCHARGE_EFFICIENCY`: Efficiency of discharging (e.g. 0.90).
-  - `MIN_SOC_RESERVE_WINTER` / `MIN_SOC_RESERVE_SUMMER`: Minimum SoC reserve (%) the optimizer always keeps (defaults 20 / 5).
+  - `MIN_SOC_RESERVE_WINTER` / `MIN_SOC_RESERVE_SUMMER`: Optimizer planning reserve (%) selected explicitly by `WINTER_MODE` (defaults 20 / 5); these do not write Victron's hard minimum.
+  - `VICTRON_HARDWARE_MIN_SOC`: Independent Victron `MinimumSocLimit` (default 0). Raising it above current SoC triggers Victron Recharge immediately, outside optimizer scheduling. Invalid manual values are rejected without changing the live Victron limit.
   - `OPTIMIZER_SOC_STEP_PCT`: DP SoC discretization step in percentage points (default 1.0; smaller = finer control, more compute).
   - `ESS_MAX_GRID_IMPORT_KW` / `ESS_MAX_GRID_EXPORT_KW`: Grid power limits (kW) for the optimizer's feasibility checks.
   - `ESS_MAX_CHARGE_KW` / `ESS_MAX_DISCHARGE_KW`: Optional battery power caps (default to the grid limits).

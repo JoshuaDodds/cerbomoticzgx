@@ -183,12 +183,15 @@ def is_winter_month():
 def current_min_soc_reserve() -> float:
     """Single source of truth for the battery minimum-SoC reserve (%).
 
-    Resolves the seasonal reserve from .env (MIN_SOC_RESERVE_WINTER / SUMMER)
-    using the one season rule (is_winter_month). Both the optimizer's planning
-    floor AND the Victron hardware MinimumSocLimit derive from this, so they can
-    never diverge. The cells' own BMS remains the ultimate low-SoC cutoff.
+    Resolves the reserve from .env (MIN_SOC_RESERVE_WINTER / SUMMER) using the
+    explicit WINTER_MODE control-policy toggle. This is an optimizer planning
+    floor, not Victron's ``MinimumSocLimit``: the latter can trigger autonomous
+    Recharge and is configured independently by ``VICTRON_HARDWARE_MIN_SOC``.
+    ``is_winter_month`` intentionally remains calendar-based for legacy appliance
+    behavior; it does not select the ESS control policy.
     """
     from lib.config_retrieval import retrieve_setting
+    from lib.ess_mode import WINTER_MODE
 
     def _f(name, default):
         try:
@@ -196,7 +199,7 @@ def current_min_soc_reserve() -> float:
         except (TypeError, ValueError):
             return default
 
-    if is_winter_month():
+    if WINTER_MODE:
         return _f('MIN_SOC_RESERVE_WINTER', 20.0)
     return _f('MIN_SOC_RESERVE_SUMMER', 5.0)
 
