@@ -63,8 +63,12 @@ def test_charge_current_request_and_max_and_energy():
 def test_soc_and_limit_and_amps():
     assert tb.translate("Soc", 64)["topics"]["Tesla/vehicle0/battery_soc"] == 64.0
     assert tb.translate("ChargeLimitSoc", 80)["topics"]["Tesla/vehicle0/battery_soc_setpoint"] == 80.0
-    # Telemetry OWNS the charging_amps display topic (accurate per-phase); not scaled.
-    assert tb.translate("ChargeAmps", 15)["topics"]["Tesla/vehicle0/charging_amps"] == 15.0
+    # Fleet ChargeAmps is diagnostic only. The ABB meter is the sole owner of the
+    # shared measured-current topic, preventing retained/stale car telemetry from
+    # overwriting the value used by legacy UI and control.
+    out = tb.translate("ChargeAmps", 15)
+    assert out["state"]["tesla_amps_reported"] == 15.0
+    assert "Tesla/vehicle0/charging_amps" not in out.get("topics", {})
 
 
 def test_ac_power_is_unmapped():

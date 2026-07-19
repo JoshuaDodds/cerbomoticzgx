@@ -14,7 +14,7 @@ V2_FIELDS = (
     "load_l1", "load_l2", "load_l3",
     "batt_temp", "batt_voltage", "batt_current", "batt_ttg",
     "system_state",
-    "ev_energy_kwh", "ev_charge_time",
+    "ev_energy_kwh", "ev_charge_time", "ev_l1_a", "ev_l2_a", "ev_l3_a",
 )
 
 
@@ -32,6 +32,7 @@ def test_snapshot_exposes_v2_fields_when_present():
         "batt_temp": 36, "batt_voltage": 52.85, "batt_current": -122,
         "batt_ttg": 24840, "system_state": 256,
         "ev_energy_kwh": 18420.5, "ev_charge_time": 0,
+        "ev_l1_a": 13.1, "ev_l2_a": 13.0, "ev_l3_a": 13.2,
     })
     # Grid + AC-loads per-phase (signs preserved as the meter reports them).
     assert snap["grid_l1"] == -2056 and snap["grid_l3"] == -1445
@@ -46,6 +47,9 @@ def test_snapshot_exposes_v2_fields_when_present():
     # EV session detail.
     assert snap["ev_energy_kwh"] == 18420.5
     assert snap["ev_charge_time"] == 0
+    assert snap["ev_l1_a"] == 13.1
+    assert snap["ev_l2_a"] == 13.0
+    assert snap["ev_l3_a"] == 13.2
 
 
 def test_snapshot_v2_fields_default_to_none_when_absent():

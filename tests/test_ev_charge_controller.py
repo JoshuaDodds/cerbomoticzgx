@@ -111,6 +111,18 @@ def test_engaged_while_charging_even_without_local_meter(monkeypatch):
     assert c._local_engagement_signal() is True
 
 
+def test_controller_does_not_publish_shared_measured_current(monkeypatch):
+    """Only the ABB event path may own Tesla/vehicle0/charging_amps."""
+    c = _charger(monkeypatch, FakeTesla(), charging_amps=0)
+    published = []
+    monkeypatch.setattr(ecc, "publish_message", lambda *a, **k: published.append((a, k)))
+
+    c.update_charging_amp_totals(12)
+
+    assert c.global_state["tesla_charging_amps_total"] == 12
+    assert not any("Tesla/vehicle0/charging_amps" in str(call) for call in published)
+
+
 def test_stops_when_full(monkeypatch):
     tesla = FakeTesla(is_full=True, is_charging=True)
     c = _charger(monkeypatch, tesla, charging_amps=6)
@@ -260,8 +272,8 @@ def test_failed_stop_does_not_lie_about_meter(monkeypatch):
 
 def test_stale_not_charging_status_does_not_skip_the_stop(monkeypatch):
     # Regression: a stale/unconfirmed tesla.is_charging=False (e.g. the last forced refresh
-    # failed) must NOT be trusted as "confirmed not charging" — even with the under-reading
-    # local meter also below 1A, the stop must still be attempted, not silently skipped.
+    # failed) must NOT be trusted as "confirmed not charging" — even when the local meter is
+    # also below 1A, the stop must still be attempted, not silently skipped.
     tesla = FakeTesla(is_charging=False, last_update_ts=time.time() - (ecc.STALE_STATUS_MAX_AGE_S + 60))
     c = _charger(monkeypatch, tesla, charging_amps=0)
     c._intent_off_edge = True

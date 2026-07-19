@@ -6,6 +6,10 @@ INDEX_HTML = ROOT / "frontend" / "templates" / "index.html"
 APP_JS = ROOT / "frontend" / "static" / "js" / "app.js"
 APP_CSS = ROOT / "frontend" / "static" / "css" / "app.css"
 MOBILE_CSS = ROOT / "frontend" / "static" / "css" / "app.mobile.css"
+POWERFLOW_JS = ROOT / "frontend" / "static" / "js" / "powerflow.js"
+LIVE_PY = ROOT / "frontend" / "live.py"
+EVENT_HANDLER_PY = ROOT / "lib" / "event_handler.py"
+EV_CONTROLLER_PY = ROOT / "lib" / "ev_charge_controller.py"
 
 
 def test_mobile_stylesheet_loads_after_desktop_stylesheet():
@@ -14,6 +18,37 @@ def test_mobile_stylesheet_loads_after_desktop_stylesheet():
     assert 'content="width=device-width, initial-scale=1, viewport-fit=cover"' in html
     assert "css/app.mobile.css" in html
     assert html.index("css/app.css") < html.index("css/app.mobile.css")
+
+
+def test_powerflow_ev_card_sums_phase_amps_without_changing_vehicle_metric():
+    powerflow = POWERFLOW_JS.read_text(encoding="utf-8")
+    live = LIVE_PY.read_text(encoding="utf-8")
+    app = APP_JS.read_text(encoding="utf-8")
+
+    for phase in (1, 2, 3):
+        assert f'"ev_l{phase}_a": f"N/{{sid}}/evcharger/42/Ac/L{phase}/Current"' in live
+        assert f'out["ev_l{phase}_a"] = _num("ev_l{phase}_a")' in live
+    assert "const evMeterPhaseAmps" in powerflow
+    assert "live.ev_l1_a, live.ev_l2_a, live.ev_l3_a" in powerflow
+    assert ".reduce((total, amps) => total + amps, 0)" in powerflow
+    assert "ev <= EV_IDLE_POWER_W" in powerflow
+    assert "evPhaseAmps * evPhases" not in powerflow
+    assert 'card("Charge current", amps(L.veh_amps))' in app
+
+
+def test_abb_event_path_is_only_shared_current_topic_publisher():
+    event_handler = EVENT_HANDLER_PY.read_text(encoding="utf-8")
+    controller = EV_CONTROLLER_PY.read_text(encoding="utf-8")
+    event_aggregate = event_handler.split("    def update_charging_amp_totals", 1)[1].split(
+        "    def set_surplus_amps", 1
+    )[0]
+    controller_aggregate = controller.split("    def update_charging_amp_totals", 1)[1].split(
+        "    @staticmethod", 1
+    )[0]
+
+    assert 'publish_message("Tesla/vehicle0/charging_amps"' in event_aggregate
+    assert "TESLA_TELEMETRY_ENABLED" not in event_aggregate
+    assert 'publish_message("Tesla/vehicle0/charging_amps"' not in controller_aggregate
 
 
 def test_mobile_navigation_markup_is_hidden_by_default():
@@ -423,15 +458,63 @@ def test_horizon_weather_and_impact_tooltips_use_large_multiline_style():
     assert "font-size: 14px" in css
 
 
-def test_monthly_chart_renders_projected_today_marker():
+def test_monthly_chart_has_rich_daily_net_tooltip():
     charts = (ROOT / "frontend" / "static" / "js" / "charts.js").read_text(encoding="utf-8")
 
-    assert "projected_net_eur" in charts
-    assert "projected-today" in charts
-    assert "Projected full day" in charts
     assert 'tip.className = "chart-tip rich-tip monthly-tip";' in charts
     assert "Import " in charts
     assert "Export " in charts
+
+
+def test_header_has_accessible_server_offline_overlay_and_staleness_watchdog():
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    js = APP_JS.read_text(encoding="utf-8")
+    css = APP_CSS.read_text(encoding="utf-8")
+
+    assert 'id="server-offline-banner"' in html
+    assert 'role="status"' in html and 'aria-live="assertive"' in html
+    assert "Server Offline" in html
+    assert "SERVER_OFFLINE_AFTER_MS" in js
+    assert "noteServerData" in js
+    assert "noteServerFailure" in js
+    assert "_liveES.onerror" in js
+    assert "server offline — showing last data" in js
+    assert "error loading:" not in js
+    assert ".server-offline-banner" in css
+
+
+def test_pl_summary_includes_human_readable_remaining_day_strategy():
+    js = APP_JS.read_text(encoding="utf-8")
+    css = APP_CSS.read_text(encoding="utf-8")
+
+    assert "function planStrategySummary" in js
+    assert '"pl-strategy"' in js
+    assert "until midnight" in js
+    assert "Buy low" in js
+    assert ".pl-strategy" in css
+
+
+def test_pl_summary_explains_winter_household_protection_policy():
+    js = APP_JS.read_text(encoding="utf-8")
+
+    assert 'plan.optimizer_mode === "winter"' in js
+    assert "winter_policy" in js
+    assert "protected household requirement" in js
+    assert "An exceptional spread cleared every loss and safety hurdle" in js
+    assert "Winter Mode degraded safely" in js
+
+
+def test_monthly_chart_uses_forecast_candles_and_actual_settlement_dots():
+    charts = (ROOT / "frontend" / "static" / "js" / "charts.js").read_text(encoding="utf-8")
+
+    assert "forecast_low_eur" in charts
+    assert "forecast_high_eur" in charts
+    assert "forecast_open_eur" in charts
+    assert "forecast_close_eur" in charts
+    assert 'class="forecast-candle"' in charts
+    assert 'class="actual-net-dot"' in charts
+    assert "Forecast range" in charts
+    assert "Settled actual" in charts
 
 
 def test_schedule_timeline_has_running_today_ledger_row():

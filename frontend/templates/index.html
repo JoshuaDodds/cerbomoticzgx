@@ -10,6 +10,10 @@
 </head>
 <body>
   <header class="topbar">
+    <div id="server-offline-banner" class="server-offline-banner" role="status" aria-live="assertive" hidden>
+      <strong>Server Offline</strong>
+      <span>Showing the last data received</span>
+    </div>
     <div class="brand" data-home data-mobile-home>
       <img src="{{ url_for('static', filename='img/logo_final.png') }}" alt="CerbomoticzGX" class="brand-logo"/>
       <nav class="app-nav" aria-label="Application sections">

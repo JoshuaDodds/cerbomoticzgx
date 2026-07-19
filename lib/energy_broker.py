@@ -1,5 +1,6 @@
 import time
 import threading
+import math
 import schedule as scheduler
 
 from paho.mqtt import publish
@@ -12,7 +13,11 @@ from lib.notifications import pushover_notification
 from lib.tibber_api import publish_pricing_data, get_all_price_points
 from lib.global_state import GlobalStateClient
 from lib.victron_integration import ac_power_setpoint, limit_grid_feed_in, set_minimum_ess_soc
-from lib.ai_powered_ess import optimize_schedule
+from lib.ess_optimizer_selector import (
+    OPTIMIZER_MODE,
+    _coerce_datetime,
+    optimize_schedule,
+)
 from lib import history_store as _hist
 
 STATE = GlobalStateClient()
@@ -55,6 +60,15 @@ _WEATHER_LOAD_LOG_THRESHOLD_KWH = 0.10
 _WEATHER_PV_SHIFT_LOG_THRESHOLD_KWH = 0.25
 _WEATHER_PV_TOTAL_LOG_THRESHOLD_KWH = 0.10
 _AI_OPTIMIZER_LOCK = threading.Lock()
+
+# History classification guardrails. These do not constrain live control; they
+# only decide whether a sample is trustworthy enough to teach the optimizer.
+_EV_CHARGER_MAX_KW = 16.0
+_SITE_MAX_LOAD_KW = 32.0
+_EV_POWER_COHERENCE_TOLERANCE_W = 500.0
+_LEGACY_UNCLASSIFIED_LOAD_MAX_W = 6000.0
+_METER_DELTA_MARGIN = 1.25
+_METER_DELTA_RESOLUTION_KWH = 0.05
 
 
 def _is_truthy(value: str | None, default: bool) -> bool:
@@ -774,8 +788,34 @@ def _build_pv_forecast_by_slot(price_slots: list, slot_duration_h: float) -> dic
         except (TypeError, ValueError):
             return 0.0
 
-    today_kwh = _kwh('pv_projected_remaining')
-    tomorrow_kwh = _kwh('pv_projected_tomorrow')
+    today = _date.today()
+    tomorrow = today + _td(days=1)
+    today_key = today.isoformat()
+    tomorrow_key = tomorrow.isoformat()
+
+    projected_today_date = str(STATE.get('pv_projected_today_date') or '')[:10]
+    projected_tomorrow_date = str(STATE.get('pv_projected_tomorrow_date') or '')[:10]
+
+    if not projected_today_date:
+        # Backward compatibility for state written before forecast provenance was
+        # introduced. A successful VRM refresh will date it on the next cycle.
+        today_kwh = _kwh('pv_projected_remaining')
+    elif projected_today_date == today_key:
+        today_kwh = _kwh('pv_projected_remaining')
+    elif projected_tomorrow_date == today_key:
+        # At midnight, yesterday's explicitly dated "tomorrow" becomes today's
+        # best forecast until the first successful new-day VRM request. Never use
+        # yesterday's retained zero-remaining value for the new day.
+        today_kwh = _kwh('pv_projected_tomorrow')
+    else:
+        today_kwh = 0.0
+
+    if not projected_tomorrow_date:
+        tomorrow_kwh = _kwh('pv_projected_tomorrow')
+    elif projected_tomorrow_date == tomorrow_key:
+        tomorrow_kwh = _kwh('pv_projected_tomorrow')
+    else:
+        tomorrow_kwh = 0.0
 
     # Learned daylight shape (trailing N days), used both to redistribute the day's
     # total AND to gauge how far through the solar curve we are for the intraday
@@ -786,8 +826,6 @@ def _build_pv_forecast_by_slot(price_slots: list, slot_duration_h: float) -> dic
     # (tomorrow stays on VRM — no actuals yet).
     today_kwh = _pv_intraday_remaining_kwh(shape, today_kwh)
 
-    today = _date.today()
-    tomorrow = today + _td(days=1)
     daylight_start_h, daylight_end_h = PV_DAYLIGHT_START_H, PV_DAYLIGHT_END_H
 
     today_slots, tomorrow_slots = [], []
@@ -1192,6 +1230,55 @@ def _apply_low_soc_retain_before_cheaper_buy(result, batt_soc):
     return result
 
 
+def _winter_safe_retain_result(prices, slot_duration_h):
+    """Return an observable, neutral fallback when Winter Mode cannot plan.
+
+    A mode-changing restart can leave retained summer export setpoints and charge
+    slots on the Victron bus.  Returning a normal broker result keeps the shared
+    application path running so it clears those slots, applies the winter hardware
+    reserve, and retains the battery instead of silently leaving stale summer
+    control active.
+    """
+    current_price = 0.0
+    for point in prices or []:
+        try:
+            current_price = float(point['total'])
+            break
+        except (KeyError, TypeError, ValueError):
+            continue
+    return {
+        'schedule': [],
+        'victron_slots': [],
+        'optimizer_guardrails': _optimizer_guardrails_snapshot(),
+        'winter_policy': {
+            'mode': 'winter',
+            'selected_candidate': 'self_sufficiency',
+            'next_replenishment_time': None,
+            'forecast_house_energy_required_kwh': None,
+            'uncertainty_allowance_kwh': None,
+            'protected_soc_percent': current_min_soc_reserve(),
+            'protected_energy_kwh': None,
+            'exceptional_spread_eur_per_kwh': None,
+            'expected_incremental_benefit_eur': 0.0,
+            'reason_code': 'WINTER_OPTIMIZER_FAILED_SAFE_RETAIN',
+            'reason': 'Winter optimizer could not produce a feasible plan',
+            'warning': 'optimizer_failed_safe_retain',
+            'active_charge_windows': 0,
+        },
+        'optimizer_mode': 'winter',
+        'setpoint': 0.0,
+        'mode': 'hold',
+        'control_action': 'RETAIN',
+        'reason': 'Winter optimizer unavailable; safely retaining the battery',
+        'reason_code': 'WINTER_OPTIMIZER_FAILED_SAFE_RETAIN',
+        'grid_assist': True,
+        'pv_surplus': False,
+        'current_price': current_price,
+        'limit_feed_in': current_price < 0.0,
+        'slot_duration_h': slot_duration_h,
+    }
+
+
 def _filter_victron_slots_for_grid_charge_cap(victron_slots, batt_soc, now=None):
     """Apply ESS_MAX_GRID_CHARGE_SOC to Victron forced charge windows.
 
@@ -1365,6 +1452,61 @@ def _estimate_daily_consumption_kwh() -> float:
     return DAILY_HOME_ENERGY_CONSUMPTION
 
 
+def _robust_bucket_kw(values: list) -> float | None:
+    """Reduce a slot bucket of load samples (kW) to a robust central value.
+
+    Defense-in-depth for the load forecast: even after EV draw is excluded via
+    base_load_w, any surprise spike (a one-off heavy appliance, a stale reading,
+    an un-tagged EV session in older records) must not pull the learned profile
+    up. We clamp each sample to median + 3·MAD before averaging, so a minority of
+    extreme samples are capped rather than allowed to dominate a plain mean.
+    Returns None for an empty bucket.
+    """
+    if not values:
+        return None
+    s = sorted(values)
+    n = len(s)
+    med = s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2.0
+    devs = sorted(abs(x - med) for x in s)
+    mad = devs[n // 2] if n % 2 else (devs[n // 2 - 1] + devs[n // 2]) / 2.0
+    # MAD==0 (all samples equal / tiny spread): fall back to 2× median as the cap
+    # so a lone spike is still bounded without distorting a genuinely flat bucket.
+    hi = med + 3.0 * mad if mad > 0 else med * 2.0
+    return sum(min(x, hi) for x in s) / n
+
+
+def _classify_cycle_load(load_w, ev_w, *, meter_available: bool,
+                         meter_fresh: bool = True) -> tuple[float | None, str]:
+    """Return a trustworthy EV-excluded load and its classification.
+
+    MQTT measurements are updated independently, so an EV reading materially
+    above the simultaneous AC-out load is treated as incoherent instead of being
+    subtracted into a false zero-load sample. Missing or invalid measurements are
+    retained in the raw record but are not promoted to measured base load.
+    """
+    try:
+        load = float(load_w)
+    except (TypeError, ValueError):
+        return None, "load_missing"
+    if not meter_available or ev_w is None:
+        return None, "ev_meter_missing"
+    if not meter_fresh:
+        return None, "ev_meter_stale"
+    try:
+        ev = float(ev_w)
+    except (TypeError, ValueError):
+        return None, "ev_power_incoherent"
+    max_plausible_ev_w = (
+        _EV_CHARGER_MAX_KW * 1000.0 * _METER_DELTA_MARGIN
+        + _EV_POWER_COHERENCE_TOLERANCE_W
+    )
+    if (not math.isfinite(load) or not math.isfinite(ev) or load < 0.0 or ev < 0.0
+            or ev > load + _EV_POWER_COHERENCE_TOLERANCE_W
+            or ev > max_plausible_ev_w):
+        return None, "ev_power_incoherent"
+    return round(max(0.0, load - ev), 1), "measured"
+
+
 def _historical_load_by_slot(days: int = 3) -> dict:
     """Average realised house load (kW) per quarter-hour-of-day over the last
     ``days`` days of history, keyed by ``'HH:MM'`` (15-min buckets).
@@ -1381,14 +1523,26 @@ def _historical_load_by_slot(days: int = 3) -> dict:
 
     try:
         history_dir = retrieve_setting('HISTORY_DIR') or 'data/history'
-        buckets = {}  # "HH:MM" -> [load_kw, ...]
+        buckets = {}  # "HH:MM" -> one representative load_kW per day
         today = _dt.now().date()
         for i in range(max(1, days)):
             d = today - _td(days=i)
+            daily_buckets = {}  # de-duplicate scheduler replans within a day/slot
             for r in _hist.read_day(d, history_dir):   # NDJSON hot + Parquet cold
                 if r.get('kind') == 'settlement':
                     continue
-                load, batt, ts = r.get('load_w'), r.get('batt_w'), r.get('ts')
+                # Prefer measured EV-excluded load. Legacy records have no EV meter
+                # provenance: retain ordinary loads but skip obvious high-load/EV
+                # samples instead of inventing a historical decomposition.
+                load = r.get('base_load_w')
+                if load is None:
+                    load = r.get('load_w')
+                    try:
+                        if float(load) > _LEGACY_UNCLASSIFIED_LOAD_MAX_W:
+                            continue
+                    except (TypeError, ValueError):
+                        continue
+                batt, ts = r.get('batt_w'), r.get('ts')
                 if load is None or ts is None:
                     continue
                 try:
@@ -1396,10 +1550,16 @@ def _historical_load_by_slot(days: int = 3) -> dict:
                         continue
                     when = _dt.fromisoformat(ts)
                     key = f"{when.hour:02d}:{(when.minute // 15) * 15:02d}"
-                    buckets.setdefault(key, []).append(float(load) / 1000.0)
+                    daily_buckets.setdefault(key, []).append(float(load) / 1000.0)
                 except (TypeError, ValueError):
                     continue
-        return {k: sum(v) / len(v) for k, v in buckets.items() if v}
+            for key, values in daily_buckets.items():
+                values = sorted(values)
+                n = len(values)
+                daily_value = (values[n // 2] if n % 2 else
+                               (values[n // 2 - 1] + values[n // 2]) / 2.0)
+                buckets.setdefault(key, []).append(daily_value)
+        return {k: _robust_bucket_kw(v) for k, v in buckets.items() if v}
     except Exception as e:
         logging.debug(f"EnergyBroker: historical load read failed: {e}")
         return {}
@@ -1594,6 +1754,7 @@ def _publish_plan_json(result, *, batt_soc, price_points, pv_remaining,
 
         payload = {
             'generated_at': _dt.now().astimezone().isoformat(),
+            'optimizer_mode': result.get('optimizer_mode') or OPTIMIZER_MODE,
             'battery_soc': batt_soc,
             'price_points': price_points,
             'pv_remaining_wh': pv_remaining,
@@ -1603,7 +1764,11 @@ def _publish_plan_json(result, *, batt_soc, price_points, pv_remaining,
             'pv_adjusted_remaining_source': pv_adjusted_source,
             'pv_adjustment_kwh': pv_adjustment_kwh,
             'pv_today_total_kwh': STATE.get('pv_projected_today'),
+            'pv_today_forecast_date': STATE.get('pv_projected_today_date'),
             'pv_tomorrow_wh': STATE.get('pv_projected_tomorrow'),
+            'pv_tomorrow_forecast_date': STATE.get('pv_projected_tomorrow_date'),
+            'pv_forecast_updated_at': STATE.get('pv_forecast_updated_at'),
+            'pv_actual_quality': STATE.get('pv_actual_quality'),
             'slot_duration_h': result.get('slot_duration_h'),
             'current': {
                 'mode': result.get('mode'),
@@ -1622,6 +1787,7 @@ def _publish_plan_json(result, *, batt_soc, price_points, pv_remaining,
                 result.get('optimizer_guardrails') or _optimizer_guardrails_snapshot()
             ),
             'planning_policy': _json_safe(result.get('planning_policy')),
+            'winter_policy': _json_safe(result.get('winter_policy')),
             'victron_slots': victron_slots,
             'schedule': schedule,
         }
@@ -1692,11 +1858,20 @@ def _append_history(result, *, batt_soc, applied_setpoint, today_actuals, realiz
             except (TypeError, ValueError):
                 return None
 
+        def _slot_day(slot):
+            try:
+                slot_time = slot.get('time')
+                return (slot_time.date() if hasattr(slot_time, 'date')
+                        else _dt.fromisoformat(str(slot_time).replace('Z', '+00:00')).date())
+            except (TypeError, ValueError):
+                return None
+
         # Forecast net € over the planned horizon (profit positive), so we can
         # later compare it against the realised net and learn the optimizer's
         # bias. Excludes stored PV surplus (it isn't sold, so it isn't realised
         # revenue) to stay comparable with grid-measured actuals.
         f_imp_cost = f_exp_rev = 0.0
+        today_f_imp_cost = today_f_exp_rev = 0.0
         for s in (result.get('schedule') or []):
             try:
                 g = float(s.get('grid_energy') or 0.0)
@@ -1710,14 +1885,20 @@ def _append_history(result, *, batt_soc, applied_setpoint, today_actuals, realiz
                 continue
             if g > 0:
                 f_imp_cost += g * b
+                if _slot_day(s) == now.date():
+                    today_f_imp_cost += g * b
             elif g < 0:
                 f_exp_rev += -g * sl
+                if _slot_day(s) == now.date():
+                    today_f_exp_rev += -g * sl
         plan_horizon_net_eur = round(f_exp_rev - f_imp_cost, 4)
 
         # Realised net so far today (profit positive) = export reward - import cost.
         _exp_rev = _num(act.get('exp_rev')) or 0.0
         _imp_cost = _num(act.get('imp_cost')) or 0.0
         realized_net_eur = round(_exp_rev - _imp_cost, 4)
+        plan_today_remaining_net_eur = round(today_f_exp_rev - today_f_imp_cost, 4)
+        forecast_day_net_eur = round(realized_net_eur + plan_today_remaining_net_eur, 4)
 
         # Actual PV produced so far today (kWh) from the two MPPT daily yields.
         pv_actual_today_kwh = round((_num(STATE.get('c1_daily_yield')) or 0.0)
@@ -1738,9 +1919,22 @@ def _append_history(result, *, batt_soc, applied_setpoint, today_actuals, realiz
         if fresh_day and (load_actual_today_wh or 0.0) > 2000.0:
             load_actual_today_wh = 0.0
 
+        # Decompose raw AC-out using the evcharger Ac/Power reading only when the
+        # independently updated measurements are fresh and physically coherent.
+        _ev_w = _num(rp.get('ev_w'))
+        _load_w = _num(rp.get('load_w'))
+        _ev_meter_available = rp.get('ev_meter_available')
+        if _ev_meter_available is None:
+            _ev_meter_available = 'ev_w' in rp and rp.get('ev_w') is not None
+        _ev_meter_fresh = rp.get('ev_meter_fresh', True)
+        _base_load_w, _load_decomposition = _classify_cycle_load(
+            _load_w, _ev_w, meter_available=bool(_ev_meter_available),
+            meter_fresh=bool(_ev_meter_fresh))
+
         record = {
             "ts": now.isoformat(),
             "kind": "cycle",
+            "optimizer_mode": result.get('optimizer_mode') or OPTIMIZER_MODE,
             "soc": batt_soc,
             "control_action": result.get('control_action'),
             # What the system was actually doing (from live flow) when this record
@@ -1759,15 +1953,33 @@ def _append_history(result, *, batt_soc, applied_setpoint, today_actuals, realiz
             "pv_w": _num(rp.get('pv_w')),
             "load_w": _num(rp.get('load_w')),
             "batt_w": _num(rp.get('batt_w')),
+            # EV charge draw and EV-excluded house ("base") load. load_w is the raw
+            # AC-out reading with the EV charger booked inside it; base_load_w is
+            # what the optimizer should learn as the home's own consumption. Both
+            # are additive — load_w is untouched so nothing downstream breaks.
+            "ev_w": _ev_w,
+            "base_load_w": _base_load_w,
+            "load_decomposition_quality": _load_decomposition,
             # Forecast context.
             "pv_remaining_wh": STATE.get('pv_projected_remaining'),
             "pv_tomorrow_wh": STATE.get('pv_projected_tomorrow'),
+            "pv_forecast_today_date": STATE.get('pv_projected_today_date'),
+            "pv_forecast_tomorrow_date": STATE.get('pv_projected_tomorrow_date'),
+            "pv_forecast_updated_at": STATE.get('pv_forecast_updated_at'),
+            "pv_actual_quality": STATE.get('pv_actual_quality'),
+            "pv_actual_raw_kwh": _num(STATE.get('pv_actual_raw_kwh')),
+            "pv_actual_effective_kwh": _num(STATE.get('pv_actual_effective_kwh')),
             # Forecast vs actual (for learning VRM/optimizer bias over time).
             "pv_forecast_today_kwh": _num(STATE.get('pv_projected_today')),
             "pv_actual_today_kwh": pv_actual_today_kwh,
             "load_forecast_today_wh": _num(STATE.get('consumption_total_projected')),
             "load_actual_today_wh": load_actual_today_wh,
             "plan_horizon_net_eur": plan_horizon_net_eur,
+            # Intraday forecast of today's final settled net (profit positive).
+            # This deliberately excludes tomorrow even when its prices are already
+            # present in the optimizer horizon, so snapshots remain comparable.
+            "plan_today_remaining_net_eur": plan_today_remaining_net_eur,
+            "forecast_day_net_eur": forecast_day_net_eur,
             "realized_net_eur": realized_net_eur,
             # Running daily actuals (reset by Tibber at midnight).
             "day_import_kwh": act.get('imp_kwh'),
@@ -1775,6 +1987,34 @@ def _append_history(result, *, batt_soc, applied_setpoint, today_actuals, realiz
             "day_export_kwh": act.get('exp_kwh'),
             "day_export_reward": act.get('exp_rev'),
         }
+        winter_policy = result.get('winter_policy') or {}
+        if winter_policy:
+            record.update({
+                "winter_policy_selected": winter_policy.get('selected_candidate'),
+                "winter_policy_reason_code": winter_policy.get('reason_code'),
+                "winter_next_replenishment": winter_policy.get(
+                    'next_replenishment_time'),
+                "winter_required_house_kwh": _num(
+                    winter_policy.get('forecast_house_energy_required_kwh')),
+                "winter_uncertainty_kwh": _num(
+                    winter_policy.get('uncertainty_allowance_kwh')),
+                "winter_protected_soc": _num(
+                    winter_policy.get('protected_soc_percent')),
+                "winter_exceptional_spread_eur_per_kwh": _num(
+                    winter_policy.get('exceptional_spread_eur_per_kwh')),
+                "winter_incremental_benefit_eur": _num(
+                    winter_policy.get('expected_incremental_benefit_eur')),
+                "winter_warning": winter_policy.get('warning'),
+            })
+        guardrails = result.get('optimizer_guardrails') or {}
+        record.update({
+            "battery_cost_basis_eur_per_dc_kwh": _num(
+                guardrails.get('cost_basis_eur_per_dc_kwh')),
+            "battery_cost_basis_sell_floor": _num(
+                guardrails.get('cost_basis_sell_floor')),
+            "battery_initial_protected_soc": _num(
+                guardrails.get('initial_protected_soc')),
+        })
         weather_summary = (result.get('weather_context') or {}).get('summary') or {}
         if weather_summary:
             record.update({
@@ -1828,6 +2068,10 @@ def _settle_prior_slot(result, *, batt_soc, today_actuals, now=None) -> None:
             except (TypeError, ValueError):
                 return None
 
+        ev_meter_available = (
+            STATE.has('tesla_charge_energy_forward')
+            if hasattr(STATE, 'has') else STATE.get('tesla_charge_energy_forward') is not None
+        )
         cur = {
             'ts': now.isoformat(),
             'day_import_kwh': _f(act.get('imp_kwh')),
@@ -1841,6 +2085,14 @@ def _settle_prior_slot(result, *, batt_soc, today_actuals, now=None) -> None:
             # Read from STATE here (this function has no cycle-record locals); _diff
             # turns a midnight counter reset into None, same as the other counters.
             'load_actual_wh': _f(STATE.get('consumption_total_cumulative')),
+            # Lifetime EV-charge energy (kWh) straight from the evcharger meter's
+            # Ac/Energy/Forward totalizer — the bus source of truth. Diffed below
+            # into this slot's ev_charge_kwh. Monotonic; a meter reset/replacement
+            # makes _diff() return None rather than a bogus negative.
+            'ev_energy_fwd_kwh': (
+                _f(STATE.get('tesla_charge_energy_forward')) if ev_meter_available else None
+            ),
+            'ev_meter_available': ev_meter_available,
             'slot_key': cur_slot,
         }
         sched0 = (result.get('schedule') or [{}])[0]
@@ -1901,6 +2153,38 @@ def _settle_prior_slot(result, *, batt_soc, today_actuals, now=None) -> None:
             imp_cost, exp_rev = _diff('day_import_cost'), _diff('day_export_reward')
             pv_kwh = _diff('pv_kwh')
             load_act_wh = _diff('load_actual_wh')   # cumulative Wh delta -> per-slot load
+            if load_act_wh is None:
+                load_meter_quality = 'counter_reset_or_missing'
+            elif incomplete or gap_s is None or gap_s <= 0:
+                load_meter_quality = 'incomplete_interval'
+            else:
+                max_load_delta_wh = (
+                    _SITE_MAX_LOAD_KW * 1000.0 * gap_s / 3600.0 * _METER_DELTA_MARGIN
+                    + _METER_DELTA_RESOLUTION_KWH * 1000.0
+                )
+                load_meter_quality = (
+                    'implausible_delta' if load_act_wh > max_load_delta_wh else 'measured'
+                )
+            ev_kwh = None
+            if not prev.get('ev_meter_available') or not cur.get('ev_meter_available'):
+                ev_meter_quality = 'missing_endpoint'
+            elif incomplete or gap_s is None or gap_s <= 0:
+                ev_meter_quality = 'incomplete_interval'
+            else:
+                raw_ev_delta = _diff('ev_energy_fwd_kwh')
+                if raw_ev_delta is None:
+                    ev_meter_quality = 'counter_reset'
+                else:
+                    raw_ev_delta = max(0.0, raw_ev_delta)  # tolerate sub-micro kWh counter noise
+                    max_ev_delta = (
+                        _EV_CHARGER_MAX_KW * gap_s / 3600.0 * _METER_DELTA_MARGIN
+                        + _METER_DELTA_RESOLUTION_KWH
+                    )
+                    if raw_ev_delta > max_ev_delta:
+                        ev_meter_quality = 'implausible_delta'
+                    else:
+                        ev_kwh = raw_ev_delta
+                        ev_meter_quality = 'measured'
             soc_start, soc_end = prev.get('soc'), cur.get('soc')
             soc_delta = (soc_end - soc_start) if (soc_start is not None and soc_end is not None) else None
             actual_net = (exp_rev - imp_cost) if (exp_rev is not None and imp_cost is not None) else None
@@ -1951,6 +2235,18 @@ def _settle_prior_slot(result, *, batt_soc, today_actuals, now=None) -> None:
                 'actual_net_eur': round(actual_net, 4) if actual_net is not None else None,
                 'actual_pv_kwh': round(pv_kwh, 3) if pv_kwh is not None else None,
                 'actual_load_kwh': round(load_act_wh / 1000.0, 3) if load_act_wh is not None else None,
+                # EV charge energy this slot, and the EV-excluded base load the
+                # forecaster should learn. base = total - EV, clamped >= 0 so a
+                # measurement mismatch can never make base negative. actual_load_kwh
+                # is left intact (total site load) for accounting/charts.
+                'ev_charge_kwh': round(ev_kwh, 3) if ev_kwh is not None else None,
+                'base_load_kwh': (
+                    round(max(0.0, load_act_wh / 1000.0 - ev_kwh), 3)
+                    if load_act_wh is not None and ev_kwh is not None
+                    and load_meter_quality == 'measured' else None
+                ),
+                'ev_meter_quality': ev_meter_quality,
+                'load_meter_quality': load_meter_quality,
                 'predicted_pv_kwh': pred.get('predicted_pv_kwh'),
                 'predicted_load_kwh': pred.get('predicted_load_kwh'),
                 'temp_forecast_c': pred.get('temp_forecast_c'),
@@ -2017,11 +2313,31 @@ def _run_ai_optimizer_once():
         # Snapshot the realized power NOW, before we apply this cycle's setpoint,
         # so the history record reflects the steady-state outcome of the prior
         # decision (not a just-applied/transient value).
+        ev_meter_available = (
+            STATE.has('tesla_power') if hasattr(STATE, 'has') else STATE.get('tesla_power') is not None
+        )
+        ev_power_updated_at = (
+            STATE.get('tesla_power_updated_at')
+            if hasattr(STATE, 'has') and STATE.has('tesla_power_updated_at') else None
+        )
+        try:
+            ev_meter_fresh = (
+                ev_power_updated_at is not None
+                and 0.0 <= time.time() - float(ev_power_updated_at) <= 120.0
+            )
+        except (TypeError, ValueError):
+            ev_meter_fresh = False
         realized_power = {
             'grid_w': STATE.get('ac_in_power'),
             'pv_w': STATE.get('pv_power'),
             'load_w': STATE.get('ac_out_power'),
             'batt_w': STATE.get('batt_power'),
+            # Total EV power from the local meter. MQTT values are independently
+            # updated, so _classify_cycle_load validates coherence before allowing
+            # this sample to teach the base-load forecast.
+            'ev_w': STATE.get('tesla_power') if ev_meter_available else None,
+            'ev_meter_available': ev_meter_available,
+            'ev_meter_fresh': ev_meter_fresh,
         }
 
         prices = get_all_price_points()
@@ -2031,7 +2347,6 @@ def _run_ai_optimizer_once():
 
         # 2. Build forecasts from available system data.
         # Normalise price slot starts for the PV forecast distribution.
-        from lib.ai_powered_ess import _coerce_datetime
         normalised_slots = []
         for p in prices:
             try:
@@ -2080,8 +2395,24 @@ def _run_ai_optimizer_once():
         # 3. Optimize
         result = optimize_schedule(batt_soc, prices, load_forecast, pv_forecast)
         if not result:
-            logging.warning("AI_ESS: Optimization failed or returned nothing.")
-            return
+            if OPTIMIZER_MODE != 'winter':
+                logging.warning("AI_ESS: Optimization failed or returned nothing.")
+                return
+            logging.error(
+                "AI_ESS: Winter optimization failed; applying safe RETAIN and "
+                "clearing retained charge schedules."
+            )
+            result = _winter_safe_retain_result(prices, slot_duration_h)
+        # The startup selector is authoritative. Publishing this on every plan
+        # makes the active engine observable without inferring it from behavior.
+        result['optimizer_mode'] = OPTIMIZER_MODE
+        STATE.set('ai_optimizer_mode', OPTIMIZER_MODE)
+        if OPTIMIZER_MODE == 'winter':
+            winter_policy = result.get('winter_policy') or {}
+            STATE.set('ai_winter_candidate', winter_policy.get('selected_candidate'))
+            STATE.set('ai_winter_protected_soc', winter_policy.get('protected_soc_percent'))
+            STATE.set('ai_winter_next_replenishment', winter_policy.get('next_replenishment_time'))
+            STATE.set('ai_winter_warning', winter_policy.get('warning'))
         if weather_context:
             result['weather_context'] = weather_context
 
@@ -2094,8 +2425,9 @@ def _run_ai_optimizer_once():
             else:
                 limit_grid_feed_in(enabled=False)
 
-        # Keep the Victron hardware MinimumSocLimit in sync with the seasonal
-        # reserve (single source of truth). Idempotent — only writes on change.
+        # Reconcile Victron's independent hardware safety floor. This must not
+        # mirror the optimizer's seasonal reserve: current SoC below
+        # MinimumSocLimit triggers Victron Recharge outside the optimized schedule.
         set_minimum_ess_soc()
 
         # 4b. Manual override wins over the plan; otherwise damp SELL flapping.
@@ -2224,9 +2556,18 @@ def _run_ai_optimizer_once():
         # so we keep the service log clean with a one-line summary instead of the
         # multi-line plan table.
         charge_slot_note = ". Victron charge slots scheduled." if victron_slots else ""
+        if OPTIMIZER_MODE == 'winter':
+            winter_policy = result.get('winter_policy') or {}
+            logging.info(
+                "AI_ESS: Winter policy — candidate=%s protected_soc=%s%% next=%s warning=%s",
+                winter_policy.get('selected_candidate'),
+                winter_policy.get('protected_soc_percent'),
+                winter_policy.get('next_replenishment_time'),
+                winter_policy.get('warning') or 'none',
+            )
         logging.info(
-            "AI_ESS: Optimization complete — action=%s setpoint=%sW SoC=%.0f%% price=%.3f%s",
-            result.get('control_action'), applied_setpoint,
+            "AI_ESS: Optimization complete — mode=%s action=%s setpoint=%sW SoC=%.0f%% price=%.3f%s",
+            OPTIMIZER_MODE, result.get('control_action'), applied_setpoint,
             (batt_soc if batt_soc is not None else float('nan')),
             (result.get('current_price') or 0.0),
             charge_slot_note,

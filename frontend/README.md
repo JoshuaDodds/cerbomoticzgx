@@ -81,6 +81,8 @@ sharing the host's `/dev/shm` (so it can read the published plan). Expose
   net) + clock. **Today** and **Month** are signed € chips — green `+` for profit,
   red `−` for loss, no "profit"/"cost" word. **Month** is the sum of this month's
   settled daily totals (`Σ export_reward − Σ import_cost` from the history).
+  If the backend stops responding, an accessible **Server Offline** banner appears
+  after the live-feed grace period while the dashboard retains its last good values.
   On phones, `app.mobile.css` compacts the header into logo + action/SoC pill + clock
   with the full status strip as a horizontal swipe row; the current price chip sits at
   the end of that swipe row. External Battery/Venus iframe views are scaled to 90%
@@ -91,6 +93,8 @@ sharing the host's `/dev/shm` (so it can read the published plan). Expose
   original source value is shown underneath as `VRM forecast: ... kWh remaining`, so
   the card and schedule use the same number without hiding where the raw forecast
   came from.
+  The P/L summary begins with a short, human-readable description of the remaining
+  buy/charge, hold, and sell strategy from now until midnight.
 - **Live** (tab): real-time power-flow diagram (v2) — **VRM-style info cards** laid
   out in the real Victron **physical topology**: Grid — **Inverter/Charger** — AC
   Loads across the AC bus; the Inverter/Charger linked down to the Battery; **Solar
@@ -122,8 +126,10 @@ sharing the host's `/dev/shm` (so it can read the published plan). Expose
 - **Trends** (tab): HA-style metric cards (**self-sufficiency %**, **self-consumed
   solar %**, **grid balance** bar) above a gradient SoC% + buy-price line chart with
   a `now` marker and clickable series legends, an actual-vs-forecast PV/load overlay,
-  plus a **monthly net chart** with today's projected full-day marker
-  (`/api/history/month`).
+  plus a **monthly net forecast-evolution chart** (`/api/history/month`). Each day
+  with prospective snapshots gets a candle (first/latest forecast body and intraday
+  low/high range) and a round settled-actual point. Legacy days remain actual-only;
+  no historical forecast spread is inferred or backfilled.
 - **Schedule** (tab): expandable hour → 15-min → reasoning tree, color-coded by
   control action, with a per-hour timeline bar and aggregates. For today, the
   timeline starts at midnight with settled history rows, then flows into the forward
@@ -170,7 +176,9 @@ and watcher all use the same file. The main service picks it up because:
   value applies on the **next optimization/decision cycle** (and it republishes the
   `Cerbomoticzgx/config/<KEY>` MQTT mirror on that read), and
 - `lib.config_change_handler.ConfigWatcher` detects the file change and runs any
-  per-key handler (e.g. a restart for `ACTIVE_MODULES`).
+  per-key handler (e.g. a restart for `ACTIVE_MODULES` or `WINTER_MODE`). Changes
+  to `VICTRON_HARDWARE_MIN_SOC` are applied immediately; startup and optimizer
+  cycles also reconcile that independent hard floor.
 
 Only keys in `config_schema.py` are writable. Runtime *control* values that live in
 `GlobalState`/the MQTT bus (e.g. `ess_net_metering_enabled`) are a separate future
