@@ -494,6 +494,16 @@ def test_pl_summary_includes_human_readable_remaining_day_strategy():
     assert ".pl-strategy" in css
 
 
+def test_pl_summary_explains_winter_household_protection_policy():
+    js = APP_JS.read_text(encoding="utf-8")
+
+    assert 'plan.optimizer_mode === "winter"' in js
+    assert "winter_policy" in js
+    assert "protected household requirement" in js
+    assert "An exceptional spread cleared every loss and safety hurdle" in js
+    assert "Winter Mode degraded safely" in js
+
+
 def test_monthly_chart_uses_forecast_candles_and_actual_settlement_dots():
     charts = (ROOT / "frontend" / "static" / "js" / "charts.js").read_text(encoding="utf-8")
 

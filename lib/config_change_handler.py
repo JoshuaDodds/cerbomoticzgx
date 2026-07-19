@@ -13,7 +13,7 @@ def handle_env_change(env_variable):
     """
     handle changes in .env variables
     """
-    if env_variable == "ACTIVE_MODULES":
+    if env_variable in {"ACTIVE_MODULES", "WINTER_MODE"}:
         logging.info(f"config_change_handler: This change requires a restart...")
         publish_message("Cerbomoticzgx/system/shutdown", message="True", retain=True)
 
@@ -22,6 +22,22 @@ def handle_env_change(env_variable):
 
         logging.info(f"config_change_handler: Updating EnergyBroker...")
         manage_grid_usage_based_on_current_price()
+
+    if env_variable == "VICTRON_HARDWARE_MIN_SOC":
+        from lib.victron_integration import set_minimum_ess_soc
+
+        logging.info("config_change_handler: Applying Victron hardware minimum SoC...")
+        try:
+            set_minimum_ess_soc(force=True)
+        except Exception as error:
+            # The watcher runs from a timer thread. A transient MQTT failure must
+            # not terminate that thread; startup and each optimizer cycle also
+            # reconcile this idempotent setting.
+            logging.error(
+                "config_change_handler: Failed to apply Victron hardware minimum "
+                "SoC; startup/optimizer reconciliation will retry: %s",
+                error,
+            )
 
 
 class ConfigWatcher(FileSystemEventHandler):
@@ -79,6 +95,11 @@ class ConfigWatcher(FileSystemEventHandler):
 
         # Add new keys if introduced
         for key in current_values.keys() - self._cache.keys():
+            # These settings do not exist in older deployed .env files. Their
+            # first dashboard write must still run the corresponding handler;
+            # silently caching them would defer the intended restart/write.
+            if key in {"WINTER_MODE", "VICTRON_HARDWARE_MIN_SOC"} and self.handler:
+                self.handler(key)
             self._cache[key] = current_values[key]
 
     def start(self):

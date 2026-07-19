@@ -684,6 +684,7 @@ function renderDaySummary(plan) {
 
 function planStrategySummary(plan) {
   const now = new Date();
+  const winterPolicy = plan.optimizer_mode === "winter" ? (plan.winter_policy || {}) : null;
   const configuredSlotHours = Number(plan.slot_duration_h);
   const slotHours = Number.isFinite(configuredSlotHours) && configuredSlotHours > 0
     ? configuredSlotHours : 0.25;
@@ -695,7 +696,15 @@ function planStrategySummary(plan) {
     .filter((entry) => !Number.isNaN(entry.at.getTime()) && sameLocalDay(entry.at)
       && entry.at.getTime() + durationMs > now.getTime())
     .sort((a, b) => a.at - b.at);
-  if (!slots.length) return "From now until midnight: no further scheduled grid action; use solar locally and avoid unnecessary battery cycling.";
+  if (!slots.length) {
+    if (winterPolicy) {
+      if (winterPolicy.warning === "optimizer_failed_safe_retain") {
+        return "Winter Mode degraded safely: the optimizer could not produce a plan, so retained charge windows were cleared and the battery is being preserved from the grid.";
+      }
+      return "Winter Mode: no further grid action is needed today; preserve the protected household reserve until the next low-price window.";
+    }
+    return "From now until midnight: no further scheduled grid action; use solar locally and avoid unnecessary battery cycling.";
+  }
 
   const groupsFor = (action) => {
     const matches = slots.filter((entry) => caOf(entry.slot) === action);
@@ -722,6 +731,25 @@ function planStrategySummary(plan) {
   }
   if (sells.length) parts.push(`export during the price peaks at ${ranges(sells)}`);
   if (!parts.length) parts.push("hold the battery for household demand and use available solar locally");
+
+  if (winterPolicy) {
+    const selected = winterPolicy.selected_candidate || "self_sufficiency";
+    const protectedSoc = Number(winterPolicy.protected_soc_percent);
+    const requiredKwh = Number(winterPolicy.forecast_house_energy_required_kwh);
+    const target = buys.length
+      ? Math.max(...buys.flatMap((g) => g.entries.map((e) => Number(e.slot.soc_end)).filter(Number.isFinite)))
+      : null;
+    const objective = selected === "exceptional_arbitrage"
+      ? "An exceptional spread cleared every loss and safety hurdle; only energy above the protected household requirement may be sold."
+      : "The plan buys only the forecast household requirement at low prices and avoids routine battery export.";
+    const detail = [
+      Number.isFinite(target) ? `charge toward ${Math.round(target)}%` : null,
+      Number.isFinite(requiredKwh) ? `${requiredKwh.toFixed(1)} kWh forecast house energy protected` : null,
+      Number.isFinite(protectedSoc) ? `protected floor ${Math.round(protectedSoc)}%` : null,
+    ].filter(Boolean).join(" · ");
+    const warning = winterPolicy.warning ? ` Warning: ${winterPolicy.warning}` : "";
+    return `Winter Mode: ${parts.join(", then ")}. ${objective}${detail ? ` ${detail}.` : ""}${warning}`;
+  }
 
   let strategy = "Avoid unnecessary grid use";
   if (buys.length && sells.length) strategy = "Buy low, then sell at the stronger price peaks";

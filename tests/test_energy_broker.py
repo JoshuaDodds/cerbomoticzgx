@@ -457,6 +457,13 @@ def test_publish_plan_json_serializes_weather_datetime_maps(monkeypatch, tmp_pat
             "today_sacrifice_eur": 10.0,
             "future_gain_eur": 3.0,
         },
+        "optimizer_mode": "winter",
+        "winter_policy": {
+            "mode": "winter",
+            "selected_candidate": "self_sufficiency",
+            "protected_soc_percent": 46.0,
+            "reason_code": "WINTER_EXCEPTIONAL_SPREAD_REJECTED",
+        },
     }
 
     energy_broker._publish_plan_json(
@@ -487,6 +494,13 @@ def test_publish_plan_json_serializes_weather_datetime_maps(monkeypatch, tmp_pat
     }
     assert payload["planning_policy"]["selected"] == "today_first"
     assert payload["planning_policy"]["reason_code"] == "DAILY_SETTLEMENT_PROTECTED"
+    assert payload["optimizer_mode"] == "winter"
+    assert payload["winter_policy"] == {
+        "mode": "winter",
+        "selected_candidate": "self_sufficiency",
+        "protected_soc_percent": 46.0,
+        "reason_code": "WINTER_EXCEPTIONAL_SPREAD_REJECTED",
+    }
 
 
 def test_weather_context_log_message_explains_applied_adjustments():
@@ -582,17 +596,21 @@ def test_manual_grid_assist_reports_retain_even_with_zero_setpoint():
     assert energy_broker._grid_assist_control_action(applied_setpoint=0, manual_grid_assist=False) == "IDLE"
 
 
-def test_current_min_soc_reserve_is_seasonal(monkeypatch):
+def test_current_min_soc_reserve_follows_explicit_winter_mode(monkeypatch):
     import sys
+    import lib.ess_mode as ess_mode
     import lib.helpers as helpers
     cr = sys.modules.get("lib.config_retrieval")
-    monkeypatch.setattr(cr, "retrieve_setting",
-                        lambda n: {"MIN_SOC_RESERVE_WINTER": "40", "MIN_SOC_RESERVE_SUMMER": "0"}.get(n))
+    settings = {
+        "MIN_SOC_RESERVE_WINTER": "40",
+        "MIN_SOC_RESERVE_SUMMER": "0",
+    }
+    monkeypatch.setattr(cr, "retrieve_setting", settings.get)
+    monkeypatch.setattr(ess_mode, "WINTER_MODE", True)
 
-    monkeypatch.setattr(helpers, "is_winter_month", lambda: True)
     assert helpers.current_min_soc_reserve() == 40.0
 
-    monkeypatch.setattr(helpers, "is_winter_month", lambda: False)
+    monkeypatch.setattr(ess_mode, "WINTER_MODE", False)
     assert helpers.current_min_soc_reserve() == 0.0
 
 
@@ -951,6 +969,69 @@ def test_ai_optimizer_applies_pv_nowcast_when_weather_unavailable(monkeypatch):
 
     nowcast.assert_called_once()
     assert nowcast.call_args.args[2]["available"] is False
+
+
+def test_winter_optimizer_failure_clears_stale_control_and_retains(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    import lib.weather as weather
+
+    start = datetime.now(timezone.utc)
+    prices = [
+        {"start": (start + timedelta(minutes=15 * i)).isoformat(), "total": 0.20}
+        for i in range(2)
+    ]
+    monkeypatch.setattr(energy_broker, "OPTIMIZER_MODE", "winter")
+    monkeypatch.setattr(
+        energy_broker,
+        "retrieve_setting",
+        lambda name: "1" if name == "AI_POWERED_ESS_ALGORITHM" else None,
+    )
+    monkeypatch.setattr(
+        energy_broker,
+        "STATE",
+        DummyState({"batt_soc": 42, "ac_in_power": 0, "pv_power": 0,
+                    "ac_out_power": 1000, "batt_power": -1000}),
+    )
+    monkeypatch.setattr(energy_broker, "get_all_price_points", lambda: prices)
+    monkeypatch.setattr(energy_broker, "_build_pv_forecast_by_slot", lambda *args: {})
+    monkeypatch.setattr(energy_broker, "_build_load_forecast_by_slot", lambda *args: {})
+    monkeypatch.setattr(energy_broker, "_apply_pv_nowcast", lambda pv, *args: pv)
+    monkeypatch.setattr(
+        weather, "weather_context_for_slots",
+        lambda *args, **kwargs: {"available": False, "summary": {}, "slots": {}},
+    )
+    monkeypatch.setattr(energy_broker, "optimize_schedule", lambda *args: None)
+    monkeypatch.setattr(energy_broker, "current_min_soc_reserve", lambda: 40.0)
+    minimum_soc = MagicMock()
+    clear_slots = MagicMock()
+    grid_assist = MagicMock()
+    monkeypatch.setattr(energy_broker, "set_minimum_ess_soc", minimum_soc)
+    monkeypatch.setattr(energy_broker, "clear_victron_schedules", clear_slots)
+    monkeypatch.setattr(energy_broker, "_set_grid_assist", grid_assist)
+    monkeypatch.setattr(energy_broker, "_apply_grid_assist_setpoint", lambda **kwargs: None)
+    monkeypatch.setattr(energy_broker, "_grid_assist_setpoint_watts", lambda **kwargs: 1000)
+    monkeypatch.setattr(energy_broker, "limit_grid_feed_in", lambda **kwargs: None)
+    monkeypatch.setattr(energy_broker, "get_today_energy_actuals", lambda: {})
+    monkeypatch.setattr(energy_broker, "_append_history", lambda *args, **kwargs: None)
+    monkeypatch.setattr(energy_broker, "_settle_prior_slot", lambda *args, **kwargs: None)
+    published = []
+    monkeypatch.setattr(
+        energy_broker, "_publish_plan_json",
+        lambda result, **kwargs: published.append(result.copy()),
+    )
+
+    assert energy_broker.run_ai_optimizer() is True
+
+    minimum_soc.assert_called_once()
+    clear_slots.assert_called_once()
+    grid_assist.assert_called_with(True)
+    assert published[0]["optimizer_mode"] == "winter"
+    assert published[0]["control_action"] == "RETAIN"
+    assert published[0]["winter_policy"]["warning"] == "optimizer_failed_safe_retain"
+    assert energy_broker.STATE.get("ai_optimizer_mode") == "winter"
+    assert energy_broker.STATE.get("ai_winter_candidate") == "self_sufficiency"
+    assert energy_broker.STATE.get("ai_winter_protected_soc") == 40.0
+    assert energy_broker.STATE.get("ai_winter_warning") == "optimizer_failed_safe_retain"
 
 
 def test_low_soc_idle_retain_defers_to_cheaper_planned_buy(monkeypatch):

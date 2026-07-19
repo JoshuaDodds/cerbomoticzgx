@@ -631,6 +631,7 @@ def get_plan() -> dict:
     return {
         "available": True,
         "generated_at": raw.get("generated_at"),
+        "optimizer_mode": raw.get("optimizer_mode") or "summer",
         "age_seconds": age_s,
         "stale": (age_s is not None and age_s > 1800),  # >30 min old
         "battery_soc": raw.get("battery_soc"),
@@ -645,6 +646,7 @@ def get_plan() -> dict:
         "price_points": raw.get("price_points"),
         "slot_duration_h": raw.get("slot_duration_h"),
         "current": raw.get("current", {}),
+        "winter_policy": raw.get("winter_policy"),
         "today": raw.get("today", {}),
         "victron_slots": raw.get("victron_slots", []),
         "hours": group_by_hour(timeline_schedule),

@@ -13,7 +13,11 @@ from lib.notifications import pushover_notification
 from lib.tibber_api import publish_pricing_data, get_all_price_points
 from lib.global_state import GlobalStateClient
 from lib.victron_integration import ac_power_setpoint, limit_grid_feed_in, set_minimum_ess_soc
-from lib.ai_powered_ess import optimize_schedule
+from lib.ess_optimizer_selector import (
+    OPTIMIZER_MODE,
+    _coerce_datetime,
+    optimize_schedule,
+)
 from lib import history_store as _hist
 
 STATE = GlobalStateClient()
@@ -1226,6 +1230,55 @@ def _apply_low_soc_retain_before_cheaper_buy(result, batt_soc):
     return result
 
 
+def _winter_safe_retain_result(prices, slot_duration_h):
+    """Return an observable, neutral fallback when Winter Mode cannot plan.
+
+    A mode-changing restart can leave retained summer export setpoints and charge
+    slots on the Victron bus.  Returning a normal broker result keeps the shared
+    application path running so it clears those slots, applies the winter hardware
+    reserve, and retains the battery instead of silently leaving stale summer
+    control active.
+    """
+    current_price = 0.0
+    for point in prices or []:
+        try:
+            current_price = float(point['total'])
+            break
+        except (KeyError, TypeError, ValueError):
+            continue
+    return {
+        'schedule': [],
+        'victron_slots': [],
+        'optimizer_guardrails': _optimizer_guardrails_snapshot(),
+        'winter_policy': {
+            'mode': 'winter',
+            'selected_candidate': 'self_sufficiency',
+            'next_replenishment_time': None,
+            'forecast_house_energy_required_kwh': None,
+            'uncertainty_allowance_kwh': None,
+            'protected_soc_percent': current_min_soc_reserve(),
+            'protected_energy_kwh': None,
+            'exceptional_spread_eur_per_kwh': None,
+            'expected_incremental_benefit_eur': 0.0,
+            'reason_code': 'WINTER_OPTIMIZER_FAILED_SAFE_RETAIN',
+            'reason': 'Winter optimizer could not produce a feasible plan',
+            'warning': 'optimizer_failed_safe_retain',
+            'active_charge_windows': 0,
+        },
+        'optimizer_mode': 'winter',
+        'setpoint': 0.0,
+        'mode': 'hold',
+        'control_action': 'RETAIN',
+        'reason': 'Winter optimizer unavailable; safely retaining the battery',
+        'reason_code': 'WINTER_OPTIMIZER_FAILED_SAFE_RETAIN',
+        'grid_assist': True,
+        'pv_surplus': False,
+        'current_price': current_price,
+        'limit_feed_in': current_price < 0.0,
+        'slot_duration_h': slot_duration_h,
+    }
+
+
 def _filter_victron_slots_for_grid_charge_cap(victron_slots, batt_soc, now=None):
     """Apply ESS_MAX_GRID_CHARGE_SOC to Victron forced charge windows.
 
@@ -1701,6 +1754,7 @@ def _publish_plan_json(result, *, batt_soc, price_points, pv_remaining,
 
         payload = {
             'generated_at': _dt.now().astimezone().isoformat(),
+            'optimizer_mode': result.get('optimizer_mode') or OPTIMIZER_MODE,
             'battery_soc': batt_soc,
             'price_points': price_points,
             'pv_remaining_wh': pv_remaining,
@@ -1733,6 +1787,7 @@ def _publish_plan_json(result, *, batt_soc, price_points, pv_remaining,
                 result.get('optimizer_guardrails') or _optimizer_guardrails_snapshot()
             ),
             'planning_policy': _json_safe(result.get('planning_policy')),
+            'winter_policy': _json_safe(result.get('winter_policy')),
             'victron_slots': victron_slots,
             'schedule': schedule,
         }
@@ -1879,6 +1934,7 @@ def _append_history(result, *, batt_soc, applied_setpoint, today_actuals, realiz
         record = {
             "ts": now.isoformat(),
             "kind": "cycle",
+            "optimizer_mode": result.get('optimizer_mode') or OPTIMIZER_MODE,
             "soc": batt_soc,
             "control_action": result.get('control_action'),
             # What the system was actually doing (from live flow) when this record
@@ -1931,6 +1987,25 @@ def _append_history(result, *, batt_soc, applied_setpoint, today_actuals, realiz
             "day_export_kwh": act.get('exp_kwh'),
             "day_export_reward": act.get('exp_rev'),
         }
+        winter_policy = result.get('winter_policy') or {}
+        if winter_policy:
+            record.update({
+                "winter_policy_selected": winter_policy.get('selected_candidate'),
+                "winter_policy_reason_code": winter_policy.get('reason_code'),
+                "winter_next_replenishment": winter_policy.get(
+                    'next_replenishment_time'),
+                "winter_required_house_kwh": _num(
+                    winter_policy.get('forecast_house_energy_required_kwh')),
+                "winter_uncertainty_kwh": _num(
+                    winter_policy.get('uncertainty_allowance_kwh')),
+                "winter_protected_soc": _num(
+                    winter_policy.get('protected_soc_percent')),
+                "winter_exceptional_spread_eur_per_kwh": _num(
+                    winter_policy.get('exceptional_spread_eur_per_kwh')),
+                "winter_incremental_benefit_eur": _num(
+                    winter_policy.get('expected_incremental_benefit_eur')),
+                "winter_warning": winter_policy.get('warning'),
+            })
         guardrails = result.get('optimizer_guardrails') or {}
         record.update({
             "battery_cost_basis_eur_per_dc_kwh": _num(
@@ -2272,7 +2347,6 @@ def _run_ai_optimizer_once():
 
         # 2. Build forecasts from available system data.
         # Normalise price slot starts for the PV forecast distribution.
-        from lib.ai_powered_ess import _coerce_datetime
         normalised_slots = []
         for p in prices:
             try:
@@ -2321,8 +2395,24 @@ def _run_ai_optimizer_once():
         # 3. Optimize
         result = optimize_schedule(batt_soc, prices, load_forecast, pv_forecast)
         if not result:
-            logging.warning("AI_ESS: Optimization failed or returned nothing.")
-            return
+            if OPTIMIZER_MODE != 'winter':
+                logging.warning("AI_ESS: Optimization failed or returned nothing.")
+                return
+            logging.error(
+                "AI_ESS: Winter optimization failed; applying safe RETAIN and "
+                "clearing retained charge schedules."
+            )
+            result = _winter_safe_retain_result(prices, slot_duration_h)
+        # The startup selector is authoritative. Publishing this on every plan
+        # makes the active engine observable without inferring it from behavior.
+        result['optimizer_mode'] = OPTIMIZER_MODE
+        STATE.set('ai_optimizer_mode', OPTIMIZER_MODE)
+        if OPTIMIZER_MODE == 'winter':
+            winter_policy = result.get('winter_policy') or {}
+            STATE.set('ai_winter_candidate', winter_policy.get('selected_candidate'))
+            STATE.set('ai_winter_protected_soc', winter_policy.get('protected_soc_percent'))
+            STATE.set('ai_winter_next_replenishment', winter_policy.get('next_replenishment_time'))
+            STATE.set('ai_winter_warning', winter_policy.get('warning'))
         if weather_context:
             result['weather_context'] = weather_context
 
@@ -2335,8 +2425,9 @@ def _run_ai_optimizer_once():
             else:
                 limit_grid_feed_in(enabled=False)
 
-        # Keep the Victron hardware MinimumSocLimit in sync with the seasonal
-        # reserve (single source of truth). Idempotent — only writes on change.
+        # Reconcile Victron's independent hardware safety floor. This must not
+        # mirror the optimizer's seasonal reserve: current SoC below
+        # MinimumSocLimit triggers Victron Recharge outside the optimized schedule.
         set_minimum_ess_soc()
 
         # 4b. Manual override wins over the plan; otherwise damp SELL flapping.
@@ -2465,9 +2556,18 @@ def _run_ai_optimizer_once():
         # so we keep the service log clean with a one-line summary instead of the
         # multi-line plan table.
         charge_slot_note = ". Victron charge slots scheduled." if victron_slots else ""
+        if OPTIMIZER_MODE == 'winter':
+            winter_policy = result.get('winter_policy') or {}
+            logging.info(
+                "AI_ESS: Winter policy — candidate=%s protected_soc=%s%% next=%s warning=%s",
+                winter_policy.get('selected_candidate'),
+                winter_policy.get('protected_soc_percent'),
+                winter_policy.get('next_replenishment_time'),
+                winter_policy.get('warning') or 'none',
+            )
         logging.info(
-            "AI_ESS: Optimization complete — action=%s setpoint=%sW SoC=%.0f%% price=%.3f%s",
-            result.get('control_action'), applied_setpoint,
+            "AI_ESS: Optimization complete — mode=%s action=%s setpoint=%sW SoC=%.0f%% price=%.3f%s",
+            OPTIMIZER_MODE, result.get('control_action'), applied_setpoint,
             (batt_soc if batt_soc is not None else float('nan')),
             (result.get('current_price') or 0.0),
             charge_slot_note,
