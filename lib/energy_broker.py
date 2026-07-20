@@ -18,6 +18,7 @@ from lib.ess_optimizer_selector import (
     _coerce_datetime,
     optimize_schedule,
 )
+from lib.appliance_mode import APPLIANCE_OPTIMIZATION_ENABLED
 from lib import history_store as _hist
 
 STATE = GlobalStateClient()
@@ -1601,6 +1602,51 @@ def _build_load_forecast_by_slot(price_slots: list, slot_duration_h: float) -> d
     return out
 
 
+def _apply_appliance_reservations_to_forecast(
+        load_forecast: dict, *, slot_duration_h: float, now=None) -> tuple[dict, dict]:
+    """Overlay acknowledged Home Connect work in either ESS policy.
+
+    Reservations are deliberately applied after weather correction: known
+    appliance demand is not temperature-sensitive household baseline demand and
+    must not be scaled by the HVAC adjustment.
+    """
+    policy_enabled = bool(
+        APPLIANCE_OPTIMIZATION_ENABLED
+        and _is_truthy(
+            retrieve_setting("HOME_CONNECT_APPLIANCE_SCHEDULING"), False)
+    )
+    context = {
+        "enabled": policy_enabled,
+        "devices": [],
+        "reserved_kwh": 0.0,
+        "active_reservations": 0,
+    }
+
+    try:
+        from lib import appliance_reservations
+
+        reservations = appliance_reservations.active(now=now)
+        # The toggle gates creation of new optimized schedules, not physical work
+        # Home Connect already accepted.  Continue forecasting an outstanding
+        # reservation after either switch is disabled until completion or expiry.
+        if not reservations:
+            return load_forecast, context
+        overlaid, diagnostics = appliance_reservations.overlay_forecast(
+            load_forecast,
+            reservations,
+            slot_duration_h=slot_duration_h,
+        )
+        diagnostics["enabled"] = policy_enabled
+        return overlaid, diagnostics
+    except Exception as error:
+        # Forecast enrichment is best-effort.  A corrupt/unwritable reservation
+        # file must never prevent the critical ESS control cycle from running.
+        logging.warning("AI_ESS: appliance reservation overlay skipped: %s", error)
+        failed = dict(context)
+        failed["error"] = str(error)
+        return load_forecast, failed
+
+
 def get_today_energy_actuals() -> dict:
     """Return today's accumulated energy actuals from the MQTT bus (retained).
 
@@ -1783,6 +1829,9 @@ def _publish_plan_json(result, *, batt_soc, price_points, pv_remaining,
             'today_actuals': today_actuals,
             'today': today_block,
             'weather': _json_safe(weather_context),
+            'appliance_reservations': _json_safe(
+                result.get('appliance_reservations') or {}
+            ),
             'optimizer_guardrails': _json_safe(
                 result.get('optimizer_guardrails') or _optimizer_guardrails_snapshot()
             ),
@@ -2026,6 +2075,16 @@ def _append_history(result, *, batt_soc, applied_setpoint, today_actuals, realiz
                 "weather_max_temp_c": weather_summary.get("max_temp_c"),
                 "weather_pv_shadow_abs_delta_kwh": weather_summary.get("pv_shadow_abs_delta_kwh"),
             })
+        appliance_context = result.get('appliance_reservations') or {}
+        record.update({
+            "appliance_reservations_enabled": bool(
+                appliance_context.get("enabled", False)),
+            "appliance_reserved_kwh": _num(
+                appliance_context.get("reserved_kwh")) or 0.0,
+            "appliance_reserved_devices": appliance_context.get("devices") or [],
+            "appliance_active_reservations": int(
+                appliance_context.get("active_reservations") or 0),
+        })
 
         path = os.path.join(history_dir, f"ess-{now.strftime('%Y-%m-%d')}.ndjson")
         with open(path, "a") as fh:
@@ -2385,6 +2444,11 @@ def _run_ai_optimizer_once():
         except Exception as e:
             logging.warning("Weather: shadow forecast skipped: %s", e)
 
+        load_forecast, appliance_context = _apply_appliance_reservations_to_forecast(
+            load_forecast,
+            slot_duration_h=slot_duration_h,
+        )
+
         pv_forecast = _apply_pv_nowcast(
             pv_forecast,
             forecast_slots,
@@ -2415,6 +2479,15 @@ def _run_ai_optimizer_once():
             STATE.set('ai_winter_warning', winter_policy.get('warning'))
         if weather_context:
             result['weather_context'] = weather_context
+        result['appliance_reservations'] = appliance_context
+        STATE.set(
+            'ai_appliance_reserved_kwh',
+            appliance_context.get('reserved_kwh', 0.0),
+        )
+        STATE.set(
+            'ai_appliance_reserved_devices',
+            ','.join(appliance_context.get('devices') or []),
+        )
 
         # 4. Negative-price grid feed-in protection.
         # When the current price is negative, exporting costs money, so limit

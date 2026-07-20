@@ -176,9 +176,13 @@ and watcher all use the same file. The main service picks it up because:
   value applies on the **next optimization/decision cycle** (and it republishes the
   `Cerbomoticzgx/config/<KEY>` MQTT mirror on that read), and
 - `lib.config_change_handler.ConfigWatcher` detects the file change and runs any
-  per-key handler (e.g. a restart for `ACTIVE_MODULES` or `WINTER_MODE`). Changes
-  to `VICTRON_HARDWARE_MIN_SOC` are applied immediately; startup and optimizer
-  cycles also reconcile that independent hard floor.
+  per-key handler (e.g. a restart for `ACTIVE_MODULES`, `WINTER_MODE`, or
+  `APPLIANCE_OPTIMIZATION_ENABLED`). Appliance price deferral is active in either
+  ESS season when `APPLIANCE_OPTIMIZATION_ENABLED` and the existing
+  `HOME_CONNECT_APPLIANCE_SCHEDULING` master switch are enabled; preferred
+  dishwasher-program enforcement remains governed by the Home Connect master.
+  Changes to `VICTRON_HARDWARE_MIN_SOC` are applied immediately; startup and
+  optimizer cycles also reconcile that independent hard floor.
 
 Only keys in `config_schema.py` are writable. Runtime *control* values that live in
 `GlobalState`/the MQTT bus (e.g. `ess_net_metering_enabled`) are a separate future

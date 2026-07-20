@@ -17,6 +17,7 @@ stub_victron_integration = types.ModuleType("lib.victron_integration")
 stub_victron_integration.ac_power_setpoint = MagicMock()
 stub_victron_integration.limit_grid_feed_in = MagicMock()
 stub_victron_integration.set_minimum_ess_soc = MagicMock()
+stub_victron_integration.regulate_battery_max_voltage = MagicMock()
 sys.modules.setdefault("lib.victron_integration", stub_victron_integration)
 
 stub_config_retrieval = types.ModuleType("lib.config_retrieval")
@@ -464,6 +465,12 @@ def test_publish_plan_json_serializes_weather_datetime_maps(monkeypatch, tmp_pat
             "protected_soc_percent": 46.0,
             "reason_code": "WINTER_EXCEPTIONAL_SPREAD_REJECTED",
         },
+        "appliance_reservations": {
+            "enabled": True,
+            "devices": ["Dishwasher", "Dryer"],
+            "reserved_kwh": 2.35,
+            "active_reservations": 2,
+        },
     }
 
     energy_broker._publish_plan_json(
@@ -500,6 +507,12 @@ def test_publish_plan_json_serializes_weather_datetime_maps(monkeypatch, tmp_pat
         "selected_candidate": "self_sufficiency",
         "protected_soc_percent": 46.0,
         "reason_code": "WINTER_EXCEPTIONAL_SPREAD_REJECTED",
+    }
+    assert payload["appliance_reservations"] == {
+        "enabled": True,
+        "devices": ["Dishwasher", "Dryer"],
+        "reserved_kwh": 2.35,
+        "active_reservations": 2,
     }
 
 

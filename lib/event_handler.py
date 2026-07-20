@@ -75,12 +75,16 @@ class Event:
             logging.debug("AC Input: Grid is online.")
 
     def dryer_state(self):
-        if HOME_CONNECT_APPLIANCE_SCHEDULING:
-            handle_dryer_event(self.value)
+        handle_dryer_event(
+            self.value,
+            automation_enabled=HOME_CONNECT_APPLIANCE_SCHEDULING,
+        )
 
     def dishwasher_state(self):
-        if HOME_CONNECT_APPLIANCE_SCHEDULING:
-            handle_dishwasher_event(self.value)
+        handle_dishwasher_event(
+            self.value,
+            automation_enabled=HOME_CONNECT_APPLIANCE_SCHEDULING,
+        )
 
     def ac_power_setpoint(self):
         if float(self.value) > 0 or float(self.value) < 0:

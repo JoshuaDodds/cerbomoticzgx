@@ -14,6 +14,8 @@ CONFIG_SCHEMA = [
              "desc": "Master switch for the AI-powered ESS optimizer."},
             {"key": "WINTER_MODE", "label": "Winter Mode", "type": "bool",
              "desc": "Use the restart-isolated winter optimizer and winter SoC reserve. Off keeps the summer optimizer and summer reserve."},
+            {"key": "APPLIANCE_OPTIMIZATION_ENABLED", "label": "Appliance optimized scheduling", "type": "bool",
+             "desc": "Defer supported appliances to lower-cost times in either Summer or Winter Mode when Home Connect scheduling is enabled. Dishwasher preferred-program enforcement remains active whenever Home Connect scheduling is enabled. Requires a restart."},
             {"key": "OPTIMIZER_SLOT_MINUTES", "label": "Planning resolution (min)", "type": "int",
              "desc": "Sub-divides hourly prices into slots of this size; 15 matches quarter-hourly prices."},
             {"key": "OPTIMIZER_SOC_STEP_PCT", "label": "SoC step (%)", "type": "float",
