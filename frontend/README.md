@@ -147,7 +147,10 @@ sharing the host's `/dev/shm` (so it can read the published plan). Expose
 - **Weather** (desktop tab): visualizes cached Open-Meteo temperature/cloud patterns
   and shadow-mode HVAC load / GTI summaries with clickable series legends. It is
   observational unless `HVAC_LOAD_APPLY` or `PV_WEATHER_APPLY` are deliberately
-  enabled after validation.
+  enabled after validation. HVAC evaluates cooling anomalies in Summer Mode and
+  heating anomalies in Winter Mode against the trailing three days. Panel azimuth
+  is entered as a conventional compass bearing (`0=N`, `180=S`) and converted for
+  Open-Meteo internally.
 - **Advisor** (tab): a manually-triggered, read-only AI review. Click to stream a
   short markdown report on recent performance, or ask a free-text question ("why did
   we sell at 15:00 yesterday?"). It sends recent history + the allow-listed tunables

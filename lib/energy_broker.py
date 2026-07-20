@@ -939,8 +939,17 @@ def _pv_nowcast_anchor_kwh(slot_duration_h: float, now=None) -> dict | None:
     recent = _latest_settled_pv_slot_kwh(slot_h, now=now)
     live = None
     try:
-        pv_w = float(STATE.get('pv_power') or 0.0)
-        if pv_w > 0:
+        updated_at = float(STATE.get('pv_power_updated_at'))
+        reference_ts = (now.timestamp() if now is not None else time.time())
+        fresh = 0.0 <= reference_ts - updated_at <= 120.0
+        pv_available = (
+            STATE.has('pv_power') if hasattr(STATE, 'has')
+            else STATE.get('pv_power') is not None
+        )
+        if fresh and pv_available:
+            # A fresh zero is critical evidence at sunset or after an abrupt
+            # production stop; treating it as missing preserves stale PV.
+            pv_w = max(0.0, float(STATE.get('pv_power')))
             live = pv_w / 1000.0 * slot_h
     except (TypeError, ValueError):
         live = None
@@ -961,7 +970,8 @@ def _pv_nowcast_anchor_kwh(slot_duration_h: float, now=None) -> dict | None:
     else:
         anchor = live if live is not None else recent
 
-    if anchor is None or anchor <= 0.03:
+    confirmed_drop_to_zero = source == "live_drop" and anchor == 0.0
+    if anchor is None or (anchor <= 0.03 and not confirmed_drop_to_zero):
         return None
     return {
         "slot_kwh": float(anchor),
@@ -1011,7 +1021,10 @@ def _apply_pv_nowcast(pv_forecast: dict, forecast_slots: list, weather_context: 
     out = dict(pv_forecast)
     delta = 0.0
     adjusted_slots = 0
-    drop_ratio = float(anchor.get("drop_ratio", 1.0) or 1.0)
+    try:
+        drop_ratio = float(anchor.get("drop_ratio", 1.0))
+    except (TypeError, ValueError):
+        drop_ratio = 1.0
 
     for start in starts:
         if start.date() != today:
@@ -1023,7 +1036,7 @@ def _apply_pv_nowcast(pv_forecast: dict, forecast_slots: list, weather_context: 
             weight = 0.90 - 0.20 * (hours_ahead / 2.0)
         else:
             weight = 0.70 * max(0.0, 1.0 - (hours_ahead - 2.0) / 2.0)
-        if drop_ratio < 0.75:
+        if drop_ratio < 0.75 and float(anchor.get("slot_kwh", 0.0)) > 0.0:
             weight *= max(0.25, drop_ratio)
         if weight <= 0:
             continue
@@ -1073,6 +1086,10 @@ def _apply_pv_nowcast(pv_forecast: dict, forecast_slots: list, weather_context: 
     if adjusted_slots:
         weather_context["pv_nowcast_forecast"] = out
         weather_context["pv_forecast"] = out
+    for start in starts:
+        row = slot_context.setdefault(start.isoformat(), {})
+        row["final_pv_forecast_kwh"] = round(
+            max(0.0, float(out.get(start, 0.0) or 0.0)), 4)
     return out
 
 
@@ -2155,7 +2172,9 @@ def _settle_prior_slot(result, *, batt_soc, today_actuals, now=None) -> None:
             'slot_key': cur_slot,
         }
         sched0 = (result.get('schedule') or [{}])[0]
-        weather_slots = (result.get('weather_context') or {}).get('slots') or {}
+        settlement_weather = result.get('weather_context') or {}
+        weather_slots = settlement_weather.get('slots') or {}
+        weather_summary = settlement_weather.get('summary') or {}
 
         def _slot_weather(slot):
             try:
@@ -2179,6 +2198,13 @@ def _settle_prior_slot(result, *, batt_soc, today_actuals, now=None) -> None:
             'cloud_forecast_pct': _f(w0.get('cloud_forecast_pct')),
             'weather_load_adj_kwh': _f(w0.get('weather_load_adj_kwh')),
             'weather_pv_shadow_kwh': _f(w0.get('weather_pv_shadow_kwh')),
+            'baseline_load_forecast_kwh': _f(w0.get('baseline_load_kwh')),
+            'weather_load_shadow_kwh': _f(w0.get('weather_load_shadow_kwh')),
+            'final_load_forecast_kwh': _f(w0.get('final_load_forecast_kwh')),
+            'baseline_pv_forecast_kwh': _f(w0.get('baseline_pv_kwh')),
+            'final_pv_forecast_kwh': _f(w0.get('final_pv_forecast_kwh')),
+            'weather_hvac_apply': bool(weather_summary.get('hvac_apply')),
+            'weather_pv_apply': bool(weather_summary.get('pv_apply')),
         }
 
         prev = None
@@ -2313,6 +2339,13 @@ def _settle_prior_slot(result, *, batt_soc, today_actuals, now=None) -> None:
                 'cloud_forecast_pct': pred.get('cloud_forecast_pct'),
                 'weather_load_adj_kwh': pred.get('weather_load_adj_kwh'),
                 'weather_pv_shadow_kwh': pred.get('weather_pv_shadow_kwh'),
+                'baseline_load_forecast_kwh': pred.get('baseline_load_forecast_kwh'),
+                'weather_load_shadow_kwh': pred.get('weather_load_shadow_kwh'),
+                'final_load_forecast_kwh': pred.get('final_load_forecast_kwh'),
+                'baseline_pv_forecast_kwh': pred.get('baseline_pv_forecast_kwh'),
+                'final_pv_forecast_kwh': pred.get('final_pv_forecast_kwh'),
+                'weather_hvac_apply': pred.get('weather_hvac_apply'),
+                'weather_pv_apply': pred.get('weather_pv_apply'),
                 'soc_start': soc_start,
                 'soc_end': soc_end,
                 'soc_delta': round(soc_delta, 2) if soc_delta is not None else None,
@@ -2455,6 +2488,17 @@ def _run_ai_optimizer_once():
             weather_context,
             slot_duration_h,
         )
+        if weather_context.get('available'):
+            weather_slots = weather_context.setdefault('slots', {})
+            for slot in forecast_slots:
+                start = slot.get('start')
+                if start is None:
+                    continue
+                row = weather_slots.setdefault(start.isoformat(), {})
+                row['final_load_forecast_kwh'] = round(
+                    max(0.0, float(load_forecast.get(start, 0.0) or 0.0)), 4)
+                row['final_pv_forecast_kwh'] = round(
+                    max(0.0, float(pv_forecast.get(start, 0.0) or 0.0)), 4)
 
         # 3. Optimize
         result = optimize_schedule(batt_soc, prices, load_forecast, pv_forecast)

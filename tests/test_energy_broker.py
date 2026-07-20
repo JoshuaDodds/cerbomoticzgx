@@ -247,6 +247,62 @@ def test_pv_nowcast_does_not_lower_on_missing_gti(monkeypatch):
     assert adjusted[far] == base[far]
 
 
+def test_pv_nowcast_accepts_fresh_zero_watts_as_sunset_evidence(monkeypatch):
+    from datetime import datetime, timezone
+
+    now = datetime(2026, 7, 19, 21, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        energy_broker,
+        "STATE",
+        DummyState({
+            "pv_power": 0.0,
+            "pv_power_updated_at": now.timestamp(),
+        }),
+    )
+    monkeypatch.setattr(
+        energy_broker,
+        "_latest_settled_pv_slot_kwh",
+        lambda slot_h, now=None: 0.8,
+    )
+
+    anchor = energy_broker._pv_nowcast_anchor_kwh(0.25, now=now)
+
+    assert anchor["source"] == "live_drop"
+    assert anchor["slot_kwh"] == 0.0
+    assert anchor["drop_ratio"] == 0.0
+
+
+def test_confirmed_zero_pv_strongly_lowers_stale_sunset_forecast(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    start = datetime(2026, 7, 19, 21, 0, tzinfo=timezone.utc)
+    slots = [{"start": start + timedelta(minutes=15 * i)} for i in range(4)]
+    base = {slot["start"]: 0.8 for slot in slots}
+    weather_context = {
+        "available": True,
+        "slots": {
+            slot["start"].isoformat(): {"gti_forecast_wm2": 0.0}
+            for slot in slots
+        },
+        "summary": {},
+    }
+    monkeypatch.setattr(
+        energy_broker,
+        "_pv_nowcast_anchor_kwh",
+        lambda slot_h, now=None: {
+            "slot_kwh": 0.0,
+            "source": "live_drop",
+            "drop_ratio": 0.0,
+        },
+    )
+
+    adjusted = energy_broker._apply_pv_nowcast(
+        base, slots, weather_context, 0.25, now=start)
+
+    assert adjusted[slots[0]["start"]] <= 0.1
+    assert adjusted[slots[-1]["start"]] < base[slots[-1]["start"]]
+
+
 def test_pv_intraday_correction_scales_up_on_outperformance(monkeypatch):
     from datetime import datetime
     monkeypatch.setattr(energy_broker, "retrieve_setting", lambda name: None)  # defaults
@@ -645,6 +701,20 @@ def test_settlement_writes_predicted_vs_actual(monkeypatch, tmp_path):
 
     t1 = datetime(2026, 7, 10, 10, 0, tzinfo=timezone.utc)
     t2 = t1 + timedelta(minutes=15)   # next slot -> the prior slot settles
+    res["schedule"][0].update({"time": t1, "pv": 0.7, "load": 0.8})
+    res["weather_context"] = {
+        "summary": {"hvac_apply": False, "pv_apply": False},
+        "slots": {
+            t1.isoformat(): {
+                "baseline_load_kwh": 0.6,
+                "weather_load_shadow_kwh": 0.65,
+                "final_load_forecast_kwh": 0.8,
+                "baseline_pv_kwh": 0.9,
+                "weather_pv_shadow_kwh": 0.75,
+                "final_pv_forecast_kwh": 0.7,
+            },
+        },
+    }
 
     # Cycle 1: counters at import 1.0 kWh (€0.20), no export; SoC 80%.
     energy_broker._settle_prior_slot(
@@ -672,6 +742,14 @@ def test_settlement_writes_predicted_vs_actual(monkeypatch, tmp_path):
     assert abs(s["soc_delta"] - (-8.0)) < 1e-6
     # Cost-basis field is recorded (discharge slot -> basis present, may be 0).
     assert "cost_basis_eur_per_kwh" in s
+    assert s["baseline_load_forecast_kwh"] == 0.6
+    assert s["weather_load_shadow_kwh"] == 0.65
+    assert s["final_load_forecast_kwh"] == 0.8
+    assert s["baseline_pv_forecast_kwh"] == 0.9
+    assert s["weather_pv_shadow_kwh"] == 0.75
+    assert s["final_pv_forecast_kwh"] == 0.7
+    assert s["weather_hvac_apply"] is False
+    assert s["weather_pv_apply"] is False
 
 
 def test_settlement_ignores_extra_cycle_within_same_slot(monkeypatch, tmp_path):

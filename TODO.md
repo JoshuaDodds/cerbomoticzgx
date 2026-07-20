@@ -1,14 +1,44 @@
 # TODO / roadmap
 
-- **Weather forecast validation / apply tuning** — Open-Meteo fetch/cache, Weather tab,
-  history recording, and the HVAC/PV apply gates are implemented. Production `.env`
-  may enable `HVAC_LOAD_APPLY` / `PV_WEATHER_APPLY`, and the current plan confirms
-  they change forecasts (`hvac_apply=True`, `pv_apply=True`). Do **not** mark this
-  effective yet: the first partial 2026-06-28 sample only has afternoon/evening
-  weather rows and the load counterfactual was slightly worse with weather
-  (weather MAE ~0.240 kWh vs base ~0.227 kWh on non-trivial load rows). Keep
-  collecting data, fit/tune `HVAC_ALPHA_COOL` / `HVAC_ALPHA_HEAT`, and only call the
-  apply phase done after multiple full days show lower forecast error.
+- **Weather forecast validation / apply tuning** — The first 21-full-day validation
+  found the original apply model harmful: load MAE was 0.2163 kWh/slot with weather
+  versus 0.1155 without it, and weather improved 0/21 days. Root causes were full-day
+  HVAC demand being reallocated into every shrinking remaining-day horizon, absolute
+  HVAC demand being added to a trailing baseline which already contained HVAC, a
+  compass/Open-Meteo azimuth convention mismatch, preceding-hour GTI being assigned
+  to the following hour, and fresh 0 W sunset evidence being discarded. The
+  `hvac-pv-validation-tuning` branch repairs these and records explicit baseline,
+  shadow, and final forecasts. Summer now evaluates cooling anomalies only; Winter
+  evaluates heating anomalies only. Keep `HVAC_LOAD_APPLY=False` and
+  `PV_WEATHER_APPLY=False` while collecting repaired shadow rows. Re-enable each gate
+  independently only after multiple full holdout days show a material reduction in
+  error; summer history tentatively supports `HVAC_ALPHA_COOL=2.0`, while heating
+  still requires winter data.
+
+  Immediate validation of the repaired implementation has passed: configuration and
+  provider azimuth, 144-hour weather coverage, cooling-mode selection, disabled apply
+  gates, bounded slot adjustments, Weather-tab presentation, and the new settlement
+  fields all checked out. Deferred operational validation that needs future slots or
+  additional seasons remains:
+
+  - Over several replans and through the end of a day, confirm the HVAC adjustment
+    remains stable as the horizon shrinks, does not accumulate into late slots, and
+    stays below the temporary investigation threshold of 0.5 kWh per 15-minute slot.
+  - At sunset on multiple days, confirm a fresh live 0 W PV reading suppresses any
+    stale near-term PV forecast. `pv_nowcast_source=live_drop` is expected when a
+    correction is needed; no applied correction is correct when the baseline is
+    already zero.
+  - After at least 7 complete days, preferably 14 with varied temperature and cloud
+    cover, compare baseline versus shadow forecasts against settlement measurements.
+    Require roughly 5% lower combined MAE, improvement on a majority of complete
+    days, no materially worse bias, and no recurring oversized adjustments before
+    enabling either apply gate.
+  - Evaluate HVAC and PV separately and enable at most one apply gate at a time,
+    followed by another multi-day observation period to catch optimizer-plan
+    instability or unintended schedule changes.
+  - Do not enable or declare the heating model validated from summer cooling data.
+    Collect and evaluate at least 7–14 complete winter-mode days with meaningful
+    heating demand before selecting `HVAC_ALPHA_HEAT` or enabling winter HVAC apply.
 
 ## AI Advisor
 - Phase 2 — approve-to-apply for tunables only. Each setting has hard min/max bounds;
