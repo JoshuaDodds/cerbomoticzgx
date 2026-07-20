@@ -132,11 +132,13 @@ def translate(field, value, home=None) -> dict:
         # here rather than publishing a vestigial *_reported topic nothing reads (audit L2).
         return {}
     if f == "ChargeAmps":
-        # Telemetry is the ACCURATE per-phase current (it agrees with ChargerVoltage x amps vs
-        # ACChargingPower; the local Victron meter under-reads ~3x). So telemetry OWNS the display
-        # topic Tesla/vehicle0/charging_amps in telemetry mode; the local meter is control-only.
-        v = _num(value)                     # per-phase amps drawn (as Tesla reports — not scaled)
-        return {"state": {"tesla_amps": v}, "topics": {"Tesla/vehicle0/charging_amps": v}} if v is not None else {}
+        # Diagnostic car-reported value only. The local ABB meter exclusively
+        # owns Tesla/vehicle0/charging_amps because Fleet telemetry is change-only
+        # and can retain a non-zero ChargeAmps value after charging stops.
+        v = _num(value)                     # per-phase amps drawn (as Tesla reports)
+        if v is None:
+            return {}
+        return {"state": {"tesla_amps_reported": v}}
     if f == "ChargeCurrentRequest":
         v = _num(value)                     # amps requested
         return {"state": {"tesla_charge_current_request": v},

@@ -102,15 +102,20 @@ def _day_totals(path: str):
 
 
 def monthly_history() -> list:
-    """Per-day net totals for the current calendar month (Trends monthly chart).
-    net_eur = export_reward - import_cost (profit positive). Days with no data are
-    skipped."""
+    """Per-day settled net and prospective intraday forecast ranges.
+
+    ``net_eur`` is export reward minus import cost (profit positive). Forecast
+    candle fields are emitted only when the newer cycle records contain a
+    same-day final-net forecast; legacy history remains an honest actual-only
+    point instead of receiving an invented range.
+    """
     today = datetime.now().date()
     d = today.replace(day=1)
     out = []
     today_projection = projected_today_net_eur()
     while d <= today:
-        t = _day_totals_from_records(_hist.read_day(d, history_dir()))
+        records = _hist.read_day(d, history_dir())
+        t = _day_totals_from_records(records)
         if t is not None:
             imp_cost = t["import_cost"] or 0.0
             exp_rev = t["export_reward"] or 0.0
@@ -123,9 +128,26 @@ def monthly_history() -> list:
                 "import_kwh": t["import_kwh"],
                 "export_kwh": t["export_kwh"],
                 "is_today": d == today,
+                "settled": d < today,
             }
+            forecasts = []
+            for record in records:
+                if record.get("kind") not in (None, "cycle"):
+                    continue
+                value = _f(record.get("forecast_day_net_eur"))
+                if value is not None:
+                    forecasts.append(value)
             if d == today and today_projection is not None:
                 row["projected_net_eur"] = today_projection
+                forecasts.append(today_projection)
+            if forecasts:
+                row.update({
+                    "forecast_open_eur": round(forecasts[0], 2),
+                    "forecast_low_eur": round(min(forecasts), 2),
+                    "forecast_high_eur": round(max(forecasts), 2),
+                    "forecast_close_eur": round(forecasts[-1], 2),
+                    "forecast_samples": len(forecasts),
+                })
             out.append(row)
         d += timedelta(days=1)
     return out
@@ -609,6 +631,7 @@ def get_plan() -> dict:
     return {
         "available": True,
         "generated_at": raw.get("generated_at"),
+        "optimizer_mode": raw.get("optimizer_mode") or "summer",
         "age_seconds": age_s,
         "stale": (age_s is not None and age_s > 1800),  # >30 min old
         "battery_soc": raw.get("battery_soc"),
@@ -623,6 +646,7 @@ def get_plan() -> dict:
         "price_points": raw.get("price_points"),
         "slot_duration_h": raw.get("slot_duration_h"),
         "current": raw.get("current", {}),
+        "winter_policy": raw.get("winter_policy"),
         "today": raw.get("today", {}),
         "victron_slots": raw.get("victron_slots", []),
         "hours": group_by_hour(timeline_schedule),

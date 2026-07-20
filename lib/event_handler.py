@@ -1,6 +1,7 @@
 import os
 import math
 import signal
+import time
 
 from lib.helpers import get_topic_key, publish_message, is_truthy
 from lib.constants import logging
@@ -152,6 +153,7 @@ class Event:
 
     def tesla_power(self):
         _value = round(self.value)
+        self.gs_client.set("tesla_power_updated_at", time.time())
         self.adjust_ac_out_power()
         publish_message("Tesla/vehicle0/charging_watts", message=f"{_value}", retain=True)
         publish_message("Tesla/vehicle0/Ac/tesla_load", message=f"{_value}", retain=True)
@@ -255,19 +257,16 @@ class Event:
         return round(surplus_watts, 0)
 
     def update_charging_amp_totals(self, charging_amp_totals=None):
-        if not charging_amp_totals:
+        if charging_amp_totals is None:
             l1, l2, l3 = self.gs_client.get("tesla_l1_current"), self.gs_client.get("tesla_l2_current"), self.gs_client.get("tesla_l3_current")
             charging_amp_totals = (l1 + l2 + l3) / 3
 
-        charging_amps = round(charging_amp_totals, 2)
+        per_phase = round(charging_amp_totals, 2)
 
-        # STATE stays per-phase for the surplus control math. But in telemetry mode the
-        # fleet-telemetry bridge OWNS Tesla/vehicle0/charging_amps with the car's own accurate
-        # per-phase current (the local Victron meter under-reads ~3x) — publishing here too would
-        # fight it and flap the value. So only publish in legacy polling mode.
-        self.gs_client.set("tesla_charging_amps_total", charging_amps)
-        if not is_truthy(retrieve_setting("TESLA_TELEMETRY_ENABLED"), False):
-            publish_message("Tesla/vehicle0/charging_amps", message=f"{charging_amps}", retain=True)
+        # Single MQTT owner: measured ABB per-phase average for legacy UI and the
+        # controller. Fleet ChargeAmps is retained separately as diagnostic data.
+        self.gs_client.set("tesla_charging_amps_total", per_phase)
+        publish_message("Tesla/vehicle0/charging_amps", message=f"{per_phase}", retain=True)
 
     def set_surplus_amps(self, surplus_amps):
         self.gs_client.set("surplus_amps", surplus_amps)

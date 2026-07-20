@@ -59,6 +59,10 @@
   const GAS_EDGE = { key: "gas", a: "house", ap: ["bottom", 0.26], b: "gas", bp: ["top", 0], color: PALETTE.gas };
 
   const A = (w) => isFinite(w) && Math.abs(w) > 15;
+  // The ABB meter reports a few watts of idle electronics draw. Below this
+  // threshold the charger is not delivering energy, so stale phase-current
+  // notifications must render as 0 A rather than a phantom charging current.
+  const EV_IDLE_POWER_W = 100;
   const f = (v) => (isFinite(v) ? v.toFixed(1) : "0");
   const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
   const num = (v) => { const n = Number(v); return isFinite(n) ? n : null; };
@@ -554,7 +558,14 @@
       const _charging = live.veh_is_charging === true || String(live.veh_is_charging) === "True";
       V["pf-ev-soc"] = _pct(live.veh_soc);
       V["pf-ev-limit"] = _pct(live.veh_soc_limit);
-      V["pf-ev-amps"] = _amps(live.veh_amps);
+      // This card alone mirrors the Tesla in-car/app total-current convention by
+      // summing the ABB meter's physical phase readings. veh_amps remains the
+      // canonical car-reported metric used by the Vehicle tab.
+      const evMeterPhaseAmps = [live.ev_l1_a, live.ev_l2_a, live.ev_l3_a].map(num);
+      const haveAllEvPhases = evMeterPhaseAmps.every((amps) => Number.isFinite(amps));
+      const evTotalAmps = ev <= EV_IDLE_POWER_W ? 0 : (haveAllEvPhases
+        ? evMeterPhaseAmps.reduce((total, amps) => total + amps, 0) : null);
+      V["pf-ev-amps"] = Number.isFinite(evTotalAmps) ? _amps(evTotalAmps) : "—";
       V["pf-ev-eta"] = (_charging && live.veh_eta && live.veh_eta !== "N/A") ? String(live.veh_eta) : "—";
     }
     if (gasM3 != null) big("gas", gasM3.toFixed(2) + " m³");

@@ -240,6 +240,34 @@ def test_monthly_history_adds_projected_today_profit_from_current_plan(monkeypat
     assert today_row["projected_net_eur"] == 6.2
 
 
+def test_monthly_history_exposes_intraday_forecast_candle_and_final_actual(monkeypatch, tmp_path):
+    today = datetime.now().astimezone().date()
+    day = today - timedelta(days=1)
+    records = [
+        {"kind": "cycle", "ts": f"{day.isoformat()}T08:00:00+02:00",
+         "forecast_day_net_eur": -1.5, "day_import_cost": 1.0, "day_export_reward": 0.0},
+        {"kind": "cycle", "ts": f"{day.isoformat()}T12:00:00+02:00",
+         "forecast_day_net_eur": 2.0, "day_import_cost": 2.0, "day_export_reward": 1.0},
+        {"kind": "cycle", "ts": f"{day.isoformat()}T20:00:00+02:00",
+         "forecast_day_net_eur": 0.5, "day_import_cost": 3.0, "day_export_reward": 4.25},
+    ]
+    (tmp_path / f"ess-{day.isoformat()}.ndjson").write_text(
+        "".join(json.dumps(r) + "\n" for r in records)
+    )
+    monkeypatch.setattr(data, "_env", lambda: {"HISTORY_DIR": str(tmp_path)})
+
+    rows = data.monthly_history()
+
+    row = next(r for r in rows if r["date"] == day.isoformat())
+    assert row["forecast_open_eur"] == -1.5
+    assert row["forecast_low_eur"] == -1.5
+    assert row["forecast_high_eur"] == 2.0
+    assert row["forecast_close_eur"] == 0.5
+    assert row["forecast_samples"] == 3
+    assert row["net_eur"] == 1.25
+    assert row["settled"] is True
+
+
 def test_day_summary_idle_surplus_charges_battery_not_grid():
     # A future IDLE slot with PV surplus but a non-full battery charges the battery
     # (SoC up / cost basis down); it must NOT book phantom grid-export profit.

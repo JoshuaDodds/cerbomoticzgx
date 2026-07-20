@@ -64,8 +64,32 @@ let lastLive = null;
 let expandedHours = new Set();   // hour keys the user has expanded (survive refreshes)
 let lastHoursGen = null;          // generated_at of the last tree we built
 let lastCurrentHourKey = null;
+const SERVER_OFFLINE_AFTER_MS = 35000; // > two 15-second SSE heartbeats
+let lastServerDataAt = 0;
+let serverHasResponded = false;
 const MOBILE_MQ = window.matchMedia("(max-width: 680px)");
 const isMobileLayout = () => MOBILE_MQ.matches;
+
+function setServerOffline(offline) {
+  const banner = document.getElementById("server-offline-banner");
+  if (banner) banner.hidden = !offline;
+  document.body.classList.toggle("server-offline", offline);
+  if (lastPlan) renderMeta(lastPlan);
+}
+
+function noteServerData() {
+  lastServerDataAt = Date.now();
+  serverHasResponded = true;
+  setServerOffline(false);
+}
+
+function noteServerFailure() {
+  // A cold-start failure is definitive. After a successful response, tolerate a
+  // short fetch/SSE reconnect gap and retain the last good dashboard values.
+  if (!serverHasResponded || Date.now() - lastServerDataAt >= SERVER_OFFLINE_AFTER_MS) {
+    setServerOffline(true);
+  }
+}
 
 // Logs tab state — declared here (not down near the Logs functions below) because
 // activateTab() calls disconnectLogsStream() on EVERY tab switch, including the very first
@@ -608,6 +632,9 @@ function renderDaySummary(plan) {
   const box = $("#day-summary");
   box.innerHTML = "<h3 style='margin:2px 0 12px'>P/L summary (actuals + forecast)</h3>";
   if (!plan.available || !plan.day_summary) { box.innerHTML += "<span class='muted'>—</span>"; return; }
+  const strategy = el("div", "pl-strategy");
+  strategy.textContent = planStrategySummary(plan);
+  box.appendChild(strategy);
   // Four aligned columns: label | import | export | net. The day-row and day-sub
   // rows share the same grid template so the numbers line up vertically.
   const cells = (lbl, impKwh, impC, expKwh, expC, netCell) =>
@@ -653,6 +680,82 @@ function renderDaySummary(plan) {
     p.textContent = "Pending — tomorrow's prices not published yet.";
     box.appendChild(p);
   }
+}
+
+function planStrategySummary(plan) {
+  const now = new Date();
+  const winterPolicy = plan.optimizer_mode === "winter" ? (plan.winter_policy || {}) : null;
+  const configuredSlotHours = Number(plan.slot_duration_h);
+  const slotHours = Number.isFinite(configuredSlotHours) && configuredSlotHours > 0
+    ? configuredSlotHours : 0.25;
+  const durationMs = Math.max(0.05, slotHours) * 3600000;
+  const sameLocalDay = (d) => d.getFullYear() === now.getFullYear()
+    && d.getMonth() === now.getMonth() && d.getDate() === now.getDate();
+  const slots = ((plan.hours || []).flatMap((hour) => hour.slots || []))
+    .map((slot) => ({ slot, at: new Date(slot.time) }))
+    .filter((entry) => !Number.isNaN(entry.at.getTime()) && sameLocalDay(entry.at)
+      && entry.at.getTime() + durationMs > now.getTime())
+    .sort((a, b) => a.at - b.at);
+  if (!slots.length) {
+    if (winterPolicy) {
+      if (winterPolicy.warning === "optimizer_failed_safe_retain") {
+        return "Winter Mode degraded safely: the optimizer could not produce a plan, so retained charge windows were cleared and the battery is being preserved from the grid.";
+      }
+      return "Winter Mode: no further grid action is needed today; preserve the protected household reserve until the next low-price window.";
+    }
+    return "From now until midnight: no further scheduled grid action; use solar locally and avoid unnecessary battery cycling.";
+  }
+
+  const groupsFor = (action) => {
+    const matches = slots.filter((entry) => caOf(entry.slot) === action);
+    const groups = [];
+    matches.forEach((entry) => {
+      const previous = groups[groups.length - 1];
+      if (!previous || entry.at.getTime() - previous.end > durationMs * 1.25) {
+        groups.push({ start: entry.at.getTime(), end: entry.at.getTime() + durationMs, entries: [entry] });
+      } else {
+        previous.end = entry.at.getTime() + durationMs;
+        previous.entries.push(entry);
+      }
+    });
+    return groups;
+  };
+  const time = (ms) => new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+  const ranges = (groups) => groups.slice(0, 3).map((g) => `${time(g.start)}–${time(g.end)}`).join(", ");
+  const buys = groupsFor("BUY");
+  const sells = groupsFor("SELL");
+  const parts = [];
+  if (buys.length) {
+    const target = Math.max(...buys.flatMap((g) => g.entries.map((e) => Number(e.slot.soc_end)).filter(Number.isFinite)));
+    parts.push(`charge${Number.isFinite(target) ? ` toward ${Math.round(target)}%` : ""} at ${ranges(buys)}`);
+  }
+  if (sells.length) parts.push(`export during the price peaks at ${ranges(sells)}`);
+  if (!parts.length) parts.push("hold the battery for household demand and use available solar locally");
+
+  if (winterPolicy) {
+    const selected = winterPolicy.selected_candidate || "self_sufficiency";
+    const protectedSoc = Number(winterPolicy.protected_soc_percent);
+    const requiredKwh = Number(winterPolicy.forecast_house_energy_required_kwh);
+    const target = buys.length
+      ? Math.max(...buys.flatMap((g) => g.entries.map((e) => Number(e.slot.soc_end)).filter(Number.isFinite)))
+      : null;
+    const objective = selected === "exceptional_arbitrage"
+      ? "An exceptional spread cleared every loss and safety hurdle; only energy above the protected household requirement may be sold."
+      : "The plan buys only the forecast household requirement at low prices and avoids routine battery export.";
+    const detail = [
+      Number.isFinite(target) ? `charge toward ${Math.round(target)}%` : null,
+      Number.isFinite(requiredKwh) ? `${requiredKwh.toFixed(1)} kWh forecast house energy protected` : null,
+      Number.isFinite(protectedSoc) ? `protected floor ${Math.round(protectedSoc)}%` : null,
+    ].filter(Boolean).join(" · ");
+    const warning = winterPolicy.warning ? ` Warning: ${winterPolicy.warning}` : "";
+    return `Winter Mode: ${parts.join(", then ")}. ${objective}${detail ? ` ${detail}.` : ""}${warning}`;
+  }
+
+  let strategy = "Avoid unnecessary grid use";
+  if (buys.length && sells.length) strategy = "Buy low, then sell at the stronger price peaks";
+  else if (buys.length) strategy = "Buy low to cover the planned energy requirement";
+  else if (sells.length) strategy = "Sell stored energy only at the strongest remaining prices";
+  return `From now until midnight: ${parts.join(", then ")}. ${strategy} to minimise cost and maximise the day's net result.`;
 }
 
 // ---- Render: hours tree ----
@@ -1070,7 +1173,11 @@ function renderMeta(plan) {
   let when = plan.generated_at;
   try { when = new Date(plan.generated_at).toLocaleTimeString([], { hour12: false }); } catch (e) {}
   let txt = "plan generated at " + when;
-  if (lastLive) txt += " · live feed " + (lastLive.connected ? "connected" : "offline");
+  if (document.body.classList.contains("server-offline")) {
+    txt += " · server offline — showing last data";
+  } else if (lastLive) {
+    txt += " · live feed " + (lastLive.connected ? "connected" : "offline");
+  }
   if (plan.stale) txt += " — STALE (optimizer may not be running)";
   m.textContent = txt;
 }
@@ -1089,7 +1196,7 @@ async function loadConfig() {
     const cfg = await fetch("/api/config").then((r) => r.json());
     renderConfig(cfg);
   } catch (e) {
-    $("#config").innerHTML = `<span class="cost">error loading config: ${e}</span>`;
+    $("#config").innerHTML = '<span class="muted">Configuration unavailable while the server is offline.</span>';
   }
 }
 
@@ -1109,6 +1216,7 @@ function safeRenderChart() {
 async function refreshPlan() {
   try {
     lastPlan = await fetch("/api/plan").then((r) => r.json());
+    noteServerData();
     renderOverview();
     renderDaySummary(lastPlan);
     // Only rebuild the schedule tree when the plan actually changed, so a
@@ -1121,7 +1229,7 @@ async function refreshPlan() {
     renderVictron(lastPlan);
     renderMeta(lastPlan);
   } catch (e) {
-    $("#status-strip").innerHTML = `<span class="cost">error loading: ${e}</span>`;
+    noteServerFailure();
   }
 }
 
@@ -1161,6 +1269,7 @@ function renderVehicle() {
 }
 
 function applyLive(data) {
+  noteServerData();
   lastLive = data;
   renderOverview();             // overlay live values onto the plan
   if (lastPlan) renderDaySummary(lastPlan);
@@ -1172,7 +1281,7 @@ function applyLive(data) {
 
 async function pollLive() {     // backup path (and the initial fetch)
   try { applyLive(await fetch("/api/live").then((r) => r.json())); }
-  catch (e) { /* keep last values on transient errors */ }
+  catch (e) { noteServerFailure(); /* keep last values on transient errors */ }
 }
 
 // Push stream: update the instant a new MQTT value arrives (no polling lag).
@@ -1182,8 +1291,9 @@ function startLiveStream() {
   try {
     _liveES = new EventSource("/api/live/stream");
     _liveES.onmessage = (e) => { try { applyLive(JSON.parse(e.data)); } catch (_) {} };
-    // On error the browser auto-reconnects; the slow poll below covers any gap.
-  } catch (_) { _liveES = null; }
+    _liveES.onerror = () => noteServerFailure();
+    // The browser auto-reconnects; the watchdog preserves values during short gaps.
+  } catch (_) { _liveES = null; noteServerFailure(); }
 }
 
 // Sticky-header clock + sunrise/sunset (globally useful info). The clock ticks
@@ -1993,6 +2103,7 @@ startLiveStream();              // instant live updates via SSE
 // arrive via the SSE push; keep a slow poll as a fallback if the stream drops.
 setInterval(refreshPlan, 30000);
 setInterval(pollLive, 20000);
+setInterval(noteServerFailure, 5000);
 setInterval(renderHeaderClock, 1000);
 setInterval(refreshForecastAccuracy, 120000);
 setInterval(refreshWeather, 1800000);
