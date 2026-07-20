@@ -9,11 +9,23 @@ from lib.helpers import publish_message
 from lib.constants import logging
 
 
+RESTART_REQUIRED_ENV_KEYS = {
+    "ACTIVE_MODULES",
+    "WINTER_MODE",
+    "APPLIANCE_OPTIMIZATION_ENABLED",
+}
+FIRST_WRITE_HANDLER_KEYS = {
+    "WINTER_MODE",
+    "APPLIANCE_OPTIMIZATION_ENABLED",
+    "VICTRON_HARDWARE_MIN_SOC",
+}
+
+
 def handle_env_change(env_variable):
     """
     handle changes in .env variables
     """
-    if env_variable in {"ACTIVE_MODULES", "WINTER_MODE"}:
+    if env_variable in RESTART_REQUIRED_ENV_KEYS:
         logging.info(f"config_change_handler: This change requires a restart...")
         publish_message("Cerbomoticzgx/system/shutdown", message="True", retain=True)
 
@@ -98,7 +110,7 @@ class ConfigWatcher(FileSystemEventHandler):
             # These settings do not exist in older deployed .env files. Their
             # first dashboard write must still run the corresponding handler;
             # silently caching them would defer the intended restart/write.
-            if key in {"WINTER_MODE", "VICTRON_HARDWARE_MIN_SOC"} and self.handler:
+            if key in FIRST_WRITE_HANDLER_KEYS and self.handler:
                 self.handler(key)
             self._cache[key] = current_values[key]
 

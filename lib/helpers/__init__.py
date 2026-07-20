@@ -187,8 +187,8 @@ def current_min_soc_reserve() -> float:
     explicit WINTER_MODE control-policy toggle. This is an optimizer planning
     floor, not Victron's ``MinimumSocLimit``: the latter can trigger autonomous
     Recharge and is configured independently by ``VICTRON_HARDWARE_MIN_SOC``.
-    ``is_winter_month`` intentionally remains calendar-based for legacy appliance
-    behavior; it does not select the ESS control policy.
+    ``is_winter_month`` remains only as a compatibility helper for legacy callers;
+    it no longer selects ESS or Home Connect appliance behavior.
     """
     from lib.config_retrieval import retrieve_setting
     from lib.ess_mode import WINTER_MODE

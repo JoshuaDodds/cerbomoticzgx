@@ -75,6 +75,7 @@ Note: The name of this project is a nod to both Victron Energy & the Domoticz pr
 - **AI Optimization Configuration**:
   - `AI_POWERED_ESS_ALGORITHM=True`: Enable the new AI optimizer.
   - `WINTER_MODE=False`: Select the restart-isolated optimizer policy. `False` preserves summer trading behavior; `True` activates winter self-sufficiency behavior after the supervised restart requested by the dashboard/config watcher.
+  - `APPLIANCE_OPTIMIZATION_ENABLED=False`: Enable lower-cost appliance start deferral in either Summer or Winter Mode when `HOME_CONNECT_APPLIANCE_SCHEDULING` is enabled. The Home Connect setting remains the master switch, while preferred dishwasher-program enforcement remains active in either season whenever that master switch is enabled. Changing this setting requests a supervised restart.
   - `BATTERY_CAPACITY_KWH`: Your battery capacity in kWh (default 42.0).
   - `AC_DC_CHARGE_EFFICIENCY`: Efficiency of charging (e.g. 0.90).
   - `AC_DC_DISCHARGE_EFFICIENCY`: Efficiency of discharging (e.g. 0.90).
