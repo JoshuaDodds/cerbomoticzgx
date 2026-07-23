@@ -18,6 +18,11 @@ except Exception:  # paho optional at import time
     mqtt = None
 
 
+# The dedicated ABB/Victron EV meter idles at a few watts even when no energy is being
+# transferred. Keep this aligned with the Power Flow card's existing standby threshold.
+EV_IDLE_POWER_W = 100.0
+
+
 def _config():
     cfg = {}
     cfg.update(dotenv_values(secrets_path()) or {})
@@ -265,6 +270,31 @@ class MqttLive:
         out["veh_is_supercharging"] = vals.get("veh_is_supercharging")
         out["veh_eta"] = vals.get("veh_eta")               # time-to-limit while charging
         out["veh_last_update"] = vals.get("veh_last_update")
+        # Fleet Telemetry is change-driven and an old retained DetailedChargeState can survive
+        # a confirmed stop if the vehicle never emits the matching edge. The dedicated local EV
+        # meter is faster and authoritative for whether energy is actually flowing. Reconcile
+        # only the unambiguous idle case; with no meter sample (or real draw), preserve Tesla's
+        # own status rather than inventing one.
+        raw_charging = out["veh_is_charging"]
+        says_charging = (
+            raw_charging is True
+            or str(raw_charging).strip().lower() in {"true", "1", "yes", "on"}
+            or str(out["veh_charging_status"] or "").strip().lower() == "charging"
+        )
+        explicitly_idle = (
+            raw_charging is False
+            or str(raw_charging).strip().lower() in {"false", "0", "no", "off"}
+            or str(out["veh_charging_status"] or "").strip().lower()
+            in {"idle", "stopped", "complete", "disconnected", "no power"}
+        )
+        if explicitly_idle and not says_charging:
+            out["veh_eta"] = "N/A"
+        if (out["ev_w"] is not None
+                and abs(out["ev_w"]) <= EV_IDLE_POWER_W
+                and says_charging):
+            out["veh_is_charging"] = False
+            out["veh_charging_status"] = "Idle"
+            out["veh_eta"] = "N/A"
         out["setpoint_w"] = _num("setpoint_w")
         out["mode"] = vals.get("mode")
         out["control_action"] = vals.get("control_action")

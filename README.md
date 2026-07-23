@@ -34,12 +34,33 @@ a Domoticz server via its REST API for monitoring and historic tracking
 - Included a custom module which can be installed on a cerbo gx to read out ABB B2x kWh meters
 - EV Charge Controller - Tesla vehicle charging at lowest rates or using only excess solar energy,
   with a dedicated manual **Start/Stop** control decoupled from the house-battery grid-assist toggle
-  (toggling grid-assist never starts or stops the car)
+  (toggling grid-assist never starts or stops the car). Manual/grid starts first restore the
+  configured full-rate request, bounded by the live vehicle ceiling, then confirm the pushed
+  requested-current state within 60 seconds and retry only once. Actual ABB delivery is observed
+  but never used to fight Maxem throttling.
+- **Deadline-aware EV smart charging** (off by default): create one target-SoC/ready-by job on
+  the Vehicle tab, preview a plain-language daily charge plan, then optionally
+  apply it through budget-gated Tesla Fleet commands. A deterministic onboard Tesla schedule
+  protects the latest safe start, while Maxem remains authoritative for instantaneous 25 A/phase
+  overload throttling. Planned EV energy is added explicitly to both Summer and Winter ESS plans;
+  by default the home battery is not discharged into the car. Jobs longer than 48 hours make
+  gentle daily progress, but forecast solar may advance that progress when its lost export value
+  is cheaper than the later planned energy it replaces. Forecast PV is reserved for the home
+  battery up to `MINIMUM_ESS_SOC` before it is offered to the EV; unknown future sources remain
+  visibly pending rather than being labelled as grid. Shorter jobs remain deadline-first.
+  Live smart control requires Fleet Telemetry and confirms charge limit, requested current, and
+  charging state within 60 seconds, with at most three attempts. ABB delivery is observed for
+  actual power flow but never used to fight Maxem throttling. While an applied job waits between
+  planned blocks, the established excess-PV path may advance it after the home battery reaches
+  `MINIMUM_ESS_SOC`. A solar-only planned block is likewise capped to live surplus rather than
+  silently becoming a full-power grid block; manual/external charging remains untouched.
 - **Tesla Fleet Telemetry** (`TESLA_TELEMETRY_ENABLED`, off by default): an optional streaming push
   mode where the car reports state via Tesla's Fleet Telemetry instead of REST polling, eliminating
   billable `vehicle_data` reads/wakes for status. `lib/tesla_telemetry_bridge.py` translates the
   stream to the same internal topics/state the REST path uses, so the rest of the system is
-  unaffected; falls back to the REST polling path when disabled
+  unaffected; falls back to the REST polling path when disabled. Fleet OAuth uses Tesla's current
+  Fleet Auth host and automatically refreshes and atomically persists rotated access/refresh tokens;
+  the runtime `.secrets` file must therefore be writable by the controller process.
 - Energy Broker module which attempts to buy energy at the lowest possible rate in a 48 hour period and store this in your home battery
 - Tibber graphing module to generate visuals of the upcoming electricity prices (Thanks to [Tibberios](https://github.com/Lef-F/tibberios))
 - Tibber API integration to constantly monitor current energy rates, daily consumption and production, forecasted pricing, etc (Thanks to [Tibber.py](https://github.com/BeatsuDev/tibber.py))
@@ -49,7 +70,7 @@ a Domoticz server via its REST API for monitoring and historic tracking
 - solar forecasting data specific to your installation using ML models and AI for quite accurate current day production forecasts (courtesy of new VRM API features developed by Victron Energy). Note: A Victron VRM portal account is needed for this feature.
 - **AI Powered ESS Optimization**: A feature-flagged module that optimizes battery charging and discharging schedules using a dynamic-programming search over battery state-of-charge. It plans across the full available Tibber price horizon (today, and tomorrow once day-ahead prices publish around 13:00), accounts for charge/discharge efficiency, PV and load forecasts, seasonal SoC reserves, battery wear, export economics, and stored-energy cost basis. Its primary policy is **best daily settlement**: make today's result as profitable as possible, or reduce unavoidable cost as close to zero as possible, while allowing tomorrow-first carryover only when the future upside is clearly exceptional relative to learned history and forecast risk. Grid charging is chosen by path economics instead of a hard price-cap knob. When the current price is negative it also limits Victron grid feed-in to 0W (auto-reverting when prices recover).
 - HomeConnect supported appliance control. Schedules appliances to run at cheapest time of day without user intervention
-- **Web dashboard** (`frontend/`): a self-contained operator dashboard (Flask). It shows the Overview entry point, ESS tabs, current decision, a plain-language remaining-day P/L strategy, expandable hour->15-min->reasoning schedule tree (with a collapsed **previous-day settled** view and a moving today-so-far ledger row), a **live power-flow** diagram, **Trends** (toggleable SoC/price chart, actual-vs-forecast PV/load overlay, and daily final-net forecast candles with settled-actual dots), a desktop **Weather** tab with toggleable chart series, sticky header status chips and a stale-backend **Server Offline** banner, guarded Victron Schedule clearing, Replan/Restart/Override/Grid assist operator buttons, and allow-listed `.env` config editing. Runs as its own process/sidecar (`python -m frontend`) or an optional in-process thread. Set `APP_ENV_PATH` when the writable `.env` lives outside the app working directory. See `frontend/README.md`.
+- **Web dashboard** (`frontend/`): a self-contained operator dashboard (Flask). It shows the Overview entry point, ESS tabs, current decision, a plain-language remaining-day P/L strategy, expandable hour->15-min->reasoning schedule tree (with a collapsed **previous-day settled** view and a moving today-so-far ledger row), a **live power-flow** diagram, **Trends** (toggleable SoC/price chart, actual-vs-forecast PV/load overlay, and daily final-net forecast spread with settled/latest-projection dots), a desktop **Weather** tab with toggleable chart series, sticky header status chips and a stale-backend **Server Offline** banner, guarded Victron Schedule clearing, Replan/Restart/Override/Grid assist operator buttons, and allow-listed `.env` config editing. Runs as its own process/sidecar (`python -m frontend`) or an optional in-process thread. Set `APP_ENV_PATH` when the writable `.env` lives outside the app working directory. See `frontend/README.md`.
 - **Weather shadow mode** (`lib/weather.py` + dashboard Weather tab): fetches keyless Open-Meteo forecasts using `HOME_ADDRESS_LAT` / `HOME_ADDRESS_LONG`, caches them in `data/weather/`, computes Summer cooling or Winter heating anomalies relative to the trailing three-day load baseline, and builds GTI-shaped PV shadow forecasts. Panel azimuth uses a conventional compass bearing (`0=N`, `90=E`, `180=S`, `270=W`) and is converted for the provider. `HVAC_LOAD_APPLY` and `PV_WEATHER_APPLY` default to `False`; validate before enabling.
 - **AI Advisor** (dashboard "Advisor" tab): a manually-triggered, **read-only** AI review of recent optimizer behaviour. Run the default review or ask an open question ("Why did we sell at 15:00 yesterday?"); it streams a short, plain-language report and can pull deeper days from history on demand. It analyses recent history + the allow-listed tunables (never secrets) and recommends improvements (existing-tunable / new-tunable / code change), and it cannot change anything. Auth uses a **subscription-login CLI** — set `ADVISOR_CLI_CMD` to your provider's CLI (`gemini -p {prompt}`, `codex exec {prompt}`, or Claude Code) so usage draws from your existing plan; a `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` path also exists. (Phase 1 of a planned advise→approve→apply workflow.)
 
@@ -76,6 +97,11 @@ Note: The name of this project is a nod to both Victron Energy & the Domoticz pr
   - `AI_POWERED_ESS_ALGORITHM=True`: Enable the new AI optimizer.
   - `WINTER_MODE=False`: Select the restart-isolated optimizer policy. `False` preserves summer trading behavior; `True` activates winter self-sufficiency behavior after the supervised restart requested by the dashboard/config watcher.
   - `APPLIANCE_OPTIMIZATION_ENABLED=False`: Enable lower-cost appliance start deferral in either Summer or Winter Mode when `HOME_CONNECT_APPLIANCE_SCHEDULING` is enabled. The Home Connect setting remains the master switch, while preferred dishwasher-program enforcement remains active in either season whenever that master switch is enabled. Changing this setting requests a supervised restart.
+  - `EV_SMART_CHARGE_ENABLED=False` / `EV_SMART_CHARGE_APPLY=False`: separate plan and control gates for one target-SoC/ready-by EV job. Enable planning first and validate the Vehicle-tab schedule before enabling Fleet commands.
+  - `EV_CHARGER_MAX_KW` is the requested ceiling; `EV_EXPECTED_DELIVERY_KW` is the conservative sustained rate used to calculate feasibility/latest-safe-start when Maxem or taper reduces delivery. `EV_CHARGER_MAX_AMPS` is per phase.
+    Per-slot EV energy is further capped to forecast grid headroom after house load/PV, so a 16 kW request is never modelled as 16 kW on top of other site demand.
+  - `EV_CHARGE_BLOCK_START_PENALTY_EUR` is a small virtual optimization penalty per charging block, preventing needless start/stop cycles for tiny price differences without changing the reported electricity cost.
+  - `EV_ALLOW_ESS_DISCHARGE=False`: hold stationary-battery SoC flat during planned EV slots so grid/PV supplies the flexible load. Set true only when deliberately allowing the home battery to charge the car.
   - `BATTERY_CAPACITY_KWH`: Your battery capacity in kWh (default 42.0).
   - `AC_DC_CHARGE_EFFICIENCY`: Efficiency of charging (e.g. 0.90).
   - `AC_DC_DISCHARGE_EFFICIENCY`: Efficiency of discharging (e.g. 0.90).

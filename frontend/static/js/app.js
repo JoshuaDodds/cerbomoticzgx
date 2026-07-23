@@ -48,6 +48,11 @@ const fmtGrid = (v) => {
 };
 const prodCell = (v) => (v == null || Math.abs(Number(v)) < 0.005) ? '<span class="muted">—</span>' : Number(v).toFixed(2);
 const consCell = (v) => (v == null || Math.abs(Number(v)) < 0.005) ? '<span class="muted">—</span>' : Number(v).toFixed(2);
+function escapeHtml(value) {
+  return String(value == null ? "" : value).replace(/[&<>'"]/g, (ch) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;",
+  })[ch]);
+}
 const socPair = (a, b) => (a == null || b == null)
   ? '<span class="muted">—</span>'
   : `${Math.round(a)}→${Math.round(b)}%`;
@@ -61,6 +66,7 @@ const fmtPower = (w) => {
 
 let lastPlan = null;
 let lastLive = null;
+let lastEvSmartCharge = null;
 let expandedHours = new Set();   // hour keys the user has expanded (survive refreshes)
 let lastHoursGen = null;          // generated_at of the last tree we built
 let lastCurrentHourKey = null;
@@ -819,8 +825,15 @@ function jumpToMobileViewTop(behavior = "smooth") {
 
 function hourRowInner(h) {
   const nowTag = h.is_current ? '<span class="now-tag">NOW</span>' : "";
+  const evEnergy = Number(h.planned_ev_kwh || 0);
+  const evKw = Number(h.ev_target_kw || 0);
+  const evSupply = ["solar", "mixed", "grid"].includes(String(h.ev_supply || "").toLowerCase())
+    ? String(h.ev_supply).toLowerCase() : "grid";
+  const evTag = evEnergy > 0.001
+    ? `<span class="ev-hour-tag ev-supply-${evSupply}${h.ev_tentative ? " ev-tentative" : ""}" title="${evEnergy.toFixed(2)} kWh planned EV energy">EV ${evKw > 0 ? `${evKw.toFixed(1)} kW` : `${evEnergy.toFixed(2)} kWh`}</span>`
+    : "";
   return (
-    `<span class="col-time"><span class="caret">▸</span>${h.label}${nowTag}</span>` +
+    `<span class="col-time"><span class="caret">▸</span>${h.label}${nowTag}${evTag}</span>` +
     `<span class="col-bar"></span>` +
     `<span class="col-num">€${h.avg_price.toFixed(3)}</span>` +
     `<span class="col-num">${fmtGrid(h.grid_kwh)}</span>` +
@@ -880,9 +893,16 @@ function makeSlotRow(s) {
     : imp * Number(s.price) - projExp * sell;
   const gridStr = fmtGrid(g);
   const gridCell = idleStore ? `<span class='muted'>${gridStr}</span>` : gridStr;
+  const evEnergy = Number(s.planned_ev_kwh || 0);
+  const evKw = Number(s.ev_target_kw || 0);
+  const evSupply = ["solar", "mixed", "grid"].includes(String(s.ev_supply || "").toLowerCase())
+    ? String(s.ev_supply).toLowerCase() : "grid";
+  const evTag = evEnergy > 0.001
+    ? `<span class="ev-slot-tag ev-supply-${evSupply}${s.ev_tentative ? " ev-tentative" : ""}">EV ${evKw > 0 ? `${evKw.toFixed(1)} kW` : `${evEnergy.toFixed(2)} kWh`}</span>`
+    : "";
   sr.innerHTML =
     `<span><span class="slot-dot" style="background:var(--${slotColorVar(s)})"></span>${s.time.slice(11, 16)}</span>` +
-    `<span>${caOf(s)}</span>` +
+    `<span>${caOf(s)}${evTag}</span>` +
     `<span class="col-num">€${Number(s.price || 0).toFixed(3)}</span>` +
     `<span class="col-num">${gridCell}</span>` +
     `<span class="col-num">${prodCell(s.pv)}</span>` +
@@ -1245,7 +1265,7 @@ function renderVehicle() {
   const yesno = (v) => has(v) ? (bool(v) ? "Yes" : "No") : null;
 
   const cards = [];
-  const card = (label, val) => { if (has(val)) cards.push(`<div class="metric"><div class="label">${label}</div><div class="value">${val}</div></div>`); };
+  const card = (label, val) => { if (has(val)) cards.push(`<div class="metric"><div class="label">${escapeHtml(label)}</div><div class="value">${escapeHtml(val)}</div></div>`); };
 
   card("Car SoC", pct(L.veh_soc));
   card("Charge limit", pct(L.veh_soc_limit));
@@ -1266,6 +1286,307 @@ function renderVehicle() {
     : `<span class="muted">waiting for vehicle status…</span>`;
   const title = document.querySelector("#tab-vehicle h3");
   if (title && has(L.veh_name)) title.textContent = L.veh_name;
+}
+
+function evSmartView(data) {
+  const payload = data || {};
+  const rawPlan = payload.plan || payload.ev_plan || payload.plan_snapshot
+    || (lastPlan && lastPlan.ev_smart_charge) || {};
+  let job = null;
+  if (Object.prototype.hasOwnProperty.call(payload, "job")) job = payload.job;
+  else if (Object.prototype.hasOwnProperty.call(payload, "active_job")) job = payload.active_job;
+  else job = rawPlan.job || null;
+  const planJob = rawPlan.job || {};
+  const sameJob = !!(job && planJob && String(planJob.id || "") === String(job.id || "")
+    && String(planJob.status || "active") === String(job.status || "active"));
+  const plan = sameJob ? rawPlan : {};
+  const jobStatus = String(job && job.status || "").toLowerCase();
+  const status = !job ? "idle" : jobStatus === "paused" ? "paused"
+    : sameJob ? String(plan.status || "active").toLowerCase() : "waiting_for_plan";
+  return { payload, plan, job, status };
+}
+
+function evSmartDeadlineParts(value) {
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return {date: "", time: ""};
+  const pad = (v) => String(v).padStart(2, "0");
+  return {
+    date: `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`,
+    time: `${pad(d.getHours())}:${pad(d.getMinutes())}`,
+  };
+}
+
+function evSmartDefaultDeadline() {
+  const d = new Date();
+  d.setDate(d.getDate() + 1);
+  d.setHours(7, 0, 0, 0);
+  return evSmartDeadlineParts(d);
+}
+
+function evSmartPopulateTimeOptions(select, selected = "") {
+  if (!select) return;
+  const values = [];
+  for (let minutes = 0; minutes < 24 * 60; minutes += 15) {
+    values.push(`${String(Math.floor(minutes / 60)).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`);
+  }
+  if (selected && !values.includes(selected)) values.push(selected);
+  values.sort();
+  select.textContent = "";
+  values.forEach((value) => {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = value;
+    select.appendChild(option);
+  });
+  if (selected) select.value = selected;
+}
+
+function evSmartNumber(source, names) {
+  for (const name of names) {
+    if (!source || source[name] == null || source[name] === "") continue;
+    const value = Number(source && source[name]);
+    if (Number.isFinite(value)) return value;
+  }
+  return null;
+}
+
+function evSmartAddMetric(grid, label, value) {
+  if (value == null || value === "") return;
+  const card = el("div", "metric");
+  const lbl = el("div", "label");
+  const val = el("div", "value");
+  lbl.textContent = label;
+  val.textContent = String(value);
+  card.appendChild(lbl);
+  card.appendChild(val);
+  grid.appendChild(card);
+}
+
+function evSmartDailyPlan(data) {
+  const box = document.getElementById("ev-smart-plan");
+  if (!box) return;
+  box.textContent = "";
+  const { plan, job } = evSmartView(data);
+  let days = Array.isArray(plan.daily_plan) ? plan.daily_plan : [];
+  if (!days.length) {
+    const grouped = new Map();
+    (plan.blocks || plan.charge_blocks || []).forEach((block) => {
+      const start = new Date(block.start || block.start_at);
+      if (Number.isNaN(start.getTime())) return;
+      const key = `${start.getFullYear()}-${start.getMonth()}-${start.getDate()}`;
+      if (!grouped.has(key)) grouped.set(key, {
+        date: key, start: block.start, end: block.end, blocks: [], energy_kwh: 0,
+        soc_start: block.soc_start, soc_end: block.soc_end, tentative: false,
+        estimated_cost_eur: 0, provisional_cost_eur: 0,
+        supply: block.supply || (block.tentative ? "pending" : "grid"),
+      });
+      const day = grouped.get(key);
+      day.blocks.push(block);
+      day.end = block.end;
+      day.energy_kwh += Number(block.energy_kwh || block.planned_ev_kwh || 0);
+      day.soc_end = block.soc_end;
+      day.tentative = day.tentative || block.tentative === true;
+      if (block.estimated_cost_eur == null) day.estimated_cost_eur = null;
+      else if (day.estimated_cost_eur != null) day.estimated_cost_eur += Number(block.estimated_cost_eur);
+      day.provisional_cost_eur += Number(block.provisional_cost_eur || 0);
+      if (day.supply !== block.supply) day.supply = "mixed";
+    });
+    days = Array.from(grouped.values());
+  }
+  if (!job || !days.length) return;
+
+  const dateOf = (value) => {
+    const parsed = new Date(value);
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+  };
+  const dayLabel = (value) => {
+    const date = dateOf(value);
+    if (!date) return "Planned day";
+    const today = new Date();
+    const tomorrow = new Date(today); tomorrow.setDate(today.getDate() + 1);
+    const key = date.toLocaleDateString();
+    const prefix = key === today.toLocaleDateString() ? "Today"
+      : key === tomorrow.toLocaleDateString() ? "Tomorrow"
+        : date.toLocaleDateString([], {weekday: "long"});
+    return `${prefix}, ${date.toLocaleDateString([], {day: "numeric", month: "short"})}`;
+  };
+  const timeLabel = (value) => {
+    const date = dateOf(value);
+    return date ? date.toLocaleTimeString([], {
+      hour: "2-digit", minute: "2-digit", hour12: false,
+    }) : "—";
+  };
+  const totalEnergy = evSmartNumber(plan, ["planned_ac_kwh", "required_ac_kwh"]);
+  const solarEnergy = evSmartNumber(plan, ["forecast_pv_kwh"]);
+  const gridEnergy = evSmartNumber(plan, ["forecast_grid_kwh"]);
+  const pendingEnergy = evSmartNumber(plan, ["source_pending_kwh"]);
+  const strategy = plan.planning_strategy === "daily_paced";
+  const intro = el("div", "ev-charge-plan-intro");
+  const introTitle = el("strong");
+  introTitle.textContent = strategy ? "Solar-first daily charging" : "Cheapest charging before departure";
+  const introText = el("span", "muted");
+  const sourceSummary = [
+    solarEnergy > 0 ? `${solarEnergy.toFixed(1)} kWh forecast solar` : null,
+    gridEnergy > 0 ? `${gridEnergy.toFixed(1)} kWh forecast grid` : null,
+    pendingEnergy > 0 ? `${pendingEnergy.toFixed(1)} kWh source pending` : null,
+  ].filter(Boolean).join(", ");
+  const policy = "Solar surplus is used when it costs less than the energy it replaces; low-cost grid covers the remaining deadline need.";
+  introText.textContent = strategy
+    ? `${totalEnergy == null ? "Energy is" : `${totalEnergy.toFixed(1)} kWh`} planned over ${days.length} days. ${policy}${sourceSummary ? ` Current forecast: ${sourceSummary}.` : ""} Future days update as prices and solar forecasts arrive. These blocks run under live control; the Tesla app shows only the deadline safety fallback.`
+    : `${totalEnergy == null ? "Charging is" : `${totalEnergy.toFixed(1)} kWh`} scheduled in the best available windows before ${new Date(job.ready_by).toLocaleString([], {weekday: "short", hour: "2-digit", minute: "2-digit", hour12: false})}. ${policy}${sourceSummary ? ` Current forecast: ${sourceSummary}.` : ""}`;
+  intro.appendChild(introTitle);
+  intro.appendChild(introText);
+  box.appendChild(intro);
+
+  const list = el("div", "ev-charge-day-list");
+  days.forEach((day) => {
+    const row = el("article", "ev-charge-day");
+    const heading = el("div", "ev-charge-day-heading");
+    const label = el("strong"); label.textContent = dayLabel(day.start || day.date);
+    const state = el("span", `ev-charge-day-state ${day.tentative ? "pending" : "confirmed"}`);
+    state.textContent = day.tentative ? "Price estimate" : "Price confirmed";
+    heading.appendChild(label); heading.appendChild(state); row.appendChild(heading);
+
+    const windows = el("div", "ev-charge-windows");
+    (day.windows || day.blocks || []).forEach((block) => {
+      const window = el("div", "ev-charge-window");
+      const when = el("strong", "ev-charge-window-time");
+      when.textContent = day.tentative
+        ? "Best time to be chosen"
+        : `${timeLabel(block.start)}–${timeLabel(block.end)}`;
+      const detail = el("span");
+      const energy = evSmartNumber(block, ["energy_kwh", "planned_ev_kwh"]);
+      const startSoc = evSmartNumber(block, ["soc_start"]);
+      const endSoc = evSmartNumber(block, ["soc_end"]);
+      detail.textContent = [
+        energy == null ? null : `+${energy.toFixed(1)} kWh`,
+        startSoc == null || endSoc == null ? null : `${startSoc.toFixed(0)}% → ${endSoc.toFixed(0)}%`,
+      ].filter(Boolean).join(" · ");
+      window.appendChild(when); window.appendChild(detail); windows.appendChild(window);
+    });
+    row.appendChild(windows);
+
+    const meta = el("div", "ev-charge-day-meta");
+    const knownCost = day.estimated_cost_eur == null ? null : Number(day.estimated_cost_eur);
+    const provisionalCost = day.provisional_cost_eur == null ? null : Number(day.provisional_cost_eur);
+    const cost = Number.isFinite(knownCost) ? knownCost : Number.isFinite(provisionalCost) ? provisionalCost : null;
+    const rawPrice = day.average_price_eur_per_kwh;
+    const price = rawPrice == null ? null : Number(rawPrice);
+    const source = String(day.supply || (day.tentative ? "pending" : "grid")).toLowerCase();
+    const sourceLabel = source === "pending" ? "Source to be chosen" : source === "solar" ? "Solar surplus" : source === "mixed" ? "Solar + grid" : "Grid";
+    meta.textContent = [
+      `${Number(day.energy_kwh || 0).toFixed(1)} kWh total`,
+      cost == null ? null : `${day.tentative ? "about " : ""}€${cost.toFixed(2)}`,
+      price == null ? (day.tentative ? "future price pending" : null) : `${(price * 100).toFixed(1)} c/kWh`,
+      sourceLabel,
+    ].filter(Boolean).join(" · ");
+    row.appendChild(meta);
+    list.appendChild(row);
+  });
+  box.appendChild(list);
+}
+
+function renderEvSmartCharge(data) {
+  lastEvSmartCharge = data || {};
+  const { payload, plan, job, status } = evSmartView(lastEvSmartCharge);
+  const statusBox = document.getElementById("ev-smart-status");
+  const message = document.getElementById("ev-smart-message");
+  const summary = document.getElementById("ev-smart-summary");
+  const actions = document.getElementById("ev-smart-actions");
+  const form = document.getElementById("ev-smart-charge-form");
+  if (!statusBox || !message || !summary || !actions || !form) return;
+
+  const validStatuses = ["idle", "waiting_for_plan", "waiting_for_plug", "planned", "charging", "paused", "at_risk", "infeasible", "completed"];
+  const safeStatus = validStatuses.includes(status) ? status : "idle";
+  statusBox.className = `ev-smart-status status-${safeStatus}`;
+  const controlMode = payload.apply === true ? "active" : "preview";
+  statusBox.textContent = `${controlMode} · ${safeStatus.replaceAll("_", " ")}`;
+  message.className = "ev-smart-message muted";
+  message.textContent = payload.message || plan.message || (safeStatus === "waiting_for_plan"
+    ? "Job saved; waiting for the optimizer to publish its charge plan."
+    : job ? "" : "No smart-charge job is active.");
+
+  const moduleAvailable = payload.available !== false;
+  const enabled = moduleAvailable && payload.enabled !== false;
+  Array.from(form.querySelectorAll ? form.querySelectorAll("input, select, button") : []).forEach((control) => {
+    control.disabled = !enabled;
+  });
+  if (!moduleAvailable) message.textContent = payload.message || "Smart charging is unavailable in this service version.";
+  else if (!enabled) message.textContent = "Smart charging is disabled in Configuration.";
+  else if (payload.apply !== true && job && !message.textContent) {
+    message.textContent = "Preview only — these planned times will not control the car. Existing excess-solar charging remains active.";
+  }
+  else if (safeStatus === "infeasible") message.textContent = "The target cannot be reached in the available slots. Choose a later deadline or lower target.";
+  else if (safeStatus === "completed") message.textContent = "The requested charge target has been reached.";
+  else if (safeStatus === "waiting_for_plug") message.textContent = "Connect the car by the plug-in time shown below to protect the deadline.";
+
+  const targetInput = document.getElementById("ev-smart-target-soc");
+  const readyDate = document.getElementById("ev-smart-ready-date");
+  const readyTime = document.getElementById("ev-smart-ready-time");
+  if (job) {
+    if (targetInput && job.target_soc != null) targetInput.value = String(job.target_soc);
+    if (job.ready_by) {
+      const parts = evSmartDeadlineParts(job.ready_by);
+      if (readyDate) readyDate.value = parts.date;
+      evSmartPopulateTimeOptions(readyTime, parts.time);
+    }
+  } else if (readyDate && readyTime && (!readyDate.value || !readyTime.value)) {
+    const parts = evSmartDefaultDeadline();
+    readyDate.value = parts.date;
+    evSmartPopulateTimeOptions(readyTime, parts.time);
+  }
+  const saveButton = document.getElementById("ev-smart-save");
+  if (saveButton && !saveButton.disabled) saveButton.textContent = job ? "Update plan" : "Plan charge";
+
+  summary.textContent = "";
+  if (job) {
+    const grid = el("div", "metrics-grid ev-smart-summary");
+    const targetSoc = evSmartNumber(job, ["target_soc"]);
+    const currentSoc = evSmartNumber(plan, ["current_soc"]);
+    const energy = evSmartNumber(plan, ["required_ac_kwh", "required_energy_kwh"]);
+    const cost = evSmartNumber(plan, ["estimated_incremental_cost_eur", "estimated_incremental_cost", "estimated_cost_eur"]);
+    const provisionalCost = evSmartNumber(plan, ["provisional_incremental_cost_eur"]);
+    const saving = evSmartNumber(plan, ["estimated_saving_eur", "estimated_saving", "estimated_savings_eur"]);
+    const provisionalSaving = evSmartNumber(plan, ["provisional_saving_eur"]);
+    evSmartAddMetric(grid, "Battery goal", targetSoc == null ? null : `${currentSoc == null ? "" : `${currentSoc.toFixed(0)}% → `}${targetSoc.toFixed(0)}%`);
+    evSmartAddMetric(grid, "Energy needed", energy == null ? null : `${energy.toFixed(1)} kWh`);
+    evSmartAddMetric(grid, "Expected cost", cost != null ? `€${cost.toFixed(2)}`
+      : provisionalCost == null ? null : `about €${provisionalCost.toFixed(2)}`);
+    evSmartAddMetric(grid, "Saving vs now", saving != null ? `€${saving.toFixed(2)}`
+      : provisionalSaving == null ? null : `about €${provisionalSaving.toFixed(2)}`);
+    summary.appendChild(grid);
+  }
+
+  actions.hidden = !job;
+  const advertisedActions = payload.actions || plan.actions || [];
+  actions.querySelectorAll("[data-ev-smart-action]").forEach((btn) => {
+    const action = btn.dataset.evSmartAction;
+    const chargeNowAllowed = advertisedActions.includes("charge_now") || plan.charge_now_available === true;
+    btn.hidden = (action === "pause" && ["paused", "completed"].includes(safeStatus))
+      || (action === "resume" && safeStatus !== "paused")
+      || (action === "charge_now" && (safeStatus === "completed" || !chargeNowAllowed));
+    if (action === "charge_now") {
+      btn.disabled = !chargeNowAllowed;
+    }
+  });
+  evSmartDailyPlan(lastEvSmartCharge);
+}
+
+async function refreshEvSmartCharge() {
+  try {
+    const response = await fetch("/api/ev/smart-charge");
+    renderEvSmartCharge(await response.json());
+  } catch (error) {
+    renderEvSmartCharge({available: false, message: "Smart-charge status is unavailable while the server is offline."});
+  }
+}
+
+async function requestEvSmartReplan() {
+  try {
+    const response = await fetch("/api/replan", {method: "POST"});
+    const result = await response.json();
+    return response.ok && result.ok;
+  } catch (_) { return false; }
 }
 
 function applyLive(data) {
@@ -2090,6 +2411,102 @@ document.querySelectorAll("[data-vehicle-refresh]").forEach((btn) => {
   });
 });
 
+const evSmartForm = document.getElementById("ev-smart-charge-form");
+if (evSmartForm) {
+  evSmartForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const target = document.getElementById("ev-smart-target-soc");
+    const readyDate = document.getElementById("ev-smart-ready-date");
+    const readyTime = document.getElementById("ev-smart-ready-time");
+    const save = document.getElementById("ev-smart-save");
+    const message = document.getElementById("ev-smart-message");
+    const deadline = new Date(`${readyDate && readyDate.value}T${readyTime && readyTime.value}:00`);
+    if (!target || !readyDate || !readyTime || Number.isNaN(deadline.getTime())) return;
+    if (save) { save.disabled = true; save.textContent = "Planning…"; }
+    if (message) { message.className = "ev-smart-message muted"; message.textContent = "Creating the lowest-cost feasible plan…"; }
+    try {
+      const response = await fetch("/api/ev/smart-charge", {
+        method: "PUT",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({target_soc: Number(target.value), ready_by: deadline.toISOString()}),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.ok) throw new Error(result.error || "Could not save the charge job");
+      const replanned = await requestEvSmartReplan();
+      await refreshEvSmartCharge();
+      await refreshPlan();
+      if (!replanned && message) {
+        message.className = "ev-smart-message muted";
+        message.textContent = "Job saved. The charge plan will update on the optimizer’s next cycle.";
+      }
+    } catch (error) {
+      if (message) { message.className = "ev-smart-message error"; message.textContent = error.message; }
+    } finally {
+      if (save) { save.disabled = false; save.textContent = lastEvSmartCharge && evSmartView(lastEvSmartCharge).job ? "Update plan" : "Plan charge"; }
+    }
+  });
+}
+
+document.querySelectorAll("[data-ev-smart-action]").forEach((btn) => {
+  btn.addEventListener("click", async () => {
+    const message = document.getElementById("ev-smart-message");
+    btn.disabled = true;
+    try {
+      const response = await fetch("/api/ev/smart-charge/action", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({action: btn.dataset.evSmartAction}),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.ok) throw new Error(result.error || "Smart-charge action failed");
+      const replanned = await requestEvSmartReplan();
+      await refreshEvSmartCharge();
+      await refreshPlan();
+      if (!replanned && message) {
+        message.className = "ev-smart-message muted";
+        message.textContent = "Action saved. The charge plan will update on the optimizer’s next cycle.";
+      }
+    } catch (error) {
+      if (message) { message.className = "ev-smart-message error"; message.textContent = error.message; }
+    } finally { btn.disabled = false; }
+  });
+});
+
+document.querySelectorAll("[data-ev-smart-edit]").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    const target = document.getElementById("ev-smart-target-soc");
+    if (target) { target.focus(); target.select(); }
+  });
+});
+
+document.querySelectorAll("[data-ev-smart-cancel]").forEach((btn) => {
+  btn.addEventListener("click", async () => {
+    const confirmed = await advisorConfirm({
+      title: "Cancel smart-charge job?",
+      message: "The fallback schedule and all remaining planned EV blocks will be removed.",
+      confirmText: "Cancel job",
+      danger: true,
+    });
+    if (!confirmed) return;
+    const message = document.getElementById("ev-smart-message");
+    btn.disabled = true;
+    try {
+      const response = await fetch("/api/ev/smart-charge", {method: "DELETE"});
+      const result = await response.json();
+      if (!response.ok || !result.ok) throw new Error(result.error || "Could not cancel the charge job");
+      const replanned = await requestEvSmartReplan();
+      await refreshEvSmartCharge();
+      await refreshPlan();
+      if (!replanned && message) {
+        message.className = "ev-smart-message muted";
+        message.textContent = "Job cancelled. The optimizer will remove its EV load on the next cycle.";
+      }
+    } catch (error) {
+      if (message) { message.className = "ev-smart-message error"; message.textContent = error.message; }
+    } finally { btn.disabled = false; }
+  });
+});
+
 initMobileChrome();
 load();
 loadAdvisorLatest();
@@ -2097,6 +2514,7 @@ refreshForecastAccuracy();
 refreshWeather();
 refreshMonthly();
 refreshVehicleUsage();
+refreshEvSmartCharge();
 renderHeaderClock();
 startLiveStream();              // instant live updates via SSE
 // Plan refreshes slowly (changes only when the optimizer runs). Live values now
@@ -2109,3 +2527,4 @@ setInterval(refreshForecastAccuracy, 120000);
 setInterval(refreshWeather, 1800000);
 setInterval(refreshMonthly, 120000);   // month chart changes slowly
 setInterval(refreshVehicleUsage, 60000);   // Tesla API usage tally
+setInterval(refreshEvSmartCharge, 30000);  // durable EV job + independently published plan

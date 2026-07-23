@@ -23,7 +23,7 @@ import argparse
 
 sys.path.append(os.getcwd())
 
-TESLA_AUTH_TOKEN_URL = "https://auth.tesla.com/oauth2/v3/token"
+TESLA_AUTH_TOKEN_URL = "https://fleet-auth.prd.vn.cloud.tesla.com/oauth2/v3/token"
 # Partner-token scopes. Override with --scope if your app is granted a different set.
 DEFAULT_SCOPE = "vehicle_device_data vehicle_location vehicle_cmds vehicle_charging_cmds"
 

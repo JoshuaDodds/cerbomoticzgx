@@ -1,4 +1,6 @@
 import json
+import sys
+import types
 import pytest
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -153,6 +155,75 @@ def test_group_by_hour_aggregates_settled_actuals(monkeypatch, tmp_path):
     assert hour["hour_start"] == now.isoformat()
 
 
+def test_group_by_hour_exposes_compact_ev_schedule_annotations():
+    now = datetime.now().astimezone().replace(hour=8, minute=0, second=0, microsecond=0)
+    slots = [
+        {
+            "time": (now + timedelta(minutes=offset)).isoformat(),
+            "control_action": "BUY",
+            "grid_energy": 4.0,
+            "price": 0.12,
+            "pv": 0.0,
+            "load": 4.3,
+            "planned_ev_kwh": ev_kwh,
+            "ev_target_kw": target_kw,
+        }
+        for offset, ev_kwh, target_kw in ((0, 4.0, 16.0), (15, 2.0, 8.0))
+    ]
+    slots[0]["ev_supply"] = "solar"
+    slots[0]["ev_tentative"] = True
+    slots[1]["ev_supply"] = "solar"
+
+    hour = data.group_by_hour(slots)[0]
+
+    assert hour["planned_ev_kwh"] == 6.0
+    assert hour["ev_target_kw"] == 16.0
+    assert hour["ev_supply"] == "solar"
+    assert hour["ev_tentative"] is True
+
+
+def test_plan_exposes_ev_smart_charge_snapshot(monkeypatch, tmp_path):
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps({
+        "generated_at": datetime.now().astimezone().isoformat(),
+        "schedule": [],
+        "ev_smart_charge": {"status": "planned", "blocks": []},
+    }))
+    monkeypatch.setattr(data, "_env", lambda: {"AI_PLAN_EXPORT_PATH": str(plan_path)})
+
+    plan = data.get_plan()
+
+    assert plan["ev_smart_charge"]["status"] == "planned"
+
+
+def test_ev_smart_charge_dashboard_uses_configured_job_and_plan_paths(monkeypatch, tmp_path):
+    calls = []
+    fake = types.SimpleNamespace(
+        load_job=lambda path=None: calls.append(("job", path)) or {"id": "j1", "status": "active"},
+        load_plan_snapshot=lambda path=None: calls.append(("plan", path)) or {
+            "job": {"id": "j1", "status": "active"}, "status": "planned",
+        },
+    )
+    monkeypatch.setitem(sys.modules, "lib.ev_smart_charge", fake)
+    monkeypatch.setattr(data, "load_raw_plan", lambda: {})
+    monkeypatch.setattr(data, "_env", lambda: {
+        "EV_SMART_CHARGE_ENABLED": "True",
+        "EV_SMART_CHARGE_APPLY": "False",
+        "EV_SMART_CHARGE_JOB_PATH": str(tmp_path / "job.json"),
+        "EV_SMART_CHARGE_PLAN_PATH": str(tmp_path / "plan.json"),
+    })
+
+    result = data.ev_smart_charge_dashboard()
+
+    assert result["enabled"] is True
+    assert result["apply"] is False
+    assert result["plan"]["status"] == "planned"
+    assert calls == [
+        ("job", str(tmp_path / "job.json")),
+        ("plan", str(tmp_path / "plan.json")),
+    ]
+
+
 def test_forecast_accuracy_uses_settlement_predicted_and_actuals(monkeypatch, tmp_path):
     monkeypatch.setattr(data, "_env", lambda: {"HISTORY_DIR": str(tmp_path)})
     day = datetime.now().astimezone().replace(hour=10, minute=0, second=0, microsecond=0)
@@ -240,7 +311,7 @@ def test_monthly_history_adds_projected_today_profit_from_current_plan(monkeypat
     assert today_row["projected_net_eur"] == 6.2
 
 
-def test_monthly_history_exposes_intraday_forecast_candle_and_final_actual(monkeypatch, tmp_path):
+def test_monthly_history_hides_box_plot_for_too_few_forecast_samples(monkeypatch, tmp_path):
     today = datetime.now().astimezone().date()
     day = today - timedelta(days=1)
     records = [
@@ -259,13 +330,104 @@ def test_monthly_history_exposes_intraday_forecast_candle_and_final_actual(monke
     rows = data.monthly_history()
 
     row = next(r for r in rows if r["date"] == day.isoformat())
+    assert "forecast_q1_eur" not in row
+    assert "forecast_median_eur" not in row
+    assert "forecast_range_low_eur" not in row
     assert row["forecast_open_eur"] == -1.5
     assert row["forecast_low_eur"] == -1.5
     assert row["forecast_high_eur"] == 2.0
     assert row["forecast_close_eur"] == 0.5
     assert row["forecast_samples"] == 3
+    assert row["forecast_raw_samples"] == 3
+    assert row["forecast_complete"] is False
     assert row["net_eur"] == 1.25
     assert row["settled"] is True
+
+
+def test_forecast_box_stats_keeps_every_observation_in_the_visible_range():
+    stats = data._forecast_box_stats([0, 1, 2, 3, 4, 5, 6, 7, 8, 100])
+
+    assert stats == {
+        "forecast_q1_eur": 2.25,
+        "forecast_median_eur": 4.5,
+        "forecast_q3_eur": 6.75,
+        "forecast_range_low_eur": 0.0,
+        "forecast_range_high_eur": 100.0,
+    }
+
+
+def test_forecast_box_stats_requires_two_samples_per_quartile():
+    assert data._forecast_box_stats([0, 1, 2, 100, 101, 102, 103]) == {}
+
+
+def test_monthly_history_deduplicates_replans_into_latest_quarter_snapshot(
+        monkeypatch, tmp_path):
+    today = datetime.now().astimezone().date()
+    day = today - timedelta(days=1)
+    records = []
+    for index in range(96):
+        hour, quarter = divmod(index, 4)
+        minute = quarter * 15
+        records.append({
+            "kind": "cycle",
+            "ts": f"{day.isoformat()}T{hour:02d}:{minute:02d}:00+02:00",
+            "forecast_day_net_eur": float(index),
+            "day_import_cost": 1.0,
+            "day_export_reward": 2.0,
+        })
+        if index == 40:
+            # A request-triggered replan in the same quarter must replace, not
+            # statistically outweigh, the scheduled cycle.
+            records.append({
+                "kind": "cycle",
+                "ts": f"{day.isoformat()}T{hour:02d}:{minute + 5:02d}:00+02:00",
+                "forecast_day_net_eur": -50.0,
+                "day_import_cost": 1.0,
+                "day_export_reward": 2.0,
+            })
+    (tmp_path / f"ess-{day.isoformat()}.ndjson").write_text(
+        "".join(json.dumps(record) + "\n" for record in records)
+    )
+    monkeypatch.setattr(data, "_env", lambda: {"HISTORY_DIR": str(tmp_path)})
+
+    row = next(
+        item for item in data.monthly_history()
+        if item["date"] == day.isoformat()
+    )
+
+    assert row["forecast_raw_samples"] == 97
+    assert row["forecast_samples"] == 96
+    assert row["forecast_coverage_pct"] == 100.0
+    assert row["forecast_complete"] is True
+    assert row["forecast_range_low_eur"] == -50.0
+    assert row["forecast_range_high_eur"] == 95.0
+
+
+def test_monthly_history_does_not_claim_full_day_stats_from_midday_cluster(
+        monkeypatch, tmp_path):
+    today = datetime.now().astimezone().date()
+    day = today - timedelta(days=1)
+    records = [{
+        "kind": "cycle",
+        "ts": f"{day.isoformat()}T12:{index * 5:02d}:00+02:00",
+        "forecast_day_net_eur": float(index),
+        "day_import_cost": 1.0,
+        "day_export_reward": 2.0,
+    } for index in range(8)]
+    (tmp_path / f"ess-{day.isoformat()}.ndjson").write_text(
+        "".join(json.dumps(record) + "\n" for record in records)
+    )
+    monkeypatch.setattr(data, "_env", lambda: {"HISTORY_DIR": str(tmp_path)})
+
+    row = next(
+        item for item in data.monthly_history()
+        if item["date"] == day.isoformat()
+    )
+
+    assert row["forecast_raw_samples"] == 8
+    assert row["forecast_samples"] == 3
+    assert row["forecast_complete"] is False
+    assert "forecast_q1_eur" not in row
 
 
 def test_day_summary_idle_surplus_charges_battery_not_grid():

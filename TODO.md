@@ -1,5 +1,22 @@
 # TODO / roadmap
 
+- **Daily-net forecast calibration** — The Trends chart now treats intraday values as
+  time-ordered forecast revisions rather than independent statistical samples: one latest
+  value per 15-minute period, full observed range without outlier labels, complete-day
+  coverage checks, and a comparable latest-full-day marker for today. Five complete
+  2026-07-18–22 days show that the final forecast is already close (about €0.23 MAE), but
+  earlier forecasts are optimistic: approximately €2.40–€2.48 MAE from midnight through
+  18:00 with +€1.02 to +€2.48 profit bias. New history rows separately persist remaining
+  forecast import cost and export reward so this can be attributed instead of guessed.
+
+  - Collect at least 7 complete days, preferably 14, with
+    `forecast_remaining_import_cost_eur` and
+    `forecast_remaining_export_reward_eur`.
+  - Recalculate error by time-to-settlement and attribute the positive bias to predicted
+    import cost, export reward, or both. Check EV/appliance days separately.
+  - Tune the underlying forecast only after the component history identifies the source;
+    require lower morning/midday MAE without degrading the approximately €0.23 closing MAE.
+
 - **Weather forecast validation / apply tuning** — The first 21-full-day validation
   found the original apply model harmful: load MAE was 0.2163 kWh/slot with weather
   versus 0.1155 without it, and weather improved 0/21 days. Root causes were full-day
@@ -50,56 +67,87 @@
   the "apply" button opens a PR/branch for human review and your normal pytest gate.
   Keep a human on the actual diff before anything restarts a 16 kW controller.
 
-## EV smart-charge scheduling (phase 2 of the EV/base-load decomposition)
+## EV smart-charge scheduling — operator validation / learning follow-up
 
-The EV/base-load split (see `docs/EV_LOAD_DECOMPOSITION.md`) is the enabling
-groundwork. Now that base load and EV charge energy are recorded separately, EV
-charging can be modelled as a **schedulable flexible load** the optimizer places
-into the cheapest / greenest slots — the "set and forget" goal:
+Phase 2 implementation is complete on `optimized-ev-charging`: one durable
+target-SoC/ready-by job, a pure 15-minute cost/PV planner, feasibility and
+latest-safe-start calculation, Summer/Winter ESS load integration, separate
+shadow/apply gates, readable day-by-day Vehicle plan, budget-aware Fleet execution, an
+application-owned Tesla fallback schedule, and one durable Pushover plug reminder.
+The sub-5 A double-send workaround is intentional. Maxem remains authoritative
+for 25 A/phase overload protection; the controller never chases lower ABB power.
+Jobs beyond 48 hours are automatically paced across local days at each day's cheapest
+available time, with cost-effective forecast solar allowed to advance later grid demand;
+shorter jobs retain deadline-first global price optimisation. Forecast PV is reserved for
+the home battery to `MINIMUM_ESS_SOC`, and the applied job can also use live surplus between
+blocks after that threshold. Unknown future energy sources stay visibly pending.
 
-> "I need to leave by 10am tomorrow. Charge the car most efficiently and as
-> cheaply as you can but have it at 80% by 10am."
+Do not consider production apply validated until these attended/multi-slot checks
+have been completed:
 
-### Job interface
-Define an EV charge job the DP can consume:
-
-```
-EvChargeJob = {
-    current_soc:  float,   # % now (from telemetry battery_soc)
-    target_soc:   float,   # % required by the deadline (e.g. 80)
-    deadline:     datetime,# be at target_soc by this time
-    max_kw:       float,   # charger ceiling (16 kW for this installation)
-    min_kw:       float,   # optional floor if the car won't modulate low
-    energy_kwh:   float,   # derived: (target-current)/100 * battery_capacity_kwh / charge_eff
-}
-```
-
-### DP integration
-- Add EV energy as an additional, deferrable demand over the horizon: the
-  optimizer already models per-slot grid cost and PV surplus; extend it to place
-  `energy_kwh` of EV load across the slots between now and `deadline` that
-  minimise cost (prefer PV surplus, then cheapest grid), subject to `max_kw`.
-- Respect existing safety: never let EV scheduling override ESS control, the
-  Tesla budget guard, or the home-geofence gate. EV draw is charged via the
-  dedicated `ev_charge_requested` intent flag, not `grid_charging_enabled`.
-- Feasibility check: if `energy_kwh` can't fit before the deadline at `max_kw`,
-  charge flat-out and surface a "won't reach target by deadline" warning.
-
-### Data / inputs already available
-- `current_soc` / `target_soc`: telemetry `battery_soc` / `battery_soc_setpoint`.
-- `ev_charge_kwh` per slot (settlement) + `ev_w` per cycle: measured EV behaviour
-  to validate the model and learn real charge curves (taper near the SoC limit).
-- Charger ceiling and phases: installation ceiling (16 kW), telemetry
-  `ChargerPhases`, and evcharger `Ac/Power`.
-
-### Suggested build order
-1. `EvChargeJob` dataclass + a pure planner (`plan_ev_charge(job, price_slots,
-   pv_forecast)`) returning per-slot EV kW — unit-tested in isolation.
-2. UI to set target SoC + deadline (Vehicle tab), writing the job to STATE.
-3. Wire the planner's per-slot EV kW into the optimizer's demand, gated behind a
-   `EV_SMART_CHARGE_ENABLED` flag (off by default).
-4. Close the loop: compare planned vs measured `ev_charge_kwh`, tune the charge
-   curve / efficiency.
+- After a surplus-PV session has left the Tesla request at 5 A or below, press Vehicle
+  **Start** once. Confirm one full-rate request bounded by the live Tesla ceiling, a fresh pushed
+  `ChargeCurrentRequest` acknowledgement within 60 seconds, and normally ABB delivery above 5 A.
+  If acknowledgement is absent, confirm exactly one retry and no third command. If Maxem holds
+  actual delivery low after the request is confirmed, expect `delivery_limited` status/a warning
+  and no repeated current increases.
+- During a planned EV/grid block that overlaps an ESS BUY window, compare each quarter-hour's
+  actual grid import, PV, ABB EV energy and ESS SoC delta with the dashboard plan. The displayed
+  simultaneous ESS rise is valid only from the residual
+  `grid + PV - EV - non-EV load`; a Maxem reduction should lower EV progress and be corrected by
+  the next measured-SoC replan, never be hidden as full planned EV delivery.
+- Run at least one full job in shadow mode (`EV_SMART_CHARGE_ENABLED=True`,
+  `EV_SMART_CHARGE_APPLY=False`) and confirm the selected blocks, cost, target,
+  tentative-price marking, ESS EV-load overlay, and latest-safe-start are credible.
+- On a sunny multi-day shadow plan, confirm a day with cheap forecast surplus may exceed its
+  even daily share and later grid days fall by the same kWh. Confirm a high export-value PV
+  period is not preferred over genuinely cheaper grid energy, and days beyond the available
+  PV forecast say **Source to be chosen**, not **Grid**.
+- With an applied job waiting between scheduled blocks, attend one surplus event after the home
+  battery reaches `MINIMUM_ESS_SOC`. Confirm charging starts/adjusts to exportable amps, Maxem
+  may reduce actual delivery without command chasing, a 60-second cloud dip grace applies, and
+  actual SoC progress reduces the next plan. Press Vehicle **Stop** once and confirm the same
+  opportunistic session is not restarted. Repeat below `MINIMUM_ESS_SOC` and confirm the EV does
+  not take the forecast/live PV reserved for the stationary battery.
+- Attend one selected **Solar surplus** block during variable cloud. Confirm its requested amps
+  never exceed live surplus, it does not silently become a full-rate grid charge when PV misses
+  forecast, and the next replan moves any undelivered energy into later mixed/grid capacity while
+  preserving the ready-by target.
+- Run an attended applied job with Fleet Telemetry fresh. Confirm only block-edge
+  commands occur, sub-5 A requests are sent twice, no duplicate Tesla schedule is
+  created, and an ABB/Maxem throttle does not cause repeated current increases.
+- After restarting onto the Fleet Auth fix, confirm the expired access token refreshes
+  without an `auth.tesla.com` 401. Change the job target/current during an attended slot:
+  the UI/controller state should move from pending to confirmed from pushed telemetry
+  within 60 seconds. A missing or contradictory acknowledgement may cause at most three
+  logical attempts; it must not recur every 15 minutes. Maxem-reduced ABB delivery is not
+  a failed requested-current acknowledgement.
+- During the applied charge, confirm all ABB `Ac/L{1,2,3}/Current` values are
+  populated and already in amperes, and compare planned kWh/SoC with ABB settled
+  `ev_charge_kwh` and actual SoC increase.
+- Turn off/interrupt the service before the latest-safe start and confirm the
+  onboard Tesla safety schedule uses local vehicle time and a continuous remaining-
+  energy window ending at the deadline (it intentionally does not mirror the daily
+  low-cost blocks, which use live control). Confirm it completes the job only inside
+  that allowed fallback window. For a deadline over seven days away, confirm no Tesla
+  fallback is installed yet; once the exact start is within seven days, confirm it appears
+  on the intended local date with a non-zero interval. Then resume and confirm both known
+  application-owned IDs are reconciled without touching user schedules. Repeat once with
+  the car deeply asleep: one explicit unavailable response
+  may cause one wake and one retry, while a generic schedule error must not cause wakes.
+- While charge intent is already off, begin a charge outside a selected smart block using the
+  temporary branch-created Tesla fallback, then press Vehicle **Stop** once. Confirm a stop
+  command is attempted on the next controller tick (normally within 30 seconds), ABB current
+  falls to zero, the Vehicle card changes to **Idle** at EV-meter standby draw (normally only a
+  few watts), its ETA disappears, and the stale fallback no longer appears in the Tesla app.
+  Repeat with stale home/plug telemetry if that condition can be reproduced safely.
+- Stop one optimizer-started block manually in the Tesla app and confirm it is not
+  restarted within that block; a later distinct block may resume.
+- Leave the car unplugged through the reminder lead time and confirm exactly one
+  normal-priority Pushover notification survives a service restart without spam.
+- Collect several completed sessions before tuning `EV_BATTERY_USABLE_KWH`,
+  `EV_CHARGE_EFFICIENCY`, `EV_EXPECTED_DELIVERY_KW`, startup delay, or high-SoC
+  taper. Do not auto-learn/apply these from one session.
 
 # Bugs / Testing
 

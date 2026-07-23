@@ -93,7 +93,7 @@ def main():
         return 0
 
     if args.proxy_cert:
-        # Trust BOTH the public CA roots (needed for auth.tesla.com token refresh) AND the
+        # Trust BOTH the public CA roots (needed for Tesla Fleet Auth token refresh) AND the
         # proxy's self-signed cert. Setting REQUESTS_CA_BUNDLE to only the proxy cert would
         # break verification of every real Tesla endpoint, so build a combined bundle.
         import certifi

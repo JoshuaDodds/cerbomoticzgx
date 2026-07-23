@@ -574,7 +574,8 @@ class OptimizationEngine:
     # Optimization
     # ------------------------------------------------------------------ #
     def optimize(self, current_soc_percent, price_data, load_forecast=None,
-                 pv_forecast=None, protected_soc_percent=None):
+                 pv_forecast=None, protected_soc_percent=None,
+                 discharge_blocked_slots=None):
         """Compute the optimal plan.
 
         :param current_soc_percent: current battery SoC (0-100)
@@ -606,6 +607,13 @@ class OptimizationEngine:
             return None
 
         normalised.sort(key=lambda x: x['start'])
+
+        blocked_starts = set()
+        for value in discharge_blocked_slots or ():
+            try:
+                blocked_starts.add(round(_coerce_datetime(value).timestamp()))
+            except (TypeError, ValueError):
+                logging.warning("AI_ESS: Ignoring malformed discharge-blocked slot %r.", value)
 
         tzinfo = normalised[0]['start'].tzinfo
         now = datetime.now(tzinfo)
@@ -686,6 +694,15 @@ class OptimizationEngine:
                         continue
 
                     dc_change_kwh = (nsoc - soc) / 100.0 * cap
+
+                    # EV smart-charge load is normally supplied by grid/PV, not
+                    # cycled through the stationary battery.  Maxem can lower the
+                    # real EV draw independently; this constraint only prevents
+                    # the plan from deliberately discharging during requested EV
+                    # slots and never attempts to counteract Maxem throttling.
+                    if (dc_change_kwh < -EPS
+                            and round(future_prices[t]['start'].timestamp()) in blocked_starts):
+                        continue
 
                     # Battery power limit.
                     batt_kw = abs(dc_change_kwh) / slot_duration_h
@@ -806,7 +823,8 @@ class OptimizationEngine:
 
     def optimize_with_daily_policy(self, current_soc_percent, price_data,
                                    load_forecast=None, pv_forecast=None,
-                                   opportunity_model=None):
+                                   opportunity_model=None,
+                                   discharge_blocked_slots=None):
         """Optimize the horizon, then protect same-day settlement when warranted.
 
         The full 48h DP remains the baseline. When the known horizon crosses a
@@ -817,7 +835,9 @@ class OptimizationEngine:
         and forecast risk.
         """
         opening_protected_soc = self._snap_soc(current_soc_percent)
-        full = self.optimize(current_soc_percent, price_data, load_forecast, pv_forecast)
+        full = self.optimize(
+            current_soc_percent, price_data, load_forecast, pv_forecast,
+            discharge_blocked_slots=discharge_blocked_slots)
         if not full:
             return full
 
@@ -864,6 +884,7 @@ class OptimizationEngine:
             today_prices,
             _filter_forecast_for_indices(load_forecast, today_indices),
             _filter_forecast_for_indices(pv_forecast, today_indices),
+            discharge_blocked_slots=discharge_blocked_slots,
         )
         if not today_plan or not today_plan.get('schedule'):
             _, policy = _select_daily_settlement_candidate(full, None, model)
@@ -878,6 +899,7 @@ class OptimizationEngine:
             _filter_forecast_for_indices(load_forecast, future_indices),
             _filter_forecast_for_indices(pv_forecast, future_indices),
             protected_soc_percent=min(opening_protected_soc, future_start_soc),
+            discharge_blocked_slots=discharge_blocked_slots,
         )
         if not future_plan or not future_plan.get('schedule'):
             _, policy = _select_daily_settlement_candidate(full, None, model)
@@ -1170,7 +1192,8 @@ class OptimizationEngine:
         }
 
 
-def optimize_schedule(current_soc, price_data, load_forecast=None, pv_forecast=None):
+def optimize_schedule(current_soc, price_data, load_forecast=None, pv_forecast=None,
+                      discharge_blocked_slots=None):
     engine = OptimizationEngine()
     # Protect the opening stored-energy tranche at its persisted cost basis. New
     # energy bought later in this plan retains its own economics (best-effort;
@@ -1180,7 +1203,9 @@ def optimize_schedule(current_soc, price_data, load_forecast=None, pv_forecast=N
         engine.set_cost_basis_floor(ess_cost_basis.current_basis())
     except Exception as e:  # pragma: no cover - defensive
         logging.warning("AI_ESS: cost-basis floor unavailable (%s); planning without it.", e)
-    return engine.optimize_with_daily_policy(current_soc, price_data, load_forecast, pv_forecast)
+    return engine.optimize_with_daily_policy(
+        current_soc, price_data, load_forecast, pv_forecast,
+        discharge_blocked_slots=discharge_blocked_slots)
 
 
 def format_plan_summary(result, *, batt_soc=None, source="", price_points=None,

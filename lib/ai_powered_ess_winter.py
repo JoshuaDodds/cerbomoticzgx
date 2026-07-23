@@ -477,7 +477,8 @@ class OptimizationEngine:
         }
 
     def _run_candidate(self, slots, slot_h, windows, checkpoints,
-                       export_envelope, allow_exceptional_export):
+                       export_envelope, allow_exceptional_export,
+                       discharge_blocked_starts=None):
         steps = len(slots)
         allowed_charge = {
             index for start, end in windows for index in range(start, end + 1)
@@ -508,6 +509,9 @@ class OptimizationEngine:
                     if next_soc < self.min_soc - EPS and next_soc < soc - EPS:
                         continue
                     dc_change = (next_soc - soc) / 100.0 * self.battery_capacity
+                    if (dc_change < -EPS and round(slot['start'].timestamp())
+                            in (discharge_blocked_starts or set())):
+                        continue
                     if dc_change >= 0:
                         if dc_change > self.max_charge_power * slot_h + EPS:
                             continue
@@ -688,11 +692,17 @@ class OptimizationEngine:
         }
 
     def optimize(self, current_soc_percent, price_data, load_forecast=None,
-                 pv_forecast=None):
+                 pv_forecast=None, discharge_blocked_slots=None):
         slots, slot_h = self._normalise(price_data, load_forecast, pv_forecast)
         if not slots:
             logging.warning("WINTER_ESS: No future usable price data.")
             return None
+        discharge_blocked_starts = set()
+        for value in discharge_blocked_slots or ():
+            try:
+                discharge_blocked_starts.add(round(_coerce_datetime(value).timestamp()))
+            except (TypeError, ValueError):
+                logging.warning("WINTER_ESS: Ignoring malformed discharge-blocked slot %r.", value)
         # Represent telemetry exactly at the opening boundary. Nearest-state
         # snapping can otherwise create or discard up to half a DP step of energy.
         opening_soc = _clamp(float(current_soc_percent), 0.0, 100.0)
@@ -702,7 +712,8 @@ class OptimizationEngine:
         checkpoints, export_envelope, details = self._coverage(slots, slot_h, windows)
 
         normal = self._run_candidate(
-            slots, slot_h, windows, checkpoints, export_envelope, False)
+            slots, slot_h, windows, checkpoints, export_envelope, False,
+            discharge_blocked_starts)
         warning = next((item['warning'] for item in details if item['warning']), None)
         if self.max_grid_charge_soc < self.min_soc - EPS:
             warning = 'max_grid_charge_soc_below_winter_reserve'
@@ -712,7 +723,8 @@ class OptimizationEngine:
             # checkpoint, surface the degraded guarantee, and retain all physical
             # limits and the configured reserve.
             normal = self._run_candidate(
-                slots, slot_h, windows, {}, export_envelope, False)
+                slots, slot_h, windows, {}, export_envelope, False,
+                discharge_blocked_starts)
             warning = 'coverage_infeasible_safest_feasible_plan'
         if normal is None:
             logging.error("WINTER_ESS: No physically feasible self-sufficiency plan.")
@@ -725,7 +737,8 @@ class OptimizationEngine:
         reason = 'Normal winter self-sufficiency selected; exceptional spread hurdle not met'
         if economics['qualifies']:
             exceptional = self._run_candidate(
-                slots, slot_h, windows, checkpoints, export_envelope, True)
+                slots, slot_h, windows, checkpoints, export_envelope, True,
+                discharge_blocked_starts)
             if exceptional is not None:
                 benefit = normal['objective_cost'] - exceptional['objective_cost']
             if exceptional is not None and benefit >= WINTER_EXCEPTIONAL_MIN_BENEFIT_EUR - EPS:
@@ -775,7 +788,8 @@ class OptimizationEngine:
         return self._finish(selected, slot_h, policy)
 
 
-def optimize_schedule(current_soc, price_data, load_forecast=None, pv_forecast=None):
+def optimize_schedule(current_soc, price_data, load_forecast=None, pv_forecast=None,
+                      discharge_blocked_slots=None):
     """Public Winter Mode entry point matching the summer optimizer contract."""
     engine = OptimizationEngine()
     try:
@@ -783,7 +797,9 @@ def optimize_schedule(current_soc, price_data, load_forecast=None, pv_forecast=N
         engine.set_cost_basis_floor(ess_cost_basis.current_basis())
     except Exception as exc:  # pragma: no cover - defensive best effort
         logging.warning("WINTER_ESS: cost-basis unavailable (%s).", exc)
-    return engine.optimize(current_soc, price_data, load_forecast, pv_forecast)
+    return engine.optimize(
+        current_soc, price_data, load_forecast, pv_forecast,
+        discharge_blocked_slots=discharge_blocked_slots)
 
 
 def format_plan_summary(result, **_kwargs):

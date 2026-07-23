@@ -27,6 +27,7 @@ DISHWASHER_FALLBACK_RUNTIME_MINUTES = 60.0
 DRYER_FALLBACK_RUNTIME_MINUTES = 150.0
 DISHWASHER_ESTIMATED_POWER_W = 1200.0
 DRYER_ESTIMATED_POWER_W = 900.0
+USER_INTERVENTION_WINDOW_SECONDS = 15 * 60
 
 _worker_guard = threading.Lock()
 _active_workers = {}
@@ -34,6 +35,7 @@ _pending_plans = {}
 _coordinator_commands = {}
 
 TRACKED_KEYS = [
+    "ActiveProgram",
     "SelectedProgram",
     "RemoteControlStartAllowed",
     "DoorState",
@@ -189,6 +191,45 @@ def _program_id(device):
     return value if value > 0 else 0
 
 
+def _active_program_id(device):
+    """Return the programme confirmed as active by Home Connect telemetry."""
+    try:
+        value = int(gs_client.get(f"{device}_ActiveProgram") or 0)
+    except (TypeError, ValueError):
+        return 0
+    return value if value > 0 else 0
+
+
+def _record_user_intervention(device):
+    """Increment the short-lived manual-override count for an appliance."""
+    now = time.time()
+    try:
+        count = int(gs_client.get(f"{device}_UserInterventionCount") or 0)
+    except (TypeError, ValueError):
+        count = 0
+    try:
+        previous_at = float(gs_client.get(f"{device}_UserInterventionAt") or 0)
+    except (TypeError, ValueError):
+        previous_at = 0
+    elapsed = now - previous_at
+    if (
+        previous_at <= 0
+        or elapsed < 0
+        or elapsed > USER_INTERVENTION_WINDOW_SECONDS
+    ):
+        count = 0
+    count += 1
+    gs_client.set(f"{device}_UserInterventionCount", count)
+    gs_client.set(f"{device}_UserInterventionAt", now)
+    logging.debug("%s UserInterventionCount: %s", device, count)
+    return count
+
+
+def _reset_user_intervention(device):
+    gs_client.set(f"{device}_UserInterventionCount", 0)
+    gs_client.set(f"{device}_UserInterventionAt", 0)
+
+
 def _completion_after_quiet_threshold(plan):
     try:
         end = datetime.fromisoformat(str(plan["end"]).replace("Z", "+00:00"))
@@ -220,11 +261,24 @@ def _prepare_appliance_plan(device):
             logging.warning("Appliance scheduler: Dryer selected program unavailable.")
             return None
 
-    if not price_deferral_enabled():
+    force_immediate = (
+        device == "Dishwasher"
+        and is_truthy(gs_client.get("Dishwasher_ForceImmediateProgram"), False)
+    )
+    if force_immediate:
+        # Consume the one-shot timing override. It changes *when* the preferred
+        # programme runs, never which programme is allowed to run.
+        gs_client.set("Dishwasher_ForceImmediateProgram", False)
+
+    if force_immediate or not price_deferral_enabled():
         return {
             "device": device,
             "decision": "immediate",
-            "reason": "appliance_optimization_disabled",
+            "reason": (
+                "manual_timing_override"
+                if force_immediate
+                else "appliance_optimization_disabled"
+            ),
             "start": now.isoformat(),
             "end": (now + timedelta(minutes=runtime)).isoformat(),
             "runtime_minutes": runtime,
@@ -455,7 +509,7 @@ def _reschedule_worker(device):
     if (
         device == "Dishwasher"
         and not delayed
-        and _program_id("Dishwasher") == PREFERRED_DISHWASHER_PROGRAM
+        and _active_program_id("Dishwasher") == PREFERRED_DISHWASHER_PROGRAM
     ):
         _remove_reservation(device)
         _set_schedule_status(device, "Immediate", "preferred_program_already_running")
@@ -604,24 +658,26 @@ def handle_user_intervention(device, current_state, new_state):
     # User cancels a delayed start
     if current_operation == "DelayedStart" and new_operation == "Ready":
         logging.info(f"{device} delayed start was canceled by user.")
-        user_intervention_count = int(gs_client.get(f"{device}_UserInterventionCount") or 0)
-        user_intervention_count += 1
-        gs_client.set(f"{device}_UserInterventionCount", user_intervention_count)
-        logging.debug(f"{device} UserInterventionCount: {user_intervention_count}")
+        _record_user_intervention(device)
         return False  # Indicating further handling is not needed.
 
     # User starts the appliance from Ready to Run
     if current_operation == "Ready" and new_operation == "Run":
         logging.info(f"{device} was manually started by user.")
-        user_intervention_count = int(gs_client.get(f"{device}_UserInterventionCount") or 0)
-        user_intervention_count += 1
-        gs_client.set(f"{device}_UserInterventionCount", user_intervention_count)
-        logging.debug(f"{device} UserInterventionCount: {user_intervention_count}")
+        user_intervention_count = _record_user_intervention(device)
 
-        # Allow immediate run if the user intervened multiple times
+        # A repeated start is a timing override. Dishwasher programme selection
+        # remains under automation so Eco cannot bypass the preferred programme.
         if user_intervention_count >= 2:
+            _reset_user_intervention(device)
+            if device == "Dishwasher":
+                logging.info(
+                    "Dishwasher user intervened multiple times. Running the "
+                    "preferred programme immediately."
+                )
+                gs_client.set("Dishwasher_ForceImmediateProgram", True)
+                return False
             logging.info(f"{device} user intervened multiple times. Allowing immediate run.")
-            gs_client.set(f"{device}_UserInterventionCount", 0)  # Reset count
             return True  # Allow the run.
 
     # Reset the count ONLY after a successful uninterrupted delayed start run
@@ -632,11 +688,11 @@ def handle_user_intervention(device, current_state, new_state):
                 device,
             )
             _remove_reservation(device)
-            gs_client.set(f"{device}_UserInterventionCount", 0)
+            _reset_user_intervention(device)
             _set_schedule_status(device, "ManualOverride")
             return True
         logging.info(f"{device} is starting a scheduled operation. Resetting intervention count.")
-        gs_client.set(f"{device}_UserInterventionCount", 0)
+        _reset_user_intervention(device)
         return False  # Normal operation; no special handling.
 
     return False  # No special handling needed.
@@ -660,7 +716,7 @@ def _release_reservation_for_transition(device, current_operation, new_operation
     if current_operation in {"DelayedStart", "Run", "Pause"} and new_operation in terminal:
         _remove_reservation(device)
     if current_operation in {"Run", "Pause"} and new_operation in {"Finished", "Inactive"}:
-        gs_client.set(f"{device}_UserInterventionCount", 0)
+        _reset_user_intervention(device)
 
 
 def detect_changed_state_values(device, new_state, *, automation_enabled=True):
@@ -727,6 +783,16 @@ def detect_changed_state_values(device, new_state, *, automation_enabled=True):
         # Reconcile a persisted reservation even when the service missed the
         # transition or automation is now disabled.
         _remove_reservation(device)
+
+    # ActiveProgram from an earlier run must never prove that a newly started
+    # dishwasher is already using the preferred programme. Treat an omitted
+    # value on the Ready -> Run edge as unknown and enforce conservatively.
+    if (
+        current_state.get("OperationState") != "Run"
+        and new_state.get("OperationState") == "Run"
+        and "ActiveProgram" not in new_state
+    ):
+        gs_client.set(f"{device}_ActiveProgram", 0)
 
     # Commit the complete incoming snapshot before a worker is allowed to read
     # programme/runtime/remote-start metadata.  The old snapshot above remains

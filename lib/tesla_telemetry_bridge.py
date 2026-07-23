@@ -11,6 +11,7 @@ when TESLA_TELEMETRY_ENABLED is on, so this module is inert by default.
 """
 import json
 import threading
+import time
 
 from lib.constants import logging
 
@@ -18,6 +19,11 @@ _STREAM_FLUSH_EVERY = 20              # batch stream-signal counter writes to th
 # fleet-telemetry emits non-"V" record types too (connectivity/alerts/errors); those are not
 # billed as vehicle-data SIGNALS, so exclude them from the streaming-signal estimate.
 _NON_SIGNAL_FIELDS = {"connectivity", "alerts", "errors", "status", "V", "v"}
+_ACK_TIMESTAMP_KEYS = {
+    "ChargeLimitSoc": "tesla_soc_setpoint_updated_at",
+    "ChargeCurrentRequest": "tesla_charge_current_request_updated_at",
+    "DetailedChargeState": "tesla_charge_state_updated_at",
+}
 
 
 # --- pure translation (no I/O) --------------------------------------------
@@ -43,7 +49,7 @@ def _detailed_charge_state(value) -> dict:
     norm = str(value).lower().replace("detailedchargestate", "").strip()
     plugged = norm not in ("disconnected", "", "none", "unknown")
     charging = norm == "charging"
-    return {
+    result = {
         "state": {"tesla_is_plugged": str(plugged), "tesla_is_charging": str(charging)},
         "topics": {
             "Tesla/vehicle0/plugged_status": "Plugged" if plugged else "Unplugged",
@@ -51,6 +57,13 @@ def _detailed_charge_state(value) -> dict:
             "Tesla/vehicle0/charging_status": "Charging" if charging else "Idle",
         },
     }
+    if not charging:
+        # TimeToFullCharge is change-driven and is not guaranteed to emit when a
+        # charge stops. The charge-state edge is authoritative: an ETA is not
+        # meaningful while stopped, complete, disconnected, or without power.
+        result["state"]["tesla_time_to_full"] = "N/A"
+        result["topics"]["Tesla/vehicle0/time_until_full"] = "N/A"
+    return result
 
 
 def _charge_port_latch(value) -> dict:
@@ -243,9 +256,13 @@ class TeslaTelemetryBridge:
         state = GlobalStateClient()
         for k, v in updates.get("state", {}).items():
             state.set(k, v)
+        observed_at = time.time()
+        state.set("tesla_telemetry_last_update_ts", observed_at)
+        acknowledgement_key = _ACK_TIMESTAMP_KEYS.get(field)
+        if acknowledgement_key:
+            state.set(acknowledgement_key, observed_at)
         for topic, v in updates.get("topics", {}).items():
             publish_message(topic, payload=f'{{"value": "{v}"}}', qos=0, retain=True)
-        import time
         publish_message("Tesla/vehicle0/last_update_at",
                         payload=f'{{"value": "{time.strftime("%Y-%m-%d %H:%M:%S")}"}}', qos=0, retain=True)
 

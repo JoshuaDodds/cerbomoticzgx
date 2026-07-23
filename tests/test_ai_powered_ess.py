@@ -721,5 +721,25 @@ class TestAIPoweredESS(unittest.TestCase):
         self.assertEqual(result['planning_policy']['selected'], 'full_horizon')
         self.assertEqual(result['planning_policy']['reason_code'], 'SAME_DAY_HORIZON')
 
+    def test_discharge_blocked_slot_cannot_feed_ev_load_from_home_battery(self):
+        start = datetime.now(tz.UTC).replace(minute=0, second=0, microsecond=0)
+        prices = [
+            {'start': start + timedelta(hours=i), 'total': 0.80, 'level': 'EXPENSIVE'}
+            for i in range(3)
+        ]
+        blocked = {row['start'] for row in prices}
+
+        result = self.engine.optimize_with_daily_policy(
+            80.0,
+            prices,
+            load_forecast=[3.0] * len(prices),
+            pv_forecast=[0.0] * len(prices),
+            discharge_blocked_slots=blocked,
+        )
+
+        self.assertIsNotNone(result)
+        for step in result['schedule']:
+            self.assertGreaterEqual(step['soc_end'], step['soc_start'])
+
 if __name__ == '__main__':
     unittest.main()

@@ -11,7 +11,11 @@ import os
 import json
 import time
 import logging
+import inspect
+import math
+from dataclasses import asdict, is_dataclass
 from datetime import datetime, timedelta
+from importlib import import_module
 
 from dotenv import dotenv_values
 
@@ -21,6 +25,11 @@ from lib import history_store as _hist
 from lib import tesla_budget as _tesla_budget
 
 DEFAULT_PLAN_PATH = "/dev/shm/cerbo_ai_plan.json"
+MIN_FORECAST_BOX_SAMPLES = 8
+FORECAST_BUCKETS_PER_DAY = 96
+MIN_COMPLETE_FORECAST_COVERAGE = 0.75
+LATEST_COMPLETE_START_BUCKET = 2   # a first observation no later than 00:30
+EARLIEST_COMPLETE_END_BUCKET = 94  # a final observation no earlier than 23:30
 
 
 def _env():
@@ -101,13 +110,111 @@ def _day_totals(path: str):
     return _day_totals_from_records(_records_from_path(path))
 
 
+def _forecast_box_stats(values) -> dict:
+    """Return the middle spread and full observed range of daily forecasts.
+
+    These are successive revisions, not independent random observations. Every
+    valid snapshot therefore remains visible in the low/high range; labelling a
+    late, accurate revision as a statistical outlier would be misleading.
+    """
+    ordered = sorted(
+        value for raw in values
+        if (value := _f(raw)) is not None and math.isfinite(value)
+    )
+    # Eight observations provide at least two samples per quartile. Below this,
+    # quartile interpolation and Tukey outlier labels look authoritative without
+    # representing a useful intraday forecast distribution.
+    if len(ordered) < MIN_FORECAST_BOX_SAMPLES:
+        return {}
+
+    def percentile(fraction: float) -> float:
+        position = (len(ordered) - 1) * fraction
+        lower = math.floor(position)
+        upper = math.ceil(position)
+        if lower == upper:
+            return ordered[lower]
+        weight = position - lower
+        return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+    q1 = percentile(0.25)
+    median = percentile(0.50)
+    q3 = percentile(0.75)
+    return {
+        "forecast_q1_eur": round(q1, 2),
+        "forecast_median_eur": round(median, 2),
+        "forecast_q3_eur": round(q3, 2),
+        "forecast_range_low_eur": round(ordered[0], 2),
+        "forecast_range_high_eur": round(ordered[-1], 2),
+    }
+
+
+def _canonical_forecast_snapshots(records, *, day, extra=None) -> dict:
+    """Keep the latest forecast in each local 15-minute period.
+
+    Optimizer replans can also be event-triggered, so raw history may contain
+    several revisions in one quarter and no revision in another. Treating each
+    write as an equally weighted sample lets restarts/button presses distort the
+    chart. Canonical buckets give elapsed time—not replan frequency—the weight.
+    """
+    raw_values = []
+    buckets = {}
+
+    def add(value, timestamp):
+        numeric = _f(value)
+        if numeric is None or not math.isfinite(numeric):
+            return
+        try:
+            parsed = (
+                timestamp if isinstance(timestamp, datetime)
+                else datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+            )
+        except (TypeError, ValueError):
+            raw_values.append(numeric)
+            return
+        if parsed.date() != day:
+            return
+        raw_values.append(numeric)
+        bucket = parsed.hour * 4 + parsed.minute // 15
+        previous = buckets.get(bucket)
+        if previous is None or parsed >= previous[0]:
+            buckets[bucket] = (parsed, numeric)
+
+    for record in records:
+        if record.get("kind") not in (None, "cycle"):
+            continue
+        add(record.get("forecast_day_net_eur"), record.get("ts"))
+    if extra is not None:
+        add(extra[0], extra[1])
+
+    ordered = [buckets[key][1] for key in sorted(buckets)]
+    if not ordered:
+        # Preserve compatibility fields for old timestamp-less history, but do
+        # not claim coverage or distribution statistics from it.
+        ordered = raw_values
+    bucket_count = len(buckets)
+    coverage = bucket_count / FORECAST_BUCKETS_PER_DAY
+    complete = bool(
+        bucket_count >= MIN_FORECAST_BOX_SAMPLES
+        and coverage >= MIN_COMPLETE_FORECAST_COVERAGE
+        and min(buckets, default=FORECAST_BUCKETS_PER_DAY) <= LATEST_COMPLETE_START_BUCKET
+        and max(buckets, default=-1) >= EARLIEST_COMPLETE_END_BUCKET
+    )
+    return {
+        "values": ordered,
+        "raw_samples": len(raw_values),
+        "samples": bucket_count if buckets else len(ordered),
+        "coverage_pct": round(coverage * 100.0, 1),
+        "complete": complete,
+    }
+
+
 def monthly_history() -> list:
-    """Per-day settled net and prospective intraday forecast ranges.
+    """Per-day settled net and prospective intraday forecast distributions.
 
     ``net_eur`` is export reward minus import cost (profit positive). Forecast
-    candle fields are emitted only when the newer cycle records contain a
-    same-day final-net forecast; legacy history remains an honest actual-only
-    point instead of receiving an invented range.
+    Box-plot and compatibility range fields are emitted only when newer cycle
+    records contain a same-day final-net forecast; legacy history remains an
+    honest actual-only point instead of receiving an invented distribution.
     """
     today = datetime.now().date()
     d = today.replace(day=1)
@@ -130,24 +237,27 @@ def monthly_history() -> list:
                 "is_today": d == today,
                 "settled": d < today,
             }
-            forecasts = []
-            for record in records:
-                if record.get("kind") not in (None, "cycle"):
-                    continue
-                value = _f(record.get("forecast_day_net_eur"))
-                if value is not None:
-                    forecasts.append(value)
+            extra = None
             if d == today and today_projection is not None:
                 row["projected_net_eur"] = today_projection
-                forecasts.append(today_projection)
+                extra = (today_projection, datetime.now().astimezone())
+            snapshot_data = _canonical_forecast_snapshots(
+                records, day=d, extra=extra)
+            forecasts = snapshot_data["values"]
             if forecasts:
                 row.update({
                     "forecast_open_eur": round(forecasts[0], 2),
                     "forecast_low_eur": round(min(forecasts), 2),
                     "forecast_high_eur": round(max(forecasts), 2),
                     "forecast_close_eur": round(forecasts[-1], 2),
-                    "forecast_samples": len(forecasts),
+                    "forecast_samples": snapshot_data["samples"],
+                    "forecast_raw_samples": snapshot_data["raw_samples"],
+                    "forecast_coverage_pct": snapshot_data["coverage_pct"],
+                    "forecast_complete": snapshot_data["complete"],
+                    "forecast_box_min_samples": MIN_FORECAST_BOX_SAMPLES,
                 })
+                if d == today or snapshot_data["complete"]:
+                    row.update(_forecast_box_stats(forecasts))
             out.append(row)
         d += timedelta(days=1)
     return out
@@ -486,6 +596,10 @@ def group_by_hour(schedule: list) -> list:
                 "grid_kwh": 0.0, "production_kwh": 0.0, "consumption_kwh": 0.0,
                 "prices": [],
                 "mode_counts": {},
+                "planned_ev_kwh": 0.0,
+                "ev_target_kw": 0.0,
+                "ev_supply_counts": {},
+                "ev_tentative": False,
             }
             order.append(key)
         h = hours[key]
@@ -496,6 +610,12 @@ def group_by_hour(schedule: list) -> list:
         h["grid_kwh"] += g
         h["production_kwh"] += slot.get("pv", 0.0) or 0.0
         h["consumption_kwh"] += slot.get("load", 0.0) or 0.0
+        h["planned_ev_kwh"] += _f(slot.get("planned_ev_kwh")) or 0.0
+        h["ev_target_kw"] = max(h["ev_target_kw"], _f(slot.get("ev_target_kw")) or 0.0)
+        if (_f(slot.get("planned_ev_kwh")) or 0.0) > 0:
+            supply = str(slot.get("ev_supply") or "grid").lower()
+            h["ev_supply_counts"][supply] = h["ev_supply_counts"].get(supply, 0) + 1
+            h["ev_tentative"] = h["ev_tentative"] or bool(slot.get("ev_tentative"))
         if slot.get("settled"):
             imp = slot.get("actual_import_kwh")
             exp = slot.get("actual_export_kwh")
@@ -530,6 +650,8 @@ def group_by_hour(schedule: list) -> list:
         n = len(h["prices"]) or 1
         modes = h["mode_counts"]
         dominant = max(modes, key=modes.get) if modes else ""
+        ev_supplies = h["ev_supply_counts"]
+        ev_supply = max(ev_supplies, key=ev_supplies.get) if ev_supplies else None
         result.append({
             "key": h["key"],
             "label": h["label"],
@@ -544,6 +666,10 @@ def group_by_hour(schedule: list) -> list:
             "grid_kwh": round(h["grid_kwh"], 2),
             "production_kwh": round(h["production_kwh"], 2),
             "consumption_kwh": round(h["consumption_kwh"], 2),
+            "planned_ev_kwh": round(h["planned_ev_kwh"], 2),
+            "ev_target_kw": round(h["ev_target_kw"], 2),
+            "ev_supply": ev_supply,
+            "ev_tentative": h["ev_tentative"],
             "net_kwh": round(h["import_kwh"] - h["export_kwh"], 2),
             "net_cost": round(h["import_cost"] - h["export_rev"], 3),
             "soc_start": h["slots"][0].get("soc_start"),
@@ -649,10 +775,78 @@ def get_plan() -> dict:
         "winter_policy": raw.get("winter_policy"),
         "today": raw.get("today", {}),
         "victron_slots": raw.get("victron_slots", []),
+        "ev_smart_charge": raw.get("ev_smart_charge") or raw.get("ev_charge_plan"),
         "hours": group_by_hour(timeline_schedule),
         "day_summary": day_summary(schedule, raw.get("today_actuals")),
         "mtd_net": mtd_net_eur(),
     }
+
+
+def _json_value(value):
+    if value is None or isinstance(value, (str, int, float, bool, list, dict)):
+        return value
+    if is_dataclass(value):
+        return asdict(value)
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        return to_dict()
+    return vars(value) if hasattr(value, "__dict__") else str(value)
+
+
+def _optional_path_call(fn, path):
+    parameters = inspect.signature(fn).parameters
+    accepts_path = "path" in parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    return fn(path=path) if path and accepts_path else fn()
+
+
+def ev_smart_charge_dashboard() -> dict:
+    """Read the optional job lazily and combine it with the published shadow/live plan."""
+    raw = load_raw_plan() or {}
+    plan = raw.get("ev_smart_charge") or raw.get("ev_charge_plan")
+    try:
+        module = import_module("lib.ev_smart_charge")
+        snapshot = getattr(module, "dashboard_snapshot", None)
+        if callable(snapshot):
+            value = _json_value(snapshot()) or {}
+            if isinstance(value, dict):
+                value.setdefault("available", True)
+                if plan is not None:
+                    value.setdefault("plan", plan)
+                return value
+        loader = next((getattr(module, name, None) for name in
+                       ("load_job", "get_job", "current_job")
+                       if callable(getattr(module, name, None))), None)
+        env = _env()
+        job = _json_value(_optional_path_call(
+            loader, env.get("EV_SMART_CHARGE_JOB_PATH"))) if loader else None
+        plan_loader = getattr(module, "load_plan_snapshot", None)
+        if plan is None and callable(plan_loader):
+            plan = _json_value(_optional_path_call(
+                plan_loader, env.get("EV_SMART_CHARGE_PLAN_PATH")))
+        enabled = getattr(module, "enabled", None)
+        configured = str(env.get("EV_SMART_CHARGE_ENABLED", "False")).strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        apply_enabled = str(env.get("EV_SMART_CHARGE_APPLY", "False")).strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        return {
+            "available": True,
+            "enabled": bool(enabled()) if callable(enabled) else configured,
+            "apply": apply_enabled,
+            "job": job,
+            "plan": plan,
+        }
+    except (ImportError, OSError, RuntimeError, ValueError) as e:
+        return {
+            "available": False,
+            "job": None,
+            "plan": plan,
+            "message": f"Smart charging is unavailable: {e}",
+        }
 
 
 def tesla_usage() -> dict:
