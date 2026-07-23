@@ -73,3 +73,51 @@ def test_snapshot_bad_values_become_none_not_exceptions():
     snap = _snapshot_with({"batt_current": "n/a", "system_state": None})
     assert snap["batt_current"] is None
     assert snap["system_state"] is None
+
+
+def test_local_ev_meter_overrides_stale_charging_status_at_idle_power():
+    snap = _snapshot_with({
+        "ev_w": "4",
+        "veh_is_charging": "True",
+        "veh_charging_status": "Charging",
+        "veh_eta": "15 hr 48 min",
+    })
+
+    assert snap["veh_is_charging"] is False
+    assert snap["veh_charging_status"] == "Idle"
+    assert snap["veh_eta"] == "N/A"
+
+
+def test_vehicle_status_is_not_overridden_without_local_meter_evidence():
+    snap = _snapshot_with({
+        "veh_is_charging": "True",
+        "veh_charging_status": "Charging",
+        "veh_eta": "1 hr 5 min",
+    })
+
+    assert snap["veh_is_charging"] == "True"
+    assert snap["veh_charging_status"] == "Charging"
+    assert snap["veh_eta"] == "1 hr 5 min"
+
+
+def test_explicit_idle_vehicle_never_exposes_stale_eta_without_meter_sample():
+    snap = _snapshot_with({
+        "veh_is_charging": "False",
+        "veh_charging_status": "Idle",
+        "veh_eta": "4 hr 12 min",
+    })
+
+    assert snap["veh_is_charging"] == "False"
+    assert snap["veh_charging_status"] == "Idle"
+    assert snap["veh_eta"] == "N/A"
+
+
+def test_vehicle_charging_status_remains_when_ev_meter_shows_real_draw():
+    snap = _snapshot_with({
+        "ev_w": "2380",
+        "veh_is_charging": "True",
+        "veh_charging_status": "Charging",
+    })
+
+    assert snap["veh_is_charging"] == "True"
+    assert snap["veh_charging_status"] == "Charging"

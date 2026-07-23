@@ -1,8 +1,9 @@
 """TDD coverage for season-independent Home Connect appliance scheduling.
 
-These tests deliberately exercise policy separately from MQTT transport.  A manual
-second start is the household override, while a start installed by Home Connect's
-``DelayedStart`` state must never be mistaken for a new manual intervention.
+These tests deliberately exercise policy separately from MQTT transport. A manual
+second start overrides timing but not the dishwasher's preferred programme, while a
+start installed by Home Connect's ``DelayedStart`` state must never be mistaken for
+a new manual intervention.
 """
 
 import json
@@ -216,7 +217,32 @@ def test_dishwasher_uses_deferred_start_only_under_appliance_price_policy(
     assert callbacks == [expected_callback]
 
 
-def test_first_manual_start_is_intercepted_but_second_start_is_override(monkeypatch):
+def test_dishwasher_timing_override_skips_price_deferral_but_keeps_program(
+        monkeypatch):
+    from lib import event_handler_appliances as appliances
+
+    state = FakeState({
+        "Dishwasher_ForceImmediateProgram": True,
+        "Dishwasher_SelectedProgram": 8196,
+        "Dishwasher_RemainingProgramTime": 4 * 3600,
+    })
+    monkeypatch.setattr(appliances, "gs_client", state)
+    monkeypatch.setattr(appliances, "price_deferral_enabled", lambda: True)
+    monkeypatch.setattr(
+        appliances,
+        "get_all_price_points",
+        lambda: pytest.fail("an immediate override must not enter price planning"),
+    )
+
+    plan = appliances._prepare_appliance_plan("Dishwasher")
+
+    assert plan["decision"] == "immediate"
+    assert plan["reason"] == "manual_timing_override"
+    assert plan["program"] == appliances.PREFERRED_DISHWASHER_PROGRAM
+    assert plan["runtime_minutes"] == appliances.DISHWASHER_FALLBACK_RUNTIME_MINUTES
+
+
+def test_repeated_dishwasher_start_forces_preferred_program_immediately(monkeypatch):
     from lib import event_handler_appliances as appliances
 
     state = FakeState()
@@ -226,8 +252,32 @@ def test_first_manual_start_is_intercepted_but_second_start_is_override(monkeypa
     assert appliances.handle_user_intervention("Dishwasher", *transition) is False
     assert state.values["Dishwasher_UserInterventionCount"] == 1
 
-    assert appliances.handle_user_intervention("Dishwasher", *transition) is True
+    # Timing override remains, but it must not bypass preferred-program enforcement.
+    assert appliances.handle_user_intervention("Dishwasher", *transition) is False
     assert state.values["Dishwasher_UserInterventionCount"] == 0
+    assert state.values["Dishwasher_ForceImmediateProgram"] is True
+
+
+@pytest.mark.parametrize("now", [50.0, 100.0 + 3600.0])
+def test_stale_intervention_count_is_not_a_second_start(monkeypatch, now):
+    from lib import event_handler_appliances as appliances
+
+    state = FakeState({
+        "Dishwasher_UserInterventionCount": 1,
+        "Dishwasher_UserInterventionAt": 100.0,
+    })
+    monkeypatch.setattr(appliances, "gs_client", state)
+    monkeypatch.setattr(appliances.time, "time", lambda: now)
+
+    allow = appliances.handle_user_intervention(
+        "Dishwasher",
+        {"OperationState": "Ready"},
+        {"OperationState": "Run"},
+    )
+
+    assert allow is False
+    assert state.values["Dishwasher_UserInterventionCount"] == 1
+    assert state.values.get("Dishwasher_ForceImmediateProgram") is not True
 
 
 def test_coordinator_immediate_run_is_not_counted_as_second_user_start(monkeypatch):
@@ -252,16 +302,22 @@ def test_coordinator_immediate_run_is_not_counted_as_second_user_start(monkeypat
     assert state.values["Dishwasher_UserInterventionCount"] == 1
 
 
-def test_user_cancel_then_second_manual_start_remains_an_override(monkeypatch):
+def test_user_cancel_then_second_dishwasher_start_is_immediate_preferred_override(
+        monkeypatch):
     from lib import event_handler_appliances as appliances
 
-    state = FakeState({"Dishwasher_UserInterventionCount": 1})
+    now = 1000.0
+    state = FakeState({
+        "Dishwasher_UserInterventionCount": 1,
+        "Dishwasher_UserInterventionAt": now - 30,
+    })
     coordinator_commands = {
         "Dishwasher": {"expected_operation": "Run"},
     }
     monkeypatch.setattr(appliances, "gs_client", state)
     monkeypatch.setattr(
         appliances, "_coordinator_commands", coordinator_commands, raising=False)
+    monkeypatch.setattr(appliances.time, "time", lambda: now)
     monkeypatch.setattr(appliances, "_remove_reservation", lambda device: None)
 
     assert appliances.handle_user_intervention(
@@ -279,8 +335,9 @@ def test_user_cancel_then_second_manual_start_remains_an_override(monkeypatch):
         "Dishwasher",
         {"OperationState": "Ready"},
         {"OperationState": "Run"},
-    ) is True
+    ) is False
     assert state.values["Dishwasher_UserInterventionCount"] == 0
+    assert state.values["Dishwasher_ForceImmediateProgram"] is True
 
 
 def test_operation_wait_remembers_brief_coordinator_acknowledgement(monkeypatch):
@@ -611,7 +668,7 @@ def test_correct_dishwasher_program_with_immediate_plan_is_left_running(monkeypa
             "program": appliances.PREFERRED_DISHWASHER_PROGRAM,
         },
     )
-    monkeypatch.setattr(appliances, "_program_id", lambda device: 8203)
+    monkeypatch.setattr(appliances, "_active_program_id", lambda device: 8203)
     monkeypatch.setattr(appliances, "abort_dishwasher", lambda: aborts.append("abort"))
     monkeypatch.setattr(appliances, "_remove_reservation", lambda device: None)
     monkeypatch.setattr(appliances, "_set_schedule_status", lambda *args, **kwargs: None)
@@ -619,6 +676,64 @@ def test_correct_dishwasher_program_with_immediate_plan_is_left_running(monkeypa
     appliances._reschedule_worker("Dishwasher")
 
     assert aborts == []
+
+
+def test_selected_program_alone_cannot_bypass_preferred_program_enforcement(
+        monkeypatch):
+    from lib import event_handler_appliances as appliances
+
+    aborts = []
+    monkeypatch.setattr(
+        appliances,
+        "_prepare_appliance_plan",
+        lambda device: {
+            "device": device,
+            "decision": "immediate",
+            "program": appliances.PREFERRED_DISHWASHER_PROGRAM,
+        },
+    )
+    # SelectedProgram is known to remain stale around activeProgram commands. Only
+    # ActiveProgram can prove which programme the current run is actually using.
+    monkeypatch.setattr(appliances, "_program_id", lambda device: 8203)
+    monkeypatch.setattr(appliances, "_active_program_id", lambda device: 8196)
+    monkeypatch.setattr(appliances, "_remote_start_available", lambda device: True)
+    monkeypatch.setattr(appliances, "abort_dishwasher", lambda: aborts.append("abort"))
+    monkeypatch.setattr(appliances, "wait_for_ready_state", lambda *args, **kwargs: True)
+    monkeypatch.setattr(appliances, "_wait_for_operation_state", lambda *args, **kwargs: True)
+    monkeypatch.setattr(appliances, "_remove_reservation", lambda device: None)
+    monkeypatch.setattr(appliances, "_set_schedule_status", lambda *args, **kwargs: None)
+
+    appliances._reschedule_worker("Dishwasher")
+
+    assert aborts == ["abort"]
+
+
+def test_repeated_dishwasher_start_still_launches_program_enforcement_worker(
+        monkeypatch):
+    from lib import event_handler_appliances as appliances
+
+    now = 1000.0
+    state = FakeState({
+        "Dishwasher_OperationState": "Ready",
+        "Dishwasher_UserInterventionCount": 1,
+        "Dishwasher_UserInterventionAt": now - 30,
+    })
+    workers = []
+    monkeypatch.setattr(appliances, "gs_client", state)
+    monkeypatch.setattr(appliances.time, "time", lambda: now)
+    monkeypatch.setattr(appliances, "_coordinator_commands", {}, raising=False)
+    monkeypatch.setattr(appliances, "_remove_reservation", lambda device: None)
+    monkeypatch.setattr(
+        appliances, "_start_reschedule_worker", lambda device: workers.append(device))
+
+    appliances.handle_dishwasher_event({
+        "OperationState": "Run",
+        "SelectedProgram": 8196,
+        "ActiveProgram": 8196,
+    })
+
+    assert workers == ["Dishwasher"]
+    assert state.values["Dishwasher_ForceImmediateProgram"] is True
 
 
 def test_event_snapshot_is_committed_before_worker_reads_new_metadata(monkeypatch):
@@ -647,6 +762,30 @@ def test_event_snapshot_is_committed_before_worker_reads_new_metadata(monkeypatc
     assert observed[0]["SelectedProgram"] == 8203
     assert observed[0]["RemainingProgramTime"] == 3600
     assert observed[0]["RemoteControlStartAllowed"] is True
+
+
+def test_missing_active_program_on_new_run_cannot_reuse_previous_program(monkeypatch):
+    from lib import event_handler_appliances as appliances
+
+    state = FakeState({
+        "Dishwasher_OperationState": "Ready",
+        "Dishwasher_ActiveProgram": appliances.PREFERRED_DISHWASHER_PROGRAM,
+    })
+    observed = []
+    monkeypatch.setattr(appliances, "gs_client", state)
+    monkeypatch.setattr(appliances, "_remove_reservation", lambda device: None)
+    monkeypatch.setattr(
+        appliances,
+        "_start_reschedule_worker",
+        lambda device: observed.append(appliances._active_program_id(device)),
+    )
+
+    appliances.handle_dishwasher_event({
+        "OperationState": "Run",
+        "SelectedProgram": 8196,
+    })
+
+    assert observed == [0]
 
 
 def test_coordinator_generated_run_is_not_rescheduled(monkeypatch):

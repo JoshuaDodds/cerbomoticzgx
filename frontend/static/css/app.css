@@ -142,17 +142,25 @@ main { padding: 12px 16px 80px; max-width: 1100px; margin: 0 auto; }
 .chart { width: 100%; }
 .chart-legend { display: flex; gap: 18px; justify-content: center; font-size: 12px; margin-top: 6px; }
 .chart-legend .swatch { display: inline-block; width: 11px; height: 11px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
-.chart-legend .legend-candle {
-  display: inline-block; width: 8px; height: 14px; margin: 0 6px -3px 0;
-  border: 2px solid var(--sell); background: rgba(34, 197, 94, .22); position: relative;
-}
-.chart-legend .legend-candle::before {
-  content: ""; position: absolute; width: 2px; height: 20px; left: 1px; top: -5px;
-  background: var(--sell); z-index: -1;
-}
 .chart-legend .legend-dot {
   display: inline-block; width: 10px; height: 10px; margin: 0 6px 0 0;
   border-radius: 50%; background: var(--sell); border: 1px solid #0b0f14;
+}
+.chart-legend .legend-dot.hollow { background: var(--panel); border: 2px solid var(--sell); }
+.monthly-box-legend { flex-wrap: wrap; row-gap: 8px; }
+.monthly-box-legend i { display: inline-block; margin-right: 6px; vertical-align: middle; }
+.monthly-box-legend .legend-boxplot {
+  width: 12px; height: 10px; border: 2px solid var(--accent);
+  background: rgba(74,168,255,.20); border-radius: 2px;
+}
+.monthly-box-legend .legend-median {
+  width: 14px; height: 0; border-top: 3px solid var(--text);
+}
+.monthly-box-legend .legend-whisker {
+  width: 14px; height: 12px;
+  background: linear-gradient(var(--accent),var(--accent)) center/2px 100% no-repeat,
+              linear-gradient(var(--accent),var(--accent)) center top/10px 2px no-repeat,
+              linear-gradient(var(--accent),var(--accent)) center bottom/10px 2px no-repeat;
 }
 /* Hover tooltip for the horizon chart (price at the hovered slot). */
 .chart-tip {
@@ -330,6 +338,81 @@ main { padding: 12px 16px 80px; max-width: 1100px; margin: 0 auto; }
 .vehicle-card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
 .vehicle-card-head h3 { flex: 1 1 auto; min-width: 0; }
 .vehicle-card-head .btn-secondary { flex: 0 0 auto; padding: 6px 12px; font-size: 13px; }
+
+.ev-smart-card { overflow: hidden; }
+.ev-smart-form {
+  display: grid; grid-template-columns: minmax(130px, .55fr) minmax(230px, 1fr) auto;
+  gap: 10px; align-items: end; margin: 12px 0;
+}
+.ev-smart-form label, .ev-smart-ready-fields {
+  display: grid; gap: 5px; color: var(--muted); font-size: 12px;
+}
+.ev-smart-ready-fields { min-width: 0; margin: 0; padding: 0; border: 0; }
+.ev-smart-ready-fields legend { margin: 0 0 5px; padding: 0; }
+.ev-smart-ready-fields > div { display: grid; grid-template-columns: minmax(145px, 1fr) 80px; gap: 7px; }
+.ev-smart-form input, .ev-smart-form select {
+  width: 100%; box-sizing: border-box; color: var(--text); background: var(--panel-2);
+  border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; font: inherit;
+}
+.ev-smart-form input:focus, .ev-smart-form select:focus {
+  border-color: var(--accent); outline: 2px solid rgba(74,168,255,.16);
+}
+.ev-smart-form input:disabled, .ev-smart-form select:disabled,
+.ev-smart-form button:disabled { opacity: .5; cursor: not-allowed; }
+.ev-smart-input-with-unit { display: flex; align-items: center; gap: 6px; }
+.ev-smart-input-with-unit input { min-width: 0; }
+.ev-smart-status {
+  border: 1px solid var(--line); border-radius: 999px; padding: 3px 9px;
+  font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .35px;
+}
+.ev-smart-status.status-planned, .ev-smart-status.status-charging,
+.ev-smart-status.status-completed { color: var(--sell); border-color: color-mix(in srgb, var(--sell) 55%, var(--line)); }
+.ev-smart-status.status-waiting-for-plan, .ev-smart-status.status-waiting-for-plug { color: var(--accent); border-color: var(--accent); }
+.ev-smart-status.status-at-risk, .ev-smart-status.status-infeasible { color: #fbbf24; border-color: #fbbf24; }
+.ev-smart-status.status-paused { color: var(--retain); border-color: var(--retain); }
+.ev-smart-message { min-height: 18px; font-size: 13px; margin: 3px 0 8px; }
+.ev-smart-message.error { color: #f87171; }
+.ev-smart-summary { margin: 8px 0 12px; }
+.ev-smart-summary .metric .value { font-size: 17px; }
+.ev-smart-plan { display: grid; gap: 10px; margin: 12px 0; min-width: 0; }
+.ev-charge-plan-intro {
+  display: grid; gap: 3px; padding: 12px 14px; background: rgba(74,168,255,.08);
+  border: 1px solid rgba(74,168,255,.25); border-radius: 9px;
+}
+.ev-charge-plan-intro strong { font-size: 15px; }
+.ev-charge-plan-intro span { font-size: 13px; line-height: 1.45; }
+.ev-charge-day-list { display: grid; gap: 8px; }
+.ev-charge-day {
+  display: grid; grid-template-columns: minmax(130px, .7fr) minmax(220px, 1.5fr) minmax(180px, 1fr);
+  gap: 10px 18px; align-items: center; padding: 12px 14px;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 9px;
+}
+.ev-charge-day-heading { display: grid; gap: 5px; align-content: center; }
+.ev-charge-day-heading strong { font-size: 14px; }
+.ev-charge-day-state {
+  width: fit-content; padding: 2px 7px; border: 1px solid var(--line); border-radius: 999px;
+  color: var(--muted); font-size: 10px; font-weight: 700; text-transform: uppercase;
+}
+.ev-charge-day-state.confirmed { color: var(--sell); border-color: rgba(34,197,94,.5); }
+.ev-charge-day-state.pending { color: #fbbf24; border-color: rgba(251,191,36,.5); }
+.ev-charge-windows { display: grid; gap: 5px; }
+.ev-charge-window {
+  display: flex; align-items: baseline; gap: 10px; min-width: 0; padding: 6px 9px;
+  background: rgba(74,168,255,.10); border-left: 3px solid var(--accent); border-radius: 5px;
+}
+.ev-charge-window-time { flex: 0 0 auto; color: var(--text); font-size: 14px; }
+.ev-charge-window span { color: var(--muted); font-size: 12px; }
+.ev-charge-day-meta { color: var(--muted); font-size: 12px; line-height: 1.45; }
+.ev-smart-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
+.ev-smart-actions[hidden] { display: none; }
+.ev-smart-actions button[hidden] { display: none; }
+.ev-smart-footnote { margin-top: 10px; }
+.ev-hour-tag, .ev-slot-tag {
+  display: inline-block; margin-left: 6px; border: 1px solid rgba(74,168,255,.55);
+  color: var(--accent); border-radius: 999px; padding: 0 5px; font-size: 9px; font-weight: 700;
+}
+.ev-hour-tag.ev-supply-solar, .ev-slot-tag.ev-supply-solar { color: #22c55e; border-color: rgba(34,197,94,.65); }
+.ev-hour-tag.ev-supply-mixed, .ev-slot-tag.ev-supply-mixed { color: #34d399; border-color: rgba(52,211,153,.65); }
 
 /* Logs tab — scrollable, auto-scrolling terminal-style tail */
 .logs-card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }

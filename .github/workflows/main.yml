@@ -26,6 +26,11 @@ jobs:
           python -m pip install -r requirements.txt pytest
 
       - name: Run unit tests
+        env:
+          # Runtime .env/.secrets are intentionally untracked. Use the checked-in,
+          # non-secret defaults so collection cannot depend on files from a developer host.
+          APP_ENV_PATH: .env.example
+          APP_SECRETS_PATH: /dev/null
         run: |
           export DEV=1
           pytest -q

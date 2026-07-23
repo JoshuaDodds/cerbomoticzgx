@@ -244,6 +244,44 @@ def test_mobile_schedule_button_scrolls_to_current_slot():
     assert "scrollToCurrentScheduleSlot()" in js
 
 
+def test_vehicle_tab_contains_smart_charge_job_form_and_readable_daily_plan():
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    js = APP_JS.read_text(encoding="utf-8")
+    css = MOBILE_CSS.read_text(encoding="utf-8")
+    desktop_css = APP_CSS.read_text(encoding="utf-8")
+
+    assert 'id="ev-smart-charge-form"' in html
+    assert 'id="ev-smart-target-soc"' in html
+    assert 'id="ev-smart-ready-date"' in html
+    assert 'id="ev-smart-ready-time"' in html
+    assert 'aria-label="Ready time, 24-hour format"' in html
+    assert 'id="ev-smart-plan"' in html
+    assert 'fetch("/api/ev/smart-charge"' in js
+    assert "function renderEvSmartCharge" in js
+    assert "function evSmartDailyPlan" in js
+    assert "function evSmartPopulateTimeOptions" in js
+    assert "Tesla app shows only the deadline safety fallback" in js
+    assert "Solar surplus is used when it costs less than the energy it replaces" in js
+    assert 'source === "pending" ? "Source to be chosen"' in js
+    assert "ev-charge-day" in js
+    assert 'hour: "2-digit", minute: "2-digit", hour12: false' in js
+    assert 'source[name] == null' in js
+    assert 'about €${provisionalCost.toFixed(2)}' in js
+    assert "function escapeHtml" in js
+    assert "function requestEvSmartReplan" in js
+    assert 'fetch("/api/replan", {method: "POST"})' in js
+    assert ".ev-smart-form" in css
+    assert ".ev-smart-actions[hidden]" in desktop_css
+
+
+def test_daily_schedule_has_compact_ev_annotation_hooks():
+    js = APP_JS.read_text(encoding="utf-8")
+
+    assert "planned_ev_kwh" in js
+    assert "ev_target_kw" in js
+    assert "ev-slot-tag" in js
+
+
 def test_mobile_non_schedule_navigation_jumps_to_top():
     js = APP_JS.read_text(encoding="utf-8")
 
@@ -504,17 +542,28 @@ def test_pl_summary_explains_winter_household_protection_policy():
     assert "Winter Mode degraded safely" in js
 
 
-def test_monthly_chart_uses_forecast_candles_and_actual_settlement_dots():
+def test_monthly_chart_uses_forecast_spread_and_comparable_actual_markers():
     charts = (ROOT / "frontend" / "static" / "js" / "charts.js").read_text(encoding="utf-8")
 
-    assert "forecast_low_eur" in charts
-    assert "forecast_high_eur" in charts
-    assert "forecast_open_eur" in charts
-    assert "forecast_close_eur" in charts
-    assert 'class="forecast-candle"' in charts
-    assert 'class="actual-net-dot"' in charts
-    assert "Forecast range" in charts
-    assert "Settled actual" in charts
+    assert "forecast_q1_eur" in charts
+    assert "forecast_median_eur" in charts
+    assert "forecast_q3_eur" in charts
+    assert "forecast_range_low_eur" in charts
+    assert "forecast_range_high_eur" in charts
+    assert "forecast_outliers_eur" not in charts
+    assert 'class="forecast-boxplot"' in charts
+    assert 'class="forecast-outlier-dot"' not in charts
+    assert "actual-net-dot" in charts
+    assert "Box: middle 50% of observed forecasts" in charts
+    assert "Centre line: median forecast" in charts
+    assert "Range: lowest–highest forecast observed" in charts
+    assert "Solid dot: settled actual" in charts
+    assert "Hollow dot: latest full-day forecast for today" in charts
+    assert "Settled so far" in charts
+    assert "projected_net_eur" in charts
+    assert "one per 15-minute period" in charts
+    assert "minimum 8" in charts
+    assert "First → latest" not in charts
 
 
 def test_schedule_timeline_has_running_today_ledger_row():

@@ -71,7 +71,7 @@
           <div id="forecast-accuracy-chart" class="chart"><span class="muted">loading…</span></div>
         </div>
         <div class="card">
-          <h3 style="margin:2px 0 10px">Daily net — month so far</h3>
+          <h3 style="margin:2px 0 10px">Daily forecast spread vs actual</h3>
           <div id="monthly-chart" class="chart"><span class="muted">loading…</span></div>
         </div>
 
@@ -157,6 +157,49 @@
           <p class="cfg-note">Manually request or stop an EV charge. This sets the dedicated
             EV-charge intent (independent of grid assist); the controller then starts/stops the car
             with its safety checks (only acts when the car is home and plugged in).</p>
+        </div>
+        <div class="card ev-smart-card">
+          <div class="vehicle-card-head">
+            <div>
+              <h3 style="margin:2px 0 3px">Smart charging</h3>
+              <p class="cfg-note">Choose the charge target and when the car must be ready.</p>
+            </div>
+            <span id="ev-smart-status" class="ev-smart-status muted" role="status">Loading…</span>
+          </div>
+          <form id="ev-smart-charge-form" class="ev-smart-form">
+            <label>
+              <span>Target SoC</span>
+              <span class="ev-smart-input-with-unit">
+                <input id="ev-smart-target-soc" name="target_soc" type="number"
+                       min="50" max="100" step="1" value="80" inputmode="numeric" required>
+                <span>%</span>
+              </span>
+            </label>
+            <fieldset class="ev-smart-ready-fields">
+              <legend>Ready by</legend>
+              <div>
+                <input id="ev-smart-ready-date" name="ready_date" type="date"
+                       aria-label="Ready date" required>
+                <select id="ev-smart-ready-time" name="ready_time"
+                        aria-label="Ready time, 24-hour format" required></select>
+              </div>
+            </fieldset>
+            <button id="ev-smart-save" type="submit" class="btn">Plan charge</button>
+          </form>
+          <div id="ev-smart-message" class="ev-smart-message muted" aria-live="polite"></div>
+          <div id="ev-smart-summary"></div>
+          <div id="ev-smart-plan" class="ev-smart-plan" aria-label="Daily EV charge plan"></div>
+          <div id="ev-smart-actions" class="ev-smart-actions" hidden>
+            <button type="button" class="btn-secondary" data-ev-smart-action="pause">Pause plan</button>
+            <button type="button" class="btn-secondary" data-ev-smart-action="resume">Resume plan</button>
+            <button type="button" class="btn-secondary" data-ev-smart-action="charge_now">Charge now</button>
+            <button type="button" class="btn-secondary" data-ev-smart-edit>Edit</button>
+            <button type="button" class="btn-secondary btn-danger" data-ev-smart-cancel>Cancel job</button>
+          </div>
+          <p class="cfg-note ev-smart-footnote">Smart-charge control uses the Tesla Fleet API only
+            when its control toggle is enabled. Preview mode does not act on planned times; the
+            existing excess-solar charging remains independent. Maxem always controls the actual
+            current available to the car.</p>
         </div>
         <div class="card">
           <h3 style="margin:2px 0 10px">Tesla API usage — this billing cycle (local estimate)</h3>

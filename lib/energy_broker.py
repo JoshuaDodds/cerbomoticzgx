@@ -1664,6 +1664,306 @@ def _apply_appliance_reservations_to_forecast(
         return load_forecast, failed
 
 
+def _apply_ev_smart_charge_to_forecast(
+        load_forecast: dict, pv_forecast: dict, price_slots: list, *,
+        slot_duration_h: float, current_soc=None, ess_soc=None,
+        now=None) -> tuple[dict, dict]:
+    """Plan one persistent EV charge-by job and overlay its energy as explicit load.
+
+    This is deliberately a forecast enrichment boundary: the pure EV planner has
+    no Tesla/MQTT effects, and a disabled feature returns the caller's original
+    object unchanged.  The requested EV power is only a ceiling.  Maxem remains
+    authoritative for instantaneous 25 A/phase overload protection; subsequent
+    replans consume the new measured SoC/ABB energy instead of fighting a temporary
+    Maxem reduction.
+    """
+    context = {
+        "enabled": False,
+        "apply": _is_truthy(retrieve_setting("EV_SMART_CHARGE_APPLY"), False),
+        "active": False,
+        "status": "disabled",
+        "ess_overlay_applied": False,
+        "plan": None,
+    }
+    if not _is_truthy(retrieve_setting("EV_SMART_CHARGE_ENABLED"), False):
+        return load_forecast, context
+
+    context["enabled"] = True
+    context["status"] = "idle"
+    try:
+        from datetime import datetime as _dt, timedelta as _td
+        from lib import ev_smart_charge
+
+        job_path = retrieve_setting("EV_SMART_CHARGE_JOB_PATH") or None
+        plan_path = retrieve_setting("EV_SMART_CHARGE_PLAN_PATH") or None
+        job = ev_smart_charge.load_job(path=job_path)
+
+        # Derive a timezone from the price horizon/job, then use an aware current
+        # time.  Frontend-created jobs are required to carry an explicit offset.
+        starts = []
+        for point in price_slots or []:
+            try:
+                starts.append(_coerce_datetime(point["start"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        job_deadline = None
+        if job:
+            try:
+                job_deadline = _dt.fromisoformat(str(job.get("ready_by")).replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                job_deadline = None
+        tzinfo = (starts[0].tzinfo if starts else
+                  job_deadline.tzinfo if job_deadline is not None else
+                  _dt.now().astimezone().tzinfo)
+        planned_at = now or _dt.now(tzinfo)
+        if planned_at.tzinfo is None:
+            planned_at = planned_at.replace(tzinfo=tzinfo)
+
+        # The ESS engine may receive hourly Tibber prices and subdivide them
+        # internally. Expand the EV inputs here so its block planner always works
+        # at the canonical 15-minute resolution and its load can later be summed
+        # back into the native optimizer slots.
+        native_h = max(0.25, float(slot_duration_h or 0.25))
+        sub_count = max(1, int(round(native_h / 0.25)))
+        export_factor = _get_float_setting("ESS_EXPORT_PRICE_FACTOR", 1.0)
+        export_fee = _get_float_setting("ESS_EXPORT_FEE", 0.0)
+        def _positive_state_number(key, default):
+            try:
+                value = float(STATE.get(key))
+                return value if math.isfinite(value) and value > 0 else default
+            except (TypeError, ValueError):
+                return default
+
+        # Bound configured power by the pushed vehicle/EVSE capability. This
+        # automatically de-rates a one-phase connection or a lower vehicle limit.
+        phases = _positive_state_number("tesla_charger_phases", 3.0)
+        phases = phases if 1.0 <= phases <= 3.0 else 3.0
+        voltage = _positive_state_number("tesla_charger_voltage", 230.0)
+        voltage = voltage if 180.0 <= voltage <= 260.0 else 230.0
+        configured_amps = _get_float_setting("EV_CHARGER_MAX_AMPS", 24.0)
+        live_amps = _positive_state_number("tesla_charge_current_max", configured_amps)
+        live_amps = live_amps if 1.0 <= live_amps <= 32.0 else configured_amps
+        electrical_ceiling_kw = phases * voltage * min(configured_amps, live_amps) / 1000.0
+        requested_ceiling_kw = min(
+            _get_float_setting("EV_CHARGER_MAX_KW", 16.0),
+            electrical_ceiling_kw,
+        )
+        expected_delivery_kw = min(
+            requested_ceiling_kw,
+            _get_float_setting("EV_EXPECTED_DELIVERY_KW", 14.0),
+        )
+        site_import_limit_kw = _get_float_setting("ESS_MAX_GRID_IMPORT_KW", 13.0)
+        allow_ess_discharge = _is_truthy(
+            retrieve_setting("EV_ALLOW_ESS_DISCHARGE"), False)
+        known_base_values = [
+            max(0.0, float(value or 0.0))
+            for value in (load_forecast or {}).values()
+        ]
+        unknown_horizon_base_kw = (
+            sum(known_base_values) / len(known_base_values) / native_h
+            if known_base_values else
+            _get_float_setting("DAILY_HOME_ENERGY_CONSUMPTION", 18.0) / 24.0
+        )
+        price_by_start = {}
+        for point in price_slots or []:
+            try:
+                start = _coerce_datetime(point["start"])
+                buy = float(point["total"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            for part in range(sub_count):
+                sub_start = start + _td(minutes=15 * part)
+                price_by_start[round(sub_start.timestamp())] = buy
+
+        # Match the established live surplus rule: PV does not become available
+        # to the car until enough forecast surplus has first protected the home
+        # battery up to MINIMUM_ESS_SOC. This chronological reservation is
+        # intentionally conservative; a later replan releases PV if the ESS has
+        # already reached its target by another route.
+        protected_ess_pv_kwh = 0.0
+        try:
+            observed_ess_soc = float(ess_soc)
+            target_ess_soc = _get_float_setting("MINIMUM_ESS_SOC", 90.0)
+            ess_capacity_kwh = _get_float_setting("BATTERY_CAPACITY_KWH", 42.0)
+            ess_charge_efficiency = max(
+                0.01, _get_float_setting("AC_DC_CHARGE_EFFICIENCY", 0.96))
+            if math.isfinite(observed_ess_soc):
+                protected_ess_pv_kwh = max(
+                    0.0,
+                    (target_ess_soc - observed_ess_soc) / 100.0
+                    * ess_capacity_kwh / ess_charge_efficiency,
+                )
+        except (TypeError, ValueError):
+            # Missing ESS SoC cannot safely be guessed here. The optimizer cycle
+            # normally supplies it, while direct/shadow callers retain prior behavior.
+            protected_ess_pv_kwh = 0.0
+        remaining_ess_pv_reservation = protected_ess_pv_kwh
+
+        planning_slots = []
+        for native_start, native_load in sorted(
+                (load_forecast or {}).items(), key=lambda item: item[0]):
+            native_pv = float((pv_forecast or {}).get(native_start, 0.0) or 0.0)
+            base_part = max(0.0, float(native_load or 0.0)) / sub_count
+            pv_part = max(0.0, native_pv) / sub_count
+            for part in range(sub_count):
+                start = native_start + _td(minutes=15 * part)
+                buy = price_by_start.get(round(start.timestamp()))
+                sell = (buy * export_factor - export_fee) if buy is not None else None
+                raw_surplus = max(0.0, pv_part - base_part)
+                ess_reserved = min(raw_surplus, remaining_ess_pv_reservation)
+                remaining_ess_pv_reservation -= ess_reserved
+                planning_slots.append({
+                    "start": start,
+                    "grid_price_eur_per_kwh": buy,
+                    "pv_surplus_kwh": max(0.0, raw_surplus - ess_reserved),
+                    "pv_reserved_for_ess_kwh": ess_reserved,
+                    "pv_opportunity_cost_eur_per_kwh": sell,
+                    "supply_forecast_known": True,
+                    # Reserve forecast site headroom before the stationary ESS
+                    # optimization. Maxem remains the real-time authority, but
+                    # the plan must not assume full EV power on top of house load.
+                    "expected_delivery_kw": expected_delivery_kw if allow_ess_discharge else min(
+                        expected_delivery_kw,
+                        max(0.0, site_import_limit_kw + (pv_part - base_part) / 0.25),
+                    ),
+                })
+
+        # A charge job may extend beyond the published Tibber horizon. Represent
+        # those slots explicitly with an unknown price so the UI shows a tentative
+        # plan instead of silently claiming that the target is infeasible. Bound
+        # the expansion to seven days for Pi-class memory/CPU safety.
+        if job_deadline is not None:
+            def _ceil_quarter(value):
+                stamp = math.ceil(value.timestamp() / 900.0) * 900.0
+                return _dt.fromtimestamp(stamp, tz=value.tzinfo)
+
+            known = {round(row["start"].timestamp()) for row in planning_slots}
+            cursor = _ceil_quarter(planned_at)
+            hard_end = min(job_deadline, cursor + _td(days=7))
+            while cursor < hard_end:
+                key = round(cursor.timestamp())
+                if key not in known:
+                    planning_slots.append({
+                        "start": cursor,
+                        "grid_price_eur_per_kwh": None,
+                        "pv_surplus_kwh": 0.0,
+                        "pv_reserved_for_ess_kwh": 0.0,
+                        "pv_opportunity_cost_eur_per_kwh": None,
+                        "supply_forecast_known": False,
+                        # Unknown-horizon house/PV headroom is not fabricated;
+                        # use the conservative global delivery assumption and
+                        # mark the price/timeline tentative.
+                        "expected_delivery_kw": (
+                            expected_delivery_kw if allow_ess_discharge else min(
+                                expected_delivery_kw,
+                                max(0.0, site_import_limit_kw - unknown_horizon_base_kw),
+                            )
+                        ),
+                    })
+                cursor += _td(minutes=15)
+            planning_slots.sort(key=lambda row: row["start"])
+
+        plan = ev_smart_charge.plan_charge(
+            job,
+            planning_slots,
+            current_soc=current_soc,
+            now=planned_at,
+            usable_capacity_kwh=_get_float_setting("EV_BATTERY_USABLE_KWH", 100.0),
+            charge_efficiency=_get_float_setting("EV_CHARGE_EFFICIENCY", 0.90),
+            requested_ceiling_kw=requested_ceiling_kw,
+            conservative_delivery_kw=expected_delivery_kw,
+            block_start_penalty_eur=_get_float_setting(
+                "EV_CHARGE_BLOCK_START_PENALTY_EUR", 0.02),
+            completion_buffer_minutes=_get_float_setting(
+                "EV_DEADLINE_BUFFER_MINUTES", 30.0),
+        )
+        ev_smart_charge.save_plan_snapshot(plan, path=plan_path)
+
+        # Aggregate 15-minute EV slots back into the optimizer's native forecast
+        # keys. Keep the original forecast immutable for counterfactual/history use.
+        energy_by_ts = {}
+        for slot in plan.get("slots") or []:
+            try:
+                start = _dt.fromisoformat(str(slot["start"]).replace("Z", "+00:00"))
+                energy_by_ts[round(start.timestamp())] = max(0.0, float(slot["energy_kwh"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        overlaid = dict(load_forecast or {})
+        for native_start in overlaid:
+            native_end = native_start + _td(hours=native_h)
+            ev_kwh = sum(
+                energy for stamp, energy in energy_by_ts.items()
+                if native_start.timestamp() <= stamp < native_end.timestamp()
+            )
+            if ev_kwh > 0:
+                overlaid[native_start] = float(overlaid[native_start] or 0.0) + ev_kwh
+
+        active = bool(plan.get("active") or (
+            plan.get("job") and plan.get("status") not in ("idle", "paused", "completed")
+        ))
+        context.update({
+            "active": active,
+            "status": plan.get("status") or "idle",
+            "job_id": (plan.get("job") or {}).get("id"),
+            "planned_ev_kwh": plan.get("planned_ac_kwh", 0.0),
+            "plan": plan,
+            "ess_overlay_applied": bool(context["apply"] and active),
+        })
+        STATE.set("ev_smart_charge_status", context["status"])
+        STATE.set("ev_smart_charge_job_id", context.get("job_id"))
+        STATE.set("ev_smart_charge_planned_kwh", context.get("planned_ev_kwh"))
+        # Shadow mode must be truly observational: it publishes the complete EV
+        # plan/UI timeline but cannot alter stationary-battery decisions until
+        # the separate apply gate is enabled.
+        return (overlaid if context["ess_overlay_applied"] else load_forecast), context
+    except Exception as error:
+        # A malformed job or unwritable plan file may disable EV enrichment, but
+        # it must never prevent the critical ESS optimizer from running.
+        logging.warning("AI_ESS: EV smart-charge planning skipped: %s", error)
+        context["status"] = "error"
+        context["error"] = str(error)
+        return load_forecast, context
+
+
+def _annotate_result_with_ev_plan(result: dict, ev_context: dict) -> None:
+    """Attach EV decomposition to ESS schedule rows for history and dashboard use."""
+    from datetime import datetime as _dt, timedelta as _td
+
+    plan = (ev_context or {}).get("plan") or {}
+    ev_slots = []
+    for row in plan.get("slots") or []:
+        try:
+            start = _dt.fromisoformat(str(row["start"]).replace("Z", "+00:00"))
+            ev_slots.append((start, row))
+        except (KeyError, TypeError, ValueError):
+            continue
+    try:
+        duration_h = max(0.01, float(result.get("slot_duration_h") or 0.25))
+    except (TypeError, ValueError):
+        duration_h = 0.25
+    for slot in result.get("schedule") or []:
+        try:
+            start = slot["time"] if hasattr(slot["time"], "timestamp") else _dt.fromisoformat(
+                str(slot["time"]).replace("Z", "+00:00"))
+        except (KeyError, TypeError, ValueError):
+            continue
+        end = start + _td(hours=duration_h)
+        matching = [row for ev_start, row in ev_slots if start <= ev_start < end]
+        ev_kwh = sum(float(row.get("energy_kwh") or 0.0) for row in matching)
+        slot["planned_ev_kwh"] = round(ev_kwh, 6)
+        load_kwh = max(0.0, float(slot.get("load") or 0.0))
+        slot["non_ev_load_kwh"] = round(max(
+            0.0,
+            load_kwh - ev_kwh if (ev_context or {}).get("ess_overlay_applied") else load_kwh,
+        ), 6)
+        slot["ev_target_kw"] = max(
+            (float(row.get("requested_power_kw", row.get("target_kw", 0.0)) or 0.0)
+             for row in matching), default=0.0)
+        supplies = {str(row.get("supply") or "grid") for row in matching}
+        slot["ev_supply"] = supplies.pop() if len(supplies) == 1 else "mixed" if supplies else None
+        slot["ev_tentative"] = any(bool(row.get("tentative")) for row in matching)
+
+
 def get_today_energy_actuals() -> dict:
     """Return today's accumulated energy actuals from the MQTT bus (retained).
 
@@ -1739,6 +2039,11 @@ def _publish_plan_json(result, *, batt_soc, price_points, pv_remaining,
             'load': s.get('load'),
             'reason': s.get('reason'),
             'reason_code': s.get('reason_code'),
+            'planned_ev_kwh': s.get('planned_ev_kwh', 0.0),
+            'non_ev_load_kwh': s.get('non_ev_load_kwh'),
+            'ev_target_kw': s.get('ev_target_kw', 0.0),
+            'ev_supply': s.get('ev_supply'),
+            'ev_tentative': bool(s.get('ev_tentative', False)),
         } for s in result.get('schedule', [])]
 
         victron_slots = [{
@@ -1848,6 +2153,9 @@ def _publish_plan_json(result, *, batt_soc, price_points, pv_remaining,
             'weather': _json_safe(weather_context),
             'appliance_reservations': _json_safe(
                 result.get('appliance_reservations') or {}
+            ),
+            'ev_smart_charge': _json_safe(
+                (result.get('ev_smart_charge') or {}).get('plan') or {}
             ),
             'optimizer_guardrails': _json_safe(
                 result.get('optimizer_guardrails') or _optimizer_guardrails_snapshot()
@@ -2045,8 +2353,18 @@ def _append_history(result, *, batt_soc, applied_setpoint, today_actuals, realiz
             # This deliberately excludes tomorrow even when its prices are already
             # present in the optimizer horizon, so snapshots remain comparable.
             "plan_today_remaining_net_eur": plan_today_remaining_net_eur,
+            # Persist the two components as well as their net so future
+            # calibration can distinguish optimistic export from understated
+            # import instead of guessing from a single combined value.
+            "forecast_remaining_import_cost_eur": round(today_f_imp_cost, 4),
+            "forecast_remaining_export_reward_eur": round(today_f_exp_rev, 4),
             "forecast_day_net_eur": forecast_day_net_eur,
             "realized_net_eur": realized_net_eur,
+            "planned_ev_kwh": _num(sched0.get('planned_ev_kwh')) or 0.0,
+            "non_ev_load_forecast_kwh": _num(sched0.get('non_ev_load_kwh')),
+            "ev_target_kw": _num(sched0.get('ev_target_kw')) or 0.0,
+            "ev_supply": sched0.get('ev_supply'),
+            "ev_tentative": bool(sched0.get('ev_tentative', False)),
             # Running daily actuals (reset by Tibber at midnight).
             "day_import_kwh": act.get('imp_kwh'),
             "day_import_cost": act.get('imp_cost'),
@@ -2101,6 +2419,15 @@ def _append_history(result, *, batt_soc, applied_setpoint, today_actuals, realiz
             "appliance_reserved_devices": appliance_context.get("devices") or [],
             "appliance_active_reservations": int(
                 appliance_context.get("active_reservations") or 0),
+        })
+        ev_context = result.get('ev_smart_charge') or {}
+        record.update({
+            "ev_smart_charge_enabled": bool(ev_context.get('enabled', False)),
+            "ev_smart_charge_apply": bool(ev_context.get('apply', False)),
+            "ev_smart_charge_status": ev_context.get('status'),
+            "ev_smart_charge_job_id": ev_context.get('job_id'),
+            "ev_smart_charge_planned_kwh": _num(
+                ev_context.get('planned_ev_kwh')) or 0.0,
         })
 
         path = os.path.join(history_dir, f"ess-{now.strftime('%Y-%m-%d')}.ndjson")
@@ -2193,6 +2520,11 @@ def _settle_prior_slot(result, *, batt_soc, today_actuals, now=None) -> None:
             # settlement pairs prediction vs actual for PV and consumption too.
             'predicted_pv_kwh': _f(sched0.get('pv')),
             'predicted_load_kwh': _f(sched0.get('load')),
+            'predicted_ev_charge_kwh': _f(sched0.get('planned_ev_kwh')),
+            'predicted_non_ev_load_kwh': _f(sched0.get('non_ev_load_kwh')),
+            'ev_target_kw': _f(sched0.get('ev_target_kw')),
+            'ev_supply': sched0.get('ev_supply'),
+            'ev_tentative': bool(sched0.get('ev_tentative', False)),
             'temp_forecast_c': _f(w0.get('temp_forecast_c')),
             'gti_forecast_wm2': _f(w0.get('gti_forecast_wm2')),
             'cloud_forecast_pct': _f(w0.get('cloud_forecast_pct')),
@@ -2334,6 +2666,11 @@ def _settle_prior_slot(result, *, batt_soc, today_actuals, now=None) -> None:
                 'load_meter_quality': load_meter_quality,
                 'predicted_pv_kwh': pred.get('predicted_pv_kwh'),
                 'predicted_load_kwh': pred.get('predicted_load_kwh'),
+                'predicted_ev_charge_kwh': pred.get('predicted_ev_charge_kwh'),
+                'predicted_non_ev_load_kwh': pred.get('predicted_non_ev_load_kwh'),
+                'ev_target_kw': pred.get('ev_target_kw'),
+                'ev_supply': pred.get('ev_supply'),
+                'ev_tentative': pred.get('ev_tentative'),
                 'temp_forecast_c': pred.get('temp_forecast_c'),
                 'gti_forecast_wm2': pred.get('gti_forecast_wm2'),
                 'cloud_forecast_pct': pred.get('cloud_forecast_pct'),
@@ -2500,8 +2837,39 @@ def _run_ai_optimizer_once():
                 row['final_pv_forecast_kwh'] = round(
                     max(0.0, float(pv_forecast.get(start, 0.0) or 0.0)), 4)
 
+        ev_soc = None
+        if hasattr(STATE, 'has') and STATE.has('tesla_soc'):
+            ev_soc = STATE.get('tesla_soc')
+        elif not hasattr(STATE, 'has'):
+            ev_soc = STATE.get('tesla_soc')
+        load_forecast, ev_context = _apply_ev_smart_charge_to_forecast(
+            load_forecast,
+            pv_forecast,
+            prices,
+            slot_duration_h=slot_duration_h,
+            current_soc=ev_soc,
+            ess_soc=batt_soc,
+        )
+
         # 3. Optimize
-        result = optimize_schedule(batt_soc, prices, load_forecast, pv_forecast)
+        ev_plan = ev_context.get('plan') or {}
+        discharge_blocked_slots = {
+            row.get('start') for row in (ev_plan.get('slots') or [])
+            if row.get('start') and float(row.get('energy_kwh') or 0.0) > 0.0
+        }
+        allow_ev_from_ess = _is_truthy(
+            retrieve_setting('EV_ALLOW_ESS_DISCHARGE'), False)
+        if (ev_context.get('ess_overlay_applied')
+                and discharge_blocked_slots and not allow_ev_from_ess):
+            result = optimize_schedule(
+                batt_soc, prices, load_forecast, pv_forecast,
+                discharge_blocked_slots=discharge_blocked_slots,
+            )
+        else:
+            # Preserve the legacy four-argument contract exactly when EV smart
+            # charging is disabled/idle or home-battery supply is explicitly
+            # allowed. This also keeps external dry-run/test adapters compatible.
+            result = optimize_schedule(batt_soc, prices, load_forecast, pv_forecast)
         if not result:
             if OPTIMIZER_MODE != 'winter':
                 logging.warning("AI_ESS: Optimization failed or returned nothing.")
@@ -2514,6 +2882,8 @@ def _run_ai_optimizer_once():
         # The startup selector is authoritative. Publishing this on every plan
         # makes the active engine observable without inferring it from behavior.
         result['optimizer_mode'] = OPTIMIZER_MODE
+        result['ev_smart_charge'] = ev_context
+        _annotate_result_with_ev_plan(result, ev_context)
         STATE.set('ai_optimizer_mode', OPTIMIZER_MODE)
         if OPTIMIZER_MODE == 'winter':
             winter_policy = result.get('winter_policy') or {}

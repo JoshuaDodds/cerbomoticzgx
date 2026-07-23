@@ -8,13 +8,17 @@ def test_detailed_charge_state_charging():
     assert out["state"]["tesla_is_charging"] == "True"
     assert out["topics"]["Tesla/vehicle0/plugged_status"] == "Plugged"
     assert out["topics"]["Tesla/vehicle0/charging_status"] == "Charging"
+    assert "tesla_time_to_full" not in out["state"]
+    assert "Tesla/vehicle0/time_until_full" not in out["topics"]
 
 
 def test_detailed_charge_state_disconnected():
     out = tb.translate("DetailedChargeState", "DetailedChargeStateDisconnected")
     assert out["state"]["tesla_is_plugged"] == "False"
     assert out["state"]["tesla_is_charging"] == "False"
+    assert out["state"]["tesla_time_to_full"] == "N/A"
     assert out["topics"]["Tesla/vehicle0/plugged_status"] == "Unplugged"
+    assert out["topics"]["Tesla/vehicle0/time_until_full"] == "N/A"
 
 
 def test_detailed_charge_state_plugged_not_charging():
@@ -23,6 +27,8 @@ def test_detailed_charge_state_plugged_not_charging():
         out = tb.translate("DetailedChargeState", st)
         assert out["state"]["tesla_is_plugged"] == "True"
         assert out["state"]["tesla_is_charging"] == "False"
+        assert out["state"]["tesla_time_to_full"] == "N/A"
+        assert out["topics"]["Tesla/vehicle0/time_until_full"] == "N/A"
 
 
 def test_charge_port_latch_confirms_plugged_only():
@@ -69,6 +75,25 @@ def test_soc_and_limit_and_amps():
     out = tb.translate("ChargeAmps", 15)
     assert out["state"]["tesla_amps_reported"] == 15.0
     assert "Tesla/vehicle0/charging_amps" not in out.get("topics", {})
+
+
+def test_apply_records_field_specific_acknowledgement_timestamp(monkeypatch):
+    stored = {}
+
+    class State:
+        def set(self, key, value):
+            stored[key] = value
+
+    monkeypatch.setattr("lib.global_state.GlobalStateClient", lambda: State())
+    monkeypatch.setattr("lib.helpers.publish_message", lambda *a, **k: None)
+    monkeypatch.setattr(tb.time, "time", lambda: 1234.5)
+    bridge = tb.TeslaTelemetryBridge("broker")
+
+    bridge.apply("ChargeLimitSoc", 95)
+
+    assert stored["tesla_soc_setpoint"] == 95.0
+    assert stored["tesla_telemetry_last_update_ts"] == 1234.5
+    assert stored["tesla_soc_setpoint_updated_at"] == 1234.5
 
 
 def test_ac_power_is_unmapped():

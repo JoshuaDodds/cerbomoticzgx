@@ -122,6 +122,31 @@ def test_grid_assist_route_reuses_existing_grid_charge_toggle(monkeypatch):
     assert calls == [("grid", True)]
 
 
+def test_manual_ev_stop_sets_intent_off_and_latched_force_stop(monkeypatch):
+    import lib.global_state as global_state
+
+    calls = []
+    published = []
+
+    class FakeState:
+        def set(self, key, value):
+            calls.append((key, value))
+
+    monkeypatch.setattr(global_state, "GlobalStateClient", FakeState)
+    monkeypatch.setattr(server, "publish_message",
+                        lambda *args, **kwargs: published.append((args, kwargs)))
+
+    response = server.app.test_client().post(
+        "/api/control/ev-charge", json={"enabled": False})
+
+    assert response.status_code == 200
+    assert calls == [
+        ("ev_charge_requested", False),
+        ("vehicle_stop_requested", True),
+    ]
+    assert published
+
+
 def test_refresh_vehicle_route_sets_one_shot_state_flag(monkeypatch):
     import lib.global_state as global_state
 
@@ -256,6 +281,112 @@ def test_weather_route_returns_weather_dashboard_data(monkeypatch):
     assert response.status_code == 200
     assert response.get_json()["available"] is True
     assert calls == ["weather"]
+
+
+def test_ev_smart_charge_get_is_available_when_control_module_is_missing(monkeypatch):
+    monkeypatch.setattr(
+        server.data,
+        "ev_smart_charge_dashboard",
+        lambda: {"available": False, "message": "Smart charging is unavailable."},
+    )
+
+    response = server.app.test_client().get("/api/ev/smart-charge")
+
+    assert response.status_code == 200
+    assert response.get_json()["available"] is False
+
+
+def test_ev_smart_charge_put_validates_and_saves_one_job(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        server,
+        "_save_ev_smart_charge_job",
+        lambda payload: calls.append(payload) or {"id": "job-1", **payload},
+        raising=False,
+    )
+
+    response = server.app.test_client().put(
+        "/api/ev/smart-charge",
+        json={"target_soc": 80, "ready_by": "2099-07-21T10:00:00+02:00"},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["job"]["target_soc"] == 80
+    assert calls == [{"target_soc": 80, "ready_by": "2099-07-21T10:00:00+02:00"}]
+
+
+def test_ev_smart_charge_put_rejects_invalid_target_or_naive_deadline(monkeypatch):
+    client = server.app.test_client()
+
+    target = client.put(
+        "/api/ev/smart-charge",
+        json={"target_soc": 101, "ready_by": "2099-07-21T10:00:00+02:00"},
+    )
+    deadline = client.put(
+        "/api/ev/smart-charge",
+        json={"target_soc": 80, "ready_by": "2099-07-21T10:00"},
+    )
+    fractional = client.put(
+        "/api/ev/smart-charge",
+        json={"target_soc": 80.5, "ready_by": "2099-07-21T10:00:00+02:00"},
+    )
+    below_tesla_limit = client.put(
+        "/api/ev/smart-charge",
+        json={"target_soc": 49, "ready_by": "2099-07-21T10:00:00+02:00"},
+    )
+
+    assert target.status_code == 400
+    assert deadline.status_code == 400
+    assert fractional.status_code == 400
+    assert below_tesla_limit.status_code == 400
+
+
+def test_ev_smart_charge_delete_and_actions_delegate_to_control_module(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        server,
+        "_delete_ev_smart_charge_job",
+        lambda: calls.append("delete") or None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        server,
+        "_act_on_ev_smart_charge_job",
+        lambda action: calls.append(action) or {"status": action},
+        raising=False,
+    )
+    client = server.app.test_client()
+
+    deleted = client.delete("/api/ev/smart-charge")
+    paused = client.post("/api/ev/smart-charge/action", json={"action": "pause"})
+    bad = client.post("/api/ev/smart-charge/action", json={"action": "explode"})
+
+    assert deleted.status_code == 200
+    assert paused.status_code == 200
+    assert bad.status_code == 400
+    assert calls == ["delete", "pause"]
+
+
+def test_ev_smart_charge_save_uses_canonical_job_factory_and_live_soc(monkeypatch):
+    calls = []
+    fake = types.SimpleNamespace(
+        create_job=lambda **kwargs: calls.append(("create", kwargs)) or {"id": "canonical", **kwargs},
+        save_job=lambda job, path=None: calls.append(("save", job, path)) or job,
+    )
+    monkeypatch.setitem(sys.modules, "lib.ev_smart_charge", fake)
+    monkeypatch.setattr(server.live, "snapshot", lambda: {"veh_soc": 36})
+    monkeypatch.setattr(server.data, "_env", lambda: {"EV_SMART_CHARGE_JOB_PATH": "/tmp/custom-job.json"})
+
+    result = server._save_ev_smart_charge_job({
+        "target_soc": 80,
+        "ready_by": "2099-07-21T10:00:00+02:00",
+    })
+
+    assert result["id"] == "canonical"
+    assert calls[0][0] == "create"
+    assert calls[0][1]["current_soc"] == 36.0
+    assert calls[1][0] == "save"
+    assert calls[1][2] == "/tmp/custom-job.json"
 
 
 def test_advisor_latest_route_returns_saved_report(monkeypatch):
