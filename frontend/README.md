@@ -8,11 +8,24 @@ power-flow diagram, day/month cost summaries, a Tibber-sourced **month-to-date
 profit** chip, a **Trends** view (SoC/price + forecast accuracy + monthly net), a
 desktop **Weather** view, an **AI Advisor** that
 reviews recent performance on demand, and allow-listed `.env` config editing.
-The only direct Victron control action exposed here is the guarded **Victron
-Schedule** clear button, which disables the five scheduled-charge slots; config
-edits go to `.env`; **Restart** publishes the existing supervised restart MQTT
+The guarded controls include Victron schedule clearing and a one-job EV smart-charge
+workflow; EV mutations write only the dedicated job file and request a replan, while
+the main controller remains the sole Fleet API writer. Config edits go to `.env`;
+**Restart** publishes the existing supervised restart MQTT
 message (`Cerbomoticzgx/system/shutdown=True`) and does not kill the process from
 HTTP; the advisor only reads history and shells out to a local subscription CLI.
+
+The Vehicle plan reports forecast solar, forecast grid, and source-pending energy
+separately. Long jobs retain gentle deadline progress while cost-effective forecast
+solar can advance a later grid share; applied jobs can also consume real surplus
+between blocks after the stationary battery reaches `MINIMUM_ESS_SOC`. Solar-only
+forecast blocks are capped to live surplus; mixed/grid blocks retain their planned backup.
+The blue **Refresh data** action requests one explicit vehicle status check. Normal
+no-intent PV-surplus ticks remain dormant when pushed state says the car is away or
+unplugged; Fleet API discovery is retained only when Fleet Telemetry is disabled.
+On mobile, the Power Flow diagram uses content-budgeted detail rows and a capped
+Battery-card height so expanded BMS telemetry neither crosses the card border on
+short screens nor leaves an oversized empty tail on tall screens.
 
 ## Architecture / separation of concerns
 
@@ -74,6 +87,8 @@ sharing the host's `/dev/shm` (so it can read the published plan). Expose
 | `AI_PLAN_EXPORT_PATH` | `/dev/shm/cerbo_ai_plan.json` | where main publishes the plan / dashboard reads it |
 | `FRONTEND_HOST` | `0.0.0.0` | bind address |
 | `FRONTEND_PORT` | `8080` | bind port |
+| `EV_SMART_CHARGE_ENABLED` | `False` | publish shadow target/deadline plans without vehicle commands |
+| `EV_SMART_CHARGE_APPLY` | `False` | allow the main EV controller to reconcile the reviewed plan through Fleet API; requires Fleet Telemetry for command acknowledgement |
 
 ## Views
 
@@ -126,10 +141,16 @@ sharing the host's `/dev/shm` (so it can read the published plan). Expose
 - **Trends** (tab): HA-style metric cards (**self-sufficiency %**, **self-consumed
   solar %**, **grid balance** bar) above a gradient SoC% + buy-price line chart with
   a `now` marker and clickable series legends, an actual-vs-forecast PV/load overlay,
-  plus a **monthly net forecast-evolution chart** (`/api/history/month`). Each day
-  with prospective snapshots gets a candle (first/latest forecast body and intraday
-  low/high range) and a round settled-actual point. Legacy days remain actual-only;
-  no historical forecast spread is inferred or backfilled.
+  plus a **monthly net forecast-spread chart** (`/api/history/month`). Replans are
+  reduced to the latest forecast in each 15-minute period so restarts or button-triggered
+  recalculations cannot receive extra statistical weight. Complete settled days show the
+  middle 50% box, median centre, full lowest-to-highest observed range, and a solid
+  settled-actual point. Valid temporal revisions are never mislabelled as statistical
+  outliers. Settled spreads require at least 75% quarter-hour coverage plus near-midnight
+  first/last observations; sparse or partial historical days remain actual-only. Today may
+  show its partial spread and uses a hollow latest-full-day-projection point, while settled
+  net so far remains available in the tooltip rather than being compared on the same axis.
+  No historical forecast spread is inferred or backfilled.
 - **Schedule** (tab): expandable hour → 15-min → reasoning tree, color-coded by
   control action, with a per-hour timeline bar and aggregates. For today, the
   timeline starts at midnight with settled history rows, then flows into the forward
@@ -144,23 +165,41 @@ sharing the host's `/dev/shm` (so it can read the published plan). Expose
 - **Victron Schedule** (tab): mirrors the five Victron/CerboGX scheduled-charge
   slots from the published optimizer plan. The **Clear schedule** button calls the
   same broker helper used internally to disable those five Victron slots.
+- **Vehicle** (tab): creates one durable Tesla charge-by job (50–100% target and an
+  offset-aware deadline), shows feasibility/cost/savings, and presents the plan as readable
+  day-by-day rows with exact windows, kWh, SoC progress, price status, cost and energy source.
+  Long-horizon jobs protect gentle daily progress and can advance it with forecast solar when
+  that is cheaper than the later energy displaced; shorter jobs remain deadline-first. Pause, resume and
+  cancel request an immediate ESS replan. Planning and application have separate gates;
+  the latter uses an application-owned Tesla fallback schedule and never alters unrelated
+  user schedules. Maxem can reduce actual charger power independently without the app
+  chasing the ABB reading with repeated current commands. Preview mode gates only these new
+  smart slots; existing excess-solar Tesla control remains active independently. A confirmed
+  Fleet stop refreshes the retained Vehicle status immediately; if a change-only Tesla status
+  remains stale, dedicated EV-meter standby power (≤100 W) is shown as idle in the dashboard.
 - **Weather** (desktop tab): visualizes cached Open-Meteo temperature/cloud patterns
   and shadow-mode HVAC load / GTI summaries with clickable series legends. It is
   observational unless `HVAC_LOAD_APPLY` or `PV_WEATHER_APPLY` are deliberately
-  enabled after validation.
-- **Advisor** (tab): a manually-triggered, read-only AI review. Click to stream a
-  short markdown report on recent performance, or ask a free-text question ("why did
-  we sell at 15:00 yesterday?"). It sends recent history + the allow-listed tunables
-  (never secrets) + the current plan to a model via a **subscription-login CLI**
-  (`ADVISOR_CLI_CMD` → Claude Code / Gemini / Codex), with extended thinking off and
-  a hard prompt cap. For deep questions it pulls extra days from `data/history/` on
-  demand (`NEED_HISTORY` protocol). The Advisor tab is a persisted chat session:
-  timestamped prompts and responses are saved to `data/advisor_latest.json`, restored
-  on browser refresh, and shown newest-first. Follow-up prompts include a compact
-  transcript of the current chat so the model has session context. Individual
-  messages can be copied, and a saved exchange can be deleted as a prompt/response
-  pair. **Clear chat** empties the saved JSON and starts a fresh session. See the
-  advisor config in `.env` / `.secrets`.
+  enabled after validation. HVAC evaluates cooling anomalies in Summer Mode and
+  heating anomalies in Winter Mode against the trailing three days. Panel azimuth
+  is entered as a conventional compass bearing (`0=N`, `180=S`) and converted for
+  Open-Meteo internally.
+- **Advisor** (tab): a manually-triggered, read-only AI review. Daily review uses a
+  deterministic live/plan/performance pack. Open questions maintain bounded
+  conversation memory and may iteratively retrieve capped evidence from history,
+  the in-process log buffer, allow-listed repository source/docs, live state, and
+  explicitly named `/dev/shm` JSON artifacts. Results retain sanitized, collapsible
+  run details plus source/freshness/truncation metadata. Raw `.env`, `.secrets`,
+  arbitrary paths, shell/network tools, writes, and controls are unavailable.
+  The built-in Claude CLI path disables tools, MCP, customizations, and session
+  persistence; API authentication is also supported. `ADVISOR_CLI_CMD` is only for
+  an operator-audited text-only wrapper listed in
+  `ADVISOR_CLI_SAFE_EXECUTABLES`; raw agentic Claude, Gemini, and Codex commands are
+  rejected. Legacy `NEED_HISTORY` / `NEED_CONFIG` directives remain compatible with
+  the bounded structured retrieval protocol. The persisted chat keeps exact recent
+  exchanges plus a compact representation of older turns; saved run details and
+  sources survive reload. Individual exchanges may be copied or deleted, while
+  **Clear chat** starts a fresh session.
 - **Configuration** (tab): click any value to edit it (number/select), confirm, and Save.
   Numeric settings expose schema min/max bounds and the server rejects out-of-range
   writes. On phones, descriptions sit behind an info toggle so edit targets remain large.
@@ -176,9 +215,16 @@ and watcher all use the same file. The main service picks it up because:
   value applies on the **next optimization/decision cycle** (and it republishes the
   `Cerbomoticzgx/config/<KEY>` MQTT mirror on that read), and
 - `lib.config_change_handler.ConfigWatcher` detects the file change and runs any
-  per-key handler (e.g. a restart for `ACTIVE_MODULES` or `WINTER_MODE`). Changes
-  to `VICTRON_HARDWARE_MIN_SOC` are applied immediately; startup and optimizer
-  cycles also reconcile that independent hard floor.
+  per-key handler (e.g. a restart for `ACTIVE_MODULES`, `WINTER_MODE`, or
+  `APPLIANCE_OPTIMIZATION_ENABLED`). Appliance price deferral is active in either
+  ESS season when `APPLIANCE_OPTIMIZATION_ENABLED` and the existing
+  `HOME_CONNECT_APPLIANCE_SCHEDULING` master switch are enabled; preferred
+  dishwasher-program enforcement remains governed by the Home Connect master.
+  A non-preferred run follows the appliance-owned safety sequence—abort, wait
+  for `Ready`, then send the preferred program—without dashboard-side
+  door/remote-start preconditions.
+  Changes to `VICTRON_HARDWARE_MIN_SOC` are applied immediately; startup and
+  optimizer cycles also reconcile that independent hard floor.
 
 Only keys in `config_schema.py` are writable. Runtime *control* values that live in
 `GlobalState`/the MQTT bus (e.g. `ess_net_metering_enabled`) are a separate future
@@ -237,9 +283,20 @@ reuses `MOSQUITTO_IP` and `VRM_PORTAL_ID`.
   (`grid_charging_enabled`) so grid covers loads and the battery is held. This is the
   house-battery hold only — it no longer starts/stops the car.
 - `POST /api/control/ev-charge` — manual EV **Start/Stop** (Vehicle tab). Sets the dedicated
-  `ev_charge_requested` intent (decoupled from grid-assist); the EV controller then starts/stops
-  the car with its safety checks (home + plugged + non-supercharging, wake escalation,
-  local-meter stop verification).
+  `ev_charge_requested` intent (decoupled from grid-assist). Stop also records an imperative
+  request which stays latched until confirmation or bounded escalation, so it works when intent
+  was already off; the EV controller uses bounded wake escalation and local-meter stop
+  verification even if pushed location/plug state is stale. Start restores the configured
+  full-rate request (bounded by the configured kW and 1–25 A/phase ceilings), verifies `ChargeCurrentRequest`
+  within 60 seconds, and permits exactly one retry. ABB power is delivery evidence only, so a
+  Maxem reduction cannot cause repeated Fleet current commands.
+- `GET /api/ev/smart-charge` — current durable EV charge job and matching plan snapshot.
+- `PUT /api/ev/smart-charge` — create/replace the job with `{target_soc, ready_by}`.
+- `DELETE /api/ev/smart-charge` — cancel the job.
+- `POST /api/ev/smart-charge/action` — pause/resume a job; unsupported actions fail closed.
+- Completed/expired smart jobs are lifecycle-cleaned automatically: the controller removes only
+  its deterministic Tesla schedule IDs before deleting the matching job/plan files. This cleanup
+  remains allowed after apply is switched off, but cannot start or alter an active shadow plan.
 - `POST /api/victron/clear-schedule` — clear the five Victron scheduled-charge slots.
 - `GET /healthz` — liveness.
 

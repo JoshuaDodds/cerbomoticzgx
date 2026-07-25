@@ -16,4 +16,7 @@ __all__ = [
     'config_retrieval',
     'config_change_handler',
     'event_handler_appliances',
+    'appliance_mode',
+    'appliance_reservations',
+    'flexible_load_planner',
 ]

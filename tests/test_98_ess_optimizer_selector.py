@@ -95,6 +95,49 @@ def test_selector_imports_only_winter_optimizer_when_enabled():
     }
 
 
+def test_appliance_policy_is_restart_frozen_without_importing_ess_mode():
+    script = r'''
+import json
+import sys
+import types
+
+values = {
+    "APPLIANCE_OPTIMIZATION_ENABLED": "True",
+    "WINTER_MODE": "False",
+}
+config = types.ModuleType("lib.config_retrieval")
+config.retrieve_setting = values.get
+sys.modules["lib.config_retrieval"] = config
+
+import lib.appliance_mode as appliance_mode
+before = appliance_mode.APPLIANCE_OPTIMIZATION_ENABLED
+ess_mode_imported = "lib.ess_mode" in sys.modules
+values["APPLIANCE_OPTIMIZATION_ENABLED"] = "False"
+after = appliance_mode.APPLIANCE_OPTIMIZATION_ENABLED
+print(json.dumps({
+    "before": before,
+    "after": after,
+    "ess_mode_imported": ess_mode_imported,
+}))
+'''
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(ROOT)
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=ROOT,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert json.loads(completed.stdout.strip().splitlines()[-1]) == {
+        "before": True,
+        "after": True,
+        "ess_mode_imported": False,
+    }
+
+
 def test_winter_mode_is_second_ai_ess_dashboard_setting():
     from frontend.config_schema import CONFIG_SCHEMA
 
@@ -110,6 +153,23 @@ def test_winter_mode_is_second_ai_ess_dashboard_setting():
     }
 
 
+def test_appliance_optimization_is_directly_below_winter_mode():
+    from frontend.config_schema import CONFIG_SCHEMA
+
+    ai_group = next(group for group in CONFIG_SCHEMA if group["group"] == "AI ESS Optimizer")
+    assert ai_group["settings"][2] == {
+        "key": "APPLIANCE_OPTIMIZATION_ENABLED",
+        "label": "Appliance optimized scheduling",
+        "type": "bool",
+        "desc": (
+            "Defer supported appliances to lower-cost times in either Summer or "
+            "Winter Mode when Home Connect scheduling is enabled. Dishwasher "
+            "preferred-program enforcement remains active whenever Home Connect "
+            "scheduling is enabled. Requires a restart."
+        ),
+    }
+
+
 def test_winter_mode_change_requests_supervised_restart(monkeypatch):
     from lib import config_change_handler
 
@@ -121,6 +181,21 @@ def test_winter_mode_change_requests_supervised_restart(monkeypatch):
     )
 
     config_change_handler.handle_env_change("WINTER_MODE")
+
+    assert published == [("Cerbomoticzgx/system/shutdown", "True", True)]
+
+
+def test_appliance_optimization_change_requests_supervised_restart(monkeypatch):
+    from lib import config_change_handler
+
+    published = []
+    monkeypatch.setattr(
+        config_change_handler,
+        "publish_message",
+        lambda topic, message, retain: published.append((topic, message, retain)),
+    )
+
+    config_change_handler.handle_env_change("APPLIANCE_OPTIMIZATION_ENABLED")
 
     assert published == [("Cerbomoticzgx/system/shutdown", "True", True)]
 
@@ -141,6 +216,24 @@ def test_new_winter_mode_key_triggers_watcher_handler(tmp_path):
 
     assert handled == ["WINTER_MODE"]
     assert watcher._cache["WINTER_MODE"] == "True"
+
+
+def test_new_appliance_optimization_key_triggers_watcher_handler(tmp_path):
+    from lib.config_change_handler import ConfigWatcher
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("WINTER_MODE=True\n", encoding="utf-8")
+    handled = []
+    watcher = ConfigWatcher(env_file=str(env_file), handler=handled.append)
+
+    env_file.write_text(
+        "WINTER_MODE=True\nAPPLIANCE_OPTIMIZATION_ENABLED=True\n",
+        encoding="utf-8",
+    )
+    watcher.check_changes()
+
+    assert handled == ["APPLIANCE_OPTIMIZATION_ENABLED"]
+    assert watcher._cache["APPLIANCE_OPTIMIZATION_ENABLED"] == "True"
 
 
 def test_reserve_does_not_change_before_restart_when_setting_changes():

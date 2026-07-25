@@ -179,3 +179,49 @@ def test_answer_with_retrieval_reasks_from_inline_summary_without_loading_files(
 
     assert any(ev.get("text") == "2026-06-23: 34.75 kWh" for ev in events)
     assert len(calls) == 2
+
+
+def test_answer_with_retrieval_attaches_only_requested_config_metadata(monkeypatch):
+    user_prompt = """TASK
+
+=== DATA (JSON) ===
+{"tunables":{"KNOWN_SETTING":"7"},"performance":{"daily_summaries":{}}}
+=== END DATA ==="""
+    calls = []
+    tunables = [{
+        "key": "KNOWN_SETTING",
+        "value": "7",
+        "type": "int",
+        "group": "Test",
+        "desc": "A safe setting description.",
+    }]
+
+    monkeypatch.setattr(advisor, "_history_manifest", lambda: {"available_days": []})
+    monkeypatch.setattr(advisor, "_tunables", lambda conf: tunables)
+    monkeypatch.setattr(
+        advisor,
+        "_build_messages",
+        lambda question, conf, conversation_context=None: ("system", user_prompt),
+    )
+
+    def fake_stream_for(mode, system, user, model, conf):
+        calls.append(user)
+        if len(calls) == 1:
+            yield {"type": "delta", "text": "NEED_CONFIG: KNOWN_SETTING, SECRET_TOKEN"}
+        else:
+            assert '"KNOWN_SETTING"' in user
+            assert "A safe setting description." in user
+            assert "SECRET_TOKEN" not in user
+            yield {"type": "delta", "text": "The setting currently equals 7."}
+
+    monkeypatch.setattr(advisor, "_stream_for", fake_stream_for)
+
+    events = list(advisor._answer_with_retrieval(
+        "What exactly does KNOWN_SETTING do?",
+        {},
+        "cli",
+        "sonnet",
+    ))
+
+    assert any(ev.get("text") == "The setting currently equals 7." for ev in events)
+    assert len(calls) == 2

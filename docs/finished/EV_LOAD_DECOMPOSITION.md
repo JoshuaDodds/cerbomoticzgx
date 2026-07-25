@@ -58,10 +58,11 @@ handling is not applied to PV.
 
 ## Current display convention
 
-The shared MQTT current and Vehicle tab remain the ABB meter's per-phase average.
-Only the EV card in `powerflow.js` displays the requested total-current convention:
-it sums the ABB meter's three physical `Ac/L{1,2,3}/Current` readings. At the
-meter's normal idle draw (100 W or less), the card displays 0 A so retained phase
+The shared MQTT current, Vehicle tab, and Power Flow EV card all display the ABB
+meter's per-phase average, matching Tesla current requests and the rest of the
+application. The Power Flow card falls back to the average of available physical
+`Ac/L{1,2,3}/Current` readings if the shared current is temporarily unavailable.
+At the meter's normal idle draw (100 W or less), it displays 0 A so retained phase
 notifications cannot look like active charging.
 
 ## Migration behavior

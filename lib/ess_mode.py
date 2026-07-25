@@ -21,4 +21,7 @@ WINTER_MODE = _setting_enabled(retrieve_setting("WINTER_MODE"))
 OPTIMIZER_MODE = "winter" if WINTER_MODE else "summer"
 
 
-__all__ = ["OPTIMIZER_MODE", "WINTER_MODE"]
+__all__ = [
+    "OPTIMIZER_MODE",
+    "WINTER_MODE",
+]

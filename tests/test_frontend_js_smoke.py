@@ -38,6 +38,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SMOKE_SCRIPT = ROOT / "tests" / "js" / "cold_load_smoke.js"
+POWERFLOW_ROUTING_SCRIPT = ROOT / "tests" / "js" / "app_powerflow_routing.js"
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
@@ -53,4 +54,20 @@ def test_dashboard_scripts_execute_cleanly_on_cold_load():
         "frontend/static/js/{powerflow,charts,app}.js threw during a simulated cold page "
         "load (see tests/js/cold_load_smoke.js and this file's module docstring for why this "
         f"test exists).\n\nstdout:\n{result.stdout}\n\nstderr:\n{result.stderr}"
+    )
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_powerflow_navigation_events_reach_the_app_router():
+    result = subprocess.run(
+        ["node", str(POWERFLOW_ROUTING_SCRIPT)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        cwd=str(ROOT),
+    )
+    assert result.returncode == 0, (
+        "Power Flow emitted a navigation event that the application shell did not "
+        "route correctly.\n\n"
+        f"stdout:\n{result.stdout}\n\nstderr:\n{result.stderr}"
     )

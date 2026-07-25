@@ -20,7 +20,7 @@ def test_mobile_stylesheet_loads_after_desktop_stylesheet():
     assert html.index("css/app.css") < html.index("css/app.mobile.css")
 
 
-def test_powerflow_ev_card_sums_phase_amps_without_changing_vehicle_metric():
+def test_powerflow_ev_card_uses_per_phase_current_like_vehicle_tab():
     powerflow = POWERFLOW_JS.read_text(encoding="utf-8")
     live = LIVE_PY.read_text(encoding="utf-8")
     app = APP_JS.read_text(encoding="utf-8")
@@ -30,10 +30,49 @@ def test_powerflow_ev_card_sums_phase_amps_without_changing_vehicle_metric():
         assert f'out["ev_l{phase}_a"] = _num("ev_l{phase}_a")' in live
     assert "const evMeterPhaseAmps" in powerflow
     assert "live.ev_l1_a, live.ev_l2_a, live.ev_l3_a" in powerflow
-    assert ".reduce((total, amps) => total + amps, 0)" in powerflow
+    assert "num(live.veh_amps)" in powerflow
+    assert "evMeterPhaseAmps.length" in powerflow
+    assert "/ evMeterPhaseAmps.length" in powerflow
+    assert "evTotalAmps" not in powerflow
     assert "ev <= EV_IDLE_POWER_W" in powerflow
     assert "evPhaseAmps * evPhases" not in powerflow
     assert 'card("Charge current", amps(L.veh_amps))' in app
+
+
+def test_mobile_powerflow_battery_card_budgets_height_for_all_bms_rows():
+    powerflow = POWERFLOW_JS.read_text(encoding="utf-8")
+    mobile_css = MOBILE_CSS.read_text(encoding="utf-8")
+
+    assert "const ch = 104, batth = 220" in powerflow
+    assert "const batteryRowBudget" in powerflow
+    assert "rows.length + 2.25" in powerflow
+    assert "Math.min(rowF, batteryRowBudget)" in powerflow
+    assert "const detailRowBudget" in powerflow
+    assert "rows.length + 0.25" in powerflow
+    assert "Math.min(rowF, detailRowBudget)" in powerflow
+    assert "const battCardH = Math.min(batth * sc, 190)" in powerflow
+    assert "y: battTop + battCardH / 2" in powerflow
+    assert "height: clamp(560px, 80vh, 650px)" in mobile_css
+
+
+def test_vehicle_tab_warns_only_when_disconnected_during_apparent_charging():
+    app = APP_JS.read_text(encoding="utf-8")
+    live = LIVE_PY.read_text(encoding="utf-8")
+
+    assert '"veh_telemetry_status": "Tesla/vehicle0/telemetry_status"' in live
+    assert "telemetryActivityExpected" in app
+    assert "telemetryDisconnected && telemetryActivityExpected" in app
+    assert "Vehicle telemetry disconnected during apparent charging" in app
+    assert "VEHICLE_TELEMETRY_FRESH_SECONDS" not in app
+
+
+def test_vehicle_refresh_is_a_primary_action():
+    html = INDEX_HTML.read_text(encoding="utf-8")
+
+    assert (
+        '<button id="vehicle-refresh" type="button" class="btn" '
+        "data-vehicle-refresh"
+    ) in html
 
 
 def test_abb_event_path_is_only_shared_current_topic_publisher():
@@ -244,6 +283,44 @@ def test_mobile_schedule_button_scrolls_to_current_slot():
     assert "scrollToCurrentScheduleSlot()" in js
 
 
+def test_vehicle_tab_contains_smart_charge_job_form_and_readable_daily_plan():
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    js = APP_JS.read_text(encoding="utf-8")
+    css = MOBILE_CSS.read_text(encoding="utf-8")
+    desktop_css = APP_CSS.read_text(encoding="utf-8")
+
+    assert 'id="ev-smart-charge-form"' in html
+    assert 'id="ev-smart-target-soc"' in html
+    assert 'id="ev-smart-ready-date"' in html
+    assert 'id="ev-smart-ready-time"' in html
+    assert 'aria-label="Ready time, 24-hour format"' in html
+    assert 'id="ev-smart-plan"' in html
+    assert 'fetch("/api/ev/smart-charge"' in js
+    assert "function renderEvSmartCharge" in js
+    assert "function evSmartDailyPlan" in js
+    assert "function evSmartPopulateTimeOptions" in js
+    assert "Tesla app shows only the deadline safety fallback" in js
+    assert "Solar surplus is used when it costs less than the energy it replaces" in js
+    assert 'source === "pending" ? "Source to be chosen"' in js
+    assert "ev-charge-day" in js
+    assert 'hour: "2-digit", minute: "2-digit", hour12: false' in js
+    assert 'source[name] == null' in js
+    assert 'about €${provisionalCost.toFixed(2)}' in js
+    assert "function escapeHtml" in js
+    assert "function requestEvSmartReplan" in js
+    assert 'fetch("/api/replan", {method: "POST"})' in js
+    assert ".ev-smart-form" in css
+    assert ".ev-smart-actions[hidden]" in desktop_css
+
+
+def test_daily_schedule_has_compact_ev_annotation_hooks():
+    js = APP_JS.read_text(encoding="utf-8")
+
+    assert "planned_ev_kwh" in js
+    assert "ev_target_kw" in js
+    assert "ev-slot-tag" in js
+
+
 def test_mobile_non_schedule_navigation_jumps_to_top():
     js = APP_JS.read_text(encoding="utf-8")
 
@@ -355,6 +432,71 @@ def test_advisor_latest_report_loads_on_browser_startup():
     assert ".advisor-modal" in css
     assert ".advisor-role-user" in css
     assert "background: #f8fafc" in css
+
+
+def test_advisor_submission_clears_draft_and_prevents_duplicate_requests():
+    js = APP_JS.read_text(encoding="utf-8")
+    html = INDEX_HTML.read_text(encoding="utf-8")
+
+    assert 'id="advisor-submit"' in html
+    assert 'id="advisor-submit-status"' in html
+    assert 'role="status"' in html
+    assert "function setAdvisorBusy(" in js
+    assert 'form.setAttribute("aria-busy", String(busy))' in js
+    assert "function submitAdvisorQuestion(" in js
+    assert 'ev.type === "accepted"' in js
+    assert "const restoreDraft = () => {" in js
+    assert "const clearDraft = () => {" in js
+    assert "onAccepted: clearDraft" in js
+    assert "onStartFailure: restoreDraft" in js
+    assert "if (!started) {" in js
+    assert "restoreDraft();" in js
+    assert "if (_advisorBusy) return false;" in js
+    assert "if (!accepted && onStartFailure) onStartFailure();" in js
+    assert 'aria-label="Ask the AI Advisor a question"' in html
+
+
+def test_advisor_run_details_and_sources_survive_completed_chat_rendering():
+    js = APP_JS.read_text(encoding="utf-8")
+    css = APP_CSS.read_text(encoding="utf-8")
+
+    assert "function renderAdvisorRunDetails(" in js
+    assert "function renderAdvisorSources(" in js
+    assert 'class="advisor-run-details"' in js
+    assert 'class="advisor-sources"' in js
+    assert "Sources used" in js
+    assert "run_details" in js
+    assert "sources" in js
+    assert "<details" in js
+    assert ".advisor-run-details" in css
+    assert ".advisor-sources" in css
+    assert "chain-of-thought" not in js.lower()
+
+
+def test_advisor_pending_run_details_are_expanded_then_saved_details_collapse():
+    js = APP_JS.read_text(encoding="utf-8")
+
+    assert 'opts && opts.pending ? " open" : ""' in js
+    assert 'id="advisor-log"' in js
+    assert 'id="advisor-run-status"' in js
+    assert 'pending: true' in js
+
+
+def test_config_editor_supports_labeled_model_choices_and_custom_cli_text():
+    js = APP_JS.read_text(encoding="utf-8")
+
+    assert "s.ui_options" in js
+    assert 's.editor !== "text"' in js
+    assert "option.value" in js
+    assert "option.label" in js
+    assert "knownValues.has(currentValue)" in js
+    assert "Current selection" in js
+    assert "s.effective_label" in js
+    assert "s.editor_help" in js
+    assert "_esc(description)" in js
+    assert "function makeConfigValueEditable(" in js
+    assert 'valueControl.setAttribute("role", "button")' in js
+    assert 'valueControl.setAttribute("tabindex", "0")' in js
 
 
 def test_advisor_markdown_tables_are_rendered_as_tables():
@@ -504,17 +646,28 @@ def test_pl_summary_explains_winter_household_protection_policy():
     assert "Winter Mode degraded safely" in js
 
 
-def test_monthly_chart_uses_forecast_candles_and_actual_settlement_dots():
+def test_monthly_chart_uses_forecast_spread_and_comparable_actual_markers():
     charts = (ROOT / "frontend" / "static" / "js" / "charts.js").read_text(encoding="utf-8")
 
-    assert "forecast_low_eur" in charts
-    assert "forecast_high_eur" in charts
-    assert "forecast_open_eur" in charts
-    assert "forecast_close_eur" in charts
-    assert 'class="forecast-candle"' in charts
-    assert 'class="actual-net-dot"' in charts
-    assert "Forecast range" in charts
-    assert "Settled actual" in charts
+    assert "forecast_q1_eur" in charts
+    assert "forecast_median_eur" in charts
+    assert "forecast_q3_eur" in charts
+    assert "forecast_range_low_eur" in charts
+    assert "forecast_range_high_eur" in charts
+    assert "forecast_outliers_eur" not in charts
+    assert 'class="forecast-boxplot"' in charts
+    assert 'class="forecast-outlier-dot"' not in charts
+    assert "actual-net-dot" in charts
+    assert "Box: middle 50% of observed forecasts" in charts
+    assert "Centre line: median forecast" in charts
+    assert "Range: lowest–highest forecast observed" in charts
+    assert "Solid dot: settled actual" in charts
+    assert "Hollow dot: latest full-day forecast for today" in charts
+    assert "Settled so far" in charts
+    assert "projected_net_eur" in charts
+    assert "one per 15-minute period" in charts
+    assert "minimum 8" in charts
+    assert "First → latest" not in charts
 
 
 def test_schedule_timeline_has_running_today_ledger_row():
