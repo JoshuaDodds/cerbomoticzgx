@@ -196,8 +196,9 @@ def test_plan_excerpt_collapses_consecutive_slots_into_action_blocks(monkeypatch
 
 def test_daily_review_prioritizes_completed_day_detail(monkeypatch):
     _stub_operational_inputs(monkeypatch, tunable_count=4, detail_rows=10)
-    today_key = datetime.now().date().isoformat()
-    yesterday_key = (datetime.now().date() - timedelta(days=1)).isoformat()
+    today = datetime.now().date()
+    today_key = today.isoformat()
+    yesterday_key = (today - timedelta(days=1)).isoformat()
     monkeypatch.setattr(
         advisor,
         "_compact_recent_detail",
