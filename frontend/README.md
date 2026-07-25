@@ -184,24 +184,22 @@ sharing the host's `/dev/shm` (so it can read the published plan). Expose
   heating anomalies in Winter Mode against the trailing three days. Panel azimuth
   is entered as a conventional compass bearing (`0=N`, `180=S`) and converted for
   Open-Meteo internally.
-- **Advisor** (tab): a manually-triggered, read-only AI review. Click to stream a
-  short markdown report on recent performance, or ask a free-text question ("why did
-  we sell at 15:00 yesterday?"). It sends recent history + the allow-listed tunables
-  (never secrets) + the current plan to a model via a **subscription-login CLI**
-  (`ADVISOR_CLI_CMD` → Claude Code / Gemini / Codex), with extended thinking off and
-  a hard prompt cap. Prompt budgeting always preserves valid JSON plus the live state,
-  compressed current plan, daily summaries, and a compact map of every allow-listed
-  setting value; optional chat/history evidence is added only when it fits and
-  serialized JSON is never sliced. Repetitive 15-minute plan/history rows are
-  represented as action blocks. For deep questions it pulls extra days from
-  `data/history/` on demand (`NEED_HISTORY`) and can attach descriptions for explicitly
-  requested allow-listed settings (`NEED_CONFIG`). The Advisor tab is a persisted chat session:
-  timestamped prompts and responses are saved to `data/advisor_latest.json`, restored
-  on browser refresh, and shown newest-first. Follow-up prompts include a compact
-  transcript of the current chat so the model has session context. Individual
-  messages can be copied, and a saved exchange can be deleted as a prompt/response
-  pair. **Clear chat** empties the saved JSON and starts a fresh session. See the
-  advisor config in `.env` / `.secrets`.
+- **Advisor** (tab): a manually-triggered, read-only AI review. Daily review uses a
+  deterministic live/plan/performance pack. Open questions maintain bounded
+  conversation memory and may iteratively retrieve capped evidence from history,
+  the in-process log buffer, allow-listed repository source/docs, live state, and
+  explicitly named `/dev/shm` JSON artifacts. Results retain sanitized, collapsible
+  run details plus source/freshness/truncation metadata. Raw `.env`, `.secrets`,
+  arbitrary paths, shell/network tools, writes, and controls are unavailable.
+  The built-in Claude CLI path disables tools, MCP, customizations, and session
+  persistence; API authentication is also supported. `ADVISOR_CLI_CMD` is only for
+  an operator-audited text-only wrapper listed in
+  `ADVISOR_CLI_SAFE_EXECUTABLES`; raw agentic Claude, Gemini, and Codex commands are
+  rejected. Legacy `NEED_HISTORY` / `NEED_CONFIG` directives remain compatible with
+  the bounded structured retrieval protocol. The persisted chat keeps exact recent
+  exchanges plus a compact representation of older turns; saved run details and
+  sources survive reload. Individual exchanges may be copied or deleted, while
+  **Clear chat** starts a fresh session.
 - **Configuration** (tab): click any value to edit it (number/select), confirm, and Save.
   Numeric settings expose schema min/max bounds and the server rejects out-of-range
   writes. On phones, descriptions sit behind an info toggle so edit targets remain large.
@@ -289,7 +287,7 @@ reuses `MOSQUITTO_IP` and `VRM_PORTAL_ID`.
   request which stays latched until confirmation or bounded escalation, so it works when intent
   was already off; the EV controller uses bounded wake escalation and local-meter stop
   verification even if pushed location/plug state is stale. Start restores the configured
-  full-rate request (bounded by the configured kW and per-phase ceilings), verifies `ChargeCurrentRequest`
+  full-rate request (bounded by the configured kW and 1–25 A/phase ceilings), verifies `ChargeCurrentRequest`
   within 60 seconds, and permits exactly one retry. ABB power is delivery evidence only, so a
   Maxem reduction cannot cause repeated Fleet current commands.
 - `GET /api/ev/smart-charge` — current durable EV charge job and matching plan snapshot.

@@ -281,6 +281,24 @@ def test_retained_signal_rebuilds_value_without_claiming_fresh_observation(
     assert "Tesla/vehicle0/last_update_at" not in published
 
 
+def test_live_current_availability_gets_freshness_timestamp(monkeypatch):
+    stored = {}
+
+    class State:
+        def set(self, key, value):
+            stored[key] = value
+
+    monkeypatch.setattr("lib.global_state.GlobalStateClient", lambda: State())
+    monkeypatch.setattr("lib.helpers.publish_message", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tb.time, "time", lambda: 1234.5)
+    bridge = tb.TeslaTelemetryBridge("broker")
+
+    bridge.apply("ChargeCurrentRequestMax", 25)
+
+    assert stored["tesla_charge_current_max"] == 25.0
+    assert stored["tesla_charge_current_max_updated_at"] == 1234.5
+
+
 @pytest.mark.parametrize(
     "field",
     (

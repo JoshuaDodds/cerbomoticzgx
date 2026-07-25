@@ -15,16 +15,33 @@ const STATIC_JS = path.join(__dirname, "..", "..", "frontend", "static", "js");
 const SCRIPTS = ["powerflow.js", "charts.js", "app.js"];
 
 function makeElementStub(idHint) {
+  const classes = new Set();
+  const listeners = {};
   const el = {
     id: idHint && idHint.startsWith("#") ? idHint.slice(1) : "",
     dataset: {},
-    classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
+    classList: {
+      add(...names) { names.forEach((name) => classes.add(name)); },
+      remove(...names) { names.forEach((name) => classes.delete(name)); },
+      toggle(name, force) {
+        const enabled = force === undefined ? !classes.has(name) : !!force;
+        if (enabled) classes.add(name); else classes.delete(name);
+        return enabled;
+      },
+      contains: (name) => classes.has(name),
+    },
     style: {},
     children: [],
     childNodes: [],
     attributes: {},
-    addEventListener() {},
-    removeEventListener() {},
+    addEventListener(name, fn) { (listeners[name] = listeners[name] || []).push(fn); },
+    removeEventListener(name, fn) {
+      listeners[name] = (listeners[name] || []).filter((item) => item !== fn);
+    },
+    dispatchEvent(event) {
+      (listeners[event.type] || []).forEach((fn) => fn.call(el, event));
+      return true;
+    },
     appendChild(child) { el.childNodes.push(child); return child; },
     removeChild() {},
     setAttribute(name, value) { el.attributes[name] = value; },
@@ -44,6 +61,7 @@ function makeElementStub(idHint) {
 
 function makeDocumentStub() {
   const body = makeElementStub();
+  const listeners = {};
   // IMPORTANT: selectors must resolve to a real (non-null) stub element, not null. The bug this
   // test exists to catch (see tests/test_frontend_js_smoke.py) only manifests once a function
   // like activateTab() gets PAST its "if (!panel) return" existence guard and reaches the line
@@ -66,19 +84,46 @@ function makeDocumentStub() {
     getElementById: (id) => stubFor("#" + id),
     createElement: () => makeElementStub(),
     createDocumentFragment: () => makeElementStub(),
-    addEventListener() {},
-    removeEventListener() {},
+    addEventListener(name, fn) { (listeners[name] = listeners[name] || []).push(fn); },
+    removeEventListener(name, fn) {
+      listeners[name] = (listeners[name] || []).filter((item) => item !== fn);
+    },
+    dispatchEvent(event) {
+      (listeners[event.type] || []).forEach((fn) => fn.call(this, event));
+      return true;
+    },
   };
 }
 
 function makeWindowStub() {
   const listeners = {};
+  const location = { hash: "", href: "http://localhost/", pathname: "/", search: "" };
+  const historyCalls = [];
   const win = {
     matchMedia: () => ({ matches: false, addEventListener() {}, addListener() {} }),
     addEventListener(name, fn) { (listeners[name] = listeners[name] || []).push(fn); },
-    removeEventListener() {},
-    location: { hash: "", href: "http://localhost/", search: "" },
-    history: { replaceState() {}, pushState() {} },
+    removeEventListener(name, fn) {
+      listeners[name] = (listeners[name] || []).filter((item) => item !== fn);
+    },
+    dispatchEvent(event) {
+      (listeners[event.type] || []).forEach((fn) => fn.call(win, event));
+      return true;
+    },
+    location,
+    history: {
+      calls: historyCalls,
+      replaceState(_state, _title, url) {
+        historyCalls.push(["replaceState", url]);
+        if (typeof url === "string" && url.includes("#")) location.hash = "#" + url.split("#", 2)[1];
+        else if (typeof url === "string") location.hash = "";
+      },
+      pushState(_state, _title, url) {
+        historyCalls.push(["pushState", url]);
+        if (typeof url === "string" && url.includes("#")) location.hash = "#" + url.split("#", 2)[1];
+        else if (typeof url === "string") location.hash = "";
+      },
+    },
+    scrollTo() {},
     EventSource: class { constructor() {} close() {} },
     ResizeObserver: class { observe() {} disconnect() {} unobserve() {} },
     fetch: () => Promise.reject(new Error("fetch stubbed out in cold-load smoke test")),
@@ -92,7 +137,7 @@ function makeWindowStub() {
   return win;
 }
 
-function run() {
+function loadDashboard() {
   const document = makeDocumentStub();
   const window = makeWindowStub();
   const context = {
@@ -107,6 +152,7 @@ function run() {
     setTimeout: window.setTimeout,
     clearTimeout: window.clearTimeout,
     navigator: { userAgent: "node-cold-load-smoke-test" },
+    history: window.history,
   };
   window.window = context;   // self-reference, some browser code does window.window
   context.self = context;
@@ -120,11 +166,22 @@ function run() {
     } catch (e) {
       console.error(`COLD-LOAD SMOKE TEST FAILED while executing ${name}:`);
       console.error(e && e.stack ? e.stack : e);
-      process.exit(1);
+      throw e;
     }
+  }
+  return { context, document, window };
+}
+
+function run() {
+  try {
+    loadDashboard();
+  } catch (_) {
+    process.exit(1);
   }
   console.log("cold-load smoke test: all scripts executed without throwing.");
   process.exit(0);
 }
 
-run();
+module.exports = { loadDashboard, makeDocumentStub, makeElementStub, makeWindowStub };
+
+if (require.main === module) run();

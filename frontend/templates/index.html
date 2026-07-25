@@ -213,16 +213,18 @@
 
       <section id="tab-advisor" class="tab-panel">
         <div class="card advisor">
-          <p class="cfg-note">A read-only AI review of recent optimizer behaviour. Run the daily
-            review, or ask a specific question — it analyses history + tunables and never changes
-            config or control.</p>
+          <p class="cfg-note">A read-only AI review of optimizer behaviour. Daily review uses the
+            current plan and performance; open questions can retrieve bounded history, logs,
+            runtime state, and approved code excerpts. It never changes config or control.</p>
           <div class="advisor-controls">
             <button id="advisor-clear" class="btn-secondary btn-danger">Clear chat</button>
             <button id="advisor-review" class="btn-secondary">Run daily review</button>
             <form id="advisor-ask" class="advisor-ask">
               <input id="advisor-q" type="text" autocomplete="off"
+                     aria-label="Ask the AI Advisor a question"
                      placeholder="Ask a question, e.g. Why did we sell at 15:00 yesterday?"/>
-              <button type="submit" class="btn-secondary">Ask</button>
+              <button id="advisor-submit" type="submit" class="btn-secondary">Ask</button>
+              <span id="advisor-submit-status" class="sr-only" role="status" aria-live="polite"></span>
             </form>
           </div>
           <div id="advisor-meta" class="advisor-meta muted"></div>

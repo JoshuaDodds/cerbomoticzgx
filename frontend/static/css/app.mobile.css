@@ -562,6 +562,12 @@
     min-height: 44px;
   }
 
+  .advisor-sources {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 4px;
+  }
+
   .battery-frame,
   .live-frame {
     height: calc(100vh - 150px);

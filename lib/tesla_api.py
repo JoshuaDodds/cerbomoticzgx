@@ -993,10 +993,10 @@ class TeslaApi:
         amps = 0 if amps < 0 else amps
         try:
             configured_max = int(float(
-                18 if installation_ceiling is None else installation_ceiling))
+                25 if installation_ceiling is None else installation_ceiling))
         except (TypeError, ValueError):
-            configured_max = 18
-        configured_max = max(1, configured_max)
+            configured_max = 25
+        configured_max = min(25, max(1, configured_max))
         amps = configured_max if amps > configured_max else amps
         amps = math.floor(amps)
 

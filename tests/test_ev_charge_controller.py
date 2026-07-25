@@ -162,11 +162,12 @@ def _run_reminder_threads_inline(monkeypatch):
 
 
 def test_starts_surplus_charge_when_home_plugged_and_surplus(monkeypatch):
+    _smart_settings(monkeypatch, EV_CHARGER_MAX_AMPS="25")
     tesla = FakeTesla(is_charging=False)
     c = _charger(monkeypatch, tesla, surplus_amps=6, charging_amps=0)
     active = c._control_charging()
     assert active is True
-    assert ("amps", 6) in tesla.calls          # set current to surplus
+    assert ("amps", 6, 25.0) in tesla.calls    # set current to surplus
     assert "start" in tesla.calls
 
 
@@ -383,10 +384,11 @@ def test_surplus_recovery_cancels_pending_stop(monkeypatch):
 
 
 def test_adjusts_amps_to_track_surplus_while_charging(monkeypatch):
+    _smart_settings(monkeypatch, EV_CHARGER_MAX_AMPS="25")
     tesla = FakeTesla(is_charging=True)
     c = _charger(monkeypatch, tesla, surplus_amps=10, charging_amps=6)   # surplus rose to 10
     assert c._control_charging() is True
-    assert ("amps", 10) in tesla.calls
+    assert ("amps", 10, 25.0) in tesla.calls
     assert "start" not in tesla.calls            # already charging; only adjust
 
 
@@ -427,15 +429,88 @@ def test_grid_assist_toggle_never_commands_the_car(monkeypatch):
     assert tesla.calls == []
 
 
-def test_ev_charge_request_charges_full_and_ignores_surplus(monkeypatch):
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    (
+        ("1", 1),
+        ("1.9", 1),
+        ("5", 5),
+        ("16", 16),
+        ("24.9", 24),
+        ("25", 25),
+    ),
+)
+def test_ev_charge_request_charges_full_and_ignores_surplus(
+        monkeypatch, configured, expected):
     # The dedicated EV-charge request ON with NO surplus is an express override: start charging
-    # at the safe full-rate request and do NOT try to match the current to surplus.
+    # at the safe full-rate request and do NOT try to match the current to surplus. The
+    # installation ceiling (EV_CHARGER_MAX_AMPS) is configurable anywhere from 1-25 A/phase —
+    # the grid, inverters and EV charger can all sustain a full 25 A, with Maxem.io independently
+    # guarding against fuse overload. EV_CHARGER_MAX_KW is pinned well above any of those
+    # ceilings so the requested current always saturates to the configured max, regardless of
+    # the real .env's EV_CHARGER_MAX_KW value.
+    values = {"EV_CHARGER_MAX_AMPS": configured, "EV_CHARGER_MAX_KW": "100"}
+    original_setting = ecc.retrieve_setting
+    monkeypatch.setattr(
+        ecc, "retrieve_setting", lambda key: values.get(key, original_setting(key)))
     state = FakeState({"ev_charge_requested": "True"})
     tesla = FakeTesla(is_charging=False)
     c = _charger(monkeypatch, tesla, state=state, surplus_amps=0, charging_amps=0)
     assert c._control_charging() is True
     assert "start" in tesla.calls
-    assert ("amps", 23, 24.0) in tesla.calls
+    assert ("amps", expected, float(configured)) in tesla.calls
+
+
+def test_pv_surplus_uses_last_available_current_without_rewriting_config(
+        monkeypatch):
+    _smart_settings(monkeypatch, EV_CHARGER_MAX_AMPS="25")
+    state = FakeState({
+        "tesla_charge_current_max": 7,
+        "tesla_charge_current_max_updated_at": time.time(),
+    })
+    tesla = FakeTesla(is_charging=False)
+    c = _charger(
+        monkeypatch, tesla, state=state, surplus_amps=20, charging_amps=0)
+
+    assert c._control_charging() is True
+    assert ("amps", 7, 25.0) in tesla.calls
+    assert c._smart_installation_ceiling() == 25.0
+
+
+def test_pv_surplus_does_not_start_when_available_current_is_zero(monkeypatch):
+    _smart_settings(monkeypatch, EV_CHARGER_MAX_AMPS="25")
+    state = FakeState({"tesla_charge_current_max": 0})
+    tesla = FakeTesla(is_charging=False)
+    c = _charger(
+        monkeypatch, tesla, state=state, surplus_amps=20, charging_amps=0)
+
+    assert c._control_charging() is False
+    assert tesla.calls == []
+
+
+def test_pv_surplus_keeps_last_available_current_because_stream_is_change_driven(
+        monkeypatch):
+    _smart_settings(monkeypatch, EV_CHARGER_MAX_AMPS="25")
+    state = FakeState({
+        "tesla_charge_current_max": 7,
+        "tesla_charge_current_max_updated_at": (
+            time.time() - ecc.SMART_COMMAND_ACK_TIMEOUT_S - 1
+        ),
+    })
+    tesla = FakeTesla(is_charging=False)
+    c = _charger(
+        monkeypatch, tesla, state=state, surplus_amps=20, charging_amps=0)
+
+    assert c._control_charging() is True
+    assert ("amps", 7, 25.0) in tesla.calls
+
+
+def test_ev_current_ceiling_is_hard_bounded_to_25_amps(monkeypatch):
+    _smart_settings(monkeypatch, EV_CHARGER_MAX_AMPS="32")
+    c = _charger(monkeypatch, FakeTesla(), surplus_amps=32)
+
+    assert c._smart_installation_ceiling() == 25.0
+    assert c._surplus_target_amps() == 25
 
 
 def test_ev_charge_request_does_not_stop_on_low_surplus(monkeypatch):
@@ -758,7 +833,7 @@ def test_smart_feature_off_preserves_legacy_surplus_path(monkeypatch):
     c._smart_plan = _smart_plan(now)
 
     assert c._control_charging() is True
-    assert ("amps", 6) in tesla.calls
+    assert ("amps", 6, 24.0) in tesla.calls
     assert "start" in tesla.calls
     assert not any(call[0] == "schedule" for call in tesla.calls if isinstance(call, tuple))
 
@@ -777,7 +852,7 @@ def test_shadow_smart_plan_preserves_legacy_surplus_fleet_commands(monkeypatch):
 
     assert c._local_engagement_signal() is True
     assert c._control_charging() is True
-    assert ("amps", 6) in tesla.calls
+    assert ("amps", 6, 24.0) in tesla.calls
     assert "start" in tesla.calls
     assert not any(call[0] == "schedule" for call in tesla.calls if isinstance(call, tuple))
 

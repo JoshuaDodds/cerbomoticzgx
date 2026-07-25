@@ -128,6 +128,19 @@ main { padding: 12px 16px 80px; max-width: 1100px; margin: 0 auto; }
    in app.mobile.css. */
 .powerflow { width: 100%; height: clamp(440px, 58vh, 820px); }
 .powerflow svg { width: 100%; height: 100%; display: block; }
+.powerflow .pf-navigable-card { cursor: pointer; }
+.powerflow .pf-navigable-card > rect {
+  transition: filter .15s ease, stroke-width .15s ease;
+}
+.powerflow .pf-navigable-card:hover > rect {
+  filter: brightness(1.12);
+}
+.powerflow .pf-navigable-card:focus { outline: none; }
+.powerflow .pf-navigable-card:focus-visible > rect {
+  filter: brightness(1.14) drop-shadow(0 0 4px var(--accent));
+  stroke: var(--accent) !important;
+  stroke-width: 4;
+}
 /* iPad Mini / Air in landscape are wide enough to use the desktop card layout, but
    their landscape height is short — 58vh lands on the 440px floor, so the taller
    Battery/Solar cards (with their BMS/string detail rows) get squeezed and the text
@@ -447,6 +460,7 @@ main { padding: 12px 16px 80px; max-width: 1100px; margin: 0 auto; }
 .advisor-ask input { flex: 1; background: #f8fafc; color: #0f172a; border: 1px solid #93c5fd; border-radius: 8px; padding: 8px 11px; font-size: 13px; box-shadow: inset 0 1px 2px rgba(15, 23, 42, .16); }
 .advisor-ask input::placeholder { color: #64748b; }
 .advisor-ask input:focus { outline: 2px solid rgba(56, 189, 248, .55); outline-offset: 1px; border-color: #38bdf8; }
+.sr-only { position: absolute !important; width: 1px !important; height: 1px !important; padding: 0 !important; margin: -1px !important; overflow: hidden !important; clip: rect(0, 0, 0, 0) !important; white-space: nowrap !important; border: 0 !important; }
 .tab-actions { display: flex; justify-content: flex-start; margin: 0 0 10px; }
 .btn-secondary { background: var(--panel-2); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 8px 14px; font-weight: 600; cursor: pointer; white-space: nowrap; }
 .btn-secondary:hover { border-color: var(--accent); color: var(--accent); }
@@ -493,6 +507,16 @@ main { padding: 12px 16px 80px; max-width: 1100px; margin: 0 auto; }
 .advisor-message-body th { color: var(--text); font-weight: 700; background: rgba(148, 163, 184, .12); white-space: nowrap; }
 .advisor-message-body td { color: var(--text); }
 .advisor-message-body tbody tr:last-child td { border-bottom: 0; }
+.advisor-sources { display: flex; align-items: baseline; gap: 8px; margin-top: 10px; color: var(--muted); font-size: 11.5px; }
+.advisor-sources strong { flex: 0 0 auto; color: var(--muted); }
+.advisor-sources ul { display: flex; flex-wrap: wrap; gap: 5px 10px; list-style: none; margin: 0; padding: 0; min-width: 0; }
+.advisor-sources li { margin: 0; overflow-wrap: anywhere; }
+.advisor-sources li:not(:last-child)::after { content: "·"; margin-left: 10px; color: rgba(148, 163, 184, .55); }
+.advisor-run-details { margin-top: 10px; border-top: 1px solid var(--line); padding-top: 8px; }
+.advisor-run-details summary { display: flex; justify-content: space-between; gap: 10px; color: var(--muted); font-size: 11.5px; font-weight: 600; cursor: pointer; list-style-position: inside; }
+.advisor-run-details summary:hover { color: var(--text); }
+.advisor-run-details[open] summary { margin-bottom: 7px; }
+.advisor-run-details .advisor-log { margin: 0; max-height: 190px; }
 /* Live progress log + streamed output */
 .advisor-log { max-height: 150px; overflow-y: auto; background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin-bottom: 10px; font-family: ui-monospace, monospace; font-size: 11.5px; line-height: 1.5; }
 .advisor-log:empty { display: none; }

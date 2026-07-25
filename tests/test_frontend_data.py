@@ -43,12 +43,37 @@ def test_config_schema_exposes_grid_charge_cap_and_advisor_safe_knobs():
     assert "ADVISOR_RETRIEVAL_MAX_CHARS" in keys
 
 
+def test_advisor_model_schema_offers_curated_models_without_restricting_custom_cli():
+    advisor_group = next(group for group in CONFIG_SCHEMA if group["group"] == "AI Advisor")
+    model = next(setting for setting in advisor_group["settings"] if setting["key"] == "ADVISOR_MODEL")
+
+    assert "options" not in model  # custom provider model names must remain writable
+    assert model["ui_options"] == [
+        {"value": "", "label": "Auto / latest Sonnet (recommended)"},
+        {"value": "claude-sonnet-5", "label": "Claude Sonnet 5"},
+        {"value": "claude-sonnet-4-6", "label": "Claude Sonnet 4.6 (fallback)"},
+        {"value": "claude-opus-4-8", "label": "Claude Opus 4.8"},
+        {"value": "claude-haiku-4-5", "label": "Claude Haiku 4.5"},
+    ]
+    assert model["custom_cli_editor"] == "text"
+
+
 def test_numeric_config_schema_entries_have_bounds():
     for group in CONFIG_SCHEMA:
         for setting in group["settings"]:
             if setting.get("type") in ("int", "float"):
                 assert "min" in setting, setting["key"]
                 assert "max" in setting, setting["key"]
+
+
+def test_advisor_retrieval_ui_cap_matches_backend_hard_limit():
+    advisor_group = next(group for group in CONFIG_SCHEMA if group["group"] == "AI Advisor")
+    setting = next(
+        item for item in advisor_group["settings"]
+        if item["key"] == "ADVISOR_RETRIEVAL_MAX_CHARS"
+    )
+    assert setting["min"] == 1000
+    assert setting["max"] == 120000
 
 
 def test_numeric_config_writes_reject_values_outside_schema_bounds(tmp_path):

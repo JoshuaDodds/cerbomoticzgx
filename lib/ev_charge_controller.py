@@ -1222,7 +1222,29 @@ class EvCharger:
     @staticmethod
     def _smart_installation_ceiling() -> float:
         configured = max(0.0, _num(retrieve_setting("EV_CHARGER_MAX_AMPS"), 0.0))
-        return configured if configured > 0 else 24.0
+        return min(configured if configured > 0 else 25.0, 25.0)
+
+    def _surplus_target_amps(self) -> int:
+        """Return the safe, currently available PV-surplus current request.
+
+        ``ChargeCurrentRequestMax`` is pushed read-only Fleet Telemetry. Maxem may
+        lower it transiently, so its last valid value is useful as a conservative
+        operational cap for live PV tracking but must never rewrite the configured
+        ceiling or a grid/smart plan. Fleet signals are change-driven, so elapsed
+        wall time alone cannot invalidate an unchanged availability value.
+        """
+        target = min(
+            max(0, math.floor(_num(self.surplus_amps))),
+            math.floor(self._smart_installation_ceiling()),
+        )
+        available = _num(
+            self.global_state.get("tesla_charge_current_max"), math.nan)
+        if (
+            math.isfinite(available)
+            and available >= 0
+        ):
+            target = min(target, math.floor(available))
+        return max(0, target)
 
     @staticmethod
     def _tesla_weekday_mask(value: datetime.datetime) -> int:
@@ -1989,10 +2011,13 @@ class EvCharger:
     def _start_surplus_charge(self) -> bool:
         if not self._cooldown_ok():
             return True
-        target = int(_num(self.surplus_amps))
+        target = self._surplus_target_amps()
+        if target <= 0:
+            return False
         logging.info(f"EvCharger: PV surplus — starting charge at ~{target} A.")
         self.set_surplus_amps(target)
-        self.tesla.set_tesla_charge_amps(target)
+        self.tesla.set_tesla_charge_amps(
+            target, installation_ceiling=self._smart_installation_ceiling())
         self.tesla.start_tesla_charge()
         self._last_commanded_amps = target
         self._charge_mode = 'surplus'
@@ -2001,7 +2026,7 @@ class EvCharger:
 
     def _adjust_surplus_amps(self) -> bool:
         self._charge_mode = 'surplus'
-        target = int(_num(self.surplus_amps))
+        target = self._surplus_target_amps()
         # Compare to what we LAST COMMANDED, not an asynchronously sampled meter value, to avoid
         # re-issuing set_charging_amps on measurement lag/noise every cooldown. Re-issue only
         # when the surplus-derived target actually moves.
@@ -2009,7 +2034,8 @@ class EvCharger:
         if (last is None or abs(target - last) >= AMP_ADJUST_MIN_DELTA) and self._cooldown_ok():
             logging.info(f"EvCharger: adjusting charge {last} A -> {target} A to match surplus.")
             self.set_surplus_amps(target)
-            self.tesla.set_tesla_charge_amps(target)
+            self.tesla.set_tesla_charge_amps(
+                target, installation_ceiling=self._smart_installation_ceiling())
             self._last_commanded_amps = target
             self.update_charging_amp_totals(target)
             self._mark_command()

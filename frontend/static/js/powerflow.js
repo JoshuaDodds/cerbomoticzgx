@@ -31,6 +31,17 @@
   };
 
   const NODE_LABEL = { grid: "Grid", inv: "MultiPlus-II", house: "AC Loads", solar: "Solar", batt: "Battery", ev: "EV", gas: "Gas" };
+  // Power Flow knows which physical cards are navigable, but deliberately does not
+  // know anything about dashboard routes. The app shell owns that mapping and listens
+  // for the route-neutral `powerflow:navigate` event emitted below.
+  const CARD_NAVIGATION = {
+    batt: { target: "battery", label: "Open Battery details" },
+    inv: { target: "victron", label: "Open Victron details" },
+    ev: { target: "vehicle", label: "Open Vehicle details" },
+  };
+  const CARD_NAVIGATION_TARGETS = new Set(
+    Object.values(CARD_NAVIGATION).map((item) => item.target),
+  );
 
   // Origin-centred glyphs (the group's translate sets the visual centre).
   const ICON = {
@@ -289,6 +300,43 @@
     return s;
   }
   const gasSvg = (N) => `<path id="pf-base-gas" d="${edgePath(GAS_EDGE, N)}" fill="none" stroke="${PALETTE.gas}" stroke-width="5.5" stroke-linecap="round" opacity="0.12"/>`;
+
+  function wrapNavigableCard(key, markup) {
+    const nav = CARD_NAVIGATION[key];
+    if (!nav) return markup;
+    return `<g class="pf-navigable-card" data-pf-navigation="${nav.target}" role="button" tabindex="0" focusable="true" aria-label="${nav.label}">${markup}</g>`;
+  }
+
+  function bindPowerFlowNavigation(box) {
+    if (box.dataset.pfNavigationBound === "true") return;
+    box.dataset.pfNavigationBound = "true";
+
+    const navigationTarget = (event) => {
+      const card = event.target && event.target.closest
+        ? event.target.closest("[data-pf-navigation]")
+        : null;
+      const target = card && card.dataset ? card.dataset.pfNavigation : null;
+      return CARD_NAVIGATION_TARGETS.has(target) ? target : null;
+    };
+    const emitNavigation = (target) => {
+      box.dispatchEvent(new CustomEvent("powerflow:navigate", {
+        bubbles: true,
+        detail: { target },
+      }));
+    };
+
+    box.addEventListener("click", (event) => {
+      const target = navigationTarget(event);
+      if (target) emitNavigation(target);
+    });
+    box.addEventListener("keydown", (event) => {
+      if (event.repeat || (event.key !== "Enter" && event.key !== " ")) return;
+      const target = navigationTarget(event);
+      if (!target) return;
+      event.preventDefault();
+      emitNavigation(target);
+    });
+  }
 
   function buildCard(key, N, mobile) {
     const r = N[key]; if (!r) return "";
@@ -619,6 +667,7 @@
     if (!box) return;
     _boxId = containerId; _lastLive = live; _lastPlan = plan;
     ensureObserver(box);
+    bindPowerFlowNavigation(box);
 
     if (!live || !live.connected) {
       box.innerHTML = '<span class="muted">live feed offline — connect to see real-time power flow.</span>';
@@ -654,10 +703,13 @@
     if (fr.hasGas) cardKeys.push("gas");
 
     box.innerHTML = `
-      <svg viewBox="0 0 ${f(W)} ${f(H)}" width="100%" height="100%" preserveAspectRatio="xMidYMid meet" style="display:block" role="img" aria-label="live power flow">
+      <svg viewBox="0 0 ${f(W)} ${f(H)}" width="100%" height="100%" preserveAspectRatio="xMidYMid meet" style="display:block" role="group" aria-label="Live power flow">
         ${edges.map((e) => edgeSvg(e, N, _edgeDur[e.key], fr.flows[e.key].fwd, mobile)).join("")}
         ${!mobile && fr.hasGas ? gasSvg(N) : ""}
-        ${cardKeys.map((k) => mobile ? buildCardMobile(k, N) : buildCard(k, N, false)).join("")}
+        ${cardKeys.map((k) => wrapNavigableCard(
+          k,
+          mobile ? buildCardMobile(k, N) : buildCard(k, N, false),
+        )).join("")}
       </svg>`;
 
     applyEdges(box, fr.flows);

@@ -22,6 +22,7 @@ _NON_SIGNAL_FIELDS = {"connectivity", "alerts", "errors", "status", "V", "v"}
 _ACK_TIMESTAMP_KEYS = {
     "ChargeLimitSoc": "tesla_soc_setpoint_updated_at",
     "ChargeCurrentRequest": "tesla_charge_current_request_updated_at",
+    "ChargeCurrentRequestMax": "tesla_charge_current_max_updated_at",
     "DetailedChargeState": "tesla_charge_state_updated_at",
 }
 
