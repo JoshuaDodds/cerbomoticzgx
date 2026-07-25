@@ -31,6 +31,17 @@
   };
 
   const NODE_LABEL = { grid: "Grid", inv: "MultiPlus-II", house: "AC Loads", solar: "Solar", batt: "Battery", ev: "EV", gas: "Gas" };
+  // Power Flow knows which physical cards are navigable, but deliberately does not
+  // know anything about dashboard routes. The app shell owns that mapping and listens
+  // for the route-neutral `powerflow:navigate` event emitted below.
+  const CARD_NAVIGATION = {
+    batt: { target: "battery", label: "Open Battery details" },
+    inv: { target: "victron", label: "Open Victron details" },
+    ev: { target: "vehicle", label: "Open Vehicle details" },
+  };
+  const CARD_NAVIGATION_TARGETS = new Set(
+    Object.values(CARD_NAVIGATION).map((item) => item.target),
+  );
 
   // Origin-centred glyphs (the group's translate sets the visual centre).
   const ICON = {
@@ -134,9 +145,9 @@
     // Battery + Solar carry extra BMS/string detail rows, so they're taller than the
     // Grid/AC-Loads cards; the whole stack is scaled to fill H below.
     // evh sized for the EV card's 5 detail rows (SoC/Limit/Amps/ETA/Total) + header + hero,
-    // at the same per-row density as Solar (196/7 rows) / Battery (190/6) so fonts stay
-    // consistent and the rows don't overflow into the Solar card below.
-    const ch = 104, batth = 190, mph = 100, evh = 162, solh = 196, gash = 54;
+    // at the same per-row density as Solar (196/7 rows) / Battery (220/6 natural,
+    // content-capped below) so fonts stay consistent and rows remain inside their cards.
+    const ch = 104, batth = 220, mph = 100, evh = 162, solh = 196, gash = 54;
     // Left column: Grid, Battery. Right column: AC Loads, then EV stacked above a
     // dropped-down-and-right Solar (so its line to Battery can curve). MP-II hub
     // centred; Gas centred at the bottom overflow. Heights are content-fit; the whole
@@ -150,11 +161,16 @@
     // stack now ends at Battery (left) / Solar (right); the taller of those scales it.
     const Tnat = Math.max(nR2 + batth / 2, nSol + solh / 2) + 12;
     const sc = H / Tnat;
+    // Preserve the hub-to-Battery gap, but do not stretch a content-fit Battery card merely
+    // because a tall phone gives the overall diagram more room. The row-budget calculation
+    // below remains responsible for shrinking safely in shorter embedded viewports.
+    const battTop = (nHub + mph / 2 + 26) * sc;
+    const battCardH = Math.min(batth * sc, 190);
     const N = {
       grid:  { x: xL, y: ny1 * sc, w: colW, h: ch * sc },
       house: { x: xR, y: ny1 * sc, w: colW, h: ch * sc },
       inv:   { x: 0.5 * W, y: nHub * sc, w: 0.36 * W, h: mph * sc },
-      batt:  { x: xL, y: nR2 * sc, w: colW, h: batth * sc },
+      batt:  { x: xL, y: battTop + battCardH / 2, w: colW, h: battCardH },
       solar: { x: xR + 0.015 * W, y: nSol * sc, w: 0.40 * W, h: solh * sc },   // dropped down + right
     };
     if (hasEV)  N.ev  = { x: xR, y: nEv * sc, w: colW, h: evh * sc };          // stacked above Solar
@@ -285,6 +301,43 @@
   }
   const gasSvg = (N) => `<path id="pf-base-gas" d="${edgePath(GAS_EDGE, N)}" fill="none" stroke="${PALETTE.gas}" stroke-width="5.5" stroke-linecap="round" opacity="0.12"/>`;
 
+  function wrapNavigableCard(key, markup) {
+    const nav = CARD_NAVIGATION[key];
+    if (!nav) return markup;
+    return `<g class="pf-navigable-card" data-pf-navigation="${nav.target}" role="button" tabindex="0" focusable="true" aria-label="${nav.label}">${markup}</g>`;
+  }
+
+  function bindPowerFlowNavigation(box) {
+    if (box.dataset.pfNavigationBound === "true") return;
+    box.dataset.pfNavigationBound = "true";
+
+    const navigationTarget = (event) => {
+      const card = event.target && event.target.closest
+        ? event.target.closest("[data-pf-navigation]")
+        : null;
+      const target = card && card.dataset ? card.dataset.pfNavigation : null;
+      return CARD_NAVIGATION_TARGETS.has(target) ? target : null;
+    };
+    const emitNavigation = (target) => {
+      box.dispatchEvent(new CustomEvent("powerflow:navigate", {
+        bubbles: true,
+        detail: { target },
+      }));
+    };
+
+    box.addEventListener("click", (event) => {
+      const target = navigationTarget(event);
+      if (target) emitNavigation(target);
+    });
+    box.addEventListener("keydown", (event) => {
+      if (event.repeat || (event.key !== "Enter" && event.key !== " ")) return;
+      const target = navigationTarget(event);
+      if (!target) return;
+      event.preventDefault();
+      emitNavigation(target);
+    });
+  }
+
   function buildCard(key, N, mobile) {
     const r = N[key]; if (!r) return "";
     const F = boxFonts(r, mobile ? 0.8 : 1), x0 = r.x - r.w / 2, y0 = r.y - r.h / 2;
@@ -357,11 +410,34 @@
     const r = N[key]; if (!r) return "";
     const x0 = r.x - r.w / 2, y0 = r.y - r.h / 2;
     const pad = clamp(r.w * 0.07, 6, 12), L = x0 + pad, R = x0 + r.w - pad;
+    const rows = MOBILE_ROWS[key];
     // Fonts scale with the card's (content-fit) height so the rows fill it tightly.
     const nameF = clamp(Math.min(r.h * 0.115, r.w * 0.12), 9, 13.5);
     const bigF = clamp(Math.min(r.h * 0.24, r.w * 0.18), 14, 27);
     const unitF = Math.max(9, bigF * 0.52);
-    const rowF = clamp(Math.min(r.h * 0.105, r.w * 0.105), 9, 12.5);
+    let rowF = clamp(Math.min(r.h * 0.105, r.w * 0.105), 9, 12.5);
+    const bottomInset = 3 + Math.max(3, pad * 0.4);
+    if (key === "batt" && rows && rows.length) {
+      // Battery has an extra power/state hero above six BMS rows. The diagram itself
+      // scales with viewport height, while width-based font clamps can otherwise stop
+      // shrinking and push Capacity/Modules below the card. Budget the row font from the
+      // actual remaining height, including text descent and a visible bottom inset.
+      const bBig = bigF * 0.86;
+      const fixedHeight = pad + nameF + bBig + 15 + 3 * (rows.length - 1);
+      const batteryRowBudget = (
+        r.h - fixedHeight - bottomInset
+      ) / (rows.length + 2.25);
+      rowF = Math.max(9, Math.min(rowF, batteryRowBudget));
+    } else if (rows && rows.length) {
+      // All other detailed cards have one headline above their rows. Keep the final
+      // Grid/Loads/EV/Solar row inside the border when an embedded viewport is shorter
+      // than the normal mobile height, without taking the text below a readable 9 px.
+      const fixedHeight = pad + nameF + bigF + 11 + 3 * (rows.length - 1);
+      const detailRowBudget = (
+        r.h - fixedHeight - bottomInset
+      ) / (rows.length + 0.25);
+      rowF = Math.max(9, Math.min(rowF, detailRowBudget));
+    }
     const iscale = clamp(nameF / 15, 0.42, 0.6);
     let s = `<rect id="pf-card-${key}" x="${f(x0)}" y="${f(y0)}" width="${f(r.w)}" height="${f(r.h)}" rx="12" fill="var(--panel-2)" stroke="var(--line)" stroke-width="2"/>`;
 
@@ -401,7 +477,6 @@
     }
 
     // Compact labelled detail rows.
-    const rows = MOBILE_ROWS[key];
     if (rows && rows.length) {
       const divY = heroBottom + 5;
       s += `<line x1="${f(L)}" y1="${f(divY)}" x2="${f(R)}" y2="${f(divY)}" stroke="var(--line)"/>`;
@@ -558,14 +633,18 @@
       const _charging = live.veh_is_charging === true || String(live.veh_is_charging) === "True";
       V["pf-ev-soc"] = _pct(live.veh_soc);
       V["pf-ev-limit"] = _pct(live.veh_soc_limit);
-      // This card alone mirrors the Tesla in-car/app total-current convention by
-      // summing the ABB meter's physical phase readings. veh_amps remains the
-      // canonical car-reported metric used by the Vehicle tab.
-      const evMeterPhaseAmps = [live.ev_l1_a, live.ev_l2_a, live.ev_l3_a].map(num);
-      const haveAllEvPhases = evMeterPhaseAmps.every((amps) => Number.isFinite(amps));
-      const evTotalAmps = ev <= EV_IDLE_POWER_W ? 0 : (haveAllEvPhases
-        ? evMeterPhaseAmps.reduce((total, amps) => total + amps, 0) : null);
-      V["pf-ev-amps"] = Number.isFinite(evTotalAmps) ? _amps(evTotalAmps) : "—";
+      // Use the same per-phase convention as the Vehicle tab and Tesla current
+      // commands. The canonical topic is the ABB phase average; retaining an
+      // average-of-available-phases fallback keeps the card useful during startup.
+      const vehicleAmps = num(live.veh_amps);
+      const evMeterPhaseAmps = [live.ev_l1_a, live.ev_l2_a, live.ev_l3_a]
+        .map(num).filter((amps) => Number.isFinite(amps));
+      const fallbackPhaseAmps = evMeterPhaseAmps.length
+        ? evMeterPhaseAmps.reduce((total, amps) => total + amps, 0) / evMeterPhaseAmps.length
+        : null;
+      const evCurrent = ev <= EV_IDLE_POWER_W ? 0
+        : (Number.isFinite(vehicleAmps) ? vehicleAmps : fallbackPhaseAmps);
+      V["pf-ev-amps"] = Number.isFinite(evCurrent) ? _amps(evCurrent) : "—";
       V["pf-ev-eta"] = (_charging && live.veh_eta && live.veh_eta !== "N/A") ? String(live.veh_eta) : "—";
     }
     if (gasM3 != null) big("gas", gasM3.toFixed(2) + " m³");
@@ -588,6 +667,7 @@
     if (!box) return;
     _boxId = containerId; _lastLive = live; _lastPlan = plan;
     ensureObserver(box);
+    bindPowerFlowNavigation(box);
 
     if (!live || !live.connected) {
       box.innerHTML = '<span class="muted">live feed offline — connect to see real-time power flow.</span>';
@@ -623,10 +703,13 @@
     if (fr.hasGas) cardKeys.push("gas");
 
     box.innerHTML = `
-      <svg viewBox="0 0 ${f(W)} ${f(H)}" width="100%" height="100%" preserveAspectRatio="xMidYMid meet" style="display:block" role="img" aria-label="live power flow">
+      <svg viewBox="0 0 ${f(W)} ${f(H)}" width="100%" height="100%" preserveAspectRatio="xMidYMid meet" style="display:block" role="group" aria-label="Live power flow">
         ${edges.map((e) => edgeSvg(e, N, _edgeDur[e.key], fr.flows[e.key].fwd, mobile)).join("")}
         ${!mobile && fr.hasGas ? gasSvg(N) : ""}
-        ${cardKeys.map((k) => mobile ? buildCardMobile(k, N) : buildCard(k, N, false)).join("")}
+        ${cardKeys.map((k) => wrapNavigableCard(
+          k,
+          mobile ? buildCardMobile(k, N) : buildCard(k, N, false),
+        )).join("")}
       </svg>`;
 
     applyEdges(box, fr.flows);

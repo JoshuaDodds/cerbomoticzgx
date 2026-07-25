@@ -11,6 +11,7 @@ when TESLA_TELEMETRY_ENABLED is on, so this module is inert by default.
 """
 import json
 import threading
+import time
 
 from lib.constants import logging
 
@@ -18,6 +19,12 @@ _STREAM_FLUSH_EVERY = 20              # batch stream-signal counter writes to th
 # fleet-telemetry emits non-"V" record types too (connectivity/alerts/errors); those are not
 # billed as vehicle-data SIGNALS, so exclude them from the streaming-signal estimate.
 _NON_SIGNAL_FIELDS = {"connectivity", "alerts", "errors", "status", "V", "v"}
+_ACK_TIMESTAMP_KEYS = {
+    "ChargeLimitSoc": "tesla_soc_setpoint_updated_at",
+    "ChargeCurrentRequest": "tesla_charge_current_request_updated_at",
+    "ChargeCurrentRequestMax": "tesla_charge_current_max_updated_at",
+    "DetailedChargeState": "tesla_charge_state_updated_at",
+}
 
 
 # --- pure translation (no I/O) --------------------------------------------
@@ -41,9 +48,17 @@ def _fmt_eta_hours(value) -> str:
 def _detailed_charge_state(value) -> dict:
     # Values arrive as e.g. "DetailedChargeStateCharging" or "Charging"/"Disconnected".
     norm = str(value).lower().replace("detailedchargestate", "").strip()
-    plugged = norm not in ("disconnected", "", "none", "unknown")
+    # Unknown is not an unplugged edge. Tesla emits unavailable/null values while
+    # the car goes to sleep; replacing the last valid state with Unplugged here
+    # makes a physically connected car disappear from scheduling and the UI.
+    known_states = {
+        "disconnected", "nopower", "starting", "charging", "complete", "stopped",
+    }
+    if norm not in known_states:
+        return {}
+    plugged = norm != "disconnected"
     charging = norm == "charging"
-    return {
+    result = {
         "state": {"tesla_is_plugged": str(plugged), "tesla_is_charging": str(charging)},
         "topics": {
             "Tesla/vehicle0/plugged_status": "Plugged" if plugged else "Unplugged",
@@ -51,6 +66,13 @@ def _detailed_charge_state(value) -> dict:
             "Tesla/vehicle0/charging_status": "Charging" if charging else "Idle",
         },
     }
+    if not charging:
+        # TimeToFullCharge is change-driven and is not guaranteed to emit when a
+        # charge stops. The charge-state edge is authoritative: an ETA is not
+        # meaningful while stopped, complete, disconnected, or without power.
+        result["state"]["tesla_time_to_full"] = "N/A"
+        result["topics"]["Tesla/vehicle0/time_until_full"] = "N/A"
+    return result
 
 
 def _charge_port_latch(value) -> dict:
@@ -104,6 +126,12 @@ def translate(field, value, home=None) -> dict:
     """Map one telemetry field to {'state': {...}, 'topics': {...}} updates, or {} if unmapped.
 
     ``home`` is (lat, long) used only for the Location geofence; other fields ignore it."""
+    # Fleet Telemetry can emit JSON null as charge-only signals become
+    # unavailable during sleep. Null means "no current reading", not zero,
+    # false, unplugged, idle, N/A, or the string "None". Preserve the last
+    # valid normalized state until an explicit replacement arrives.
+    if value is None:
+        return {}
     f = str(field)
     if f == "DetailedChargeState":
         return _detailed_charge_state(value)
@@ -233,21 +261,121 @@ class TeslaTelemetryBridge:
                 self._home = (None, None)
         return self._home
 
-    def apply(self, field, value):
-        """Translate one field and push the result to GlobalState + retained MQTT topics."""
+    def apply(self, field, value, *, retained=False):
+        """Translate one field and push the result to GlobalState + retained MQTT topics.
+
+        A retained raw MQTT value is useful to rebuild last-known state after an app restart,
+        but it is not a fresh observation from the car. Do not advance freshness/command-
+        acknowledgement timestamps for those broker replays.
+        """
         updates = translate(field, value, home=self._home_coords())
         if not updates:
             return
         from lib.global_state import GlobalStateClient
         from lib.helpers import publish_message
         state = GlobalStateClient()
+        previous = {}
+        # Preserve prior live state for plug/start edges and the physical home->away
+        # disconnect invariant. A retained broker replay is only last-known state and
+        # must never invent any of those transitions.
+        if not retained and field in {
+            "DetailedChargeState", "ChargePortLatch", "Location",
+        }:
+            has = getattr(state, "has", None)
+            get = getattr(state, "get", None)
+            if callable(has) and callable(get):
+                for key in (
+                    "tesla_is_home", "tesla_is_plugged", "tesla_is_charging",
+                ):
+                    if has(key):
+                        previous[key] = get(key)
+        new_state = updates.get("state", {})
+        if (
+            not retained
+            and field == "Location"
+            and "tesla_is_home" in new_state
+            and "tesla_is_home" in previous
+            and _bool_stream(previous["tesla_is_home"])
+            and not _bool_stream(new_state["tesla_is_home"])
+        ):
+            # A live home->away transition physically requires disconnecting the home cable.
+            # Fleet charge-only signals can be absent while driving, so derive this one
+            # impossible-state correction from Location. Do not repeat it while already away:
+            # a later explicit public-charging state must remain valid.
+            new_state.update({
+                "tesla_is_plugged": "False",
+                "tesla_is_charging": "False",
+                "tesla_time_to_full": "N/A",
+            })
+            updates.setdefault("topics", {}).update({
+                "Tesla/vehicle0/plugged_status": "Unplugged",
+                "Tesla/vehicle0/is_charging": "False",
+                "Tesla/vehicle0/charging_status": "Idle",
+                "Tesla/vehicle0/time_until_full": "N/A",
+            })
         for k, v in updates.get("state", {}).items():
             state.set(k, v)
+        if not retained:
+            observed_at = time.time()
+            state.set("tesla_telemetry_last_update_ts", observed_at)
+            state.set("tesla_vehicle_last_update_ts", observed_at)
+            if (
+                "tesla_is_plugged" in new_state
+                and "tesla_is_plugged" in previous
+                and not _bool_stream(previous["tesla_is_plugged"])
+                and _bool_stream(new_state["tesla_is_plugged"])
+            ):
+                state.set("tesla_plugged_transition_ts", observed_at)
+            if (
+                "tesla_is_charging" in new_state
+                and "tesla_is_charging" in previous
+                and not _bool_stream(previous["tesla_is_charging"])
+                and _bool_stream(new_state["tesla_is_charging"])
+            ):
+                state.set("tesla_charge_started_ts", observed_at)
+            acknowledgement_key = _ACK_TIMESTAMP_KEYS.get(field)
+            if acknowledgement_key:
+                state.set(acknowledgement_key, observed_at)
         for topic, v in updates.get("topics", {}).items():
             publish_message(topic, payload=f'{{"value": "{v}"}}', qos=0, retain=True)
-        import time
-        publish_message("Tesla/vehicle0/last_update_at",
-                        payload=f'{{"value": "{time.strftime("%Y-%m-%d %H:%M:%S")}"}}', qos=0, retain=True)
+        if not retained:
+            publish_message(
+                "Tesla/vehicle0/last_update_at",
+                payload=f'{{"value": "{time.strftime("%Y-%m-%d %H:%M:%S")}"}}',
+                qos=0,
+                retain=True,
+            )
+
+    @staticmethod
+    def _connectivity_status(value):
+        if not isinstance(value, dict):
+            return str(value or "").strip().upper()
+        for key, item in value.items():
+            if str(key).lower() == "status":
+                return str(item or "").strip().upper()
+        return ""
+
+    def _apply_connectivity(self, value):
+        """Persist Fleet Telemetry's connection lifecycle separately from vehicle signals.
+
+        Connectivity records are operational metadata, not billable streaming signals. They
+        must not advance the last *vehicle-data* timestamp, but a retained DISCONNECTED record
+        is authoritative evidence that the cached Soc/charge state may be stale.
+        """
+        status = self._connectivity_status(value)
+        if not status:
+            return
+        from lib.global_state import GlobalStateClient
+        from lib.helpers import publish_message
+        state = GlobalStateClient()
+        state.set("tesla_telemetry_connection_status", status)
+        state.set("tesla_telemetry_connection_updated_at", time.time())
+        publish_message(
+            "Tesla/vehicle0/telemetry_status",
+            payload=f'{{"value": "{status}"}}',
+            qos=0,
+            retain=True,
+        )
 
     def _on_message(self, _c, _u, msg):
         parsed = parse_message(msg.topic, msg.payload, self._topic_base)
@@ -256,10 +384,17 @@ class TeslaTelemetryBridge:
         vin, field, value = parsed
         if self._vin and vin != self._vin:
             return
+        if field == "connectivity":
+            try:
+                self._apply_connectivity(value)
+            except Exception as e:             # pragma: no cover - subscriber must stay alive
+                logging.debug(
+                    "tesla_telemetry_bridge: connectivity apply failed: %s", e)
+            return
         if field not in _NON_SIGNAL_FIELDS:      # count only actual vehicle-data signals
             self._count_stream_signal()
         try:
-            self.apply(field, value)
+            self.apply(field, value, retained=bool(getattr(msg, "retain", False)))
         except Exception as e:                 # pragma: no cover - never let a bad msg kill the loop
             logging.debug("tesla_telemetry_bridge: apply failed for %s=%s: %s", field, value, e)
 

@@ -282,6 +282,8 @@ def test_cycle_history_records_projected_final_net_for_current_day(monkeypatch, 
     # Actual net so far is -€1.00; remaining SELL forecast adds +€0.60.
     assert rec["forecast_day_net_eur"] == -0.4
     assert rec["plan_today_remaining_net_eur"] == 0.6
+    assert rec["forecast_remaining_import_cost_eur"] == 0.0
+    assert rec["forecast_remaining_export_reward_eur"] == 0.6
     assert rec["plan_horizon_net_eur"] == -4.4
 
 

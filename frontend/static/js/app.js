@@ -48,6 +48,11 @@ const fmtGrid = (v) => {
 };
 const prodCell = (v) => (v == null || Math.abs(Number(v)) < 0.005) ? '<span class="muted">—</span>' : Number(v).toFixed(2);
 const consCell = (v) => (v == null || Math.abs(Number(v)) < 0.005) ? '<span class="muted">—</span>' : Number(v).toFixed(2);
+function escapeHtml(value) {
+  return String(value == null ? "" : value).replace(/[&<>'"]/g, (ch) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;",
+  })[ch]);
+}
 const socPair = (a, b) => (a == null || b == null)
   ? '<span class="muted">—</span>'
   : `${Math.round(a)}→${Math.round(b)}%`;
@@ -61,6 +66,7 @@ const fmtPower = (w) => {
 
 let lastPlan = null;
 let lastLive = null;
+let lastEvSmartCharge = null;
 let expandedHours = new Set();   // hour keys the user has expanded (survive refreshes)
 let lastHoursGen = null;          // generated_at of the last tree we built
 let lastCurrentHourKey = null;
@@ -157,16 +163,49 @@ function setAppView(viewName) {
   syncMobileNavState();
 }
 
-function appViewFromHash() {
-  const v = (window.location.hash || "").replace("#", "");
-  return APP_VIEWS.includes(v) ? v : defaultAppViewName();
+function appRouteFromHash() {
+  const raw = (window.location.hash || "").replace(/^#/, "");
+  const [viewName, tabName] = raw.split("/", 2);
+  const view = APP_VIEWS.includes(viewName) ? viewName : defaultAppViewName();
+  const tab = view === "ess" && tabName && document.getElementById("tab-" + tabName)
+    ? tabName
+    : null;
+  return { view, tab };
+}
+
+function applyAppRouteFromHash() {
+  const route = appRouteFromHash();
+  setAppView(route.view);
+  if (route.tab) activateTab(route.tab);
+}
+
+function navigatePowerFlowTarget(target) {
+  const destinations = {
+    battery: { hash: "#battery", view: "battery" },
+    victron: { hash: "#live", view: "live" },
+    vehicle: { hash: "#ess/vehicle", view: "ess", tab: "vehicle" },
+  };
+  const destination = destinations[target];
+  if (!destination) return false;
+  if (window.location.hash !== destination.hash) {
+    history.pushState(null, "", destination.hash);
+  }
+  setAppView(destination.view);
+  if (destination.tab) activateTab(destination.tab);
+  closeMobileMenu();
+  window.scrollTo({ top: 0, behavior: "smooth" });
+  return true;
 }
 
 document.querySelectorAll(".app-nav-link").forEach((link) => {
   link.addEventListener("click", () => setAppView(link.dataset.appView));
 });
-window.addEventListener("hashchange", () => setAppView(appViewFromHash()));
-setAppView(appViewFromHash());
+document.addEventListener("powerflow:navigate", (event) => {
+  navigatePowerFlowTarget(event && event.detail ? event.detail.target : null);
+});
+window.addEventListener("hashchange", applyAppRouteFromHash);
+window.addEventListener("popstate", applyAppRouteFromHash);
+applyAppRouteFromHash();
 
 // ---- Mobile chrome (guarded; hidden/no-op on desktop) ----
 function currentAppViewName() {
@@ -819,8 +858,15 @@ function jumpToMobileViewTop(behavior = "smooth") {
 
 function hourRowInner(h) {
   const nowTag = h.is_current ? '<span class="now-tag">NOW</span>' : "";
+  const evEnergy = Number(h.planned_ev_kwh || 0);
+  const evKw = Number(h.ev_target_kw || 0);
+  const evSupply = ["solar", "mixed", "grid"].includes(String(h.ev_supply || "").toLowerCase())
+    ? String(h.ev_supply).toLowerCase() : "grid";
+  const evTag = evEnergy > 0.001
+    ? `<span class="ev-hour-tag ev-supply-${evSupply}${h.ev_tentative ? " ev-tentative" : ""}" title="${evEnergy.toFixed(2)} kWh planned EV energy">EV ${evKw > 0 ? `${evKw.toFixed(1)} kW` : `${evEnergy.toFixed(2)} kWh`}</span>`
+    : "";
   return (
-    `<span class="col-time"><span class="caret">▸</span>${h.label}${nowTag}</span>` +
+    `<span class="col-time"><span class="caret">▸</span>${h.label}${nowTag}${evTag}</span>` +
     `<span class="col-bar"></span>` +
     `<span class="col-num">€${h.avg_price.toFixed(3)}</span>` +
     `<span class="col-num">${fmtGrid(h.grid_kwh)}</span>` +
@@ -880,9 +926,16 @@ function makeSlotRow(s) {
     : imp * Number(s.price) - projExp * sell;
   const gridStr = fmtGrid(g);
   const gridCell = idleStore ? `<span class='muted'>${gridStr}</span>` : gridStr;
+  const evEnergy = Number(s.planned_ev_kwh || 0);
+  const evKw = Number(s.ev_target_kw || 0);
+  const evSupply = ["solar", "mixed", "grid"].includes(String(s.ev_supply || "").toLowerCase())
+    ? String(s.ev_supply).toLowerCase() : "grid";
+  const evTag = evEnergy > 0.001
+    ? `<span class="ev-slot-tag ev-supply-${evSupply}${s.ev_tentative ? " ev-tentative" : ""}">EV ${evKw > 0 ? `${evKw.toFixed(1)} kW` : `${evEnergy.toFixed(2)} kWh`}</span>`
+    : "";
   sr.innerHTML =
     `<span><span class="slot-dot" style="background:var(--${slotColorVar(s)})"></span>${s.time.slice(11, 16)}</span>` +
-    `<span>${caOf(s)}</span>` +
+    `<span>${caOf(s)}${evTag}</span>` +
     `<span class="col-num">€${Number(s.price || 0).toFixed(3)}</span>` +
     `<span class="col-num">${gridCell}</span>` +
     `<span class="col-num">${prodCell(s.pv)}</span>` +
@@ -1079,6 +1132,19 @@ function startEdit(item, s) {
   if (s.type === "bool") {
     input = el("select");
     ["True", "False"].forEach((o) => input.appendChild(new Option(o, o, false, String(s.value) === o)));
+  } else if (s.ui_options && s.editor !== "text") {
+    input = el("select");
+    const knownValues = new Set();
+    s.ui_options.forEach((option) => {
+      const value = typeof option === "object" ? option.value : option;
+      const label = typeof option === "object" ? option.label : option;
+      knownValues.add(String(value));
+      input.appendChild(new Option(label, value, false, String(s.value || "") === String(value)));
+    });
+    const currentValue = String(s.value || "");
+    if (currentValue && !knownValues.has(currentValue)) {
+      input.appendChild(new Option(`Current selection — ${currentValue}`, currentValue, true, true));
+    }
   } else if (s.options) {
     input = el("select");
     s.options.forEach((o) => input.appendChild(new Option(o, o, false, s.value === o)));
@@ -1106,6 +1172,19 @@ function startEdit(item, s) {
   });
 }
 
+function makeConfigValueEditable(valueControl, label, activate) {
+  if (!valueControl) return;
+  valueControl.setAttribute("role", "button");
+  valueControl.setAttribute("tabindex", "0");
+  valueControl.setAttribute("aria-label", `Edit ${label}`);
+  valueControl.addEventListener("click", activate);
+  valueControl.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    activate();
+  });
+}
+
 function renderConfig(cfg) {
   const box = $("#config");
   box.innerHTML = "";
@@ -1116,11 +1195,15 @@ function renderConfig(cfg) {
     grp.appendChild(el("h3", null, g.group));
     g.settings.forEach((s) => {
       const item = el("div", "cfg-item");
-      const val = s.value === "" ? "—" : s.value;
+      const val = s.effective_label || (s.value === "" ? "—" : s.value);
+      const description = s.editor_help || s.desc || "";
+      const labelHtml = _esc(s.label || s.key || "");
+      const valueHtml = _esc(val);
+      const descriptionHtml = _esc(description);
       if (isMobileLayout()) {
-        item.innerHTML = `<span>${s.label}</span><span class="v" title="click to edit">${val}</span>` +
+        item.innerHTML = `<span>${labelHtml}</span><span class="v" title="click to edit">${valueHtml}</span>` +
           `<button type="button" class="cfg-info-toggle" aria-expanded="false" aria-label="Toggle description">i</button>` +
-          `<span class="d" hidden>${s.desc || ""}</span>`;
+          `<span class="d" hidden>${descriptionHtml}</span>`;
         const info = item.querySelector(".cfg-info-toggle");
         const desc = item.querySelector(".d");
         info.addEventListener("click", () => {
@@ -1130,9 +1213,10 @@ function renderConfig(cfg) {
           info.setAttribute("aria-expanded", String(open));
         });
       } else {
-        item.innerHTML = `<span>${s.label}</span><span class="v" title="click to edit">${val}</span><span class="d">${s.desc || ""}</span>`;
+        item.innerHTML = `<span>${labelHtml}</span><span class="v" title="click to edit">${valueHtml}</span><span class="d">${descriptionHtml}</span>`;
       }
-      item.querySelector(".v").addEventListener("click", () => startEdit(item, s));
+      const valueControl = item.querySelector(".v");
+      makeConfigValueEditable(valueControl, s.label, () => startEdit(item, s));
       grp.appendChild(item);
     });
     box.appendChild(grp);
@@ -1243,9 +1327,16 @@ function renderVehicle() {
   const pct = (v) => has(v) ? Number(v).toFixed(0) + "%" : null;
   const amps = (v) => has(v) ? Number(v).toFixed(0) + " A" : null;
   const yesno = (v) => has(v) ? (bool(v) ? "Yes" : "No") : null;
+  const telemetryDisconnected = String(L.veh_telemetry_status || "").toUpperCase() === "DISCONNECTED";
+  // Fleet fields are emitted on change, not as periodic heartbeats. Silence while
+  // parked/asleep therefore does not make the retained values stale. Raise a
+  // warning only when local/Tesla evidence says charging should be observable.
+  const telemetryActivityExpected = bool(L.veh_is_charging)
+    || String(L.veh_charging_status || "").toLowerCase() === "charging"
+    || (has(L.ev_w) && Math.abs(Number(L.ev_w)) > 100);
 
   const cards = [];
-  const card = (label, val) => { if (has(val)) cards.push(`<div class="metric"><div class="label">${label}</div><div class="value">${val}</div></div>`); };
+  const card = (label, val) => { if (has(val)) cards.push(`<div class="metric"><div class="label">${escapeHtml(label)}</div><div class="value">${escapeHtml(val)}</div></div>`); };
 
   card("Car SoC", pct(L.veh_soc));
   card("Charge limit", pct(L.veh_soc_limit));
@@ -1261,11 +1352,315 @@ function renderVehicle() {
   card("Supercharging", yesno(L.veh_is_supercharging));
   card("Updated", L.veh_last_update);
 
+  const telemetryWarning = telemetryDisconnected && telemetryActivityExpected
+    ? `<div class="banner vehicle-telemetry-warning" role="status">Vehicle telemetry disconnected during apparent charging. Live confirmation may be out of date; Refresh data will use one budget-guarded Fleet API read.</div>`
+    : "";
   box.innerHTML = cards.length
-    ? `<div class="metrics-grid">${cards.join("")}</div>`
-    : `<span class="muted">waiting for vehicle status…</span>`;
+    ? `${telemetryWarning}<div class="metrics-grid">${cards.join("")}</div>`
+    : `${telemetryWarning}<span class="muted">waiting for vehicle status…</span>`;
   const title = document.querySelector("#tab-vehicle h3");
   if (title && has(L.veh_name)) title.textContent = L.veh_name;
+}
+
+function evSmartView(data) {
+  const payload = data || {};
+  const rawPlan = payload.plan || payload.ev_plan || payload.plan_snapshot
+    || (lastPlan && lastPlan.ev_smart_charge) || {};
+  let job = null;
+  if (Object.prototype.hasOwnProperty.call(payload, "job")) job = payload.job;
+  else if (Object.prototype.hasOwnProperty.call(payload, "active_job")) job = payload.active_job;
+  else job = rawPlan.job || null;
+  const planJob = rawPlan.job || {};
+  const sameJob = !!(job && planJob && String(planJob.id || "") === String(job.id || "")
+    && String(planJob.status || "active") === String(job.status || "active"));
+  const plan = sameJob ? rawPlan : {};
+  const jobStatus = String(job && job.status || "").toLowerCase();
+  const status = !job ? "idle" : jobStatus === "paused" ? "paused"
+    : sameJob ? String(plan.status || "active").toLowerCase() : "waiting_for_plan";
+  return { payload, plan, job, status };
+}
+
+function evSmartDeadlineParts(value) {
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return {date: "", time: ""};
+  const pad = (v) => String(v).padStart(2, "0");
+  return {
+    date: `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`,
+    time: `${pad(d.getHours())}:${pad(d.getMinutes())}`,
+  };
+}
+
+function evSmartDefaultDeadline() {
+  const d = new Date();
+  d.setDate(d.getDate() + 1);
+  d.setHours(7, 0, 0, 0);
+  return evSmartDeadlineParts(d);
+}
+
+function evSmartPopulateTimeOptions(select, selected = "") {
+  if (!select) return;
+  const values = [];
+  for (let minutes = 0; minutes < 24 * 60; minutes += 15) {
+    values.push(`${String(Math.floor(minutes / 60)).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`);
+  }
+  if (selected && !values.includes(selected)) values.push(selected);
+  values.sort();
+  select.textContent = "";
+  values.forEach((value) => {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = value;
+    select.appendChild(option);
+  });
+  if (selected) select.value = selected;
+}
+
+function evSmartNumber(source, names) {
+  for (const name of names) {
+    if (!source || source[name] == null || source[name] === "") continue;
+    const value = Number(source && source[name]);
+    if (Number.isFinite(value)) return value;
+  }
+  return null;
+}
+
+function evSmartAddMetric(grid, label, value) {
+  if (value == null || value === "") return;
+  const card = el("div", "metric");
+  const lbl = el("div", "label");
+  const val = el("div", "value");
+  lbl.textContent = label;
+  val.textContent = String(value);
+  card.appendChild(lbl);
+  card.appendChild(val);
+  grid.appendChild(card);
+}
+
+function evSmartDailyPlan(data) {
+  const box = document.getElementById("ev-smart-plan");
+  if (!box) return;
+  box.textContent = "";
+  const { plan, job } = evSmartView(data);
+  let days = Array.isArray(plan.daily_plan) ? plan.daily_plan : [];
+  if (!days.length) {
+    const grouped = new Map();
+    (plan.blocks || plan.charge_blocks || []).forEach((block) => {
+      const start = new Date(block.start || block.start_at);
+      if (Number.isNaN(start.getTime())) return;
+      const key = `${start.getFullYear()}-${start.getMonth()}-${start.getDate()}`;
+      if (!grouped.has(key)) grouped.set(key, {
+        date: key, start: block.start, end: block.end, blocks: [], energy_kwh: 0,
+        soc_start: block.soc_start, soc_end: block.soc_end, tentative: false,
+        estimated_cost_eur: 0, provisional_cost_eur: 0,
+        supply: block.supply || (block.tentative ? "pending" : "grid"),
+      });
+      const day = grouped.get(key);
+      day.blocks.push(block);
+      day.end = block.end;
+      day.energy_kwh += Number(block.energy_kwh || block.planned_ev_kwh || 0);
+      day.soc_end = block.soc_end;
+      day.tentative = day.tentative || block.tentative === true;
+      if (block.estimated_cost_eur == null) day.estimated_cost_eur = null;
+      else if (day.estimated_cost_eur != null) day.estimated_cost_eur += Number(block.estimated_cost_eur);
+      day.provisional_cost_eur += Number(block.provisional_cost_eur || 0);
+      if (day.supply !== block.supply) day.supply = "mixed";
+    });
+    days = Array.from(grouped.values());
+  }
+  if (!job || !days.length) return;
+
+  const dateOf = (value) => {
+    const parsed = new Date(value);
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+  };
+  const dayLabel = (value) => {
+    const date = dateOf(value);
+    if (!date) return "Planned day";
+    const today = new Date();
+    const tomorrow = new Date(today); tomorrow.setDate(today.getDate() + 1);
+    const key = date.toLocaleDateString();
+    const prefix = key === today.toLocaleDateString() ? "Today"
+      : key === tomorrow.toLocaleDateString() ? "Tomorrow"
+        : date.toLocaleDateString([], {weekday: "long"});
+    return `${prefix}, ${date.toLocaleDateString([], {day: "numeric", month: "short"})}`;
+  };
+  const timeLabel = (value) => {
+    const date = dateOf(value);
+    return date ? date.toLocaleTimeString([], {
+      hour: "2-digit", minute: "2-digit", hour12: false,
+    }) : "—";
+  };
+  const totalEnergy = evSmartNumber(plan, ["planned_ac_kwh", "required_ac_kwh"]);
+  const solarEnergy = evSmartNumber(plan, ["forecast_pv_kwh"]);
+  const gridEnergy = evSmartNumber(plan, ["forecast_grid_kwh"]);
+  const pendingEnergy = evSmartNumber(plan, ["source_pending_kwh"]);
+  const strategy = plan.planning_strategy === "daily_paced";
+  const intro = el("div", "ev-charge-plan-intro");
+  const introTitle = el("strong");
+  introTitle.textContent = strategy ? "Solar-first daily charging" : "Cheapest charging before departure";
+  const introText = el("span", "muted");
+  const sourceSummary = [
+    solarEnergy > 0 ? `${solarEnergy.toFixed(1)} kWh forecast solar` : null,
+    gridEnergy > 0 ? `${gridEnergy.toFixed(1)} kWh forecast grid` : null,
+    pendingEnergy > 0 ? `${pendingEnergy.toFixed(1)} kWh source pending` : null,
+  ].filter(Boolean).join(", ");
+  const policy = "Solar surplus is used when it costs less than the energy it replaces; low-cost grid covers the remaining deadline need.";
+  introText.textContent = strategy
+    ? `${totalEnergy == null ? "Energy is" : `${totalEnergy.toFixed(1)} kWh`} planned over ${days.length} days. ${policy}${sourceSummary ? ` Current forecast: ${sourceSummary}.` : ""} Future days update as prices and solar forecasts arrive. These blocks run under live control; the Tesla app shows only the deadline safety fallback.`
+    : `${totalEnergy == null ? "Charging is" : `${totalEnergy.toFixed(1)} kWh`} scheduled in the best available windows before ${new Date(job.ready_by).toLocaleString([], {weekday: "short", hour: "2-digit", minute: "2-digit", hour12: false})}. ${policy}${sourceSummary ? ` Current forecast: ${sourceSummary}.` : ""}`;
+  intro.appendChild(introTitle);
+  intro.appendChild(introText);
+  box.appendChild(intro);
+
+  const list = el("div", "ev-charge-day-list");
+  days.forEach((day) => {
+    const row = el("article", "ev-charge-day");
+    const heading = el("div", "ev-charge-day-heading");
+    const label = el("strong"); label.textContent = dayLabel(day.start || day.date);
+    const state = el("span", `ev-charge-day-state ${day.tentative ? "pending" : "confirmed"}`);
+    state.textContent = day.tentative ? "Price estimate" : "Price confirmed";
+    heading.appendChild(label); heading.appendChild(state); row.appendChild(heading);
+
+    const windows = el("div", "ev-charge-windows");
+    (day.windows || day.blocks || []).forEach((block) => {
+      const window = el("div", "ev-charge-window");
+      const when = el("strong", "ev-charge-window-time");
+      when.textContent = day.tentative
+        ? "Best time to be chosen"
+        : `${timeLabel(block.start)}–${timeLabel(block.end)}`;
+      const detail = el("span");
+      const energy = evSmartNumber(block, ["energy_kwh", "planned_ev_kwh"]);
+      const startSoc = evSmartNumber(block, ["soc_start"]);
+      const endSoc = evSmartNumber(block, ["soc_end"]);
+      detail.textContent = [
+        energy == null ? null : `+${energy.toFixed(1)} kWh`,
+        startSoc == null || endSoc == null ? null : `${startSoc.toFixed(0)}% → ${endSoc.toFixed(0)}%`,
+      ].filter(Boolean).join(" · ");
+      window.appendChild(when); window.appendChild(detail); windows.appendChild(window);
+    });
+    row.appendChild(windows);
+
+    const meta = el("div", "ev-charge-day-meta");
+    const knownCost = day.estimated_cost_eur == null ? null : Number(day.estimated_cost_eur);
+    const provisionalCost = day.provisional_cost_eur == null ? null : Number(day.provisional_cost_eur);
+    const cost = Number.isFinite(knownCost) ? knownCost : Number.isFinite(provisionalCost) ? provisionalCost : null;
+    const rawPrice = day.average_price_eur_per_kwh;
+    const price = rawPrice == null ? null : Number(rawPrice);
+    const source = String(day.supply || (day.tentative ? "pending" : "grid")).toLowerCase();
+    const sourceLabel = source === "pending" ? "Source to be chosen" : source === "solar" ? "Solar surplus" : source === "mixed" ? "Solar + grid" : "Grid";
+    meta.textContent = [
+      `${Number(day.energy_kwh || 0).toFixed(1)} kWh total`,
+      cost == null ? null : `${day.tentative ? "about " : ""}€${cost.toFixed(2)}`,
+      price == null ? (day.tentative ? "future price pending" : null) : `${(price * 100).toFixed(1)} c/kWh`,
+      sourceLabel,
+    ].filter(Boolean).join(" · ");
+    row.appendChild(meta);
+    list.appendChild(row);
+  });
+  box.appendChild(list);
+}
+
+function renderEvSmartCharge(data) {
+  lastEvSmartCharge = data || {};
+  const { payload, plan, job, status } = evSmartView(lastEvSmartCharge);
+  const statusBox = document.getElementById("ev-smart-status");
+  const message = document.getElementById("ev-smart-message");
+  const summary = document.getElementById("ev-smart-summary");
+  const actions = document.getElementById("ev-smart-actions");
+  const form = document.getElementById("ev-smart-charge-form");
+  if (!statusBox || !message || !summary || !actions || !form) return;
+
+  const validStatuses = ["idle", "waiting_for_plan", "waiting_for_plug", "planned", "charging", "paused", "at_risk", "infeasible", "completed"];
+  const safeStatus = validStatuses.includes(status) ? status : "idle";
+  statusBox.className = `ev-smart-status status-${safeStatus}`;
+  const controlMode = payload.apply === true ? "active" : "preview";
+  statusBox.textContent = `${controlMode} · ${safeStatus.replaceAll("_", " ")}`;
+  message.className = "ev-smart-message muted";
+  message.textContent = payload.message || plan.message || (safeStatus === "waiting_for_plan"
+    ? "Job saved; waiting for the optimizer to publish its charge plan."
+    : job ? "" : "No smart-charge job is active.");
+
+  const moduleAvailable = payload.available !== false;
+  const enabled = moduleAvailable && payload.enabled !== false;
+  Array.from(form.querySelectorAll ? form.querySelectorAll("input, select, button") : []).forEach((control) => {
+    control.disabled = !enabled;
+  });
+  if (!moduleAvailable) message.textContent = payload.message || "Smart charging is unavailable in this service version.";
+  else if (!enabled) message.textContent = "Smart charging is disabled in Configuration.";
+  else if (payload.apply !== true && job && !message.textContent) {
+    message.textContent = "Preview only — these planned times will not control the car. Existing excess-solar charging remains active.";
+  }
+  else if (safeStatus === "infeasible") message.textContent = "The target cannot be reached in the available slots. Choose a later deadline or lower target.";
+  else if (safeStatus === "completed") message.textContent = "The requested charge target has been reached.";
+  else if (safeStatus === "waiting_for_plug") message.textContent = "Connect the car by the plug-in time shown below to protect the deadline.";
+
+  const targetInput = document.getElementById("ev-smart-target-soc");
+  const readyDate = document.getElementById("ev-smart-ready-date");
+  const readyTime = document.getElementById("ev-smart-ready-time");
+  if (job) {
+    if (targetInput && job.target_soc != null) targetInput.value = String(job.target_soc);
+    if (job.ready_by) {
+      const parts = evSmartDeadlineParts(job.ready_by);
+      if (readyDate) readyDate.value = parts.date;
+      evSmartPopulateTimeOptions(readyTime, parts.time);
+    }
+  } else if (readyDate && readyTime && (!readyDate.value || !readyTime.value)) {
+    const parts = evSmartDefaultDeadline();
+    readyDate.value = parts.date;
+    evSmartPopulateTimeOptions(readyTime, parts.time);
+  }
+  const saveButton = document.getElementById("ev-smart-save");
+  if (saveButton && !saveButton.disabled) saveButton.textContent = job ? "Update plan" : "Plan charge";
+
+  summary.textContent = "";
+  if (job) {
+    const grid = el("div", "metrics-grid ev-smart-summary");
+    const targetSoc = evSmartNumber(job, ["target_soc"]);
+    const currentSoc = evSmartNumber(plan, ["current_soc"]);
+    const energy = evSmartNumber(plan, ["required_ac_kwh", "required_energy_kwh"]);
+    const cost = evSmartNumber(plan, ["estimated_incremental_cost_eur", "estimated_incremental_cost", "estimated_cost_eur"]);
+    const provisionalCost = evSmartNumber(plan, ["provisional_incremental_cost_eur"]);
+    const saving = evSmartNumber(plan, ["estimated_saving_eur", "estimated_saving", "estimated_savings_eur"]);
+    const provisionalSaving = evSmartNumber(plan, ["provisional_saving_eur"]);
+    evSmartAddMetric(grid, "Battery goal", targetSoc == null ? null : `${currentSoc == null ? "" : `${currentSoc.toFixed(0)}% → `}${targetSoc.toFixed(0)}%`);
+    evSmartAddMetric(grid, "Energy needed", energy == null ? null : `${energy.toFixed(1)} kWh`);
+    evSmartAddMetric(grid, "Expected cost", cost != null ? `€${cost.toFixed(2)}`
+      : provisionalCost == null ? null : `about €${provisionalCost.toFixed(2)}`);
+    evSmartAddMetric(grid, "Saving vs now", saving != null ? `€${saving.toFixed(2)}`
+      : provisionalSaving == null ? null : `about €${provisionalSaving.toFixed(2)}`);
+    summary.appendChild(grid);
+  }
+
+  actions.hidden = !job;
+  const advertisedActions = payload.actions || plan.actions || [];
+  actions.querySelectorAll("[data-ev-smart-action]").forEach((btn) => {
+    const action = btn.dataset.evSmartAction;
+    const chargeNowAllowed = advertisedActions.includes("charge_now") || plan.charge_now_available === true;
+    btn.hidden = (action === "pause" && ["paused", "completed"].includes(safeStatus))
+      || (action === "resume" && safeStatus !== "paused")
+      || (action === "charge_now" && (safeStatus === "completed" || !chargeNowAllowed));
+    if (action === "charge_now") {
+      btn.disabled = !chargeNowAllowed;
+    }
+  });
+  evSmartDailyPlan(lastEvSmartCharge);
+}
+
+async function refreshEvSmartCharge() {
+  try {
+    const response = await fetch("/api/ev/smart-charge");
+    renderEvSmartCharge(await response.json());
+  } catch (error) {
+    renderEvSmartCharge({available: false, message: "Smart-charge status is unavailable while the server is offline."});
+  }
+}
+
+async function requestEvSmartReplan() {
+  try {
+    const response = await fetch("/api/replan", {method: "POST"});
+    const result = await response.json();
+    return response.ok && result.ok;
+  } catch (_) { return false; }
 }
 
 function applyLive(data) {
@@ -1552,6 +1947,60 @@ function advisorMetaText(record) {
   ].filter(Boolean).join(" · ");
 }
 
+function advisorRunDetailText(detail) {
+  if (!detail || typeof detail !== "object") return "";
+  const type = String(detail.type || "stage").toLowerCase();
+  // Never render model-internal reasoning content. A thinking event is represented
+  // only as operational status/count information.
+  if (type === "thinking") {
+    const count = Number.isFinite(Number(detail.count)) ? ` (${Number(detail.count)} updates)` : "";
+    return `Model processing${detail.done ? " complete" : ""}${count}`;
+  }
+  const allowed = new Set(["stage", "log", "retrieval", "source", "warning", "error", "completion"]);
+  if (!allowed.has(type)) return "";
+  const text = detail.msg || detail.message || detail.summary || "";
+  return String(text).trim().slice(0, 2000);
+}
+
+function renderAdvisorRunDetails(msg, opts) {
+  const details = Array.isArray(msg && msg.run_details) ? msg.run_details : [];
+  const pending = Boolean(opts && opts.pending);
+  if (!pending && !details.length) return "";
+  const detailTexts = details.map(advisorRunDetailText).filter(Boolean);
+  if (!pending && !detailTexts.length) return "";
+  const rows = detailTexts
+    .map((text) => `<div class="alog alog-line">${_esc(text)}</div>`).join("");
+  const open = opts && opts.pending ? " open" : "";
+  const status = pending
+    ? '<span id="advisor-run-status" class="muted">Running…</span>'
+    : `<span class="muted">${detailTexts.length} step${detailTexts.length === 1 ? "" : "s"}</span>`;
+  const logId = pending ? ' id="advisor-log"' : "";
+  return `<details class="advisor-run-details"${open}>
+    <summary><span>Run details</span>${status}</summary>
+    <div${logId} class="advisor-log advisor-run-log">${rows}</div>
+  </details>`;
+}
+
+function advisorSourceLabel(source) {
+  if (typeof source === "string") return source.trim().slice(0, 500);
+  if (!source || typeof source !== "object") return "";
+  const primary = source.label || source.locator || source.path || source.date
+    || source.name || source.ref || source.kind;
+  if (!primary) return "";
+  const line = source.line || source.start_line;
+  return `${primary}${line ? `:${line}` : ""}`.slice(0, 500);
+}
+
+function renderAdvisorSources(msg) {
+  const sources = Array.isArray(msg && msg.sources) ? msg.sources : [];
+  const labels = [...new Set(sources.map(advisorSourceLabel).filter(Boolean))];
+  if (!labels.length) return "";
+  return `<aside class="advisor-sources" aria-label="Sources used">
+    <strong>Sources used</strong>
+    <ul>${labels.map((label) => `<li>${_esc(label)}</li>`).join("")}</ul>
+  </aside>`;
+}
+
 function renderAdvisorMessage(msg, opts) {
   const role = msg.role === "user" ? "user" : "assistant";
   const label = role === "user" ? "You" : "Advisor";
@@ -1572,6 +2021,8 @@ function renderAdvisorMessage(msg, opts) {
       ${actions}
     </div>
     <div class="advisor-message-body">${body}</div>
+    ${role === "assistant" ? renderAdvisorSources(msg) : ""}
+    ${role === "assistant" ? renderAdvisorRunDetails(msg, opts) : ""}
   </article>`;
 }
 
@@ -1605,8 +2056,7 @@ function renderAdvisorChat(record, pendingTurn) {
   const pending = pendingTurn
     ? `<section class="advisor-turn advisor-turn-pending">
         ${renderAdvisorMessage(pendingTurn.user)}
-        ${renderAdvisorMessage(pendingTurn.assistant, { id: "advisor-streaming-message" })}
-        <div class="advisor-log" id="advisor-log"></div>
+        ${renderAdvisorMessage(pendingTurn.assistant, { id: "advisor-streaming-message", pending: true })}
       </section>`
     : "";
   const saved = turns.map((turn) => {
@@ -1769,11 +2219,29 @@ async function deleteAdvisorExchange(index, btn) {
 
 // Streams the advisor run over SSE so the user sees live progress (stages, CLI log
 // lines, and the model's output as it arrives) instead of a silent hang.
-function runAdvisor(question) {
-  if (_advisorBusy) return;
-  const meta = $("#advisor-meta"), rBtn = $("#advisor-review");
-  _advisorBusy = true;
-  if (rBtn) rBtn.disabled = true;
+function setAdvisorBusy(busy) {
+  _advisorBusy = Boolean(busy);
+  const form = $("#advisor-ask");
+  const input = $("#advisor-q");
+  const submit = $("#advisor-submit");
+  const review = $("#advisor-review");
+  const clear = $("#advisor-clear");
+  const status = $("#advisor-submit-status");
+  if (form) form.setAttribute("aria-busy", String(busy));
+  [input, submit, review, clear].forEach((control) => {
+    if (control) control.disabled = Boolean(busy);
+  });
+  if (status) {
+    status.textContent = busy ? "Advisor request in progress." : "Advisor ready.";
+  }
+}
+
+function runAdvisor(question, callbacks) {
+  if (_advisorBusy) return false;
+  const onAccepted = callbacks && callbacks.onAccepted;
+  const onStartFailure = callbacks && callbacks.onStartFailure;
+  const meta = $("#advisor-meta");
+  setAdvisorBusy(true);
   if (meta) meta.textContent = "";
   const now = new Date().toISOString();
   const pendingTurn = {
@@ -1798,9 +2266,12 @@ function runAdvisor(question) {
     if (done) return;
     done = true;
     if (_advisorES) { _advisorES.close(); _advisorES = null; }   // stop auto-reconnect
-    _advisorBusy = false;
-    if (rBtn) rBtn.disabled = false;
+    setAdvisorBusy(false);
     if (meta && metaTxt) meta.textContent = metaTxt;
+    if (question) {
+      const input = $("#advisor-q");
+      if (input) input.focus();
+    }
   };
 
   let es;
@@ -1810,13 +2281,18 @@ function runAdvisor(question) {
     addLog("alog-err", "✗ could not open the advisor stream.");
     if (outEl) outEl.innerHTML = '<div class="banner">Could not start the advisor.</div>';
     finish();
-    return;
+    return false;
   }
   _advisorES = es;
+  let accepted = false;
   es.onmessage = (e) => {
     let ev;
     try { ev = JSON.parse(e.data); } catch (_) { return; }
-    if (ev.type === "stage") addLog("alog-stage", "• " + ev.msg);
+    if (ev.type === "accepted") {
+      accepted = true;
+      if (onAccepted) onAccepted();
+    }
+    else if (ev.type === "stage") addLog("alog-stage", "• " + ev.msg);
     else if (ev.type === "log") addLog("alog-line", ev.msg);
     else if (ev.type === "thinking") {
       let th = document.getElementById("alog-think");
@@ -1830,6 +2306,7 @@ function runAdvisor(question) {
       if (outEl) outEl.innerHTML = mdToHtml(acc);
     }
     else if (ev.type === "error") {
+      if (!accepted && onStartFailure) onStartFailure();
       addLog("alog-err", "✗ " + ev.error);
       if (!acc && outEl) outEl.innerHTML = `<div class="banner">${_esc(ev.error)}</div>`;
       finish("error");
@@ -1843,12 +2320,14 @@ function runAdvisor(question) {
     }
   };
   es.onerror = () => {
-    if (!done) {
-      addLog("alog-err", "✗ stream closed (connection lost or service restarting).");
-      if (!acc && outEl) outEl.innerHTML = '<div class="banner">Advisor stream closed — is the service running?</div>';
-    }
+    if (done) return;
+    if (!accepted && onStartFailure) onStartFailure();
+    addLog("alog-err", "✗ stream closed (connection lost or service restarting).");
+    if (!acc && outEl) outEl.innerHTML = '<div class="banner">Advisor stream closed — is the service running?</div>';
     finish();
+    loadAdvisorLatest();
   };
+  return true;
 }
 const _advReview = $("#advisor-review");
 if (_advReview) _advReview.addEventListener("click", () => runAdvisor(null));
@@ -1883,10 +2362,35 @@ if (_advReport) _advReport.addEventListener("click", (e) => {
   }
 });
 const _advForm = $("#advisor-ask");
+function submitAdvisorQuestion() {
+  if (_advisorBusy) return false;
+  const input = $("#advisor-q");
+  if (!input) return false;
+  const draft = input.value;
+  const question = draft.trim();
+  if (!question) return false;
+  let draftRestored = false;
+  const restoreDraft = () => {
+    if (draftRestored) return;
+    draftRestored = true;
+    input.value = draft;
+    input.focus();
+  };
+  const clearDraft = () => {
+    input.value = "";
+  };
+  const started = runAdvisor(question, {
+    onAccepted: clearDraft,
+    onStartFailure: restoreDraft,
+  });
+  if (!started) {
+    restoreDraft();
+  }
+  return started;
+}
 if (_advForm) _advForm.addEventListener("submit", (e) => {
   e.preventDefault();
-  const q = ($("#advisor-q").value || "").trim();
-  if (q) runAdvisor(q);
+  submitAdvisorQuestion();
 });
 
 // Month-so-far daily net chart (Trends). Cheap; refreshed slowly.
@@ -2090,6 +2594,102 @@ document.querySelectorAll("[data-vehicle-refresh]").forEach((btn) => {
   });
 });
 
+const evSmartForm = document.getElementById("ev-smart-charge-form");
+if (evSmartForm) {
+  evSmartForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const target = document.getElementById("ev-smart-target-soc");
+    const readyDate = document.getElementById("ev-smart-ready-date");
+    const readyTime = document.getElementById("ev-smart-ready-time");
+    const save = document.getElementById("ev-smart-save");
+    const message = document.getElementById("ev-smart-message");
+    const deadline = new Date(`${readyDate && readyDate.value}T${readyTime && readyTime.value}:00`);
+    if (!target || !readyDate || !readyTime || Number.isNaN(deadline.getTime())) return;
+    if (save) { save.disabled = true; save.textContent = "Planning…"; }
+    if (message) { message.className = "ev-smart-message muted"; message.textContent = "Creating the lowest-cost feasible plan…"; }
+    try {
+      const response = await fetch("/api/ev/smart-charge", {
+        method: "PUT",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({target_soc: Number(target.value), ready_by: deadline.toISOString()}),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.ok) throw new Error(result.error || "Could not save the charge job");
+      const replanned = await requestEvSmartReplan();
+      await refreshEvSmartCharge();
+      await refreshPlan();
+      if (!replanned && message) {
+        message.className = "ev-smart-message muted";
+        message.textContent = "Job saved. The charge plan will update on the optimizer’s next cycle.";
+      }
+    } catch (error) {
+      if (message) { message.className = "ev-smart-message error"; message.textContent = error.message; }
+    } finally {
+      if (save) { save.disabled = false; save.textContent = lastEvSmartCharge && evSmartView(lastEvSmartCharge).job ? "Update plan" : "Plan charge"; }
+    }
+  });
+}
+
+document.querySelectorAll("[data-ev-smart-action]").forEach((btn) => {
+  btn.addEventListener("click", async () => {
+    const message = document.getElementById("ev-smart-message");
+    btn.disabled = true;
+    try {
+      const response = await fetch("/api/ev/smart-charge/action", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({action: btn.dataset.evSmartAction}),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.ok) throw new Error(result.error || "Smart-charge action failed");
+      const replanned = await requestEvSmartReplan();
+      await refreshEvSmartCharge();
+      await refreshPlan();
+      if (!replanned && message) {
+        message.className = "ev-smart-message muted";
+        message.textContent = "Action saved. The charge plan will update on the optimizer’s next cycle.";
+      }
+    } catch (error) {
+      if (message) { message.className = "ev-smart-message error"; message.textContent = error.message; }
+    } finally { btn.disabled = false; }
+  });
+});
+
+document.querySelectorAll("[data-ev-smart-edit]").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    const target = document.getElementById("ev-smart-target-soc");
+    if (target) { target.focus(); target.select(); }
+  });
+});
+
+document.querySelectorAll("[data-ev-smart-cancel]").forEach((btn) => {
+  btn.addEventListener("click", async () => {
+    const confirmed = await advisorConfirm({
+      title: "Cancel smart-charge job?",
+      message: "The fallback schedule and all remaining planned EV blocks will be removed.",
+      confirmText: "Cancel job",
+      danger: true,
+    });
+    if (!confirmed) return;
+    const message = document.getElementById("ev-smart-message");
+    btn.disabled = true;
+    try {
+      const response = await fetch("/api/ev/smart-charge", {method: "DELETE"});
+      const result = await response.json();
+      if (!response.ok || !result.ok) throw new Error(result.error || "Could not cancel the charge job");
+      const replanned = await requestEvSmartReplan();
+      await refreshEvSmartCharge();
+      await refreshPlan();
+      if (!replanned && message) {
+        message.className = "ev-smart-message muted";
+        message.textContent = "Job cancelled. The optimizer will remove its EV load on the next cycle.";
+      }
+    } catch (error) {
+      if (message) { message.className = "ev-smart-message error"; message.textContent = error.message; }
+    } finally { btn.disabled = false; }
+  });
+});
+
 initMobileChrome();
 load();
 loadAdvisorLatest();
@@ -2097,6 +2697,7 @@ refreshForecastAccuracy();
 refreshWeather();
 refreshMonthly();
 refreshVehicleUsage();
+refreshEvSmartCharge();
 renderHeaderClock();
 startLiveStream();              // instant live updates via SSE
 // Plan refreshes slowly (changes only when the optimizer runs). Live values now
@@ -2109,3 +2710,4 @@ setInterval(refreshForecastAccuracy, 120000);
 setInterval(refreshWeather, 1800000);
 setInterval(refreshMonthly, 120000);   // month chart changes slowly
 setInterval(refreshVehicleUsage, 60000);   // Tesla API usage tally
+setInterval(refreshEvSmartCharge, 30000);  // durable EV job + independently published plan

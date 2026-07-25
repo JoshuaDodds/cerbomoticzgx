@@ -438,3 +438,19 @@ def test_formatter_is_self_contained(settings):
     summary = winter.format_plan_summary(result)
     assert summary.startswith('WINTER_ESS plan:')
     assert 'protected' in summary
+
+
+def test_discharge_blocked_slot_cannot_feed_ev_load_from_home_battery(settings):
+    prices = _prices([0.80, 0.80, 0.80])
+    blocked = {row['start'] for row in prices}
+
+    result = winter.OptimizationEngine().optimize(
+        80,
+        prices,
+        [3.0] * len(prices),
+        [0.0] * len(prices),
+        discharge_blocked_slots=blocked,
+    )
+
+    assert result is not None
+    assert all(step['soc_end'] >= step['soc_start'] for step in result['schedule'])

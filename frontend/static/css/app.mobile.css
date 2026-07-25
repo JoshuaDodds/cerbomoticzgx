@@ -210,6 +210,23 @@
     padding: 7px 6px;
   }
 
+  .ev-smart-form {
+    grid-template-columns: 1fr 1.6fr;
+    gap: 8px;
+  }
+
+  .ev-smart-form .btn { grid-column: 1 / -1; width: 100%; }
+
+  .ev-smart-actions { display: grid; grid-template-columns: 1fr 1fr; }
+
+  .ev-smart-actions button { min-height: 40px; }
+
+  .ev-charge-day { grid-template-columns: 1fr; gap: 8px; padding: 11px; }
+
+  .ev-charge-day-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+
+  .ev-charge-window { justify-content: space-between; }
+
   .overview-row {
     grid-template-columns: 1fr;
     gap: 10px;
@@ -449,7 +466,7 @@
     /* Portrait VRM-style flow (2×2 corners + centre MP-II hub, driven by
        powerflow.js when the container is narrow). Content-fit cards + generous gaps
        for the radiating connectors; sized to sit comfortably in the viewport. */
-    height: clamp(500px, 74vh, 590px);
+    height: clamp(560px, 80vh, 650px);
   }
 
   .powerflow svg {
@@ -543,6 +560,12 @@
   .btn,
   .vic-row {
     min-height: 44px;
+  }
+
+  .advisor-sources {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 4px;
   }
 
   .battery-frame,
