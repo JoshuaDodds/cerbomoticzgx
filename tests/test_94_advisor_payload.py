@@ -196,12 +196,15 @@ def test_plan_excerpt_collapses_consecutive_slots_into_action_blocks(monkeypatch
 
 def test_daily_review_prioritizes_completed_day_detail(monkeypatch):
     _stub_operational_inputs(monkeypatch, tunable_count=4, detail_rows=10)
+    today = datetime.now().date()
+    today_key = today.isoformat()
+    yesterday_key = (today - timedelta(days=1)).isoformat()
     monkeypatch.setattr(
         advisor,
         "_compact_recent_detail",
         lambda detail: {
-            "2026-07-24": {"evidence": "today", "padding": "x" * 3000},
-            "2026-07-23": {"evidence": "completed", "padding": "x" * 3000},
+            today_key: {"evidence": "today", "padding": "x" * 3000},
+            yesterday_key: {"evidence": "completed", "padding": "x" * 3000},
         },
     )
 
@@ -211,7 +214,7 @@ def test_daily_review_prioritizes_completed_day_detail(monkeypatch):
     )
 
     detail = advisor._prompt_data_payload(user)["performance"]["recent_detail"]
-    assert list(detail) == ["2026-07-23"]
+    assert list(detail) == [yesterday_key]
 
 
 def test_need_config_only_returns_allow_listed_metadata():
