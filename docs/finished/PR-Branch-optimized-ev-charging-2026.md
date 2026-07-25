@@ -99,6 +99,14 @@ while guaranteeing the requested energy whenever physically feasible.
     job/plan artifacts. A failed Tesla removal retains the terminal marker for bounded retry.
     Cleanup-only reconciliation remains available after apply/telemetry is disabled without
     granting permission to execute an active shadow plan.
+17. PV-surplus control stays dormant when pushed state already says the vehicle is away or
+    unplugged. A live home-to-away location edge also clears an impossible retained home-cable
+    state (plugged, charging and ETA); a later explicit public-charging event can set those
+    values normally while away. Installations without Fleet Telemetry retain the legacy,
+    rate-limited discovery wake, and authoritative ABB current always retains the safety path.
+18. Mobile Power Flow cards reserve enough vertical space for every detailed telemetry row.
+    Content-aware row budgets prevent short embedded viewports from crossing card borders, while
+    the Battery card has a content-fit maximum height so tall phones do not add a large empty tail.
 
 ## Configuration
 
@@ -235,6 +243,26 @@ while guaranteeing the requested energy whenever physically feasible.
   during sleep. The normalization bridge now ignores null values for every configured field
   and ignores unknown detailed-charge enums, preserving the last valid retained
   `Tesla/vehicle0/*` state rather than inventing Unplugged/Idle/False/N/A values.
+- Fixed the leave-home stale-plug failure without restoring or widening the legacy polling loop.
+  Upstream `main` also engaged on PV surplus without first checking home/plug state, so reverting
+  wholesale would retain the defect. With telemetry enabled, known away/unplugged state now makes
+  a no-intent surplus tick fully dormant: it performs no Tesla status read, wake, start, stop or
+  current command and emits only the normal one-time dormant transition log. A real ABB draw,
+  manual intent/Stop, and active smart-job reconciliation remain actionable. The Vehicle-tab
+  Refresh control is now visually presented as the same blue primary action as its peers.
+- Corrected the mobile Battery card after the additional BMS rows outgrew its original fixed
+  proportions. The phone layout now has a readable height floor and per-card row budgets; the
+  Battery card remains top-anchored and capped at its content-fit height on taller/narrower
+  screens. Grid, Loads, EV, Solar, and Battery final rows were measured inside their borders at
+  390x844, and the excessive Battery tail was checked separately at 588x1280.
+- Replaced the Advisor's unsafe prefix truncation after the expanded configuration schema made
+  its tunable descriptions exceed the complete prompt budget. The v2 payload always retains
+  valid JSON, live state, a compressed action-block plan, daily summaries, and every
+  allow-listed setting value. Compact decision transitions and largest settlement errors are
+  added by priority; recent conversation is tail-bounded, long history manifests use contiguous
+  date ranges, and an impossible minimum payload fails before invoking the model. Descriptions
+  for unfamiliar safe settings are available through bounded `NEED_CONFIG` retrieval rather
+  than being repeated on every call.
 
 ## Fleet Telemetry certificate incident
 
@@ -261,9 +289,10 @@ path are archived in
   solar/grid/pending summaries and day-source labels remain readable with no horizontal overflow.
 - `git diff --check` and Python compilation are clean.
 - Final GitHub Actions-equivalent run on Python 3.11 after the attended
-  charge-on-plug, Fleet Telemetry incident, freshness-warning, and null-state
-  retention, Power Flow current, Maxem-feedback, and terminal job lifecycle fixes:
-  `677 passed` with no warnings.
+  charge-on-plug, Fleet Telemetry incident, freshness-warning, null-state retention,
+  home-to-away disconnect, no-intent surplus dormancy, Power Flow current,
+  Maxem-feedback, terminal job lifecycle fixes, and Advisor payload hardening:
+  `694 passed` with no warnings.
 
 ## Operator validation before apply
 
