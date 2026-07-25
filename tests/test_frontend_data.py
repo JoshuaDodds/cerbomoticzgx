@@ -224,6 +224,26 @@ def test_ev_smart_charge_dashboard_uses_configured_job_and_plan_paths(monkeypatc
     ]
 
 
+def test_ev_smart_charge_dashboard_hides_orphaned_terminal_plan(monkeypatch):
+    fake = types.SimpleNamespace(load_job=lambda path=None: None)
+    monkeypatch.setitem(sys.modules, "lib.ev_smart_charge", fake)
+    monkeypatch.setattr(data, "load_raw_plan", lambda: {
+        "ev_smart_charge": {
+            "job": {"id": "completed-job"},
+            "status": "completed",
+        },
+    })
+    monkeypatch.setattr(data, "_env", lambda: {
+        "EV_SMART_CHARGE_ENABLED": "True",
+        "EV_SMART_CHARGE_APPLY": "True",
+    })
+
+    result = data.ev_smart_charge_dashboard()
+
+    assert result["job"] is None
+    assert result["plan"] is None
+
+
 def test_forecast_accuracy_uses_settlement_predicted_and_actuals(monkeypatch, tmp_path):
     monkeypatch.setattr(data, "_env", lambda: {"HISTORY_DIR": str(tmp_path)})
     day = datetime.now().astimezone().replace(hour=10, minute=0, second=0, microsecond=0)

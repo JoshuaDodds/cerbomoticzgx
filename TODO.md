@@ -85,6 +85,14 @@ blocks after that threshold. Unknown future energy sources stay visibly pending.
 Do not consider production apply validated until these attended/multi-slot checks
 have been completed:
 
+- With an applied job waiting outside a selected block and no usable PV surplus, insert
+  the cable once. Tesla may begin its normal immediate charge, but the controller must
+  identify the paired live plug/start edges and stop it on the next control tick; ABB
+  draw must fall to standby and the state should report
+  `automatic_plug_start_outside_block`. Repeat inside a selected block and confirm the
+  already-running session is adopted at the planned current. A later deliberate
+  Tesla-app start while the cable is already connected must remain a manual override;
+  Vehicle **Start** remains the explicit immediate-charge intent.
 - After a surplus-PV session has left the Tesla request at 5 A or below, press Vehicle
   **Start** once. Confirm one full-rate request bounded by the live Tesla ceiling, a fresh pushed
   `ChargeCurrentRequest` acknowledgement within 60 seconds, and normally ABB delivery above 5 A.

@@ -187,6 +187,12 @@ def test_dishwasher_uses_deferred_start_only_under_appliance_price_policy(
     callbacks = []
     monkeypatch.setattr(appliances, "price_deferral_enabled", lambda: defer_prices, raising=False)
     monkeypatch.setattr(appliances, "abort_dishwasher", lambda: None)
+    monkeypatch.setattr(
+        appliances,
+        "_active_program_id",
+        lambda device: 8196,
+        raising=False,
+    )
     monkeypatch.setattr(appliances, "_remote_start_available", lambda device: True, raising=False)
     monkeypatch.setattr(
         appliances, "_wait_for_operation_state", lambda *args, **kwargs: True, raising=False
@@ -610,29 +616,90 @@ def test_immediate_fallback_without_run_ack_is_reported_failed(monkeypatch):
     assert statuses[-1] == "FallbackFailed"
 
 
-@pytest.mark.parametrize("failure", ["plan", "remote"])
-def test_worker_never_aborts_without_plan_and_remote_start_validation(monkeypatch, failure):
+def test_dishwasher_worker_never_aborts_without_replacement_plan(monkeypatch):
     from lib import event_handler_appliances as appliances
 
     aborts = []
-    plan = {
-        "device": "Dishwasher",
-        "decision": "delayed",
-        "start": "2026-01-15T12:00:00+01:00",
-        "end": "2026-01-15T13:00:00+01:00",
-        "load_kw": 1.2,
-        "load_profile": [],
-    }
-    monkeypatch.setattr(
-        appliances, "_prepare_appliance_plan", lambda device: None if failure == "plan" else plan
-    )
-    monkeypatch.setattr(
-        appliances, "_remote_start_available", lambda device: failure != "remote"
-    )
+    monkeypatch.setattr(appliances, "_prepare_appliance_plan", lambda device: None)
     monkeypatch.setattr(appliances, "abort_dishwasher", lambda: aborts.append("abort"))
     monkeypatch.setattr(appliances, "_set_schedule_status", lambda *args, **kwargs: None)
 
     appliances._reschedule_worker("Dishwasher")
+
+    assert aborts == []
+
+
+def test_dishwasher_replaces_nonpreferred_run_without_remote_or_door_preflight(
+        monkeypatch):
+    """Match main's proven workflow: abort, await Ready, then send our programme.
+
+    Home Connect's start-allowed/door values describe whether a Ready appliance can
+    begin immediately. They must not prevent aborting an already-running dishwasher;
+    the appliance itself safely waits for its door when applying the replacement.
+    """
+    from lib import event_handler_appliances as appliances
+
+    actions = []
+    plan = {
+        "device": "Dishwasher",
+        "decision": "immediate",
+        "start": "2026-01-15T12:00:00+01:00",
+        "end": "2026-01-15T13:00:00+01:00",
+        "program": appliances.PREFERRED_DISHWASHER_PROGRAM,
+        "load_kw": 1.2,
+        "load_profile": [],
+    }
+    monkeypatch.setattr(appliances, "_prepare_appliance_plan", lambda device: plan)
+    monkeypatch.setattr(appliances, "_active_program_id", lambda device: 8196)
+    monkeypatch.setattr(
+        appliances,
+        "_remote_start_available",
+        lambda device: pytest.fail("dishwasher must not use the remote/door preflight"),
+    )
+    monkeypatch.setattr(
+        appliances, "abort_dishwasher", lambda: actions.append("abort"))
+    monkeypatch.setattr(
+        appliances,
+        "wait_for_ready_state",
+        lambda device, callback, **kwargs: actions.append("wait_ready") or callback() or True,
+    )
+    monkeypatch.setattr(
+        appliances,
+        "send_immediate_start_to_dishwasher",
+        lambda: actions.append("start_preferred"),
+    )
+    monkeypatch.setattr(
+        appliances, "_wait_for_operation_state", lambda *args, **kwargs: True)
+    monkeypatch.setattr(appliances, "_remove_reservation", lambda device: None)
+    monkeypatch.setattr(appliances, "_set_schedule_status", lambda *args, **kwargs: None)
+
+    appliances._reschedule_worker("Dishwasher")
+
+    assert actions == ["abort", "wait_ready", "start_preferred"]
+
+
+def test_dryer_still_requires_remote_start_preflight_before_abort(monkeypatch):
+    from lib import event_handler_appliances as appliances
+
+    aborts = []
+    monkeypatch.setattr(
+        appliances,
+        "_prepare_appliance_plan",
+        lambda device: {
+            "device": "Dryer",
+            "decision": "delayed",
+            "start": "2026-01-15T12:00:00+01:00",
+            "end": "2026-01-15T14:30:00+01:00",
+            "program": 12345,
+            "load_kw": 0.9,
+            "load_profile": [],
+        },
+    )
+    monkeypatch.setattr(appliances, "_remote_start_available", lambda device: False)
+    monkeypatch.setattr(appliances, "abort_dryer", lambda: aborts.append("abort"))
+    monkeypatch.setattr(appliances, "_set_schedule_status", lambda *args, **kwargs: None)
+
+    appliances._reschedule_worker("Dryer")
 
     assert aborts == []
 

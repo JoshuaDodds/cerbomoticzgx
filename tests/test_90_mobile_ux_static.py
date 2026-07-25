@@ -20,7 +20,7 @@ def test_mobile_stylesheet_loads_after_desktop_stylesheet():
     assert html.index("css/app.css") < html.index("css/app.mobile.css")
 
 
-def test_powerflow_ev_card_sums_phase_amps_without_changing_vehicle_metric():
+def test_powerflow_ev_card_uses_per_phase_current_like_vehicle_tab():
     powerflow = POWERFLOW_JS.read_text(encoding="utf-8")
     live = LIVE_PY.read_text(encoding="utf-8")
     app = APP_JS.read_text(encoding="utf-8")
@@ -30,10 +30,49 @@ def test_powerflow_ev_card_sums_phase_amps_without_changing_vehicle_metric():
         assert f'out["ev_l{phase}_a"] = _num("ev_l{phase}_a")' in live
     assert "const evMeterPhaseAmps" in powerflow
     assert "live.ev_l1_a, live.ev_l2_a, live.ev_l3_a" in powerflow
-    assert ".reduce((total, amps) => total + amps, 0)" in powerflow
+    assert "num(live.veh_amps)" in powerflow
+    assert "evMeterPhaseAmps.length" in powerflow
+    assert "/ evMeterPhaseAmps.length" in powerflow
+    assert "evTotalAmps" not in powerflow
     assert "ev <= EV_IDLE_POWER_W" in powerflow
     assert "evPhaseAmps * evPhases" not in powerflow
     assert 'card("Charge current", amps(L.veh_amps))' in app
+
+
+def test_mobile_powerflow_battery_card_budgets_height_for_all_bms_rows():
+    powerflow = POWERFLOW_JS.read_text(encoding="utf-8")
+    mobile_css = MOBILE_CSS.read_text(encoding="utf-8")
+
+    assert "const ch = 104, batth = 220" in powerflow
+    assert "const batteryRowBudget" in powerflow
+    assert "rows.length + 2.25" in powerflow
+    assert "Math.min(rowF, batteryRowBudget)" in powerflow
+    assert "const detailRowBudget" in powerflow
+    assert "rows.length + 0.25" in powerflow
+    assert "Math.min(rowF, detailRowBudget)" in powerflow
+    assert "const battCardH = Math.min(batth * sc, 190)" in powerflow
+    assert "y: battTop + battCardH / 2" in powerflow
+    assert "height: clamp(560px, 80vh, 650px)" in mobile_css
+
+
+def test_vehicle_tab_warns_only_when_disconnected_during_apparent_charging():
+    app = APP_JS.read_text(encoding="utf-8")
+    live = LIVE_PY.read_text(encoding="utf-8")
+
+    assert '"veh_telemetry_status": "Tesla/vehicle0/telemetry_status"' in live
+    assert "telemetryActivityExpected" in app
+    assert "telemetryDisconnected && telemetryActivityExpected" in app
+    assert "Vehicle telemetry disconnected during apparent charging" in app
+    assert "VEHICLE_TELEMETRY_FRESH_SECONDS" not in app
+
+
+def test_vehicle_refresh_is_a_primary_action():
+    html = INDEX_HTML.read_text(encoding="utf-8")
+
+    assert (
+        '<button id="vehicle-refresh" type="button" class="btn" '
+        "data-vehicle-refresh"
+    ) in html
 
 
 def test_abb_event_path_is_only_shared_current_topic_publisher():

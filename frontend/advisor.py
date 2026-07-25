@@ -48,8 +48,13 @@ DEFAULT_RETRIEVAL_MAX_CHARS = 120000     # ~30K tokens; one full day of slots is
 # CLI version differs). stream-json + partial messages gives token-by-token output.
 DEFAULT_STREAM_ARGS = "--output-format stream-json --verbose --include-partial-messages"
 ADVISOR_LATEST_PATH = os.path.join("data", "advisor_latest.json")
+ADVISOR_PAYLOAD_SCHEMA = "advisor_payload_v2"
 
 _run_lock = threading.Lock()
+
+
+class AdvisorPayloadError(RuntimeError):
+    """Raised before a model call when a complete safe payload cannot be built."""
 
 
 # --------------------------------------------------------------------------- #
@@ -301,6 +306,16 @@ def _tunables(conf) -> list[dict]:
     return out
 
 
+def _compact_tunables(conf) -> dict:
+    """Return every allow-listed setting as a compact name -> current-value map.
+
+    Descriptions are deliberately excluded from routine prompts. Repeating the
+    configuration UI's prose consumed more space than the operational data and made
+    schema growth capable of crowding the plan and live state out of the prompt.
+    """
+    return {item["key"]: item.get("value") for item in _tunables(conf)}
+
+
 # --------------------------------------------------------------------------- #
 # History gathering
 # --------------------------------------------------------------------------- #
@@ -423,10 +438,45 @@ def _gather(days: int, detail_days: int = 2) -> dict:
 # --------------------------------------------------------------------------- #
 _DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}$")
 _NEED_RE = re.compile(r"NEED_HISTORY\s*:\s*(.+)", re.IGNORECASE | re.DOTALL)
+_NEED_CONFIG_RE = re.compile(r"NEED_CONFIG\s*:\s*(.+)", re.IGNORECASE | re.DOTALL)
 _PROMPT_DATA_RE = re.compile(
     r"=== DATA \(JSON\) ===\n(.*?)\n=== END DATA ===",
     re.IGNORECASE | re.DOTALL,
 )
+
+
+def _parse_need_config(text: str, tunables: list[dict], max_keys: int = 12) -> list[str]:
+    """Return only allow-listed keys from a standalone NEED_CONFIG directive."""
+    stripped = (text or "").strip()
+    if not stripped.upper().startswith("NEED_CONFIG"):
+        return []
+    match = _NEED_CONFIG_RE.search(stripped)
+    if not match:
+        return []
+    allowed = {item.get("key") for item in tunables if item.get("key")}
+    requested = []
+    for token in re.split(r"[,\s;]+", match.group(1).strip()):
+        key = token.strip()
+        if key in allowed and key not in requested:
+            requested.append(key)
+    return requested[:max_keys]
+
+
+def _tunable_metadata(tunables: list[dict], keys: list[str]) -> dict:
+    """Return safe schema metadata for explicitly requested allow-listed settings."""
+    requested = set(keys)
+    out = {}
+    for item in tunables:
+        key = item.get("key")
+        if key not in requested:
+            continue
+        out[key] = {
+            "value": item.get("value"),
+            "type": item.get("type"),
+            "group": item.get("group"),
+            "description": item.get("desc", ""),
+        }
+    return out
 
 
 def _history_manifest() -> dict:
@@ -574,14 +624,134 @@ def _load_days(date_strs: list[str], conf) -> dict:
     return out
 
 
+def _float_or_none(value):
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _slot_datetime(value):
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _slot_end(schedule: list[dict], index: int) -> str | None:
+    """Return the exclusive end of one plan slot, tolerating incomplete timestamps."""
+    current = _slot_datetime(schedule[index].get("time"))
+    if current is None:
+        return schedule[index].get("time")
+    if index + 1 < len(schedule):
+        following = _slot_datetime(schedule[index + 1].get("time"))
+        if following is not None and following > current:
+            return following.isoformat()
+    duration = timedelta(minutes=15)
+    if index:
+        previous = _slot_datetime(schedule[index - 1].get("time"))
+        if previous is not None:
+            observed = current - previous
+            if timedelta(minutes=1) <= observed <= timedelta(hours=2):
+                duration = observed
+    return (current + duration).isoformat()
+
+
+def _plan_group_key(slot: dict) -> tuple:
+    return (
+        slot.get("control_action"),
+        slot.get("reason_code"),
+        slot.get("ev_supply"),
+        bool(slot.get("ev_tentative")),
+    )
+
+
+def _compress_plan_slots(schedule: list[dict]) -> list[dict]:
+    """Collapse consecutive equivalent slots into economic action blocks."""
+    blocks = []
+    for index, slot in enumerate(schedule):
+        if not isinstance(slot, dict):
+            continue
+        key = _plan_group_key(slot)
+        start = slot.get("time")
+        end = _slot_end(schedule, index)
+        current_dt = _slot_datetime(start)
+        previous_end = blocks[-1].get("_end_dt") if blocks else None
+        contiguous = current_dt is not None and previous_end == current_dt
+        if not blocks or blocks[-1]["_key"] != key or not contiguous:
+            blocks.append({
+                "_key": key,
+                "_end_dt": _slot_datetime(end),
+                "_prices": [],
+                "_sell_prices": [],
+                "start": start,
+                "end": end,
+                "slots": 0,
+                "control_action": slot.get("control_action"),
+                "reason_code": slot.get("reason_code"),
+                "soc_start": slot.get("soc_start"),
+                "soc_end": slot.get("soc_end"),
+                "grid_energy_kwh": 0.0,
+                "pv_kwh": 0.0,
+                "load_kwh": 0.0,
+                "planned_ev_kwh": 0.0,
+                "ev_target_kw": 0.0,
+                "ev_supply": slot.get("ev_supply"),
+                "ev_tentative": bool(slot.get("ev_tentative")),
+            })
+        block = blocks[-1]
+        block["end"] = end
+        block["_end_dt"] = _slot_datetime(end)
+        block["slots"] += 1
+        block["soc_end"] = slot.get("soc_end")
+        price = _float_or_none(slot.get("price"))
+        sell = _float_or_none(slot.get("sell"))
+        if price is not None:
+            block["_prices"].append(price)
+        if sell is not None:
+            block["_sell_prices"].append(sell)
+        for source, target in (
+            ("grid_energy", "grid_energy_kwh"),
+            ("pv", "pv_kwh"),
+            ("load", "load_kwh"),
+            ("planned_ev_kwh", "planned_ev_kwh"),
+        ):
+            value = _float_or_none(slot.get(source))
+            if value is not None:
+                block[target] += value
+        ev_target = _float_or_none(slot.get("ev_target_kw"))
+        if ev_target is not None:
+            block["ev_target_kw"] = max(block["ev_target_kw"], ev_target)
+
+    out = []
+    for block in blocks:
+        prices = block.pop("_prices")
+        sells = block.pop("_sell_prices")
+        block.pop("_key", None)
+        block.pop("_end_dt", None)
+        if prices:
+            block["price_min"] = round(min(prices), 4)
+            block["price_max"] = round(max(prices), 4)
+            block["price_avg"] = round(sum(prices) / len(prices), 4)
+        if sells:
+            block["sell_min"] = round(min(sells), 4)
+            block["sell_max"] = round(max(sells), 4)
+        for key in ("grid_energy_kwh", "pv_kwh", "load_kwh", "planned_ev_kwh"):
+            block[key] = round(block[key], 4)
+        block["ev_target_kw"] = round(block["ev_target_kw"], 3)
+        out.append(block)
+    return out
+
+
 def _plan_excerpt() -> dict:
     raw = _data.load_raw_plan() or {}
+    schedule = [slot for slot in (raw.get("schedule") or [])[:12] if isinstance(slot, dict)]
     return {
         "generated_at": raw.get("generated_at"),
         "battery_soc": raw.get("battery_soc"),
         "current": raw.get("current"),
         "today": raw.get("today"),
-        "next_slots": (raw.get("schedule") or [])[:12],
+        "next_blocks": _compress_plan_slots(schedule),
     }
 
 
@@ -622,6 +792,145 @@ def _live_excerpt():
         "batt_w": b,            # + charging / − discharging
         "ev_w": _n("ev_w"),
         "summary": "; ".join(parts) if parts else None,
+    }
+
+
+def _series_stats(rows: list[dict], key: str) -> dict:
+    values = [_float_or_none(row.get(key)) for row in rows]
+    values = [value for value in values if value is not None]
+    if not values:
+        return {}
+    return {
+        f"{key}_min": round(min(values), 4),
+        f"{key}_max": round(max(values), 4),
+        f"{key}_avg": round(sum(values) / len(values), 4),
+    }
+
+
+def _series_average(rows: list[dict], key: str) -> dict:
+    values = [_float_or_none(row.get(key)) for row in rows]
+    values = [value for value in values if value is not None]
+    return {f"{key}_avg": round(sum(values) / len(values), 2)} if values else {}
+
+
+def _compact_cycle_blocks(rows: list[dict], max_blocks: int = 6) -> dict:
+    """Summarize slot decisions while retaining transitions and evidence of churn."""
+    blocks = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        key = (row.get("control_action"), row.get("realized_action"), row.get("reason_code"))
+        if not blocks or blocks[-1]["_key"] != key:
+            blocks.append({
+                "_key": key,
+                "_rows": [],
+                "first": row.get("ts"),
+                "last": row.get("ts"),
+                "samples": 0,
+                "control_action": row.get("control_action"),
+                "realized_action": row.get("realized_action"),
+                "reason_code": row.get("reason_code"),
+                "soc_start": row.get("soc"),
+                "soc_end": row.get("soc"),
+            })
+        block = blocks[-1]
+        block["_rows"].append(row)
+        block["last"] = row.get("ts")
+        block["samples"] += 1
+        block["soc_end"] = row.get("soc")
+
+    compact = []
+    for block in blocks:
+        rows_in_block = block.pop("_rows")
+        block.pop("_key", None)
+        for key in ("price_buy", "price_sell"):
+            block.update(_series_stats(rows_in_block, key))
+        for key in ("applied_setpoint_w", "grid_w", "pv_w", "batt_w", "load_w"):
+            block.update(_series_average(rows_in_block, key))
+        compact.append(block)
+
+    omitted = 0
+    if len(compact) > max_blocks:
+        side = max_blocks // 2
+        omitted = len(compact) - (side * 2)
+        compact = compact[:side] + compact[-side:]
+    return {
+        "action_block_count": len(blocks),
+        "action_blocks": compact,
+        "omitted_middle_blocks": omitted,
+    }
+
+
+def _compact_settlement_errors(rows: list[dict], limit: int = 3) -> dict:
+    scored = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        predicted = _float_or_none(row.get("predicted_net_eur"))
+        actual = _float_or_none(row.get("actual_net_eur"))
+        error = abs(predicted - actual) if predicted is not None and actual is not None else -1
+        scored.append((error, row))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    selected = []
+    for error, row in scored[:limit]:
+        item = _trim(row, (
+            "ts", "predicted_control_action", "predicted_net_eur", "actual_net_eur",
+            "actual_import_kwh", "actual_export_kwh", "soc_start", "soc_end",
+        ))
+        if error >= 0:
+            item["abs_net_error_eur"] = round(error, 4)
+        selected.append(item)
+    return {
+        "settlement_count": len(rows),
+        "largest_errors": selected,
+        "omitted_settlements": max(0, len(rows) - len(selected)),
+    }
+
+
+def _compact_recent_detail(detail: dict) -> dict:
+    compact = {}
+    for day, values in (detail or {}).items():
+        if not isinstance(values, dict):
+            continue
+        compact[day] = {
+            **_compact_cycle_blocks(values.get("cycles") or []),
+            **_compact_settlement_errors(values.get("settlements") or []),
+        }
+    return compact
+
+
+def _date_ranges(days: list[str]) -> list[str]:
+    """Represent a long available-day list compactly without implying missing days."""
+    parsed = []
+    for day in sorted(set(days or [])):
+        try:
+            parsed.append(datetime.strptime(day, "%Y-%m-%d").date())
+        except (TypeError, ValueError):
+            continue
+    if not parsed:
+        return []
+    ranges = []
+    start = previous = parsed[0]
+    for current in parsed[1:]:
+        if current == previous + timedelta(days=1):
+            previous = current
+            continue
+        ranges.append(start.isoformat() if start == previous
+                      else f"{start.isoformat()}..{previous.isoformat()}")
+        start = previous = current
+    ranges.append(start.isoformat() if start == previous
+                  else f"{start.isoformat()}..{previous.isoformat()}")
+    return ranges
+
+
+def _compact_history_manifest(manifest: dict) -> dict:
+    days = manifest.get("available_days") or []
+    return {
+        "available_ranges": _date_ranges(days),
+        "earliest": manifest.get("earliest"),
+        "latest": manifest.get("latest"),
+        "count": manifest.get("count", len(days)),
+        "record_schema": manifest.get("record_schema"),
     }
 
 
@@ -713,7 +1022,7 @@ charge/sell, or forecast/settlement errors that actually cost euros.
 
 BEFORE putting any tunable in **Do**, verify all three against the DATA; drop it if
 it fails any:
-  1. The tunable NAME appears in the provided `tunables` list — never invent one.
+  1. The tunable NAME appears in the provided `tunables` map — never invent one.
   2. Your value actually DIFFERS from the current value (no no-op suggestions).
   3. It really does what you claim, checked against the prices/SoC in `current_plan`.
      E.g. a max-charge-PRICE cap must sit ABOVE the slots you want to allow (a lower
@@ -743,8 +1052,9 @@ grid import is `day_import_kwh`, grid export is `day_export_kwh`, and economics 
 `realized_net_eur`. Say data is missing only when the date/field is absent from the
 user prompt, conversation_context, and inline data.
 
-DEEPER HISTORY: `history_manifest` lists EVERY day available in data/history/ plus
-the record schema. The inline `performance` data only covers the most recent few days
+DEEPER HISTORY: `history_manifest.available_ranges` identifies every day available
+in data/history/ and includes the record schema. The inline `performance` data only
+covers the most recent few days
 in detail, but daily_summaries can still answer daily aggregate questions. NEED_HISTORY only when
 the answer requires missing dates, missing fields, or slot-level records that are not already
 in the user's prompt, conversation_context, performance.daily_summaries, or recent_detail.
@@ -755,37 +1065,197 @@ naming only days present in history_manifest (max {max_days}). You will be re-as
 with those days attached, and then you answer. If the inline data already suffices,
 just answer — never request history you don't need.
 
+CONFIG METADATA: `tunables` contains every safe setting name and its current value,
+but deliberately omits repeated UI documentation. If answering truly requires the
+exact definition of an unfamiliar setting, make your ENTIRE reply exactly one line:
+  NEED_CONFIG: <comma-separated setting names from tunables>
+Request at most 12 names. You will be re-asked with their allow-listed descriptions.
+Do not request metadata for settings whose meaning is already clear.
+
 USER QUESTION: {question}"""
 
 
+def _render_prompt(task: str, payload: dict) -> str:
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
+    return f"{task}\n\n=== DATA (JSON) ===\n{encoded}\n=== END DATA ==="
+
+
+def _tail_context(context: str, limit: int) -> str | None:
+    context = (context or "").strip()
+    if not context or limit <= 0:
+        return None
+    if len(context) <= limit:
+        return context
+    marker = "...(earlier chat omitted)...\n"
+    keep = max(0, limit - len(marker))
+    return marker + context[-keep:]
+
+
 def _build_messages(question: str | None, conf, conversation_context: str | None = None) -> tuple[str, str]:
-    """Build (system, user). Keeps the prompt under ADVISOR_MAX_INPUT_CHARS by
-    progressively reducing how many days of per-slot DETAIL are included (daily
-    summaries are always kept), then hard-truncating as a last resort. This bounds
-    the input token cost of a review."""
+    """Build a bounded, valid prompt without allowing optional data to crowd out core.
+
+    The operational core is assembled as structured data and validated after JSON
+    serialization. Optional compact history and chat context are added only when they
+    fit. Serialized JSON is never sliced.
+    """
     max_chars = _conf_int(conf, "ADVISOR_MAX_INPUT_CHARS", DEFAULT_MAX_INPUT_CHARS)
-    days = _conf_int(conf, "ADVISOR_HISTORY_DAYS", DEFAULT_HISTORY_DAYS)
-    base = {"tunables": _tunables(conf), "current_plan": _plan_excerpt(),
-            "live_now": _live_excerpt(),   # ground-truth real-time power flow
-            "now": datetime.now().astimezone().isoformat()}
-    if conversation_context:
-        base["conversation_context"] = conversation_context
+    days = max(1, _conf_int(conf, "ADVISOR_HISTORY_DAYS", DEFAULT_HISTORY_DAYS))
     if question:
         max_days = _conf_int(conf, "ADVISOR_RETRIEVAL_MAX_DAYS", DEFAULT_RETRIEVAL_MAX_DAYS)
         task = _QUESTION_TASK.format(question=question.strip(), max_days=max_days)
-        base["history_manifest"] = _history_manifest()   # so it knows what it can pull
     else:
         task = _REVIEW_TASK
 
-    user = ""
-    for detail_days in (2, 1, 0):        # shrink detail until it fits the budget
-        payload = {**base, "performance": _gather(days, detail_days=detail_days)}
-        user = (f"{task}\n\n=== DATA (JSON) ===\n"
-                f"{json.dumps(payload, default=str)}\n=== END DATA ===")
-        if len(user) <= max_chars:
-            break
-    if len(user) > max_chars:            # last resort: hard cap
-        user = user[:max_chars] + "\n…(data truncated to fit the input budget)…\n=== END DATA ==="
+    gathered = _gather(days, detail_days=min(2, days))
+    summaries = dict(gathered.get("daily_summaries") or {})
+    compact_detail = _compact_recent_detail(gathered.get("recent_detail") or {})
+    plan = _plan_excerpt()
+    plan_blocks = list(plan.get("next_blocks") or [])
+    meta = {
+        "schema": ADVISOR_PAYLOAD_SCHEMA,
+        "json_validated": True,
+        "settings_count": 0,
+        "summary_days": len(summaries),
+        "detail_days": 0,
+        "conversation_chars": 0,
+        "plan_blocks_available": len(plan_blocks),
+        "plan_blocks_included": len(plan_blocks),
+        "omitted": {
+            "summary_days": 0,
+            "detail_days": 0,
+            "plan_blocks": 0,
+            "conversation_chars": 0,
+        },
+    }
+    tunables = _compact_tunables(conf)
+    meta["settings_count"] = len(tunables)
+    payload = {
+        "now": datetime.now().astimezone().isoformat(),
+        "live_now": _live_excerpt(),
+        "current_plan": plan,
+        "performance": {"daily_summaries": summaries, "recent_detail": {}},
+        "tunables": tunables,
+    }
+    if question:
+        payload["history_manifest"] = _compact_history_manifest(_history_manifest())
+    payload["payload_meta"] = meta
+
+    def _fits() -> bool:
+        return len(_render_prompt(task, payload)) <= max_chars
+
+    # Preserve the most recent summary, but discard older summaries before touching
+    # live state, current action, or the compact setting values.
+    while not _fits() and len(summaries) > 1:
+        oldest = min(summaries)
+        summaries.pop(oldest)
+        meta["summary_days"] = len(summaries)
+        meta["omitted"]["summary_days"] += 1
+
+    # Alternating actions can still produce many plan blocks. Keep the current state
+    # plus as much of the nearest future horizon as the budget safely permits.
+    while not _fits() and plan_blocks:
+        plan_blocks.pop()
+        plan["next_blocks"] = plan_blocks
+        meta["plan_blocks_included"] = len(plan_blocks)
+        meta["omitted"]["plan_blocks"] += 1
+
+    if not _fits():
+        raise AdvisorPayloadError(
+            "Advisor payload construction failed: required operational data exceeds "
+            f"the configured {max_chars}-character input budget."
+        )
+
+    # Slot history is compacted into action transitions and the largest settlement
+    # misses. Add the highest-priority days first and stop before exceeding the guard.
+    detail_days = list(compact_detail)
+    if question:
+        question_lower = question.lower()
+        preferred_days = set(re.findall(r"\d{4}-\d{2}-\d{2}", question))
+        today = datetime.now().date()
+        if "today" in question_lower:
+            preferred_days.add(today.isoformat())
+        if "yesterday" in question_lower:
+            preferred_days.add((today - timedelta(days=1)).isoformat())
+        mentioned = [day for day in detail_days if day in preferred_days]
+        detail_days = mentioned + [day for day in detail_days if day not in mentioned]
+    else:
+        today_key = datetime.now().date().isoformat()
+        completed = sorted((day for day in detail_days if day != today_key), reverse=True)
+        detail_days = completed + ([today_key] if today_key in compact_detail else [])
+    included_detail = {}
+    for day in detail_days:
+        candidate = {**included_detail, day: compact_detail[day]}
+        payload["performance"]["recent_detail"] = candidate
+        if _fits():
+            included_detail = candidate
+        else:
+            payload["performance"]["recent_detail"] = included_detail
+            meta["omitted"]["detail_days"] += 1
+    meta["detail_days"] = len(included_detail)
+
+    # Conversation is useful continuity but lower priority than current operations.
+    # Retain the newest tail that fits, never a sliced JSON envelope.
+    if conversation_context:
+        for context_limit in (6000, 4000, 2000, 1000, 500):
+            candidate = _tail_context(conversation_context, context_limit)
+            payload["conversation_context"] = candidate
+            meta["conversation_chars"] = len(candidate or "")
+            if _fits():
+                break
+        else:
+            payload.pop("conversation_context", None)
+            meta["conversation_chars"] = 0
+        meta["omitted"]["conversation_chars"] = max(
+            0, len(conversation_context.strip()) - meta["conversation_chars"]
+        )
+
+    # Metadata itself is budgeted too. Reconcile any boundary-size change by reducing
+    # structured optional fields, never by cutting the serialized envelope.
+    while not _fits() and payload.get("conversation_context"):
+        current = payload["conversation_context"]
+        excess = len(_render_prompt(task, payload)) - max_chars
+        candidate = _tail_context(current, max(0, len(current) - excess - 32))
+        if candidate:
+            payload["conversation_context"] = candidate
+            meta["conversation_chars"] = len(candidate)
+        else:
+            payload.pop("conversation_context", None)
+            meta["conversation_chars"] = 0
+        meta["omitted"]["conversation_chars"] = max(
+            0, len(conversation_context.strip()) - meta["conversation_chars"]
+        )
+    while not _fits() and included_detail:
+        day = next(reversed(included_detail))
+        included_detail.pop(day)
+        payload["performance"]["recent_detail"] = included_detail
+        meta["detail_days"] = len(included_detail)
+        meta["omitted"]["detail_days"] += 1
+
+    user = _render_prompt(task, payload)
+    if len(user) > max_chars:
+        raise AdvisorPayloadError(
+            "Advisor payload construction failed after optional-section budgeting."
+        )
+    parsed = _prompt_data_payload(user)
+    required = {"now", "live_now", "current_plan", "performance", "tunables", "payload_meta"}
+    if not required.issubset(parsed):
+        raise AdvisorPayloadError(
+            "Advisor payload construction failed JSON validation for required sections."
+        )
+    logging.info(
+        "Advisor payload built: mode=%s chars=%d/%d summaries=%d detail_days=%d "
+        "settings=%d plan_blocks=%d/%d conversation_chars=%d omitted=%s",
+        "question" if question else "review",
+        len(user),
+        max_chars,
+        meta["summary_days"],
+        meta["detail_days"],
+        meta["settings_count"],
+        meta["plan_blocks_included"],
+        meta["plan_blocks_available"],
+        meta["conversation_chars"],
+        json.dumps(meta["omitted"], separators=(",", ":")),
+    )
     return _PRIMER, user
 
 
@@ -1124,11 +1594,9 @@ def _stream_for(mode, system, user, model, conf):
 
 
 def _answer_with_retrieval(question, conf, mode, model, conversation_context: str | None = None):
-    """Question path with on-demand history. Streams the answer live, but sniffs the
-    first line: if the model replies with a NEED_HISTORY directive instead of an
-    answer, pull those day files from data/history/ and re-ask (pass 2), now streaming
-    the real answer. The daily review never comes through here, so it stays cheap."""
+    """Question path with bounded, allow-listed history/config metadata retrieval."""
     manifest = _history_manifest()
+    tunables = _tunables(conf)
     system, user = _build_messages(question, conf, conversation_context=conversation_context)
     yield {"type": "stage", "msg": f"Prompt ~{len(system) + len(user):,} chars. Asking {model}…"}
 
@@ -1144,7 +1612,8 @@ def _answer_with_retrieval(question, conf, mode, model, conversation_context: st
                 continue
             buf += txt
             if "\n" in buf or len(buf) >= 16:          # enough to judge the first line
-                if buf.lstrip().upper().startswith("NEED_HISTORY"):
+                upper = buf.lstrip().upper()
+                if upper.startswith(("NEED_HISTORY", "NEED_CONFIG")):
                     is_request, decided = True, True    # suppress; consume rest quietly
                 else:
                     decided = True
@@ -1157,7 +1626,7 @@ def _answer_with_retrieval(question, conf, mode, model, conversation_context: st
 
     # Resolve a very short pass-1 reply that never crossed the decision threshold.
     if not decided:
-        if buf.lstrip().upper().startswith("NEED_HISTORY"):
+        if buf.lstrip().upper().startswith(("NEED_HISTORY", "NEED_CONFIG")):
             is_request = True
         elif buf:
             yield {"type": "delta", "text": buf}
@@ -1167,9 +1636,34 @@ def _answer_with_retrieval(question, conf, mode, model, conversation_context: st
     if not is_request:
         return                                   # a normal answer was already streamed
 
-    # --- Retrieval: resolve the requested days and re-ask. ---
+    # --- Retrieval: resolve the requested safe metadata or history and re-ask. ---
+    response = "".join(captured)
+    if response.lstrip().upper().startswith("NEED_CONFIG"):
+        keys = _parse_need_config(response, tunables)
+        metadata = _tunable_metadata(tunables, keys)
+        if metadata:
+            yield {"type": "stage", "msg": "Attached metadata for "
+                   f"{len(metadata)} allow-listed setting(s). Re-asking…"}
+            extra = json.dumps({"requested_config_metadata": metadata},
+                               ensure_ascii=False, separators=(",", ":"), default=str)
+            user2 = (
+                user + "\n\n=== ADDITIONAL CONFIG METADATA (you requested this) ===\n"
+                + extra + "\n=== END ADDITIONAL CONFIG METADATA ===\n\n"
+                "Now answer using the original operational data and this metadata. "
+                "Do NOT request more metadata."
+            )
+        else:
+            yield {"type": "stage", "msg": "No requested configuration names were "
+                   "allow-listed — answering from the original data."}
+            user2 = user + (
+                "\n\n(The requested configuration metadata was not allow-listed. "
+                "Answer from the provided data and do not request more metadata.)"
+            )
+        yield from _stream_for(mode, system, user2, model, conf)
+        return
+
     max_days = _conf_int(conf, "ADVISOR_RETRIEVAL_MAX_DAYS", DEFAULT_RETRIEVAL_MAX_DAYS)
-    want = _parse_need_history("".join(captured), manifest.get("available_days") or [], max_days)
+    want = _parse_need_history(response, manifest.get("available_days") or [], max_days)
     if not want:
         yield {"type": "stage", "msg": "Model asked for history, but no matching days "
                "exist — answering from inline data."}

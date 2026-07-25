@@ -345,6 +345,13 @@ def _prepare_appliance_plan(device):
 
 
 def _remote_start_available(device):
+    """Conservative pre-abort gate for the dryer only.
+
+    Dishwasher programme enforcement intentionally follows the original main-branch
+    workflow and does not call this helper: abort the non-preferred run, wait for
+    Ready, then send the preferred programme. Home Connect safely holds the start
+    command until its own physical conditions (including the door) permit it.
+    """
     state = retrieve_appliance_state(device)
     allowed = state.get("RemoteControlStartAllowed")
     active = state.get("RemoteControlActive")
@@ -515,10 +522,10 @@ def _reschedule_worker(device):
         _set_schedule_status(device, "Immediate", "preferred_program_already_running")
         return
 
-    if not _remote_start_available(device):
+    if device == "Dryer" and not _remote_start_available(device):
         logging.warning(
-            "Appliance scheduler: %s remote start is unavailable; leaving current run untouched.",
-            device,
+            "Appliance scheduler: Dryer remote start is unavailable; "
+            "leaving current run untouched.",
         )
         _set_schedule_status(device, "RemoteStartUnavailable")
         return

@@ -337,7 +337,7 @@ main { padding: 12px 16px 80px; max-width: 1100px; margin: 0 auto; }
 
 .vehicle-card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
 .vehicle-card-head h3 { flex: 1 1 auto; min-width: 0; }
-.vehicle-card-head .btn-secondary { flex: 0 0 auto; padding: 6px 12px; font-size: 13px; }
+.vehicle-card-head .btn { flex: 0 0 auto; padding: 6px 12px; font-size: 13px; }
 
 .ev-smart-card { overflow: hidden; }
 .ev-smart-form {

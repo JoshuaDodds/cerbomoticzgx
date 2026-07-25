@@ -38,6 +38,7 @@ DEFAULT_UNKNOWN_PRICE_EUR_PER_KWH = 0.30
 DEFAULT_JOB_PATH = Path("data/ev_charge_job.json")
 DEFAULT_PLAN_PATH = Path("/dev/shm/cerbo_ev_charge_plan.json")
 ACTIVE_JOB_STATUSES = frozenset({"active", "paused"})
+TERMINAL_PLAN_STATUSES = frozenset({"completed", "expired", "cancelled"})
 
 _LOCK = threading.RLock()
 _EPSILON = 1e-9
@@ -254,6 +255,47 @@ def delete_job(path=None) -> bool:
 
 
 clear_job = delete_job
+
+
+def delete_plan_snapshot(path=None) -> bool:
+    """Delete the published plan snapshot. Returns whether a file existed."""
+    target = Path(path) if path is not None else DEFAULT_PLAN_PATH
+    with _LOCK:
+        try:
+            target.unlink()
+            return True
+        except FileNotFoundError:
+            return False
+
+
+def clear_job_artifacts(job_id, *, job_path=None, plan_path=None) -> bool:
+    """Remove one job's durable job/plan files without deleting a replacement.
+
+    The controller calls this only after its application-owned Tesla fallback
+    schedule has been removed. Matching both files by job ID prevents a terminal
+    cleanup racing a newly-created job.
+    """
+    expected = str(job_id or "").strip()
+    if not expected:
+        return False
+    job_target = Path(job_path) if job_path is not None else DEFAULT_JOB_PATH
+    plan_target = Path(plan_path) if plan_path is not None else DEFAULT_PLAN_PATH
+    with _LOCK:
+        job = load_job(path=job_target)
+        plan = load_plan_snapshot(path=plan_target)
+        job_matches = isinstance(job, dict) and str(job.get("id") or "") == expected
+        plan_job = plan.get("job") if isinstance(plan, dict) else None
+        plan_matches = (
+            isinstance(plan_job, Mapping)
+            and str(plan_job.get("id") or "") == expected
+        )
+        if not job_matches and not plan_matches:
+            return job is None and plan is None
+        if job_matches:
+            delete_job(path=job_target)
+        if plan_matches:
+            delete_plan_snapshot(path=plan_target)
+        return True
 
 
 def update_job_status(action: str, *, path=None, now=None) -> dict:
@@ -1091,6 +1133,18 @@ def plan_charge(
             "planned_soc": current,
         })
         return result
+    if planned_at.timestamp() >= model.ready_by.timestamp():
+        result.update({
+            "active": False,
+            "status": "expired",
+            "reason": "ready_by_elapsed",
+            "confidence": "high",
+            "feasible": False,
+            "planned_soc": current,
+            "expected_completion": None,
+            "energy_shortfall_kwh": round(ac_required, 6),
+        })
+        return result
 
     horizon_hours = max(
         0.0, (cutoff.timestamp() - first_start.timestamp()) / 3600.0)
@@ -1234,8 +1288,10 @@ __all__ = [
     "DEFAULT_USABLE_CAPACITY_KWH",
     "EVChargeJob",
     "clear_job",
+    "clear_job_artifacts",
     "create_job",
     "delete_job",
+    "delete_plan_snapshot",
     "load_job",
     "load_plan_snapshot",
     "overlay_load_forecast",

@@ -1263,6 +1263,13 @@ function renderVehicle() {
   const pct = (v) => has(v) ? Number(v).toFixed(0) + "%" : null;
   const amps = (v) => has(v) ? Number(v).toFixed(0) + " A" : null;
   const yesno = (v) => has(v) ? (bool(v) ? "Yes" : "No") : null;
+  const telemetryDisconnected = String(L.veh_telemetry_status || "").toUpperCase() === "DISCONNECTED";
+  // Fleet fields are emitted on change, not as periodic heartbeats. Silence while
+  // parked/asleep therefore does not make the retained values stale. Raise a
+  // warning only when local/Tesla evidence says charging should be observable.
+  const telemetryActivityExpected = bool(L.veh_is_charging)
+    || String(L.veh_charging_status || "").toLowerCase() === "charging"
+    || (has(L.ev_w) && Math.abs(Number(L.ev_w)) > 100);
 
   const cards = [];
   const card = (label, val) => { if (has(val)) cards.push(`<div class="metric"><div class="label">${escapeHtml(label)}</div><div class="value">${escapeHtml(val)}</div></div>`); };
@@ -1281,9 +1288,12 @@ function renderVehicle() {
   card("Supercharging", yesno(L.veh_is_supercharging));
   card("Updated", L.veh_last_update);
 
+  const telemetryWarning = telemetryDisconnected && telemetryActivityExpected
+    ? `<div class="banner vehicle-telemetry-warning" role="status">Vehicle telemetry disconnected during apparent charging. Live confirmation may be out of date; Refresh data will use one budget-guarded Fleet API read.</div>`
+    : "";
   box.innerHTML = cards.length
-    ? `<div class="metrics-grid">${cards.join("")}</div>`
-    : `<span class="muted">waiting for vehicle status…</span>`;
+    ? `${telemetryWarning}<div class="metrics-grid">${cards.join("")}</div>`
+    : `${telemetryWarning}<span class="muted">waiting for vehicle status…</span>`;
   const title = document.querySelector("#tab-vehicle h3");
   if (title && has(L.veh_name)) title.textContent = L.veh_name;
 }

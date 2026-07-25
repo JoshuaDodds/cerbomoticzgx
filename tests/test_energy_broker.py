@@ -136,7 +136,12 @@ def test_ev_smart_forecast_adds_planned_energy_and_publishes_snapshot(monkeypatc
         "EV_SMART_CHARGE_JOB_PATH": "/tmp/test-job.json",
         "EV_SMART_CHARGE_PLAN_PATH": "/tmp/test-plan.json",
     }
-    monkeypatch.setattr(energy_broker, "STATE", DummyState({}))
+    # Maxem can temporarily advertise only 5 A as currently available. That
+    # real-time protection must not rewrite the durable plan ceiling.
+    monkeypatch.setattr(
+        energy_broker, "STATE",
+        DummyState({"tesla_charge_current_max": 5}),
+    )
     monkeypatch.setattr(energy_broker, "retrieve_setting", lambda name: settings.get(name))
     monkeypatch.setattr(ev_smart_charge, "load_job", lambda path=None: {"status": "active"})
     monkeypatch.setattr(
@@ -158,9 +163,66 @@ def test_ev_smart_forecast_adds_planned_energy_and_publishes_snapshot(monkeypatc
     assert baseline[starts[0]] == pytest.approx(0.3)  # caller input was not mutated
     assert context["active"] is True
     assert saved == [(fake_plan, "/tmp/test-plan.json")]
+    assert planner_inputs[0][1]["requested_ceiling_kw"] == pytest.approx(16.0)
     # 13 kW site cap - (1.2 kW base - 0.8 kW PV) = 12.6 kW safe EV
     # forecast headroom. The 16 kW request remains only a Maxem-subordinate ceiling.
     assert planner_inputs[0][0][1][0]["expected_delivery_kw"] == pytest.approx(12.6)
+
+
+def test_shadow_terminal_ev_job_publishes_cleanup_marker_for_controller(
+        monkeypatch):
+    from datetime import datetime, timezone
+    from lib import ev_smart_charge
+
+    start = datetime(2026, 7, 21, 0, 0, tzinfo=timezone.utc)
+    baseline = {start: 0.3}
+    settings = {
+        "EV_SMART_CHARGE_ENABLED": "True",
+        "EV_SMART_CHARGE_APPLY": "False",
+        "EV_SMART_CHARGE_JOB_PATH": "/tmp/shadow-job.json",
+        "EV_SMART_CHARGE_PLAN_PATH": "/tmp/shadow-plan.json",
+    }
+    terminal = {
+        "available": True,
+        "active": False,
+        "status": "completed",
+        "reason": "target_soc_reached",
+        "job": {"id": "job-1", "status": "active"},
+        "slots": [],
+        "planned_ac_kwh": 0,
+    }
+    saved = []
+    monkeypatch.setattr(energy_broker, "STATE", DummyState({}))
+    monkeypatch.setattr(
+        energy_broker, "retrieve_setting", lambda name: settings.get(name))
+    monkeypatch.setattr(
+        ev_smart_charge, "load_job",
+        lambda path=None: {
+            "id": "job-1",
+            "status": "active",
+            "ready_by": (start.replace(hour=2)).isoformat(),
+        },
+    )
+    monkeypatch.setattr(
+        ev_smart_charge, "plan_charge", lambda *args, **kwargs: terminal)
+    monkeypatch.setattr(
+        ev_smart_charge, "save_plan_snapshot",
+        lambda plan, path=None: saved.append((plan, path)),
+    )
+
+    result, context = energy_broker._apply_ev_smart_charge_to_forecast(
+        baseline,
+        {start: 0.0},
+        [{"start": start, "total": 0.20}],
+        slot_duration_h=0.25,
+        current_soc=80,
+        now=start,
+    )
+
+    assert result is baseline
+    assert context["status"] == "completed"
+    assert context["plan"] is terminal
+    assert saved == [(terminal, "/tmp/shadow-plan.json")]
 
 
 def test_ev_smart_forecast_reserves_surplus_for_protected_home_battery(monkeypatch):

@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from lib.ev_smart_charge import (
+    clear_job_artifacts,
     clear_job,
     create_job,
     delete_job,
@@ -740,6 +741,41 @@ def test_already_at_target_requires_no_charge():
     assert plan["required_ac_kwh"] == 0
     assert plan["slots"] == []
     assert plan["blocks"] == []
+
+
+def test_past_ready_by_is_expired_not_permanently_infeasible():
+    created = datetime(2026, 7, 20, 20, tzinfo=timezone.utc)
+    job = _job(created, current=20, target=80, ready_hours=1)
+    plan = plan_ev_charge(
+        job=job,
+        now=created + timedelta(hours=1, seconds=1),
+        slots=[],
+    )
+
+    assert plan["active"] is False
+    assert plan["status"] == "expired"
+    assert plan["reason"] == "ready_by_elapsed"
+    assert plan["slots"] == []
+
+
+def test_terminal_artifact_cleanup_removes_only_matching_job_and_plan(tmp_path):
+    now = datetime(2026, 7, 20, 20, tzinfo=timezone.utc)
+    job_path = tmp_path / "job.json"
+    plan_path = tmp_path / "plan.json"
+    job = _job(now)
+    plan = plan_charge(job, [], now=now)
+    save_job(job, path=job_path)
+    save_plan_snapshot(plan, path=plan_path)
+
+    assert clear_job_artifacts(
+        "other-job", job_path=job_path, plan_path=plan_path) is False
+    assert job_path.exists()
+    assert plan_path.exists()
+
+    assert clear_job_artifacts(
+        job["id"], job_path=job_path, plan_path=plan_path) is True
+    assert not job_path.exists()
+    assert not plan_path.exists()
 
 
 def test_pause_and_resume_are_persistent_and_paused_job_reserves_no_load(tmp_path):

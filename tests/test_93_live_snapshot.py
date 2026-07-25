@@ -6,6 +6,8 @@ time-to-go, inverter system-state code, EV lifetime energy + session time).
 No broker is needed: snapshot() only reads the in-memory value cache, so we
 inject values directly and assert the parsing/None-fallback behaviour.
 """
+import time
+
 from frontend.live import MqttLive
 
 # Every key the v2 cards depend on, beyond the pre-existing power/SoC fields.
@@ -121,3 +123,27 @@ def test_vehicle_charging_status_remains_when_ev_meter_shows_real_draw():
 
     assert snap["veh_is_charging"] == "True"
     assert snap["veh_charging_status"] == "Charging"
+
+
+def test_snapshot_exposes_vehicle_telemetry_connection_status():
+    snap = _snapshot_with({"veh_telemetry_status": "DISCONNECTED"})
+
+    assert snap["veh_telemetry_status"] == "DISCONNECTED"
+
+
+def test_snapshot_exposes_vehicle_update_age_for_local_timestamp():
+    updated_at = time.strftime(
+        "%Y-%m-%d %H:%M:%S",
+        time.localtime(time.time() - 60),
+    )
+
+    snap = _snapshot_with({"veh_last_update": updated_at})
+
+    assert 59 <= snap["veh_last_update_age_s"] <= 62
+
+
+def test_snapshot_vehicle_update_age_is_none_when_timestamp_is_unavailable():
+    assert _snapshot_with({})["veh_last_update_age_s"] is None
+    assert _snapshot_with({"veh_last_update": "not-a-date"})[
+        "veh_last_update_age_s"
+    ] is None

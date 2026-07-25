@@ -15,7 +15,7 @@ from lib.tesla_api import TeslaApi
 from lib.global_state import GlobalStateClient
 from lib.helpers import publish_message, is_truthy
 from lib.notifications import pushover_notification, pushover_notification_critical
-from lib.ev_smart_charge import load_job, load_plan_snapshot
+from lib.ev_smart_charge import clear_job_artifacts, load_job, load_plan_snapshot
 
 
 # Charge-control tuning.
@@ -44,6 +44,14 @@ SMART_SCHEDULE_RETRY_S = 60
 SMART_COMMAND_RETRY_S = 60
 SMART_COMMAND_ACK_TIMEOUT_S = 60
 SMART_COMMAND_MAX_ATTEMPTS = 3
+# Current is a frequent, Maxem-influenced signal: one initial request plus one
+# confirmation retry is sufficient. Limit/schedule/start reconciliation retains
+# the broader three-attempt bound because those are not continuously adjusted.
+SMART_CURRENT_MAX_ATTEMPTS = 2
+# Tesla normally begins charging as soon as a cable is inserted. When an applied
+# job is deliberately waiting for a cheaper block, a charge edge this close to the
+# plug edge is automatic behavior, not an intentional Tesla-app override.
+SMART_PLUG_AUTOSTART_WINDOW_S = 30
 # Stable, application-owned ID. Tesla's own command proxy creates schedule IDs from Unix
 # seconds; use this feature's 2026-07-21 UTC epoch rather than an arbitrary uint64 so legacy
 # vehicle firmware receives the same shape it creates itself. Only this exact ID is touched.
@@ -210,8 +218,8 @@ class EvCharger:
 
         Preconditions (any of):
           * explicit intent: the dedicated EV-charge request is on (NOT grid-assist); or
-          * PV surplus: the sun is up, the house battery is already at/above its target
-            SoC, and there is >= 2 A of exportable surplus (i.e. PV is spilling to grid); or
+          * usable PV surplus while pushed state says the car is home and plugged (or one
+            rate-limited legacy discovery is due when Fleet Telemetry is disabled); or
           * the car is already drawing power locally (measured charger amps) — we may need
             to adjust the rate or stop.
         This is the primary cost-avoidance layer; the tesla_budget guard is the backstop.
@@ -229,14 +237,19 @@ class EvCharger:
         # Shadow mode is intentionally absent here: an unapplied plan must make zero smart
         # vehicle calls. An applied active job engages the loop so it can reconcile the one
         # fallback schedule and act exactly at block boundaries.
-        if self._smart_apply() and self._smart_plan_context().get("handled"):
+        if self._smart_enabled():
+            smart = self._smart_plan_context()
+            if (self._smart_apply()
+                    or smart.get("terminal")
+                    or smart.get("paused")
+                    or smart.get("reconcile_status") is not None):
+                if smart.get("handled"):
+                    return True
+        if self._surplus_should_engage():
             return True
-        if (self.is_the_sun_shining()
-                and _num(self.ess_soc) >= self.minimum_ess_soc
-                and _num(self.surplus_amps) >= SURPLUS_MIN_AMPS):
-            return True
-        # Stay engaged whenever we believe the car is charging (local amps OR cached Tesla
-        # state) so we can still manage/stop it — e.g. when the EV-charge request is switched off.
+        # The local ABB meter is authoritative even if pushed vehicle metadata is stale. Cached
+        # Tesla "charging" is only actionable while the same cache says the car is home and
+        # plugged; otherwise it can survive an unplug/drive-away event and spuriously engage.
         if self._charging_now():
             return True
         return False
@@ -283,27 +296,40 @@ class EvCharger:
             # Decide whether this tick may WAKE the car (the expensive call). Justified by:
             #  * a fresh intent toggle (on OR off) -> check/act now; or
             #  * a manual refresh request -> check now; or
-            #  * ongoing intent / enough PV surplus -> a rate-limited discovery wake.
+            #  * ongoing intent, or telemetry-disabled surplus with unknown vehicle
+            #    availability -> a rate-limited discovery wake.
             # All wakes remain hard-capped by the tesla_budget guard.
             surplus = self._surplus_available()
             force = wake = False
-            if intent_on_edge or self._fresh_stop_request or refresh_requested:
+            immediate_check = (
+                intent_on_edge or self._fresh_stop_request or refresh_requested
+            )
+            if immediate_check:
                 force = wake = True
                 if intent_on_edge:
                     logging.info("EvCharger: EV-charge request toggled on — checking vehicle now.")
                 elif refresh_requested:
-                    # Same telemetry-mode distinction as the discovery-wake log below (L1): in
-                    # telemetry mode update_vehicle_status() never actually wakes the car.
-                    what = "refreshing telemetry state" if self._telemetry_on() else "waking vehicle to refresh status"
+                    what = (
+                        "checking pushed telemetry (REST fallback only if stale)"
+                        if self._telemetry_on()
+                        else "waking vehicle to refresh status"
+                    )
                     logging.info(f"EvCharger: manual refresh requested — {what}.")
-            elif (intent or surplus) and self._should_discovery_wake():
+            commandable = self._vehicle_commandable()
+            discovery_needed = intent or (surplus and not commandable)
+            if (
+                not immediate_check
+                and discovery_needed
+                and self._should_discovery_wake()
+            ):
                 force = wake = True
                 self._last_discovery_wake_ts = time.time()
                 why = "charge intent on" if intent else f"PV surplus {int(_num(self.surplus_amps))}A"
-                # In telemetry mode update_vehicle_status() short-circuits to the pushed state
-                # and never actually wakes the car (audit L1) — say so instead of claiming a
-                # wake that doesn't happen.
-                what = "refreshing telemetry state" if self._telemetry_on() else "waking vehicle to check home/plugged state"
+                what = (
+                    "checking pushed telemetry (REST fallback only if stale)"
+                    if self._telemetry_on()
+                    else "waking vehicle to check home/plugged state"
+                )
                 logging.info(f"EvCharger: {why} — {what}.")
 
             self.tesla.update_vehicle_status(force=force, allow_wake=wake)
@@ -325,6 +351,11 @@ class EvCharger:
             self._reschedule(30.0)
 
     def _dormant_reason(self) -> str:
+        if not self._intent_on():
+            if not self.tesla.is_home:
+                return "vehicle away; no charge intent"
+            if not self.tesla.is_plugged:
+                return "vehicle unplugged; no charge intent"
         sa = int(_num(self.surplus_amps))
         return f"no charge intent; PV surplus {sa}A < {SURPLUS_MIN_AMPS}A threshold ({_num(self.surplus_watts):.0f}W)"
 
@@ -430,9 +461,27 @@ class EvCharger:
             if start and end and start.timestamp() <= now_dt.timestamp() < end.timestamp():
                 active_slot = slot
                 break
-        actionable = reconcile_status is None and not stale and job_status == "active" and plan_status in {
+        deadline = self._parse_plan_time(plan.get("ready_by") or job.get("ready_by"))
+        target_soc = _num(plan.get("target_soc", job.get("target_soc")), math.nan)
+        vehicle_soc = _num(getattr(self.tesla, "vehicle_soc", None), math.nan)
+        target_reached = (
+            math.isfinite(target_soc)
+            and math.isfinite(vehicle_soc)
+            and vehicle_soc + 0.05 >= target_soc
+        )
+        deadline_elapsed = (
+            deadline is not None and now_dt.timestamp() >= deadline.timestamp()
+        )
+        terminal_status = (
+            plan_status if plan_status in {"completed", "expired", "cancelled"}
+            else "completed" if target_reached
+            else "expired" if deadline_elapsed
+            else None
+        )
+        actionable = (terminal_status is None and reconcile_status is None
+                      and not stale and job_status == "active" and plan_status in {
             "planned", "infeasible", "charging", "at_risk"
-        }
+        })
         return {
             "handled": True,
             "plan": plan,
@@ -440,7 +489,8 @@ class EvCharger:
             "job_id": str(job.get("id")),
             "stale": stale,
             "paused": job_status == "paused" or plan_status == "paused",
-            "terminal": plan_status in {"completed", "cancelled", "idle"},
+            "terminal": terminal_status is not None,
+            "terminal_status": terminal_status,
             "reconcile_status": reconcile_status,
             "reconcile_reason": reconcile_reason,
             "actionable": actionable,
@@ -677,6 +727,25 @@ class EvCharger:
                 and _num(self.ess_soc) >= self.minimum_ess_soc
                 and _num(self.surplus_amps) >= SURPLUS_MIN_AMPS)
 
+    def _vehicle_commandable(self) -> bool:
+        """Whether cached pushed state permits a start/current command."""
+        return bool(
+            self.tesla.is_home
+            and self.tesla.is_plugged
+            and not self.tesla.is_supercharging
+        )
+
+    def _surplus_should_engage(self) -> bool:
+        """Use known pushed state, retaining legacy discovery only without telemetry."""
+        if not self._surplus_available():
+            return False
+        if self._vehicle_commandable():
+            return True
+        # With Fleet Telemetry enabled, home/plug edges arrive for free and a known
+        # away/unplugged car must remain dormant. Installations without telemetry still need
+        # the old, rate-limited REST wake to discover that a car was newly plugged in.
+        return not self._telemetry_on() and self._should_discovery_wake()
+
     def _should_discovery_wake(self) -> bool:
         """Rate-limit surplus/intent-driven wakes so an away or asleep car can't drain the
         wake budget: at most one per DISCOVERY_WAKE_INTERVAL_S, and a longer backoff after a
@@ -689,7 +758,10 @@ class EvCharger:
     def _charging_now(self) -> bool:
         """Is the car actually drawing? Prefer the local charger meter (free, near real-time)
         over the cached Tesla flag, which only refreshes on a (throttled) API read."""
-        return _num(self.charging_amps) >= 1 or bool(self.tesla.is_charging)
+        return (
+            _num(self.charging_amps) >= 1
+            or (self._vehicle_commandable() and bool(self.tesla.is_charging))
+        )
 
     def _cooldown_ok(self) -> bool:
         return (time.time() - self._last_command_ts) >= COMMAND_COOLDOWN_S
@@ -757,10 +829,10 @@ class EvCharger:
         if isinstance(pending, dict):
             attempts = int(pending.get("attempts", 0))
             sent_at = _num(pending.get("sent_at"), 0.0)
-            due = (
-                now_ts - sent_at >= SMART_COMMAND_ACK_TIMEOUT_S
-                or observed_at >= sent_at > 0
-            )
+            # A newer mismatching request can be Maxem reducing currently
+            # available current. Give Tesla the full acknowledgement window;
+            # never turn that live edge into an immediate command fight.
+            due = now_ts - sent_at >= SMART_COMMAND_ACK_TIMEOUT_S
             if attempts >= 2:
                 return ("unconfirmed" if due else "pending"), False
             return ("retry_due" if due else "pending"), due
@@ -862,9 +934,16 @@ class EvCharger:
         safety Stop may also use authoritative local draw when those pushed fields are stale.
         """
         t = self.tesla
-        smart = self._smart_plan_context(now=now) if self._smart_apply() else {
-            "handled": False,
-        }
+        smart = {"handled": False}
+        if self._smart_enabled():
+            candidate = self._smart_plan_context(now=now)
+            cleanup_only = (
+                candidate.get("terminal")
+                or candidate.get("paused")
+                or candidate.get("reconcile_status") is not None
+            )
+            if self._smart_apply() or cleanup_only:
+                smart = candidate
         if smart.get("handled"):
             self._maybe_send_plug_reminder(smart)
 
@@ -890,7 +969,7 @@ class EvCharger:
                 self._manual_stop_active = False
             return False
 
-        commandable = bool(t.is_home and t.is_plugged and not t.is_supercharging)
+        commandable = self._vehicle_commandable()
         if not commandable:
             if smart.get("handled"):
                 status = ("away" if not t.is_home else
@@ -909,6 +988,10 @@ class EvCharger:
                 self._stop_charge("car at its SoC limit", force=True)
             self._low_surplus_since = None
             self._charge_mode = None
+            # A smart job whose own target is now satisfied still needs its
+            # Tesla fallback schedule and local artifacts removed.
+            if smart.get("handled") and smart.get("terminal"):
+                return self._control_smart_charging(smart)
             return False
 
         # 2) EV-CHARGE REQUEST ON = express override: charge at the car's own rate; ignore
@@ -1005,35 +1088,50 @@ class EvCharger:
         return "ok" if EvCharger._smart_command_ok(result) else "failed"
 
     def _smart_target_amps(self, slot: dict) -> int:
-        """Convert the plan's kW ceiling to per-phase amps using pushed vehicle data.
+        """Convert the plan's kW ceiling to configured per-phase amps.
 
         Actual ABB current is deliberately absent from this calculation. Maxem may temporarily
-        reduce EVSE delivery for site overload protection; chasing that measured reduction with
-        repeated Fleet commands would fight the protection system and waste commands.
+        reduce both EVSE delivery and Tesla's ``ChargeCurrentRequestMax`` availability signal
+        for site overload protection. Chasing either live reduction with a new desired Fleet
+        command would fight that protection system and waste commands. The configured
+        ``EV_CHARGER_MAX_AMPS`` remains the durable installation ceiling.
         """
         explicit_amps = slot.get("target_amps")
         if explicit_amps is not None:
             configured_max = self._smart_installation_ceiling()
-            live_max = _num(self.global_state.get("tesla_charge_current_max"), 0.0)
-            live_max = live_max if 1.0 <= live_max <= 32.0 else configured_max
-            ceiling = min(configured_max, live_max)
-            return int(max(0, min(math.floor(_num(explicit_amps)), math.floor(ceiling))))
+            return int(max(
+                0, min(math.floor(_num(explicit_amps)), math.floor(configured_max))))
         target_kw = _num(slot.get("target_kw", slot.get("requested_power_kw")), 0.0)
         phases = _num(self.global_state.get("tesla_charger_phases"), 3.0)
         phases = phases if 1.0 <= phases <= 3.0 else 3.0
         voltage = _num(self.global_state.get("tesla_charger_voltage"), 230.0)
         voltage = voltage if 180.0 <= voltage <= 260.0 else 230.0
         configured_max = self._smart_installation_ceiling()
-        live_max = _num(self.global_state.get("tesla_charge_current_max"), 0.0)
-        live_max = live_max if 1.0 <= live_max <= 32.0 else 0.0
-        ceiling = min(configured_max, live_max) if live_max > 0 else configured_max
         requested = math.floor(max(0.0, target_kw) * 1000.0 / (phases * voltage))
         if target_kw > 0.0:
             # A positive partial tail must not collapse to 0 A. Tesla accepts
             # 1–4 A on this vehicle through the intentional two-send workaround
             # owned by TeslaApi.set_tesla_charge_amps().
             requested = max(1, requested)
-        return int(max(0, min(requested, math.floor(ceiling))))
+        return int(max(0, min(requested, math.floor(configured_max))))
+
+    def _smart_plug_autostart(self) -> bool:
+        """Whether the current charge began as part of the live plug-in transition.
+
+        Fleet Telemetry records these edges only from non-retained messages. Missing
+        timestamps therefore fail safely as a possible manual session, including when
+        the service restarts while a charge is already running.
+        """
+        plugged_at = _num(
+            self.global_state.get("tesla_plugged_transition_ts"), 0.0)
+        started_at = _num(
+            self.global_state.get("tesla_charge_started_ts"), 0.0)
+        delta = started_at - plugged_at
+        return (
+            plugged_at > 0
+            and started_at > 0
+            and -2.0 <= delta <= SMART_PLUG_AUTOSTART_WINDOW_S
+        )
 
     def _smart_surplus_context(self, smart: dict) -> dict:
         """Return the stable synthetic block representing between-block solar."""
@@ -1161,9 +1259,11 @@ class EvCharger:
         if isinstance(pending, dict):
             attempts = int(pending.get("attempts", 0))
             sent_at = _num(pending.get("sent_at"), 0.0)
-            due = (now_ts - sent_at >= SMART_COMMAND_ACK_TIMEOUT_S
-                   or observed_at >= sent_at > 0)
-            if attempts >= SMART_COMMAND_MAX_ATTEMPTS:
+            # Maxem can publish a newer, lower request immediately after our
+            # accepted command. Wait the full acknowledgement interval before
+            # the one allowed retry instead of responding to that edge.
+            due = now_ts - sent_at >= SMART_COMMAND_ACK_TIMEOUT_S
+            if attempts >= SMART_CURRENT_MAX_ATTEMPTS:
                 # A definitive rejected response needs no grace period. An accepted final
                 # attempt still gets the full observation window before escalation.
                 exhausted = not pending.get("accepted", False) or due
@@ -1413,6 +1513,8 @@ class EvCharger:
         return f"failed_{category}"
 
     def _remove_smart_fallback(self, smart: dict, *, force=False) -> str:
+        if not getattr(self, "_smart_schedule_supported", True):
+            return "unsupported"
         signature = getattr(self, "_smart_schedule_signature", None)
         removal_key = smart.get("job_id") or signature
         now_ts = smart.get("now", datetime.datetime.now(datetime.timezone.utc)).timestamp()
@@ -1454,45 +1556,91 @@ class EvCharger:
         self._smart_remove_failure_attempts = 0
         return "removed"
 
+    def _clear_terminal_smart_artifacts(self, job_id: str) -> bool:
+        """Delete terminal local state only after Tesla-side cleanup succeeded."""
+        job_path = retrieve_setting("EV_SMART_CHARGE_JOB_PATH") or None
+        plan_path = retrieve_setting("EV_SMART_CHARGE_PLAN_PATH") or None
+        try:
+            cleared = clear_job_artifacts(
+                job_id, job_path=job_path, plan_path=plan_path)
+        except OSError as error:
+            logging.warning(
+                "EvCharger: could not remove completed smart-charge files: %s",
+                error,
+            )
+            return False
+        if not cleared:
+            return False
+        self._smart_plan = None
+        self._smart_job = None
+        self._smart_job_loaded = True
+        self._smart_owns_charge = False
+        self._charge_mode = None
+        return True
+
     def _control_smart_charging(self, smart: dict) -> bool:
         """Execute stable smart-plan blocks while remaining subordinate to manual control."""
         job_id = smart.get("job_id", "")
         owns = bool(getattr(self, "_smart_owns_charge", False))
 
-        # Live smart control is explicitly telemetry-confirmed. Without the Fleet stream we
-        # cannot distinguish an accepted HTTP response from a command which actually changed
-        # vehicle state within the required minute, so fail closed and leave legacy behavior
-        # untouched whenever no applied smart job is present.
-        if not self._telemetry_on():
-            self._set_smart_state(
-                "telemetry_required", reason="fleet_telemetry_disabled",
-                job_id=job_id, fallback="not_reconciled")
+        if (smart.get("paused") or smart.get("terminal")
+                or smart.get("reconcile_status") is not None):
+            status = smart.get("reconcile_status") or (
+                "paused" if smart.get("paused")
+                else smart.get("terminal_status") or "completed")
+            reason = smart.get("reconcile_reason") or "job_not_actionable"
+            # A paused/terminal snapshot may be the first plan this process sees after a
+            # restart. One idempotent removal of our deterministic ID is therefore warranted
+            # even when the in-memory installed signature is unknown.
+            fallback = self._remove_smart_fallback(smart, force=True)
+            stopped = True
+            if owns and self._charging_now():
+                stopped = self._stop_charge(
+                    f"smart-charge job {status}", force=False)
+                if stopped and self._charge_mode is None:
+                    self._smart_owns_charge = False
+            cleanup_terminal = (
+                smart.get("terminal") or status == "cancelled"
+            )
+            cleanup_ready = (
+                fallback in {"removed", "not_installed", "unsupported"}
+                and stopped
+            )
+            if (cleanup_terminal and cleanup_ready
+                    and self._clear_terminal_smart_artifacts(job_id)):
+                self._set_smart_state(
+                    "idle", reason=f"{status}_cleaned_up",
+                    job_id="", fallback=fallback)
+                return False
+            self._set_smart_state(status, reason=reason, job_id=job_id,
+                                  fallback=fallback)
             return False
 
-        # Durable pause/edit/delete intent outranks snapshot age: an old active snapshot is
-        # exactly what must be neutralized when replanning failed or the broker is offline.
+        # A non-terminal abandoned plan fails closed. Terminal/cancel cleanup
+        # above intentionally outranks age so an old fallback is still removed.
         if smart.get("stale") and not smart.get("reconcile_status"):
-            self._set_smart_state("stale_plan", reason="planner_snapshot_expired", job_id=job_id)
+            self._set_smart_state(
+                "stale_plan", reason="planner_snapshot_expired", job_id=job_id)
             if owns and self._charging_now():
                 self._stop_charge("smart-charge plan became stale", force=True)
                 if self._charge_mode is None:
                     self._smart_owns_charge = False
             return False
 
-        if smart.get("paused") or smart.get("terminal") or not smart.get("actionable"):
-            status = smart.get("reconcile_status") or (
-                "paused" if smart.get("paused") else "completed")
-            reason = smart.get("reconcile_reason") or "job_not_actionable"
-            # A paused/terminal snapshot may be the first plan this process sees after a
-            # restart. One idempotent removal of our deterministic ID is therefore warranted
-            # even when the in-memory installed signature is unknown.
+        if not smart.get("actionable"):
             fallback = self._remove_smart_fallback(smart, force=True)
-            if owns and self._charging_now():
-                self._stop_charge(f"smart-charge job {status}", force=False)
-                if self._charge_mode is None:
-                    self._smart_owns_charge = False
-            self._set_smart_state(status, reason=reason, job_id=job_id,
-                                  fallback=fallback)
+            self._set_smart_state(
+                "waiting", reason="job_not_actionable",
+                job_id=job_id, fallback=fallback)
+            return False
+
+        # Live smart control is explicitly telemetry-confirmed. Terminal/cancel cleanup above
+        # is intentionally allowed without the stream: deterministic schedule removal is an
+        # idempotent lifecycle action, not permission to begin or alter a charge.
+        if not self._telemetry_on():
+            self._set_smart_state(
+                "telemetry_required", reason="fleet_telemetry_disabled",
+                job_id=job_id, fallback="not_reconciled")
             return False
 
         slot = smart.get("slot")
@@ -1522,6 +1670,38 @@ class EvCharger:
         if (not charging
                 and fallback == "fallback_waiting_for_representable_date_removed"):
             self._smart_cleanup_requires_stop = False
+
+        # Tesla automatically starts an ordinary charge when the cable is inserted.
+        # During an applied job that is waiting for a selected block, treating that
+        # charge as a manual override defeats the schedule and can immediately import
+        # at full power. Live plug/start edges let us handle only that narrow case:
+        # stop while waiting (or while a solar-only slot has no available current),
+        # otherwise adopt the already-running charge inside the selected block.
+        plug_autostart = charging and not owns and self._smart_plug_autostart()
+        if plug_autostart:
+            slot_target = self._smart_target_amps(slot) if isinstance(slot, dict) else 0
+            block_suppressed = (
+                isinstance(slot, dict) and self._smart_block_is_suppressed(smart)
+            )
+            if slot_target <= 0 or block_suppressed:
+                stopped = self._stop_charge(
+                    "automatic plug-in charge outside an available smart block",
+                    force=True,
+                )
+                self._set_smart_state(
+                    "waiting" if stopped else "stopping",
+                    reason="automatic_plug_start_outside_block",
+                    job_id=job_id,
+                    fallback=fallback or "preserved",
+                )
+                return False
+            logging.info(
+                "EvCharger: automatic plug-in charge began inside the selected "
+                "smart block; adopting it for planned current control."
+            )
+            self._smart_owns_charge = True
+            self._charge_mode = "smart"
+            owns = True
 
         # Fresh state says a charge which we started is now stopped before its block ended.
         # Without spending a read we cannot safely distinguish a Tesla-app stop from Maxem

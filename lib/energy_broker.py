@@ -1734,16 +1734,17 @@ def _apply_ev_smart_charge_to_forecast(
             except (TypeError, ValueError):
                 return default
 
-        # Bound configured power by the pushed vehicle/EVSE capability. This
-        # automatically de-rates a one-phase connection or a lower vehicle limit.
+        # Derive the durable planning ceiling from installation configuration and
+        # pushed phase/voltage topology. Do not use ChargeCurrentRequestMax here:
+        # Tesla defines it as currently available current and Maxem can lower it
+        # transiently for site protection. Folding that ephemeral value into every
+        # replan made the EV horizon and requested current oscillate with Maxem.
         phases = _positive_state_number("tesla_charger_phases", 3.0)
         phases = phases if 1.0 <= phases <= 3.0 else 3.0
         voltage = _positive_state_number("tesla_charger_voltage", 230.0)
         voltage = voltage if 180.0 <= voltage <= 260.0 else 230.0
         configured_amps = _get_float_setting("EV_CHARGER_MAX_AMPS", 24.0)
-        live_amps = _positive_state_number("tesla_charge_current_max", configured_amps)
-        live_amps = live_amps if 1.0 <= live_amps <= 32.0 else configured_amps
-        electrical_ceiling_kw = phases * voltage * min(configured_amps, live_amps) / 1000.0
+        electrical_ceiling_kw = phases * voltage * configured_amps / 1000.0
         requested_ceiling_kw = min(
             _get_float_setting("EV_CHARGER_MAX_KW", 16.0),
             electrical_ceiling_kw,

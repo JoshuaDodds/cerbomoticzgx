@@ -1,4 +1,6 @@
 """Tests for the pure translation core of the Tesla Fleet Telemetry bridge."""
+import pytest
+
 from lib import tesla_telemetry_bridge as tb
 
 
@@ -19,6 +21,14 @@ def test_detailed_charge_state_disconnected():
     assert out["state"]["tesla_time_to_full"] == "N/A"
     assert out["topics"]["Tesla/vehicle0/plugged_status"] == "Unplugged"
     assert out["topics"]["Tesla/vehicle0/time_until_full"] == "N/A"
+
+
+@pytest.mark.parametrize(
+    "value",
+    (None, "", "Unknown", "DetailedChargeStateUnknown"),
+)
+def test_unknown_detailed_charge_state_preserves_last_known_state(value):
+    assert tb.translate("DetailedChargeState", value) == {}
 
 
 def test_detailed_charge_state_plugged_not_charging():
@@ -96,6 +106,223 @@ def test_apply_records_field_specific_acknowledgement_timestamp(monkeypatch):
     assert stored["tesla_soc_setpoint_updated_at"] == 1234.5
 
 
+def test_live_charge_state_records_plug_and_charge_start_edges(monkeypatch):
+    stored = {
+        "tesla_is_plugged": "False",
+        "tesla_is_charging": "False",
+    }
+
+    class State:
+        def has(self, key):
+            return key in stored
+
+        def get(self, key):
+            return stored.get(key)
+
+        def set(self, key, value):
+            stored[key] = value
+
+    monkeypatch.setattr("lib.global_state.GlobalStateClient", lambda: State())
+    monkeypatch.setattr("lib.helpers.publish_message", lambda *a, **k: None)
+    monkeypatch.setattr(tb.time, "time", lambda: 1234.5)
+    bridge = tb.TeslaTelemetryBridge("broker")
+
+    bridge.apply("DetailedChargeState", "DetailedChargeStateCharging")
+
+    assert stored["tesla_plugged_transition_ts"] == 1234.5
+    assert stored["tesla_charge_started_ts"] == 1234.5
+
+
+def test_live_home_to_away_transition_clears_impossible_home_plug_state(
+        monkeypatch):
+    """A car cannot leave home without disconnecting its home charge cable."""
+    stored = {
+        "tesla_is_home": "True",
+        "tesla_is_plugged": "True",
+        "tesla_is_charging": "True",
+        "tesla_time_to_full": "2 hr 40 min",
+    }
+    published = {}
+
+    class State:
+        def has(self, key):
+            return key in stored
+
+        def get(self, key):
+            return stored.get(key)
+
+        def set(self, key, value):
+            stored[key] = value
+
+    monkeypatch.setattr("lib.global_state.GlobalStateClient", lambda: State())
+
+    def publish(topic, **kwargs):
+        published[topic] = kwargs["payload"]
+
+    monkeypatch.setattr("lib.helpers.publish_message", publish)
+    bridge = tb.TeslaTelemetryBridge("broker")
+    bridge._home = (52.1234, 4.5678)
+
+    bridge.apply(
+        "Location",
+        {"latitude": 52.2, "longitude": 4.6},
+        retained=False,
+    )
+
+    assert stored["tesla_is_home"] == "False"
+    assert stored["tesla_is_plugged"] == "False"
+    assert stored["tesla_is_charging"] == "False"
+    assert stored["tesla_time_to_full"] == "N/A"
+    assert '"Unplugged"' in published["Tesla/vehicle0/plugged_status"]
+    assert '"False"' in published["Tesla/vehicle0/is_charging"]
+    assert '"N/A"' in published["Tesla/vehicle0/time_until_full"]
+
+    # If it is then plugged into a different charger while away, Tesla's explicit
+    # charge-state event overrides the derived disconnect normally.
+    bridge.apply(
+        "DetailedChargeState",
+        "DetailedChargeStateCharging",
+        retained=False,
+    )
+    assert stored["tesla_is_home"] == "False"
+    assert stored["tesla_is_plugged"] == "True"
+    assert stored["tesla_is_charging"] == "True"
+
+
+def test_away_location_does_not_override_explicit_public_charging_state(
+        monkeypatch):
+    """Only the home->away edge derives an unplug; later away updates preserve public charging."""
+    stored = {
+        "tesla_is_home": "False",
+        "tesla_is_plugged": "True",
+        "tesla_is_charging": "True",
+        "tesla_time_to_full": "45 min",
+    }
+
+    class State:
+        def has(self, key):
+            return key in stored
+
+        def get(self, key):
+            return stored.get(key)
+
+        def set(self, key, value):
+            stored[key] = value
+
+    monkeypatch.setattr("lib.global_state.GlobalStateClient", lambda: State())
+    monkeypatch.setattr("lib.helpers.publish_message", lambda *a, **k: None)
+    bridge = tb.TeslaTelemetryBridge("broker")
+    bridge._home = (52.1234, 4.5678)
+
+    bridge.apply(
+        "Location",
+        {"latitude": 52.2, "longitude": 4.6},
+        retained=False,
+    )
+
+    assert stored["tesla_is_home"] == "False"
+    assert stored["tesla_is_plugged"] == "True"
+    assert stored["tesla_is_charging"] == "True"
+    assert stored["tesla_time_to_full"] == "45 min"
+
+
+def test_retained_charge_state_does_not_invent_plug_or_start_edges(monkeypatch):
+    stored = {
+        "tesla_is_plugged": "False",
+        "tesla_is_charging": "False",
+    }
+
+    class State:
+        def has(self, key):
+            return key in stored
+
+        def get(self, key):
+            return stored.get(key)
+
+        def set(self, key, value):
+            stored[key] = value
+
+    monkeypatch.setattr("lib.global_state.GlobalStateClient", lambda: State())
+    monkeypatch.setattr("lib.helpers.publish_message", lambda *a, **k: None)
+    bridge = tb.TeslaTelemetryBridge("broker")
+
+    bridge.apply(
+        "DetailedChargeState",
+        "DetailedChargeStateCharging",
+        retained=True,
+    )
+
+    assert "tesla_plugged_transition_ts" not in stored
+    assert "tesla_charge_started_ts" not in stored
+
+
+def test_retained_signal_rebuilds_value_without_claiming_fresh_observation(
+        monkeypatch):
+    stored = {}
+    published = []
+
+    class State:
+        def set(self, key, value):
+            stored[key] = value
+
+    monkeypatch.setattr("lib.global_state.GlobalStateClient", lambda: State())
+    monkeypatch.setattr(
+        "lib.helpers.publish_message",
+        lambda topic, **kwargs: published.append(topic),
+    )
+    bridge = tb.TeslaTelemetryBridge("broker")
+
+    bridge.apply("Soc", 35.4, retained=True)
+
+    assert stored["tesla_soc"] == 35.4
+    assert "tesla_telemetry_last_update_ts" not in stored
+    assert "tesla_vehicle_last_update_ts" not in stored
+    assert "Tesla/vehicle0/battery_soc" in published
+    assert "Tesla/vehicle0/last_update_at" not in published
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "DetailedChargeState",
+        "ChargePortLatch",
+        "FastChargerPresent",
+        "Location",
+        "Soc",
+        "ChargeLimitSoc",
+        "TimeToFullCharge",
+        "ACChargingPower",
+        "ChargeAmps",
+        "ChargeCurrentRequest",
+        "ChargeCurrentRequestMax",
+        "ChargerVoltage",
+        "ChargerPhases",
+        "ACChargingEnergyIn",
+        "VehicleName",
+    ),
+)
+def test_null_stream_value_does_not_replace_last_known_normalized_state(
+        monkeypatch, field):
+    stored = {}
+    published = []
+
+    class State:
+        def set(self, key, value):
+            stored[key] = value
+
+    monkeypatch.setattr("lib.global_state.GlobalStateClient", lambda: State())
+    monkeypatch.setattr(
+        "lib.helpers.publish_message",
+        lambda topic, **kwargs: published.append((topic, kwargs)),
+    )
+    bridge = tb.TeslaTelemetryBridge("broker")
+
+    bridge.apply(field, None)
+
+    assert stored == {}
+    assert published == []
+
+
 def test_ac_power_is_unmapped():
     # ACChargingPower is intentionally not translated (audit L2 cleanup): the local meter owns
     # Tesla/vehicle0/charging_watts and nothing consumed the old *_reported topic/state.
@@ -123,6 +350,41 @@ def test_on_message_counts_only_real_signals(monkeypatch):
     assert counted["n"] == 0                              # connectivity not a billed signal
     b._on_message(None, None, Msg("telemetry/VIN/v/ChargeAmps", "5"))
     assert counted["n"] == 1                              # real vehicle-data signal counted
+
+
+def test_connectivity_record_is_persisted_and_published_without_counting_signal(
+        monkeypatch):
+    stored = {}
+    published = []
+
+    class State:
+        def set(self, key, value):
+            stored[key] = value
+
+    monkeypatch.setattr("lib.global_state.GlobalStateClient", lambda: State())
+    monkeypatch.setattr(
+        "lib.helpers.publish_message",
+        lambda topic, **kwargs: published.append((topic, kwargs)),
+    )
+    monkeypatch.setattr(tb.time, "time", lambda: 1234.5)
+    bridge = tb.TeslaTelemetryBridge("broker", vin="VIN")
+    bridge._count_stream_signal = lambda: pytest.fail(
+        "connectivity events are not billable signals")
+
+    class Msg:
+        topic = "telemetry/VIN/connectivity"
+        payload = b'{"Status":"DISCONNECTED","CreatedAt":"2026-07-23T11:09:30Z"}'
+
+    bridge._on_message(None, None, Msg())
+
+    assert stored["tesla_telemetry_connection_status"] == "DISCONNECTED"
+    assert stored["tesla_telemetry_connection_updated_at"] == 1234.5
+    assert any(
+        topic == "Tesla/vehicle0/telemetry_status"
+        and '"DISCONNECTED"' in kwargs["payload"]
+        and kwargs["retain"] is True
+        for topic, kwargs in published
+    )
 
 
 def test_stream_signal_counter_batches_to_durable_file(tmp_path, monkeypatch):

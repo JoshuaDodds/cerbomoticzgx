@@ -779,6 +779,101 @@ def test_update_vehicle_status_reads_telemetry_and_skips_rest(monkeypatch):
     assert api.time_until_full == "1 hr 5 min"
 
 
+def test_forced_refresh_uses_one_rest_fallback_when_telemetry_disconnected(
+        monkeypatch):
+    monkeypatch.setattr(
+        tesla_api,
+        "retrieve_setting",
+        lambda name: "true" if name == "TESLA_TELEMETRY_ENABLED" else None,
+    )
+    store = {
+        "tesla_telemetry_connection_status": "DISCONNECTED",
+        # A recent value does not override an explicit disconnect. The vehicle
+        # may have gone to sleep immediately after publishing it.
+        "tesla_telemetry_last_update_ts": str(time.time() - 10),
+    }
+    monkeypatch.setattr(
+        tesla_api,
+        "STATE",
+        type("S", (), {
+            "get": staticmethod(lambda key: store.get(key)),
+            "set": staticmethod(lambda key, value: store.__setitem__(key, value)),
+        })(),
+    )
+    api = tesla_api.TeslaApi.__new__(tesla_api.TeslaApi)
+    api._last_read_attempt_ts = 0
+    api._asleep = False
+    api.last_update_ts = 0
+    api.last_update_ts_hr = 0
+    api._refresh_from_telemetry = lambda: None
+    data = {"response": "not used"}
+    reads = []
+    api.get_vehicle_data = lambda allow_wake=False: reads.append(allow_wake) or data
+    applied = []
+    api._apply_vehicle_data = lambda value: applied.append(value)
+    stored = []
+    api._store_rest_fallback_state = lambda: stored.append(True)
+    published = []
+    api._publish_vehicle_topics = lambda: published.append(True)
+
+    api.update_vehicle_status(force=True, allow_wake=True)
+
+    assert reads == [True]
+    assert applied == [data]
+    assert stored == [True]
+    assert published == [True]
+
+
+def test_forced_refresh_stays_zero_cost_when_connected_stream_is_quiet(
+        monkeypatch):
+    monkeypatch.setattr(
+        tesla_api,
+        "retrieve_setting",
+        lambda name: "true" if name == "TESLA_TELEMETRY_ENABLED" else None,
+    )
+    store = {
+        "tesla_telemetry_connection_status": "CONNECTED",
+        # Fleet fields publish on change, not as heartbeats. A connected stream
+        # remains healthy even when no configured value changed for hours.
+        "tesla_telemetry_last_update_ts": str(time.time() - 4 * 3600),
+    }
+    monkeypatch.setattr(
+        tesla_api,
+        "STATE",
+        type("S", (), {"get": staticmethod(lambda key: store.get(key))})(),
+    )
+    api = tesla_api.TeslaApi.__new__(tesla_api.TeslaApi)
+    api._refresh_from_telemetry = lambda: None
+    api.get_vehicle_data = lambda **kwargs: pytest.fail(
+        "fresh push telemetry must not spend a REST read")
+
+    api.update_vehicle_status(force=True, allow_wake=True)
+
+
+def test_background_refresh_does_not_poll_rest_during_telemetry_outage(
+        monkeypatch):
+    monkeypatch.setattr(
+        tesla_api,
+        "retrieve_setting",
+        lambda name: "true" if name == "TESLA_TELEMETRY_ENABLED" else None,
+    )
+    store = {
+        "tesla_telemetry_connection_status": "DISCONNECTED",
+        "tesla_telemetry_last_update_ts": str(time.time() - 3600),
+    }
+    monkeypatch.setattr(
+        tesla_api,
+        "STATE",
+        type("S", (), {"get": staticmethod(lambda key: store.get(key))})(),
+    )
+    api = tesla_api.TeslaApi.__new__(tesla_api.TeslaApi)
+    api._refresh_from_telemetry = lambda: None
+    api.get_vehicle_data = lambda **kwargs: pytest.fail(
+        "a telemetry outage must not turn every controller tick into a billable poll")
+
+    api.update_vehicle_status(force=False)
+
+
 def test_telemetry_refresh_never_exposes_eta_when_not_charging(monkeypatch):
     monkeypatch.setattr(
         tesla_api, "retrieve_setting",
@@ -872,28 +967,44 @@ def test_confirmed_stop_refreshes_retained_charge_state_in_telemetry_mode(
                for topic, kwargs in published)
 
 
-def test_wake_vehicle_skips_billable_read_when_telemetry_is_fresh(monkeypatch):
-    # audit M3: a recently-refreshed telemetry stream is proof enough the car is online, so
-    # wake_vehicle() must not spend a billable state read to confirm it.
-    import time as _time
+def test_wake_vehicle_skips_billable_read_when_telemetry_is_connected(monkeypatch):
+    # Connectivity is the online signal. Quiet change-driven data must not force
+    # a billable state read merely because no field changed recently.
     monkeypatch.setattr(tesla_api, "retrieve_setting",
                         lambda name: "true" if name == "TESLA_TELEMETRY_ENABLED" else None)
+    monkeypatch.setattr(
+        tesla_api,
+        "STATE",
+        type("S", (), {"get": staticmethod(
+            lambda key: "CONNECTED"
+            if key == "tesla_telemetry_connection_status" else None
+        )})(),
+    )
     api = tesla_api.TeslaApi.__new__(tesla_api.TeslaApi)
-    api.last_update_ts = _time.time()
+    api.last_update_ts = 0
     reads = {"n": 0}
     api._get_vehicle_state = lambda: (reads.__setitem__("n", reads["n"] + 1), "online")[1]
     assert api.wake_vehicle() is True
     assert reads["n"] == 0                        # no billable pre-command state read
 
 
-def test_wake_vehicle_falls_back_to_real_check_when_telemetry_is_stale(monkeypatch):
-    # If the telemetry refresh itself is stale (bridge/MQTT dropped), M3's shortcut must NOT
-    # apply — fall back to the real (billable) online check rather than assuming online.
+def test_wake_vehicle_falls_back_to_real_check_when_telemetry_disconnected(
+        monkeypatch):
+    # An explicit disconnect wins even if a vehicle field was received seconds
+    # earlier; commands must confirm/wake rather than assuming the car stayed online.
     import time as _time
     monkeypatch.setattr(tesla_api, "retrieve_setting",
                         lambda name: "true" if name == "TESLA_TELEMETRY_ENABLED" else None)
+    monkeypatch.setattr(
+        tesla_api,
+        "STATE",
+        type("S", (), {"get": staticmethod(
+            lambda key: "DISCONNECTED"
+            if key == "tesla_telemetry_connection_status" else None
+        )})(),
+    )
     api = tesla_api.TeslaApi.__new__(tesla_api.TeslaApi)
-    api.last_update_ts = _time.time() - (tesla_api.TELEMETRY_ONLINE_MAX_AGE_S + 60)
+    api.last_update_ts = _time.time()
     reads = {"n": 0}
     api._get_vehicle_state = lambda: (reads.__setitem__("n", reads["n"] + 1), "online")[1]
     assert api.wake_vehicle() is True

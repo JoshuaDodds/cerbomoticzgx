@@ -121,7 +121,7 @@ CONFIG_SCHEMA = [
             {"key": "EV_CHARGE_BLOCK_START_PENALTY_EUR", "label": "EV charge block start penalty (€)", "type": "float",
              "desc": "Small virtual planning penalty per charge block to avoid extra starts for insignificant slot-price differences. It is not included in reported energy cost."},
             {"key": "EV_CHARGER_MAX_AMPS", "label": "EV current ceiling (A/phase)", "type": "int",
-             "desc": "Maximum Tesla current request per phase, additionally clamped to the live vehicle/charger maximum."},
+             "desc": "Durable maximum Tesla current request per phase. Maxem may independently lower the currently available/delivered current without changing this configured ceiling."},
             {"key": "EV_DEADLINE_BUFFER_MINUTES", "label": "Ready-by safety buffer (min)", "type": "int",
              "desc": "Moves the latest safe fallback start earlier to allow for startup delay, transient Maxem throttling, and forecast error."},
             {"key": "EV_ALLOW_ESS_DISCHARGE", "label": "Allow home battery to charge EV", "type": "bool",

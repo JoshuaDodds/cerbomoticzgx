@@ -466,7 +466,7 @@
     /* Portrait VRM-style flow (2×2 corners + centre MP-II hub, driven by
        powerflow.js when the container is narrow). Content-fit cards + generous gaps
        for the radiating connectors; sized to sit comfortably in the viewport. */
-    height: clamp(500px, 74vh, 590px);
+    height: clamp(560px, 80vh, 650px);
   }
 
   .powerflow svg {

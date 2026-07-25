@@ -20,6 +20,12 @@ separately. Long jobs retain gentle deadline progress while cost-effective forec
 solar can advance a later grid share; applied jobs can also consume real surplus
 between blocks after the stationary battery reaches `MINIMUM_ESS_SOC`. Solar-only
 forecast blocks are capped to live surplus; mixed/grid blocks retain their planned backup.
+The blue **Refresh data** action requests one explicit vehicle status check. Normal
+no-intent PV-surplus ticks remain dormant when pushed state says the car is away or
+unplugged; Fleet API discovery is retained only when Fleet Telemetry is disabled.
+On mobile, the Power Flow diagram uses content-budgeted detail rows and a capped
+Battery-card height so expanded BMS telemetry neither crosses the card border on
+short screens nor leaves an oversized empty tail on tall screens.
 
 ## Architecture / separation of concerns
 
@@ -183,8 +189,13 @@ sharing the host's `/dev/shm` (so it can read the published plan). Expose
   we sell at 15:00 yesterday?"). It sends recent history + the allow-listed tunables
   (never secrets) + the current plan to a model via a **subscription-login CLI**
   (`ADVISOR_CLI_CMD` → Claude Code / Gemini / Codex), with extended thinking off and
-  a hard prompt cap. For deep questions it pulls extra days from `data/history/` on
-  demand (`NEED_HISTORY` protocol). The Advisor tab is a persisted chat session:
+  a hard prompt cap. Prompt budgeting always preserves valid JSON plus the live state,
+  compressed current plan, daily summaries, and a compact map of every allow-listed
+  setting value; optional chat/history evidence is added only when it fits and
+  serialized JSON is never sliced. Repetitive 15-minute plan/history rows are
+  represented as action blocks. For deep questions it pulls extra days from
+  `data/history/` on demand (`NEED_HISTORY`) and can attach descriptions for explicitly
+  requested allow-listed settings (`NEED_CONFIG`). The Advisor tab is a persisted chat session:
   timestamped prompts and responses are saved to `data/advisor_latest.json`, restored
   on browser refresh, and shown newest-first. Follow-up prompts include a compact
   transcript of the current chat so the model has session context. Individual
@@ -211,6 +222,9 @@ and watcher all use the same file. The main service picks it up because:
   ESS season when `APPLIANCE_OPTIMIZATION_ENABLED` and the existing
   `HOME_CONNECT_APPLIANCE_SCHEDULING` master switch are enabled; preferred
   dishwasher-program enforcement remains governed by the Home Connect master.
+  A non-preferred run follows the appliance-owned safety sequence—abort, wait
+  for `Ready`, then send the preferred program—without dashboard-side
+  door/remote-start preconditions.
   Changes to `VICTRON_HARDWARE_MIN_SOC` are applied immediately; startup and
   optimizer cycles also reconcile that independent hard floor.
 
@@ -275,13 +289,16 @@ reuses `MOSQUITTO_IP` and `VRM_PORTAL_ID`.
   request which stays latched until confirmation or bounded escalation, so it works when intent
   was already off; the EV controller uses bounded wake escalation and local-meter stop
   verification even if pushed location/plug state is stale. Start restores the configured
-  full-rate request (bounded by the pushed vehicle ceiling), verifies `ChargeCurrentRequest`
+  full-rate request (bounded by the configured kW and per-phase ceilings), verifies `ChargeCurrentRequest`
   within 60 seconds, and permits exactly one retry. ABB power is delivery evidence only, so a
   Maxem reduction cannot cause repeated Fleet current commands.
 - `GET /api/ev/smart-charge` — current durable EV charge job and matching plan snapshot.
 - `PUT /api/ev/smart-charge` — create/replace the job with `{target_soc, ready_by}`.
 - `DELETE /api/ev/smart-charge` — cancel the job.
 - `POST /api/ev/smart-charge/action` — pause/resume a job; unsupported actions fail closed.
+- Completed/expired smart jobs are lifecycle-cleaned automatically: the controller removes only
+  its deterministic Tesla schedule IDs before deleting the matching job/plan files. This cleanup
+  remains allowed after apply is switched off, but cannot start or alter an active shadow plan.
 - `POST /api/victron/clear-schedule` — clear the five Victron scheduled-charge slots.
 - `GET /healthz` — liveness.
 

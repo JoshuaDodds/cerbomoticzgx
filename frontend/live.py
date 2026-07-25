@@ -8,6 +8,8 @@ plan snapshot (which updates every optimization cycle).
 """
 import json
 import threading
+import time
+from datetime import datetime
 
 from dotenv import dotenv_values
 from lib.config_paths import env_path, secrets_path
@@ -21,6 +23,25 @@ except Exception:  # paho optional at import time
 # The dedicated ABB/Victron EV meter idles at a few watts even when no energy is being
 # transferred. Keep this aligned with the Power Flow card's existing standby threshold.
 EV_IDLE_POWER_W = 100.0
+
+
+def _timestamp_age_seconds(value):
+    """Return the age of a retained vehicle timestamp, or None when it is unusable."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        timestamp = float(value)
+    except (TypeError, ValueError):
+        try:
+            # The bridge's retained timestamp is local wall time. fromisoformat()
+            # also keeps this compatible with a future timezone-aware ISO value.
+            parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+            timestamp = parsed.timestamp()
+        except (TypeError, ValueError):
+            return None
+    if timestamp <= 0:
+        return None
+    return max(0.0, time.time() - timestamp)
 
 
 def _config():
@@ -119,6 +140,7 @@ class MqttLive:
             "veh_amps": "Tesla/vehicle0/charging_amps",
             "veh_surplus_amps": "Tesla/vehicle0/solar/surplus_amps",
             "veh_last_update": "Tesla/vehicle0/last_update_at",
+            "veh_telemetry_status": "Tesla/vehicle0/telemetry_status",
             "setpoint_w": f"N/{sid}/settings/0/Settings/CGwacs/AcPowerSetPoint",
             "mode": "Cerbomoticzgx/GlobalState/ai_mode",
             "control_action": "Cerbomoticzgx/GlobalState/ai_control_action",
@@ -270,6 +292,10 @@ class MqttLive:
         out["veh_is_supercharging"] = vals.get("veh_is_supercharging")
         out["veh_eta"] = vals.get("veh_eta")               # time-to-limit while charging
         out["veh_last_update"] = vals.get("veh_last_update")
+        out["veh_last_update_age_s"] = _timestamp_age_seconds(
+            out["veh_last_update"]
+        )
+        out["veh_telemetry_status"] = vals.get("veh_telemetry_status")
         # Fleet Telemetry is change-driven and an old retained DetailedChargeState can survive
         # a confirmed stop if the vehicle never emits the matching edge. The dedicated local EV
         # meter is faster and authoritative for whether energy is actually flowing. Reconcile

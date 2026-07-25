@@ -39,9 +39,12 @@ TESLA_WEEKDAY_NAMES = ("SUN", "MON", "TUES", "WED", "THURS", "FRI", "SAT")
 DEFAULT_POLL_INTERVAL_MIN = 15
 DEFAULT_POLL_INTERVAL_CHARGING_MIN = 10
 DEFAULT_POLL_INTERVAL_ASLEEP_MIN = 30
-# In telemetry mode, a refresh within this window is treated as proof the car is online (it's
-# actively streaming), so the pre-command billable state read can be skipped entirely (audit M3).
-TELEMETRY_ONLINE_MAX_AGE_S = 300
+# Connectivity events, not unchanged field ages, determine whether Fleet Telemetry
+# is online. This short grace applies only before the first connectivity event (or
+# during its delivery race): a just-received signal proves the socket was online.
+# It is not a general vehicle-data staleness threshold. Tesla documents 30-second
+# maximum reconnect backoff and 10–60 seconds for a wake to bring a vehicle online.
+TELEMETRY_CONNECTION_EVENT_GRACE_S = 60
 
 logging.getLogger('urllib3').setLevel(logging.WARNING)
 
@@ -189,14 +192,44 @@ class TeslaApi:
 
         self.plugged_status = "Plugged" if self.is_plugged else "Unplugged"
         self.charging_status = "Charging" if self.is_charging else "Idle"
-        self.is_online = True                      # an actively-streaming car is by definition online
-        self._asleep = False
+        connection_status = str(
+            STATE.get("tesla_telemetry_connection_status") or "").strip().upper()
         telemetry_updated = _f("tesla_telemetry_last_update_ts")
-        if telemetry_updated is not None:
+        self.is_online = (
+            connection_status == "CONNECTED"
+            or (
+                connection_status != "DISCONNECTED"
+                and telemetry_updated is not None
+                and (time.time() - telemetry_updated)
+                <= TELEMETRY_CONNECTION_EVENT_GRACE_S
+            )
+        )
+        self._asleep = not self.is_online
+        vehicle_updated = _f("tesla_vehicle_last_update_ts")
+        if vehicle_updated is not None:
+            self.last_update_ts = vehicle_updated
+        elif telemetry_updated is not None:
             self.last_update_ts = telemetry_updated
         elif not hasattr(self, "last_update_ts"):
             self.last_update_ts = 0
         self.last_update_ts_hr = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self.last_update_ts))
+
+    def _telemetry_stream_healthy(self) -> bool:
+        """Whether pushed vehicle state is fresh enough to satisfy an explicit refresh."""
+        status = str(
+            STATE.get("tesla_telemetry_connection_status") or "").strip().upper()
+        if status == "CONNECTED":
+            return True
+        if status == "DISCONNECTED":
+            return False
+        try:
+            updated = float(STATE.get("tesla_telemetry_last_update_ts") or 0)
+        except (TypeError, ValueError):
+            updated = 0
+        return bool(
+            updated
+            and (time.time() - updated) <= TELEMETRY_CONNECTION_EVENT_GRACE_S
+        )
 
     def update_vehicle_status(self, force=False, allow_wake=False):
         """Refresh cached vehicle state from ONE cheap data read.
@@ -208,9 +241,17 @@ class TeslaApi:
         of re-polling every loop. By default we never wake the car to read; ``allow_wake`` is set
         only when there is explicit intent to charge, and even then the wake is budget-capped.
         """
-        if self._telemetry_on():
+        telemetry_mode = self._telemetry_on()
+        if telemetry_mode:
             self._refresh_from_telemetry()
-            return
+            # Push telemetry remains the normal, zero-cost path. A deliberate refresh or
+            # post-command confirmation may use one REST read only when the stream is known
+            # disconnected/unavailable; background ticks never turn an outage into polling.
+            if not force or self._telemetry_stream_healthy():
+                return
+            logging.warning(
+                "TeslaApi: Fleet Telemetry is disconnected/unavailable; using one "
+                "budget-guarded vehicle_data fallback for the requested refresh.")
 
         last = self._last_read_attempt_ts
         due = (not last) or (time.time() - last >= self._poll_interval_seconds())
@@ -224,7 +265,16 @@ class TeslaApi:
             logging.debug(f"TeslaApi: no fresh data (asleep or budget-limited); keeping last state from {self.last_update_ts_hr}.")
             return
         self._asleep = False
+        self._apply_vehicle_data(vehicle_data)
+        if telemetry_mode:
+            # The bridge normally owns these retained topics. During a confirmed stream outage,
+            # publish the explicit REST result once so the UI/controller does not keep showing
+            # an hour-old SoC while still leaving telemetry_status=DISCONNECTED.
+            self._store_rest_fallback_state()
+            self._publish_vehicle_topics()
 
+    def _apply_vehicle_data(self, vehicle_data):
+        """Apply a successful Fleet API vehicle_data response to the in-memory model."""
         self.get_vehicle_name(vehicle_data)
         self.battery_soc(vehicle_data)
         self.battery_soc_setpoint(vehicle_data)
@@ -242,6 +292,27 @@ class TeslaApi:
         self.charge_state_update_ts = self.last_update_ts
         self.last_update_ts_hr = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self.last_update_ts))
         self.update_mqtt_and_domoticz()
+
+    def _store_rest_fallback_state(self):
+        """Mirror a one-shot REST fallback into the state normally maintained by the bridge."""
+        values = {
+            "tesla_vehicle_name": self.vehicle_name,
+            "tesla_soc": self.vehicle_soc,
+            "tesla_soc_setpoint": self.vehicle_soc_setpoint,
+            "tesla_charge_current_request": self.charging_amp_limit,
+            "tesla_is_charging": str(bool(self.is_charging)),
+            "tesla_is_plugged": str(bool(self.is_plugged)),
+            "tesla_is_supercharging": str(bool(self.is_supercharging)),
+            "tesla_time_to_full": self.time_until_full,
+            "tesla_vehicle_last_update_ts": self.last_update_ts,
+            "tesla_soc_setpoint_updated_at": self.charge_limit_update_ts,
+            "tesla_charge_current_request_updated_at": self.charge_current_request_update_ts,
+            "tesla_charge_state_updated_at": self.charge_state_update_ts,
+        }
+        if self.is_home is not None:
+            values["tesla_is_home"] = str(bool(self.is_home))
+        for key, value in values.items():
+            STATE.set(key, value)
 
     def update_mqtt_and_domoticz(self):
         # In telemetry (push) mode the fleet-telemetry bridge OWNS the Tesla/vehicle0/* topics
@@ -623,14 +694,24 @@ class TeslaApi:
         return success
 
     def _telemetry_considers_online(self) -> bool:
-        """In telemetry mode an actively-streaming car is online by definition — a recent
-        telemetry refresh is proof enough, so the billable pre-command state read is skipped
-        entirely (audit M3). Falls through to the real check if telemetry hasn't refreshed
-        recently (e.g. the bridge/MQTT connection dropped), so this never masks a genuinely
-        stale/disconnected stream."""
+        """Use Fleet connectivity—not unchanged field age—as the online signal.
+
+        Fields are emitted only on change, so a connected vehicle may legitimately
+        be quiet for hours. A recent field is used only as a short startup race
+        fallback before the first connectivity event is available.
+        """
         if not self._telemetry_on():
             return False
-        return (time.time() - (self.last_update_ts or 0)) <= TELEMETRY_ONLINE_MAX_AGE_S
+        status = str(
+            STATE.get("tesla_telemetry_connection_status") or ""
+        ).strip().upper()
+        if status == "CONNECTED":
+            return True
+        if status == "DISCONNECTED":
+            return False
+        return (
+            time.time() - (self.last_update_ts or 0)
+        ) <= TELEMETRY_CONNECTION_EVENT_GRACE_S
 
     def wake_vehicle(self, skip_online_check=False, critical=False):
         """Wake the car — used before a command, never just to read status.

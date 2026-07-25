@@ -822,8 +822,12 @@ def ev_smart_charge_dashboard() -> dict:
         env = _env()
         job = _json_value(_optional_path_call(
             loader, env.get("EV_SMART_CHARGE_JOB_PATH"))) if loader else None
+        # The exported ESS plan can lag one optimizer cycle behind terminal
+        # cleanup. No durable job means there is nothing current to display.
+        if loader and job is None:
+            plan = None
         plan_loader = getattr(module, "load_plan_snapshot", None)
-        if plan is None and callable(plan_loader):
+        if job is not None and plan is None and callable(plan_loader):
             plan = _json_value(_optional_path_call(
                 plan_loader, env.get("EV_SMART_CHARGE_PLAN_PATH")))
         enabled = getattr(module, "enabled", None)
