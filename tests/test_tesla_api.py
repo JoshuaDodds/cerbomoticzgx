@@ -743,17 +743,31 @@ def test_charge_amp_ceiling_accepts_explicit_smart_evse_limit():
     calls = []
     api.set_charge = lambda amps, error: calls.append(amps) or True
 
-    assert api.set_tesla_charge_amps(30, installation_ceiling=24) is True
-    assert calls == [24]
+    assert api.set_tesla_charge_amps(30, installation_ceiling=25) is True
+    assert calls == [25]
 
 
-def test_charge_amp_ceiling_preserves_legacy_18a_default():
+def test_charge_amp_ceiling_defaults_to_site_25a_limit():
     api = tesla_api.TeslaApi.__new__(tesla_api.TeslaApi)
     calls = []
     api.set_charge = lambda amps, error: calls.append(amps) or True
 
     assert api.set_tesla_charge_amps(30) is True
-    assert calls == [18]
+    assert calls == [25]
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    ((1, 1), (1.9, 1), (16, 16), (24.9, 24), (25, 25), (30, 25)),
+)
+def test_charge_amp_ceiling_accepts_1_to_25_and_floors_to_whole_amps(
+        configured, expected):
+    api = tesla_api.TeslaApi.__new__(tesla_api.TeslaApi)
+    calls = []
+    api.set_charge = lambda amps, error: calls.append(amps) or True
+
+    assert api.set_tesla_charge_amps(30, installation_ceiling=configured) is True
+    assert calls == ([expected, expected] if expected < 5 else [expected])
 
 
 def test_update_vehicle_status_reads_telemetry_and_skips_rest(monkeypatch):

@@ -1743,7 +1743,8 @@ def _apply_ev_smart_charge_to_forecast(
         phases = phases if 1.0 <= phases <= 3.0 else 3.0
         voltage = _positive_state_number("tesla_charger_voltage", 230.0)
         voltage = voltage if 180.0 <= voltage <= 260.0 else 230.0
-        configured_amps = _get_float_setting("EV_CHARGER_MAX_AMPS", 24.0)
+        configured_amps = min(
+            25.0, max(1.0, _get_float_setting("EV_CHARGER_MAX_AMPS", 25.0)))
         electrical_ceiling_kw = phases * voltage * configured_amps / 1000.0
         requested_ceiling_kw = min(
             _get_float_setting("EV_CHARGER_MAX_KW", 16.0),

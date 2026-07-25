@@ -51,7 +51,39 @@ def api_plan():
 
 @app.route("/api/config")
 def api_config():
-    return jsonify({"groups": data.get_config()})
+    groups = data.get_config()
+    # Model IDs are provider-specific. Give the built-in Claude runner a curated
+    # selector while preserving a free-text field for an explicitly allow-listed,
+    # audited text-only wrapper. Raw agentic CLIs are intentionally rejected by the
+    # Advisor backend. Do not expose the command or wrapper path itself.
+    advisor_env = data._env()
+    custom_advisor_cli = (
+        str(advisor_env.get("ADVISOR_AUTH") or "auto").strip().lower() != "api"
+        and bool((advisor_env.get("ADVISOR_CLI_CMD") or "").strip())
+    )
+    for group in groups:
+        for setting in group.get("settings", []):
+            if setting.get("key") != "ADVISOR_MODEL":
+                continue
+            current = str(setting.get("value") or "").strip()
+            setting["editor"] = (
+                setting.get("custom_cli_editor", "text")
+                if custom_advisor_cli
+                else "select"
+            )
+            setting["effective_label"] = current or (
+                "Provider default" if custom_advisor_cli else "Auto / latest Sonnet"
+            )
+            if custom_advisor_cli:
+                setting["editor_help"] = (
+                    "An audited text-only custom CLI wrapper is configured and must be "
+                    "allow-listed through ADVISOR_CLI_SAFE_EXECUTABLES. An explicit "
+                    "model is applied only when ADVISOR_CLI_CMD contains {model}; "
+                    "otherwise leave this blank for the provider default."
+                )
+            else:
+                setting["editor_help"] = setting.get("desc", "")
+    return jsonify({"groups": groups})
 
 
 @app.route("/api/history/month")
@@ -454,9 +486,11 @@ def api_control_refresh_vehicle():
 @app.route("/api/advisor", methods=["POST"])
 def api_advisor():
     """Run the read-only AI advisor — a default daily review, or answer an open
-    question (e.g. "Why did we sell at 15:00 yesterday?"). Never writes config or
-    control; only allow-listed tunables + performance data are sent to the API.
-    Blocking (the model call takes a few seconds); threaded=True keeps the UI free."""
+    question (e.g. "Why did we sell at 15:00 yesterday?"). Open questions may use
+    the bounded backend retrieval allow-list for history, recent in-process logs,
+    approved source excerpts, live/plan state, named runtime artifacts, and safe
+    config metadata. It never receives raw environment/secrets and cannot write
+    config or control. Blocking; threaded=True keeps the UI free."""
     body = request.get_json(silent=True) or {}
     question = (body.get("question") or "").strip() or None
     try:
@@ -501,7 +535,10 @@ def api_advisor_latest():
 def api_advisor_clear():
     """Clear the persisted advisor chat session."""
     from frontend import advisor
-    return jsonify(advisor.clear_chat())
+    try:
+        return jsonify(advisor.clear_chat())
+    except advisor.AdvisorBusyError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 409
 
 
 @app.route("/api/advisor/delete-exchange", methods=["POST"])
@@ -515,6 +552,8 @@ def api_advisor_delete_exchange():
         return jsonify({"ok": False, "error": "message index is required"}), 400
     try:
         return jsonify(advisor.delete_exchange(index))
+    except advisor.AdvisorBusyError as e:
+        return jsonify({"ok": False, "error": str(e)}), 409
     except IndexError as e:
         return jsonify({"ok": False, "error": str(e)}), 400
     except OSError as e:

@@ -434,6 +434,71 @@ def test_advisor_latest_report_loads_on_browser_startup():
     assert "background: #f8fafc" in css
 
 
+def test_advisor_submission_clears_draft_and_prevents_duplicate_requests():
+    js = APP_JS.read_text(encoding="utf-8")
+    html = INDEX_HTML.read_text(encoding="utf-8")
+
+    assert 'id="advisor-submit"' in html
+    assert 'id="advisor-submit-status"' in html
+    assert 'role="status"' in html
+    assert "function setAdvisorBusy(" in js
+    assert 'form.setAttribute("aria-busy", String(busy))' in js
+    assert "function submitAdvisorQuestion(" in js
+    assert 'ev.type === "accepted"' in js
+    assert "const restoreDraft = () => {" in js
+    assert "const clearDraft = () => {" in js
+    assert "onAccepted: clearDraft" in js
+    assert "onStartFailure: restoreDraft" in js
+    assert "if (!started) {" in js
+    assert "restoreDraft();" in js
+    assert "if (_advisorBusy) return false;" in js
+    assert "if (!accepted && onStartFailure) onStartFailure();" in js
+    assert 'aria-label="Ask the AI Advisor a question"' in html
+
+
+def test_advisor_run_details_and_sources_survive_completed_chat_rendering():
+    js = APP_JS.read_text(encoding="utf-8")
+    css = APP_CSS.read_text(encoding="utf-8")
+
+    assert "function renderAdvisorRunDetails(" in js
+    assert "function renderAdvisorSources(" in js
+    assert 'class="advisor-run-details"' in js
+    assert 'class="advisor-sources"' in js
+    assert "Sources used" in js
+    assert "run_details" in js
+    assert "sources" in js
+    assert "<details" in js
+    assert ".advisor-run-details" in css
+    assert ".advisor-sources" in css
+    assert "chain-of-thought" not in js.lower()
+
+
+def test_advisor_pending_run_details_are_expanded_then_saved_details_collapse():
+    js = APP_JS.read_text(encoding="utf-8")
+
+    assert 'opts && opts.pending ? " open" : ""' in js
+    assert 'id="advisor-log"' in js
+    assert 'id="advisor-run-status"' in js
+    assert 'pending: true' in js
+
+
+def test_config_editor_supports_labeled_model_choices_and_custom_cli_text():
+    js = APP_JS.read_text(encoding="utf-8")
+
+    assert "s.ui_options" in js
+    assert 's.editor !== "text"' in js
+    assert "option.value" in js
+    assert "option.label" in js
+    assert "knownValues.has(currentValue)" in js
+    assert "Current selection" in js
+    assert "s.effective_label" in js
+    assert "s.editor_help" in js
+    assert "_esc(description)" in js
+    assert "function makeConfigValueEditable(" in js
+    assert 'valueControl.setAttribute("role", "button")' in js
+    assert 'valueControl.setAttribute("tabindex", "0")' in js
+
+
 def test_advisor_markdown_tables_are_rendered_as_tables():
     js = APP_JS.read_text(encoding="utf-8")
     css = (ROOT / "frontend" / "static" / "css" / "app.css").read_text(encoding="utf-8")

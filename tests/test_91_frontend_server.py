@@ -11,6 +11,68 @@ def test_favicon_route_redirects_to_brand_icon():
     assert response.headers["Location"].endswith("/static/img/logo.svg")
 
 
+def test_config_route_uses_curated_advisor_model_selector_for_builtin_provider(monkeypatch):
+    groups = [{
+        "group": "AI Advisor",
+        "settings": [{
+            "key": "ADVISOR_MODEL",
+            "value": "",
+            "ui_options": [{"value": "", "label": "Auto / latest Sonnet (recommended)"}],
+        }],
+    }]
+    monkeypatch.setattr(server.data, "get_config", lambda: groups)
+    monkeypatch.setattr(server.data, "_env", lambda: {"ADVISOR_CLI_CMD": ""})
+
+    body = server.app.test_client().get("/api/config").get_json()
+    model = body["groups"][0]["settings"][0]
+
+    assert model["editor"] == "select"
+    assert model["effective_label"] == "Auto / latest Sonnet"
+
+
+def test_config_route_preserves_free_text_model_for_custom_cli(monkeypatch):
+    groups = [{
+        "group": "AI Advisor",
+        "settings": [{
+            "key": "ADVISOR_MODEL",
+            "value": "gemini-2.5-pro",
+            "ui_options": [{"value": "", "label": "Auto / latest Sonnet (recommended)"}],
+        }],
+    }]
+    monkeypatch.setattr(server.data, "get_config", lambda: groups)
+    monkeypatch.setattr(server.data, "_env", lambda: {
+        "ADVISOR_CLI_CMD": "gemini -p {prompt}",
+    })
+
+    body = server.app.test_client().get("/api/config").get_json()
+    model = body["groups"][0]["settings"][0]
+
+    assert model["editor"] == "text"
+    assert model["effective_label"] == "gemini-2.5-pro"
+    assert "custom CLI" in model["editor_help"]
+    assert "{model}" in model["editor_help"]
+
+
+def test_config_route_uses_claude_selector_when_api_auth_overrides_custom_cli(monkeypatch):
+    groups = [{
+        "group": "AI Advisor",
+        "settings": [{
+            "key": "ADVISOR_MODEL",
+            "value": "claude-sonnet-5",
+            "ui_options": [{"value": "claude-sonnet-5", "label": "Claude Sonnet 5"}],
+        }],
+    }]
+    monkeypatch.setattr(server.data, "get_config", lambda: groups)
+    monkeypatch.setattr(server.data, "_env", lambda: {
+        "ADVISOR_AUTH": "api",
+        "ADVISOR_CLI_CMD": "gemini -p {prompt}",
+    })
+
+    body = server.app.test_client().get("/api/config").get_json()
+
+    assert body["groups"][0]["settings"][0]["editor"] == "select"
+
+
 def test_clear_import_schedule_route_calls_broker_helper(monkeypatch):
     calls = []
 
@@ -445,6 +507,23 @@ def test_advisor_delete_exchange_route_rejects_bad_index(monkeypatch):
     assert response.status_code == 400
     assert response.get_json()["ok"] is False
     assert "message index out of range" in response.get_json()["error"]
+
+
+def test_advisor_chat_mutations_report_conflict_while_run_is_active(monkeypatch):
+    def busy(*_args, **_kwargs):
+        raise advisor.AdvisorBusyError("Advisor run is active; try again when it finishes.")
+
+    monkeypatch.setattr(advisor, "clear_chat", busy)
+    monkeypatch.setattr(advisor, "delete_exchange", busy)
+    client = server.app.test_client()
+
+    cleared = client.post("/api/advisor/clear")
+    deleted = client.post("/api/advisor/delete-exchange", json={"index": 0})
+
+    assert cleared.status_code == 409
+    assert deleted.status_code == 409
+    assert cleared.get_json()["ok"] is False
+    assert deleted.get_json()["ok"] is False
 
 
 def test_logs_route_returns_buffered_lines(monkeypatch):

@@ -163,16 +163,49 @@ function setAppView(viewName) {
   syncMobileNavState();
 }
 
-function appViewFromHash() {
-  const v = (window.location.hash || "").replace("#", "");
-  return APP_VIEWS.includes(v) ? v : defaultAppViewName();
+function appRouteFromHash() {
+  const raw = (window.location.hash || "").replace(/^#/, "");
+  const [viewName, tabName] = raw.split("/", 2);
+  const view = APP_VIEWS.includes(viewName) ? viewName : defaultAppViewName();
+  const tab = view === "ess" && tabName && document.getElementById("tab-" + tabName)
+    ? tabName
+    : null;
+  return { view, tab };
+}
+
+function applyAppRouteFromHash() {
+  const route = appRouteFromHash();
+  setAppView(route.view);
+  if (route.tab) activateTab(route.tab);
+}
+
+function navigatePowerFlowTarget(target) {
+  const destinations = {
+    battery: { hash: "#battery", view: "battery" },
+    victron: { hash: "#live", view: "live" },
+    vehicle: { hash: "#ess/vehicle", view: "ess", tab: "vehicle" },
+  };
+  const destination = destinations[target];
+  if (!destination) return false;
+  if (window.location.hash !== destination.hash) {
+    history.pushState(null, "", destination.hash);
+  }
+  setAppView(destination.view);
+  if (destination.tab) activateTab(destination.tab);
+  closeMobileMenu();
+  window.scrollTo({ top: 0, behavior: "smooth" });
+  return true;
 }
 
 document.querySelectorAll(".app-nav-link").forEach((link) => {
   link.addEventListener("click", () => setAppView(link.dataset.appView));
 });
-window.addEventListener("hashchange", () => setAppView(appViewFromHash()));
-setAppView(appViewFromHash());
+document.addEventListener("powerflow:navigate", (event) => {
+  navigatePowerFlowTarget(event && event.detail ? event.detail.target : null);
+});
+window.addEventListener("hashchange", applyAppRouteFromHash);
+window.addEventListener("popstate", applyAppRouteFromHash);
+applyAppRouteFromHash();
 
 // ---- Mobile chrome (guarded; hidden/no-op on desktop) ----
 function currentAppViewName() {
@@ -1099,6 +1132,19 @@ function startEdit(item, s) {
   if (s.type === "bool") {
     input = el("select");
     ["True", "False"].forEach((o) => input.appendChild(new Option(o, o, false, String(s.value) === o)));
+  } else if (s.ui_options && s.editor !== "text") {
+    input = el("select");
+    const knownValues = new Set();
+    s.ui_options.forEach((option) => {
+      const value = typeof option === "object" ? option.value : option;
+      const label = typeof option === "object" ? option.label : option;
+      knownValues.add(String(value));
+      input.appendChild(new Option(label, value, false, String(s.value || "") === String(value)));
+    });
+    const currentValue = String(s.value || "");
+    if (currentValue && !knownValues.has(currentValue)) {
+      input.appendChild(new Option(`Current selection — ${currentValue}`, currentValue, true, true));
+    }
   } else if (s.options) {
     input = el("select");
     s.options.forEach((o) => input.appendChild(new Option(o, o, false, s.value === o)));
@@ -1126,6 +1172,19 @@ function startEdit(item, s) {
   });
 }
 
+function makeConfigValueEditable(valueControl, label, activate) {
+  if (!valueControl) return;
+  valueControl.setAttribute("role", "button");
+  valueControl.setAttribute("tabindex", "0");
+  valueControl.setAttribute("aria-label", `Edit ${label}`);
+  valueControl.addEventListener("click", activate);
+  valueControl.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    activate();
+  });
+}
+
 function renderConfig(cfg) {
   const box = $("#config");
   box.innerHTML = "";
@@ -1136,11 +1195,15 @@ function renderConfig(cfg) {
     grp.appendChild(el("h3", null, g.group));
     g.settings.forEach((s) => {
       const item = el("div", "cfg-item");
-      const val = s.value === "" ? "—" : s.value;
+      const val = s.effective_label || (s.value === "" ? "—" : s.value);
+      const description = s.editor_help || s.desc || "";
+      const labelHtml = _esc(s.label || s.key || "");
+      const valueHtml = _esc(val);
+      const descriptionHtml = _esc(description);
       if (isMobileLayout()) {
-        item.innerHTML = `<span>${s.label}</span><span class="v" title="click to edit">${val}</span>` +
+        item.innerHTML = `<span>${labelHtml}</span><span class="v" title="click to edit">${valueHtml}</span>` +
           `<button type="button" class="cfg-info-toggle" aria-expanded="false" aria-label="Toggle description">i</button>` +
-          `<span class="d" hidden>${s.desc || ""}</span>`;
+          `<span class="d" hidden>${descriptionHtml}</span>`;
         const info = item.querySelector(".cfg-info-toggle");
         const desc = item.querySelector(".d");
         info.addEventListener("click", () => {
@@ -1150,9 +1213,10 @@ function renderConfig(cfg) {
           info.setAttribute("aria-expanded", String(open));
         });
       } else {
-        item.innerHTML = `<span>${s.label}</span><span class="v" title="click to edit">${val}</span><span class="d">${s.desc || ""}</span>`;
+        item.innerHTML = `<span>${labelHtml}</span><span class="v" title="click to edit">${valueHtml}</span><span class="d">${descriptionHtml}</span>`;
       }
-      item.querySelector(".v").addEventListener("click", () => startEdit(item, s));
+      const valueControl = item.querySelector(".v");
+      makeConfigValueEditable(valueControl, s.label, () => startEdit(item, s));
       grp.appendChild(item);
     });
     box.appendChild(grp);
@@ -1883,6 +1947,60 @@ function advisorMetaText(record) {
   ].filter(Boolean).join(" · ");
 }
 
+function advisorRunDetailText(detail) {
+  if (!detail || typeof detail !== "object") return "";
+  const type = String(detail.type || "stage").toLowerCase();
+  // Never render model-internal reasoning content. A thinking event is represented
+  // only as operational status/count information.
+  if (type === "thinking") {
+    const count = Number.isFinite(Number(detail.count)) ? ` (${Number(detail.count)} updates)` : "";
+    return `Model processing${detail.done ? " complete" : ""}${count}`;
+  }
+  const allowed = new Set(["stage", "log", "retrieval", "source", "warning", "error", "completion"]);
+  if (!allowed.has(type)) return "";
+  const text = detail.msg || detail.message || detail.summary || "";
+  return String(text).trim().slice(0, 2000);
+}
+
+function renderAdvisorRunDetails(msg, opts) {
+  const details = Array.isArray(msg && msg.run_details) ? msg.run_details : [];
+  const pending = Boolean(opts && opts.pending);
+  if (!pending && !details.length) return "";
+  const detailTexts = details.map(advisorRunDetailText).filter(Boolean);
+  if (!pending && !detailTexts.length) return "";
+  const rows = detailTexts
+    .map((text) => `<div class="alog alog-line">${_esc(text)}</div>`).join("");
+  const open = opts && opts.pending ? " open" : "";
+  const status = pending
+    ? '<span id="advisor-run-status" class="muted">Running…</span>'
+    : `<span class="muted">${detailTexts.length} step${detailTexts.length === 1 ? "" : "s"}</span>`;
+  const logId = pending ? ' id="advisor-log"' : "";
+  return `<details class="advisor-run-details"${open}>
+    <summary><span>Run details</span>${status}</summary>
+    <div${logId} class="advisor-log advisor-run-log">${rows}</div>
+  </details>`;
+}
+
+function advisorSourceLabel(source) {
+  if (typeof source === "string") return source.trim().slice(0, 500);
+  if (!source || typeof source !== "object") return "";
+  const primary = source.label || source.locator || source.path || source.date
+    || source.name || source.ref || source.kind;
+  if (!primary) return "";
+  const line = source.line || source.start_line;
+  return `${primary}${line ? `:${line}` : ""}`.slice(0, 500);
+}
+
+function renderAdvisorSources(msg) {
+  const sources = Array.isArray(msg && msg.sources) ? msg.sources : [];
+  const labels = [...new Set(sources.map(advisorSourceLabel).filter(Boolean))];
+  if (!labels.length) return "";
+  return `<aside class="advisor-sources" aria-label="Sources used">
+    <strong>Sources used</strong>
+    <ul>${labels.map((label) => `<li>${_esc(label)}</li>`).join("")}</ul>
+  </aside>`;
+}
+
 function renderAdvisorMessage(msg, opts) {
   const role = msg.role === "user" ? "user" : "assistant";
   const label = role === "user" ? "You" : "Advisor";
@@ -1903,6 +2021,8 @@ function renderAdvisorMessage(msg, opts) {
       ${actions}
     </div>
     <div class="advisor-message-body">${body}</div>
+    ${role === "assistant" ? renderAdvisorSources(msg) : ""}
+    ${role === "assistant" ? renderAdvisorRunDetails(msg, opts) : ""}
   </article>`;
 }
 
@@ -1936,8 +2056,7 @@ function renderAdvisorChat(record, pendingTurn) {
   const pending = pendingTurn
     ? `<section class="advisor-turn advisor-turn-pending">
         ${renderAdvisorMessage(pendingTurn.user)}
-        ${renderAdvisorMessage(pendingTurn.assistant, { id: "advisor-streaming-message" })}
-        <div class="advisor-log" id="advisor-log"></div>
+        ${renderAdvisorMessage(pendingTurn.assistant, { id: "advisor-streaming-message", pending: true })}
       </section>`
     : "";
   const saved = turns.map((turn) => {
@@ -2100,11 +2219,29 @@ async function deleteAdvisorExchange(index, btn) {
 
 // Streams the advisor run over SSE so the user sees live progress (stages, CLI log
 // lines, and the model's output as it arrives) instead of a silent hang.
-function runAdvisor(question) {
-  if (_advisorBusy) return;
-  const meta = $("#advisor-meta"), rBtn = $("#advisor-review");
-  _advisorBusy = true;
-  if (rBtn) rBtn.disabled = true;
+function setAdvisorBusy(busy) {
+  _advisorBusy = Boolean(busy);
+  const form = $("#advisor-ask");
+  const input = $("#advisor-q");
+  const submit = $("#advisor-submit");
+  const review = $("#advisor-review");
+  const clear = $("#advisor-clear");
+  const status = $("#advisor-submit-status");
+  if (form) form.setAttribute("aria-busy", String(busy));
+  [input, submit, review, clear].forEach((control) => {
+    if (control) control.disabled = Boolean(busy);
+  });
+  if (status) {
+    status.textContent = busy ? "Advisor request in progress." : "Advisor ready.";
+  }
+}
+
+function runAdvisor(question, callbacks) {
+  if (_advisorBusy) return false;
+  const onAccepted = callbacks && callbacks.onAccepted;
+  const onStartFailure = callbacks && callbacks.onStartFailure;
+  const meta = $("#advisor-meta");
+  setAdvisorBusy(true);
   if (meta) meta.textContent = "";
   const now = new Date().toISOString();
   const pendingTurn = {
@@ -2129,9 +2266,12 @@ function runAdvisor(question) {
     if (done) return;
     done = true;
     if (_advisorES) { _advisorES.close(); _advisorES = null; }   // stop auto-reconnect
-    _advisorBusy = false;
-    if (rBtn) rBtn.disabled = false;
+    setAdvisorBusy(false);
     if (meta && metaTxt) meta.textContent = metaTxt;
+    if (question) {
+      const input = $("#advisor-q");
+      if (input) input.focus();
+    }
   };
 
   let es;
@@ -2141,13 +2281,18 @@ function runAdvisor(question) {
     addLog("alog-err", "✗ could not open the advisor stream.");
     if (outEl) outEl.innerHTML = '<div class="banner">Could not start the advisor.</div>';
     finish();
-    return;
+    return false;
   }
   _advisorES = es;
+  let accepted = false;
   es.onmessage = (e) => {
     let ev;
     try { ev = JSON.parse(e.data); } catch (_) { return; }
-    if (ev.type === "stage") addLog("alog-stage", "• " + ev.msg);
+    if (ev.type === "accepted") {
+      accepted = true;
+      if (onAccepted) onAccepted();
+    }
+    else if (ev.type === "stage") addLog("alog-stage", "• " + ev.msg);
     else if (ev.type === "log") addLog("alog-line", ev.msg);
     else if (ev.type === "thinking") {
       let th = document.getElementById("alog-think");
@@ -2161,6 +2306,7 @@ function runAdvisor(question) {
       if (outEl) outEl.innerHTML = mdToHtml(acc);
     }
     else if (ev.type === "error") {
+      if (!accepted && onStartFailure) onStartFailure();
       addLog("alog-err", "✗ " + ev.error);
       if (!acc && outEl) outEl.innerHTML = `<div class="banner">${_esc(ev.error)}</div>`;
       finish("error");
@@ -2174,12 +2320,14 @@ function runAdvisor(question) {
     }
   };
   es.onerror = () => {
-    if (!done) {
-      addLog("alog-err", "✗ stream closed (connection lost or service restarting).");
-      if (!acc && outEl) outEl.innerHTML = '<div class="banner">Advisor stream closed — is the service running?</div>';
-    }
+    if (done) return;
+    if (!accepted && onStartFailure) onStartFailure();
+    addLog("alog-err", "✗ stream closed (connection lost or service restarting).");
+    if (!acc && outEl) outEl.innerHTML = '<div class="banner">Advisor stream closed — is the service running?</div>';
     finish();
+    loadAdvisorLatest();
   };
+  return true;
 }
 const _advReview = $("#advisor-review");
 if (_advReview) _advReview.addEventListener("click", () => runAdvisor(null));
@@ -2214,10 +2362,35 @@ if (_advReport) _advReport.addEventListener("click", (e) => {
   }
 });
 const _advForm = $("#advisor-ask");
+function submitAdvisorQuestion() {
+  if (_advisorBusy) return false;
+  const input = $("#advisor-q");
+  if (!input) return false;
+  const draft = input.value;
+  const question = draft.trim();
+  if (!question) return false;
+  let draftRestored = false;
+  const restoreDraft = () => {
+    if (draftRestored) return;
+    draftRestored = true;
+    input.value = draft;
+    input.focus();
+  };
+  const clearDraft = () => {
+    input.value = "";
+  };
+  const started = runAdvisor(question, {
+    onAccepted: clearDraft,
+    onStartFailure: restoreDraft,
+  });
+  if (!started) {
+    restoreDraft();
+  }
+  return started;
+}
 if (_advForm) _advForm.addEventListener("submit", (e) => {
   e.preventDefault();
-  const q = ($("#advisor-q").value || "").trim();
-  if (q) runAdvisor(q);
+  submitAdvisorQuestion();
 });
 
 // Month-so-far daily net chart (Trends). Cheap; refreshed slowly.
