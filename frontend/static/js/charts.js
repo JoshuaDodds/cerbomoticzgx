@@ -663,17 +663,41 @@
   }
   window.toggleWeatherImpactSeries = toggleWeatherImpactSeries;
 
-  // ---------- monthly daily-net chart ----------
+  // ---------- monthly daily-net forecast spread ----------
   window.renderMonthlyChart = function (containerId, days) {
     const box = document.getElementById(containerId);
     if (!box) return;
-    const pts = (days || []).filter((d) => d.net_eur != null);
+    const number = (value) => value == null || value === "" ? null
+      : Number.isFinite(Number(value)) ? Number(value) : null;
+    const stats = (point) => {
+      const q1 = number(point.forecast_q1_eur);
+      const median = number(point.forecast_median_eur);
+      const q3 = number(point.forecast_q3_eur);
+      const low = number(point.forecast_range_low_eur);
+      const high = number(point.forecast_range_high_eur);
+      if ([q1, median, q3, low, high].some((value) => value == null)) return null;
+      return { q1, median, q3, low, high };
+    };
+    const pts = (days || []).filter((day) => number(day.net_eur) != null);
     if (!pts.length) { box.innerHTML = '<span class="muted">no history this month yet…</span>'; return; }
-    const W = 940, H = 280, m = { l: 50, r: 20, t: 16, b: 28 };
+
+    const compact = window.matchMedia && window.matchMedia("(max-width: 600px)").matches;
+    const W = compact ? 360 : 940;
+    const H = 300;
+    const m = compact ? { l: 42, r: 8, t: 16, b: 28 } : { l: 50, r: 20, t: 16, b: 28 };
     const pw = W - m.l - m.r, ph = H - m.t - m.b;
-    const forecastValues = (p) => [p.forecast_low_eur, p.forecast_high_eur,
-      p.forecast_open_eur, p.forecast_close_eur].filter((v) => Number.isFinite(Number(v))).map(Number);
-    const nets = pts.flatMap((p) => [Number(p.net_eur), ...forecastValues(p)]);
+    const nets = [];
+    pts.forEach((point) => {
+      const marker = point.is_today
+        ? number(point.projected_net_eur)
+        : number(point.net_eur);
+      if (marker != null) nets.push(marker);
+      const distribution = stats(point);
+      if (distribution) nets.push(
+        distribution.q1, distribution.median, distribution.q3,
+        distribution.low, distribution.high
+      );
+    });
     let lo = Math.min(0, ...nets), hi = Math.max(0, ...nets);
     if (lo === hi) hi = lo + 1;
     const pad = Math.max(0.15, (hi - lo) * 0.08);
@@ -681,85 +705,148 @@
     const span = (hi - lo) || 1, n = pts.length;
     const band = pw / Math.max(1, n);
     const X = (i) => m.l + band * (i + 0.5);
-    const Y = (v) => m.t + ph - (ph * (v - lo)) / span;
+    const Y = (value) => m.t + ph - (ph * (value - lo)) / span;
 
     let grid = "";
-    for (let k = 0; k <= 4; k++) {
-      const v = lo + (span * k) / 4, yy = Y(v).toFixed(1);
+    for (let k = 0; k <= 4; k += 1) {
+      const value = lo + (span * k) / 4, yy = Y(value).toFixed(1);
       grid += `<line x1="${m.l}" y1="${yy}" x2="${m.l + pw}" y2="${yy}" stroke="var(--line)" stroke-width="1"/>`;
-      grid += `<text x="${m.l - 7}" y="${(Y(v) + 3).toFixed(1)}" text-anchor="end" font-size="11" fill="var(--muted)">€${v.toFixed(1)}</text>`;
+      grid += `<text x="${m.l - 7}" y="${(Y(value) + 3).toFixed(1)}" text-anchor="end" font-size="11" fill="var(--muted)">€${value.toFixed(1)}</text>`;
     }
     grid += `<line x1="${m.l}" y1="${Y(0).toFixed(1)}" x2="${m.l + pw}" y2="${Y(0).toFixed(1)}" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="2 2"/>`;
-    let xt = "", step = Math.max(1, Math.ceil(n / 12));
-    pts.forEach((p, i) => {
-      if (i % step === 0 || i === n - 1) xt += `<text x="${X(i).toFixed(1)}" y="${m.t + ph + 16}" text-anchor="middle" font-size="11" fill="var(--muted)">${p.day}</text>`;
+
+    let labels = "";
+    const labelStep = Math.max(1, Math.ceil(n / (compact ? 8 : 12)));
+    const labelIndexes = [];
+    pts.forEach((_point, index) => {
+      if (index % labelStep === 0) labelIndexes.push(index);
     });
-    const candleWidth = Math.max(4, Math.min(18, band * 0.42));
+    if (labelIndexes[labelIndexes.length - 1] !== n - 1) {
+      // Always label the latest day, but replace a neighbouring scheduled
+      // label instead of rendering two unreadable numbers in one narrow band.
+      if (n - 1 - labelIndexes[labelIndexes.length - 1] < 2) labelIndexes.pop();
+      labelIndexes.push(n - 1);
+    }
+    labelIndexes.forEach((index) => {
+      labels += `<text x="${X(index).toFixed(1)}" y="${m.t + ph + 16}" text-anchor="middle" font-size="11" fill="var(--muted)">${pts[index].day}</text>`;
+    });
+
+    const boxWidth = Math.max(7, Math.min(22, band * 0.50));
+    const capWidth = Math.max(5, boxWidth * 0.65);
     let marks = "";
-    pts.forEach((p, i) => {
-      const vals = forecastValues(p);
-      if (vals.length === 4) {
-        const open = Number(p.forecast_open_eur), close = Number(p.forecast_close_eur);
-        const low = Number(p.forecast_low_eur), high = Number(p.forecast_high_eur);
-        const col = close >= open ? "var(--sell)" : "#f87171";
-        const top = Math.min(Y(open), Y(close));
-        const bodyHeight = Math.max(3, Math.abs(Y(open) - Y(close)));
-        marks += `<g class="forecast-candle">
-          <line x1="${X(i).toFixed(1)}" y1="${Y(high).toFixed(1)}" x2="${X(i).toFixed(1)}" y2="${Y(low).toFixed(1)}" stroke="${col}" stroke-width="2" opacity=".9"/>
-          <rect x="${(X(i) - candleWidth / 2).toFixed(1)}" y="${top.toFixed(1)}" width="${candleWidth.toFixed(1)}" height="${bodyHeight.toFixed(1)}" fill="${col}" fill-opacity=".28" stroke="${col}" stroke-width="1.7" rx="1"/>
+    pts.forEach((point, index) => {
+      const x = X(index);
+      const distribution = stats(point);
+      if (distribution) {
+        const top = Y(distribution.q3);
+        const bottom = Y(distribution.q1);
+        const boxHeight = Math.max(2, bottom - top);
+        marks += `<g class="forecast-boxplot">
+          <line class="forecast-whisker" x1="${x.toFixed(1)}" y1="${Y(distribution.high).toFixed(1)}" x2="${x.toFixed(1)}" y2="${Y(distribution.low).toFixed(1)}" stroke="var(--accent)" stroke-width="1.7"/>
+          <line class="forecast-whisker-cap" x1="${(x - capWidth / 2).toFixed(1)}" y1="${Y(distribution.high).toFixed(1)}" x2="${(x + capWidth / 2).toFixed(1)}" y2="${Y(distribution.high).toFixed(1)}" stroke="var(--accent)" stroke-width="1.7"/>
+          <line class="forecast-whisker-cap" x1="${(x - capWidth / 2).toFixed(1)}" y1="${Y(distribution.low).toFixed(1)}" x2="${(x + capWidth / 2).toFixed(1)}" y2="${Y(distribution.low).toFixed(1)}" stroke="var(--accent)" stroke-width="1.7"/>
+          <rect class="forecast-box" x="${(x - boxWidth / 2).toFixed(1)}" y="${top.toFixed(1)}" width="${boxWidth.toFixed(1)}" height="${boxHeight.toFixed(1)}" fill="var(--accent)" fill-opacity=".20" stroke="var(--accent)" stroke-width="1.7" rx="2"/>
+          <line class="forecast-median" x1="${(x - boxWidth / 2).toFixed(1)}" y1="${Y(distribution.median).toFixed(1)}" x2="${(x + boxWidth / 2).toFixed(1)}" y2="${Y(distribution.median).toFixed(1)}" stroke="var(--text)" stroke-width="2.2"/>
         </g>`;
       }
-      const actual = Number(p.net_eur);
-      const actualCol = actual >= 0 ? "var(--sell)" : "#f87171";
-      const fill = p.settled ? actualCol : "var(--panel)";
-      marks += `<circle class="actual-net-dot" cx="${X(i).toFixed(1)}" cy="${Y(actual).toFixed(1)}" r="${p.is_today ? 5.5 : 4.5}" fill="${fill}" stroke="${actualCol}" stroke-width="2"/>`;
+      const marker = point.is_today
+        ? number(point.projected_net_eur)
+        : number(point.net_eur);
+      if (marker != null) {
+        const markerCol = marker >= 0 ? "var(--sell)" : "#f87171";
+        const fill = point.is_today ? "var(--panel)" : markerCol;
+        marks += `<circle class="actual-net-dot${point.is_today ? " today-net-dot" : ""}" cx="${x.toFixed(1)}" cy="${Y(marker).toFixed(1)}" r="${point.is_today ? 5.5 : 4.5}" fill="${fill}" stroke="${markerCol}" stroke-width="2"/>`;
+      }
     });
-    box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" width="100%" preserveAspectRatio="xMidYMid meet" role="img" aria-label="daily final-net forecast ranges and settled actuals, month so far">
-        ${grid}${xt}
+
+    box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" width="100%" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Daily final-net forecast spread and settled results, month so far">
+        ${grid}${labels}
         ${marks}
         <rect x="${m.l}" y="${m.t}" width="${pw}" height="${ph}" fill="transparent"/>
       </svg>
-      <div class="chart-legend muted">
-        <span><i class="legend-candle"></i>Forecast range (first → latest)</span>
-        <span><i class="legend-dot"></i>Settled actual</span>
-        <span>↑ profit · ↓ net cost — hollow dot is today so far</span>
+      <div class="chart-legend monthly-box-legend muted">
+        <span><i class="legend-boxplot"></i>Box: middle 50% of observed forecasts</span>
+        <span><i class="legend-median"></i>Centre line: median forecast</span>
+        <span><i class="legend-whisker"></i>Range: lowest–highest forecast observed</span>
+        <span><i class="legend-dot"></i>Solid dot: settled actual</span>
+        <span><i class="legend-dot hollow"></i>Hollow dot: latest full-day forecast for today</span>
+        <span>Forecasts are sampled one per 15-minute period; spreads require minimum 8 distinct periods</span>
+        <span>↑ profit · ↓ net cost</span>
       </div>`;
 
     const svg = box.querySelector("svg");
     if (!svg) return;
     box.style.position = "relative";
     const tip = document.createElement("div");
-    tip.className = "chart-tip rich-tip monthly-tip"; tip.style.display = "none";
+    tip.className = "chart-tip rich-tip monthly-tip";
+    tip.style.display = "none";
     box.appendChild(tip);
-    const dname = (iso) => { const d = new Date(iso); return isNaN(d) ? "" : d.toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" }); };
-    const idxFromEvent = (e) => {
-      const ctm = svg.getScreenCTM(); if (!ctm) return -1;
-      const sp = svg.createSVGPoint(); sp.x = e.clientX; sp.y = e.clientY;
-      const u = sp.matrixTransform(ctm.inverse());
-      if (u.x < m.l - 8 || u.x > m.l + pw + 8) return -1;
-      return Math.max(0, Math.min(n - 1, Math.floor((u.x - m.l) / band)));
+    const dayName = (iso) => {
+      const date = new Date(iso);
+      return isNaN(date) ? "" : date.toLocaleDateString(undefined, {
+        weekday: "short", day: "numeric", month: "short",
+      });
     };
-    svg.addEventListener("mousemove", (e) => {
-      const i = idxFromEvent(e);
-      if (i < 0) { tip.style.display = "none"; return; }
-      const p = pts[i], profit = p.net_eur >= 0;
-      const hasForecast = forecastValues(p).length === 4;
-      const actualLabel = p.settled ? "Settled actual" : "Actual so far";
-      tip.innerHTML = `<b>${dname(p.date)}${p.is_today ? " (today)" : ""}</b>`
-        + `<span>${actualLabel}: ${profit ? "€" + p.net_eur.toFixed(2) + " profit" : "€" + Math.abs(p.net_eur).toFixed(2) + " cost"}</span>`
-        + `${hasForecast ? `<span>Forecast range: €${Number(p.forecast_low_eur).toFixed(2)} to €${Number(p.forecast_high_eur).toFixed(2)}</span>` : ""}`
-        + `${hasForecast ? `<span>First → latest: €${Number(p.forecast_open_eur).toFixed(2)} → €${Number(p.forecast_close_eur).toFixed(2)} (${p.forecast_samples || "?"} snapshots)</span>` : '<span>Forecast snapshots start with the new data format.</span>'}`
-        + `<span>Import ${p.import_kwh != null ? p.import_kwh.toFixed(1) : "?"} kWh</span>`
-        + `<span>Export ${p.export_kwh != null ? p.export_kwh.toFixed(1) : "?"} kWh</span>`;
+    const idxFromEvent = (event) => {
+      const point = event.touches && event.touches.length ? event.touches[0] : event;
+      const ctm = svg.getScreenCTM();
+      if (!ctm || !point) return -1;
+      const svgPoint = svg.createSVGPoint();
+      svgPoint.x = point.clientX; svgPoint.y = point.clientY;
+      const userPoint = svgPoint.matrixTransform(ctm.inverse());
+      if (userPoint.x < m.l - 8 || userPoint.x > m.l + pw + 8) return -1;
+      return Math.max(0, Math.min(n - 1, Math.floor((userPoint.x - m.l) / band)));
+    };
+    const showTooltip = (event) => {
+      const index = idxFromEvent(event);
+      if (index < 0) { tip.style.display = "none"; return; }
+      const point = pts[index];
+      const actual = number(point.net_eur);
+      const projection = number(point.projected_net_eur);
+      const latestForecast = point.is_today ? projection : number(point.forecast_close_eur);
+      const distribution = stats(point);
+      tip.innerHTML = `<b>${dayName(point.date)}${point.is_today ? " (today)" : ""}</b>`
+        + (point.is_today && projection != null
+          ? `<span>Latest full-day forecast: ${projection >= 0 ? "€" + projection.toFixed(2) + " profit" : "€" + Math.abs(projection).toFixed(2) + " cost"}</span>`
+          : actual != null
+            ? `<span>Settled actual: ${actual >= 0 ? "€" + actual.toFixed(2) + " profit" : "€" + Math.abs(actual).toFixed(2) + " cost"}</span>`
+            : "")
+        + (point.is_today && actual != null
+          ? `<span>Settled so far: ${actual >= 0 ? "€" + actual.toFixed(2) + " profit" : "€" + Math.abs(actual).toFixed(2) + " cost"}</span>`
+          : "")
+        + (distribution ? `<span>Middle 50%: €${distribution.q1.toFixed(2)} to €${distribution.q3.toFixed(2)}</span>` : "")
+        + (distribution ? `<span>Median forecast: €${distribution.median.toFixed(2)}</span>` : "")
+        + (distribution ? `<span>Observed forecast range: €${distribution.low.toFixed(2)} to €${distribution.high.toFixed(2)}</span>` : "")
+        + (!point.is_today && latestForecast != null
+          ? `<span>Final forecast: €${latestForecast.toFixed(2)}</span>` : "")
+        + (distribution ? `<span>${point.forecast_samples || "?"} distinct 15-minute periods${point.forecast_raw_samples > point.forecast_samples ? ` (${point.forecast_raw_samples} source snapshots)` : ""}</span>`
+          : point.forecast_samples
+            ? `<span>${point.forecast_samples} distinct forecast periods — full-day spread unavailable</span>`
+            : "<span>Forecast snapshots start with the new data format.</span>")
+        + (!point.is_today && point.forecast_samples && !point.forecast_complete
+          ? "<span>Partial-day history: only the actual result is plotted.</span>" : "")
+        + `<span>Import ${point.import_kwh != null ? Number(point.import_kwh).toFixed(1) : "?"} kWh</span>`
+        + `<span>Export ${point.export_kwh != null ? Number(point.export_kwh).toFixed(1) : "?"} kWh</span>`;
       tip.style.display = "block";
-      const br = box.getBoundingClientRect(), tw = tip.offsetWidth, th = tip.offsetHeight;
-      let tx = e.clientX - br.left + 14, ty = e.clientY - br.top - th - 10;
-      if (tx + tw > br.width) tx = e.clientX - br.left - tw - 14;
-      if (ty < 0) ty = e.clientY - br.top + 16;
-      tip.style.left = `${Math.max(0, tx)}px`; tip.style.top = `${ty}px`;
-    });
+      const pointer = event.touches && event.touches.length ? event.touches[0] : event;
+      const bounds = box.getBoundingClientRect();
+      const tipWidth = tip.offsetWidth, tipHeight = tip.offsetHeight;
+      let left = pointer.clientX - bounds.left + 14;
+      let top = pointer.clientY - bounds.top - tipHeight - 10;
+      if (left + tipWidth > bounds.width) left = pointer.clientX - bounds.left - tipWidth - 14;
+      if (top < 0) top = pointer.clientY - bounds.top + 16;
+      tip.style.left = `${Math.max(0, left)}px`;
+      tip.style.top = `${top}px`;
+    };
+    svg.addEventListener("mousemove", showTooltip);
     svg.addEventListener("mouseleave", () => { tip.style.display = "none"; });
+    svg.addEventListener("touchstart", showTooltip, { passive: true });
+    svg.addEventListener("touchmove", showTooltip, { passive: true });
+    svg.addEventListener("touchend", () => {
+      window.setTimeout(() => { tip.style.display = "none"; }, 1800);
+    }, { passive: true });
   };
+
 
   // ---------- HA-style energy metrics ----------
   function gauge(pct, color) {

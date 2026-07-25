@@ -20,12 +20,28 @@ def _broker_import_probe(tmp_path, enabled):
             "BATTERY_FLOAT_VOLTAGE=54.0",
             "BATTERY_ABSORPTION_VOLTAGE=56.0",
             "BATTERY_FULL_VOLTAGE=55.0",
+            "TIMEZONE=Europe/Amsterdam",
+            "MOSQUITTO_IP=ci.invalid",
+            "TIBBER_ACCESS_TOKEN=ci-placeholder",
         )) + "\n",
         encoding="utf-8",
     )
     script = r'''
 import json
 import sys
+
+# Importing the complete broker path normally creates the shared MQTT client and
+# starts Tibber account discovery. This integration test is about optimizer-engine
+# isolation, so keep both external services deterministic and offline in the child.
+import paho.mqtt.client as mqtt
+import tibber
+
+mqtt.Client.connect = lambda self, *args, **kwargs: 0
+
+class OfflineTibberAccount:
+    homes = ()
+
+tibber.Account = lambda token: OfflineTibberAccount()
 
 import lib.energy_broker as broker
 

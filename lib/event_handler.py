@@ -148,6 +148,7 @@ class Event:
 
     def pv_power(self):
         _value = round(self.value)
+        self.gs_client.set("pv_power_updated_at", time.time())
         publish_message("Tesla/vehicle0/solar/pv_watts", message=f"{_value}", retain=True)
         self.calculate_surplus_watts()
 
