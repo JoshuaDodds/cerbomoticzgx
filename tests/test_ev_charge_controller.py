@@ -2262,7 +2262,7 @@ def test_no_future_fallback_window_fails_closed_with_visible_status(monkeypatch)
 @pytest.mark.parametrize(
     ("durable_job", "expected_status", "expected_reason"),
     [
-        (None, "cancelled", "durable_job_removed"),
+        (None, "idle", "cancelled_cleaned_up"),
         ({"id": "job-1", "status": "paused", "target_soc": 80},
          "paused", "durable_job_status_changed"),
         ({"id": "replacement", "status": "active", "target_soc": 80},
@@ -2270,8 +2270,12 @@ def test_no_future_fallback_window_fails_closed_with_visible_status(monkeypatch)
     ],
 )
 def test_durable_job_change_blocks_old_plan_and_cleans_up_owned_control(
-        monkeypatch, durable_job, expected_status, expected_reason):
-    _smart_settings(monkeypatch)
+        monkeypatch, tmp_path, durable_job, expected_status, expected_reason):
+    _smart_settings(
+        monkeypatch,
+        EV_SMART_CHARGE_JOB_PATH=str(tmp_path / "job.json"),
+        EV_SMART_CHARGE_PLAN_PATH=str(tmp_path / "plan.json"),
+    )
     now = datetime.now(timezone.utc)
     plan = _smart_plan(now)
     # The broker did not publish a replacement plan after the durable UI/script change.

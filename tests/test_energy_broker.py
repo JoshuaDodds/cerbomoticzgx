@@ -283,6 +283,7 @@ def test_ev_smart_shadow_plans_but_does_not_change_ess_load(monkeypatch):
         "EV_SMART_CHARGE_ENABLED": "True",
         "EV_SMART_CHARGE_APPLY": "False",
     }
+    monkeypatch.setattr(energy_broker, "STATE", DummyState({}))
     monkeypatch.setattr(energy_broker, "retrieve_setting", lambda name: settings.get(name))
     monkeypatch.setattr(ev_smart_charge, "load_job", lambda path=None: {"status": "active"})
     monkeypatch.setattr(ev_smart_charge, "plan_charge", lambda *args, **kwargs: fake_plan)
@@ -1362,6 +1363,8 @@ def test_ai_optimizer_overlays_ev_and_blocks_stationary_battery_discharge(monkey
     monkeypatch.setattr(energy_broker, "optimize_schedule", optimizer)
     monkeypatch.setattr(energy_broker, "_set_grid_assist", lambda enabled: None)
     monkeypatch.setattr(energy_broker, "ac_power_setpoint", lambda **kwargs: None)
+    monkeypatch.setattr(energy_broker, "limit_grid_feed_in", lambda **kwargs: None)
+    monkeypatch.setattr(energy_broker, "set_minimum_ess_soc", lambda: None)
     monkeypatch.setattr(energy_broker, "clear_victron_schedules", lambda: None)
     monkeypatch.setattr(energy_broker, "get_today_energy_actuals", lambda: {})
     monkeypatch.setattr(energy_broker, "_append_history", lambda *args, **kwargs: None)

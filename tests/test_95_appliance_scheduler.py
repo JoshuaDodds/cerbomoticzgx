@@ -434,12 +434,20 @@ def test_cancelled_or_completed_work_releases_optimizer_reservation(
     from lib import event_handler_appliances as appliances
 
     removed = []
+    state = FakeState({
+        "Dishwasher_UserInterventionCount": 2,
+        "Dishwasher_UserInterventionAt": 123,
+    })
+    monkeypatch.setattr(appliances, "gs_client", state)
     monkeypatch.setattr(appliances, "_remove_reservation", removed.append)
 
     appliances._release_reservation_for_transition(
         "Dishwasher", current_operation, new_operation)
 
     assert removed == ["Dishwasher"]
+    if current_operation == "Run":
+        assert state.values["Dishwasher_UserInterventionCount"] == 0
+        assert state.values["Dishwasher_UserInterventionAt"] == 0
 
 
 def test_start_of_reserved_work_keeps_load_in_optimizer_forecast(monkeypatch):
