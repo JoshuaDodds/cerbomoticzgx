@@ -94,6 +94,7 @@ sharing the host's `/dev/shm` (so it can read the published plan). Expose
 | `FRONTEND_PORT` | `8080` | bind port |
 | `EV_SMART_CHARGE_ENABLED` | `False` | publish shadow target/deadline plans without vehicle commands |
 | `EV_SMART_CHARGE_APPLY` | `False` | allow the main EV controller to reconcile the reviewed plan through Fleet API; requires Fleet Telemetry for command acknowledgement |
+| `EV_PV_SURPLUS_REMINDER_ENABLED` | `True` | send one daily, normal-priority Pushover nudge when an eligible unplugged car could use forecast-sustainable protected PV |
 
 ## Views
 
@@ -125,10 +126,14 @@ sharing the host's `/dev/shm` (so it can read the published plan). Expose
   connectors**; each wire stays **faintly visible** so the topology always reads, and
   **source-coloured dots** ride it in the direction of real power (grid import/export,
   battery charge/discharge). Each card carries richer telemetry — Grid & AC-Loads
-  **per-phase L1/L2/L3**, Battery **temp · V · A · SoC · time-to-go**, Solar Watts +
-  today's kWh, EV power + lifetime energy, Gas m³ — and the **Inverter/Charger** card
-  shows the live SystemState word (mirroring `lib/constants.py`); the Grid headline
-  shows **► import / ◄ export**. The SVG is **responsive** — it measures its container
+  **per-phase L1/L2/L3**, Grid **Tibber import/cost + export/reward today** with its
+  source update time, AC Loads' **house-only energy today** (Victron/VRM whole-site
+  consumption minus authoritative ABB EV energy), Battery **temp · V · A · SoC ·
+  time-to-go**, Solar Watts + today's kWh, EV power + lifetime energy plus
+  authoritative ABB energy today, Gas m³ — and
+  the **Inverter/Charger** card shows the live SystemState word (mirroring
+  `lib/constants.py`); the Grid headline shows **► import / ◄ export**. The SVG is
+  **responsive** — it measures its container
   and re-lays everything to fill the full width **and** height (good for embedding on
   any screen) via a `ResizeObserver`. On phones it switches to a **VRM-style portrait
   layout** built around a centre **MP-II hub**: Grid and AC Loads as the top corners,
@@ -136,9 +141,11 @@ sharing the host's `/dev/shm` (so it can read the published plan). Expose
   (EV wired up to AC Loads), with a small **Gas** card centred at the bottom. The four
   hub-adjacent cards (Grid, AC Loads, Battery, EV) are evenly spaced, and the
   Solar→Battery line curves so its flowing particles read clearly. Each card shows a
-  big split value (large number, small unit) over compact labelled detail rows
-  (Grid/Loads per-phase W; Battery Voltage/Current/Temp). The desktop 3-column layout
-  is untouched. Dependency-free, built once and mutated in
+  big split value (large number, small unit) over compact labelled detail rows.
+  To preserve the near-single-screen mobile diagram height, the phone Grid card
+  prioritises Import, Export, and Updated over its phase rows; AC Loads retains all
+  three phases beneath its compact house-only day total. Desktop/tablet retain the
+  Grid phases as well as the new accounting. Dependency-free, built once and mutated in
   place, updated via the live SSE push; the **EV** and **Gas** cards appear when
   `ev_w` / the plan's `gas_m³` are present. (Note: the **top-nav "Live"** entry is a
   different thing — an iframe to the external `https://venus.hs.mfis.net/app/` dashboard;
@@ -266,7 +273,12 @@ power, AC setpoint, Tibber daily import/export/cost counters, and the published
 `ai_mode`/`ai_reason`/`feed_in_limit_state`. For the **v2 power-flow cards** it also
 caches the richer per-component telemetry: **grid & AC-loads per-phase L1/L2/L3**,
 **battery temperature / voltage (LFP pack) / current / time-to-go**, the
-**inverter system-state code**, and **EV lifetime energy + session time**. Topic
+**inverter system-state code**, **EV lifetime energy + session time**, Tibber's
+daily-counter update timestamp, the VRM cumulative consumption counter, and the
+ABB EV day counter. House-only daily energy is re-anchored to the latter two
+authoritative totals whenever VRM refreshes, while fresh AC-out minus EV power is
+integrated between anchors for real-time movement. Gaps longer than two minutes are
+not extrapolated, and midnight resets the accumulator. Topic
 choices mirror `lib/constants.py`; any topic a given Venus OS build doesn't publish
 simply stays `None` and the UI hides that line. **Newly-added subscriptions only
 take effect when the dashboard process (re)starts** — the MQTT subscriber registers

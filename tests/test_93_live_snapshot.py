@@ -7,6 +7,9 @@ No broker is needed: snapshot() only reads the in-memory value cache, so we
 inject values directly and assert the parsing/None-fallback behaviour.
 """
 import time
+from datetime import datetime, timedelta
+
+import pytest
 
 from frontend import live
 from frontend.live import MqttLive
@@ -157,3 +160,173 @@ def test_snapshot_vehicle_update_age_is_none_when_timestamp_is_unavailable():
     assert _snapshot_with({"veh_last_update": "not-a-date"})[
         "veh_last_update_age_s"
     ] is None
+
+
+def test_snapshot_exposes_tibber_day_totals_and_house_only_consumption():
+    snap = _snapshot_with({
+        "day_import_kwh": "61.676",
+        "day_import_cost": "9.732679",
+        "day_export_kwh": "0.097",
+        "day_export_reward": "0.019341",
+        "day_energy_last_update": "2026-07-26 18:30:38",
+        "load_actual_today_wh": "30659.79",
+        "ev_actual_today_kwh": "12.27",
+    })
+
+    assert snap["day_import_kwh"] == pytest.approx(61.676)
+    assert snap["day_import_cost"] == pytest.approx(9.732679)
+    assert snap["day_export_kwh"] == pytest.approx(0.097)
+    assert snap["day_export_reward"] == pytest.approx(0.019341)
+    assert snap["day_energy_last_update"] == "2026-07-26 18:30:38"
+    assert snap["house_day_kwh"] == pytest.approx(18.38979)
+    assert snap["house_day_energy_quality"] == "authoritative_anchor"
+
+
+def test_snapshot_does_not_claim_house_only_total_without_ev_day_meter():
+    snap = _snapshot_with({"load_actual_today_wh": "30659.79"})
+
+    assert snap["house_day_kwh"] is None
+    assert snap["house_day_energy_quality"] == "unavailable"
+
+
+def test_house_day_total_integrates_live_non_ev_power_between_vrm_anchors():
+    tracker = MqttLive()
+    now = datetime(2026, 7, 26, 18, 30)
+
+    tracker._record_value(
+        "ev_actual_today_kwh", 2.0, now=now, monotonic_now=0.0
+    )
+    tracker._record_value(
+        "load_actual_today_wh", 10000.0, now=now, monotonic_now=0.0
+    )
+    tracker._record_value("load_w", 2000.0, now=now, monotonic_now=1.0)
+    tracker._record_value("ev_w", 500.0, now=now, monotonic_now=1.0)
+    tracker._record_value(
+        "load_w",
+        2000.0,
+        now=now + timedelta(seconds=60),
+        monotonic_now=61.0,
+    )
+    tracker._connected = True
+
+    snap = tracker.snapshot()
+    assert snap["house_day_kwh"] == pytest.approx(8.025)
+    assert snap["house_day_energy_quality"] == "live_integrated"
+
+
+def test_house_day_total_skips_long_mqtt_gaps_and_reanchors_to_vrm():
+    tracker = MqttLive()
+    now = datetime(2026, 7, 26, 18, 30)
+
+    tracker._record_value(
+        "ev_actual_today_kwh", 2.0, now=now, monotonic_now=0.0
+    )
+    tracker._record_value(
+        "load_actual_today_wh", 10000.0, now=now, monotonic_now=0.0
+    )
+    tracker._record_value("load_w", 4000.0, now=now, monotonic_now=1.0)
+    tracker._record_value("ev_w", 1000.0, now=now, monotonic_now=1.0)
+    tracker._record_value(
+        "load_w",
+        4000.0,
+        now=now + timedelta(minutes=10),
+        monotonic_now=601.0,
+    )
+    tracker._connected = True
+
+    # A disconnected ten-minute interval must not be invented from one old power
+    # sample. The authoritative 8 kWh anchor therefore remains unchanged.
+    assert tracker.snapshot()["house_day_kwh"] == pytest.approx(8.0)
+
+    tracker._record_value(
+        "ev_actual_today_kwh",
+        2.25,
+        now=now + timedelta(minutes=15),
+        monotonic_now=901.0,
+    )
+    tracker._record_value(
+        "load_actual_today_wh",
+        11250.0,
+        now=now + timedelta(minutes=15),
+        monotonic_now=901.0,
+    )
+    snap = tracker.snapshot()
+    assert snap["house_day_kwh"] == pytest.approx(9.0)
+    assert snap["house_day_energy_quality"] == "authoritative_anchor"
+
+
+def test_house_day_total_resets_instead_of_integrating_across_midnight():
+    tracker = MqttLive()
+    before_midnight = datetime(2026, 7, 26, 23, 59, 30)
+    after_midnight = datetime(2026, 7, 27, 0, 0, 15)
+
+    tracker._record_value(
+        "ev_actual_today_kwh", 5.0, now=before_midnight, monotonic_now=0.0
+    )
+    tracker._record_value(
+        "load_actual_today_wh",
+        25000.0,
+        now=before_midnight,
+        monotonic_now=0.0,
+    )
+    tracker._record_value(
+        "load_w", 2000.0, now=before_midnight, monotonic_now=1.0
+    )
+    tracker._record_value(
+        "ev_w", 0.0, now=before_midnight, monotonic_now=1.0
+    )
+    tracker._record_value(
+        "load_actual_today_wh",
+        100.0,
+        now=after_midnight,
+        monotonic_now=46.0,
+    )
+    tracker._record_value(
+        "ev_actual_today_kwh",
+        0.0,
+        now=after_midnight,
+        monotonic_now=46.0,
+    )
+    tracker._connected = True
+
+    assert tracker.snapshot()["house_day_kwh"] == pytest.approx(0.1)
+
+
+def test_house_day_total_stays_unknown_after_rollover_until_new_anchors_arrive():
+    tracker = MqttLive()
+    before_midnight = datetime(2026, 7, 26, 23, 59, 30)
+    after_midnight = datetime(2026, 7, 27, 0, 0, 1)
+
+    tracker._record_value(
+        "ev_actual_today_kwh", 5.0, now=before_midnight, monotonic_now=0.0
+    )
+    tracker._record_value(
+        "load_actual_today_wh",
+        25000.0,
+        now=before_midnight,
+        monotonic_now=0.0,
+    )
+    # An unrelated live update crosses midnight before either daily counter has
+    # reset. The stale values remain in the generic cache but must not be used as
+    # a fallback for the new day.
+    tracker._record_value(
+        "soc", 80.0, now=after_midnight, monotonic_now=31.0
+    )
+    tracker._connected = True
+
+    snap = tracker.snapshot()
+    assert snap["house_day_kwh"] is None
+    assert snap["house_day_energy_quality"] == "unavailable"
+
+
+def test_rollover_guard_does_not_hide_a_valid_zero_import_day_after_midnight():
+    assert live._midnight_counter_mismatch(
+        25000.0,
+        0.0,
+        now=datetime(2026, 7, 27, 0, 10),
+    )
+    assert not live._midnight_counter_mismatch(
+        25000.0,
+        0.0,
+        now=datetime(2026, 7, 27, 12, 0),
+    )

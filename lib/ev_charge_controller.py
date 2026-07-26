@@ -48,6 +48,13 @@ DISCOVERY_HOME_UNPLUGGED_BACKOFF_S = 1200  # home but not plugged -> recheck soo
 # bridge first synchronizes, allow the tiny retained batch to finish before the
 # EV worker consumes it and considers any paid command.
 TELEMETRY_HYDRATION_SETTLE_S = 2
+# A surplus reminder should be based on PV that can actually run the three-phase
+# charger, not a momentary few hundred watts. The live threshold deliberately
+# matches surplus charge control; the ESS plan must then sustain the equivalent
+# net PV power for the configured look-ahead window.
+EV_PV_REMINDER_VOLTS_PER_PHASE = 230.0
+EV_PV_REMINDER_PHASES = 3
+PV_SURPLUS_REMINDER_LIVE_FRESH_S = 90
 
 # A planner snapshot is refreshed on the normal quarter-hour broker cycle.  A little over one
 # cycle allows ordinary scheduling jitter without permitting an abandoned plan to start a car.
@@ -211,6 +218,9 @@ class EvCharger:
         self._smart_state_cache = {}
         self._smart_reminder_keys = None
         self._smart_suppressed_blocks = None
+        self._pv_surplus_reminder_candidate_since = None
+        self._pv_surplus_plan_cache = None
+        self._pv_surplus_plan_cache_mtime_ns = None
 
         logging.info("EvCharger (__init__): Init complete.")
 
@@ -324,6 +334,17 @@ class EvCharger:
                 )
                 self._reschedule(5.0)
                 return
+
+            # This convenience check uses pushed/local state and the already-published ESS
+            # forecast only. It must happen before the ordinary dormancy gate because an
+            # explicitly unplugged vehicle is intentionally not commandable and therefore
+            # does not otherwise engage the Fleet-control loop.
+            try:
+                self._maybe_send_pv_surplus_reminder()
+            except Exception as exc:
+                # A notification can never interrupt critical charge control.
+                logging.debug(
+                    "EvCharger: PV-surplus reminder evaluation failed: %s", exc)
 
             # Engage if something wants a charge OR the user just switched intent off (so we can
             # stop the car) OR a refresh was requested. Otherwise stay dormant and make zero
@@ -967,6 +988,220 @@ class EvCharger:
             ).start()
         except Exception as exc:
             logging.info(f"EvCharger: plug reminder worker could not start: {exc}")
+
+    def _pushed_state_value(self, key):
+        """Return an explicit pushed value, preserving missing as ``None``.
+
+        ``GlobalStateClient.get`` historically returns zero for a missing row.
+        Reminder eligibility must fail closed rather than interpreting startup
+        absence as a real vehicle value.
+        """
+        has = getattr(self.global_state, "has", None)
+        if callable(has):
+            try:
+                if not has(key):
+                    return None
+            except Exception:
+                return None
+        elif isinstance(self.global_state, dict) and key not in self.global_state:
+            return None
+        try:
+            return self.global_state.get(key)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _explicit_truth(value):
+        """Return True/False for an explicit bus boolean, otherwise ``None``."""
+        if value in (None, "", "None"):
+            return None
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        normalized = str(value).strip().lower()
+        if normalized in {"true", "1", "on", "yes"}:
+            return True
+        if normalized in {"false", "0", "off", "no"}:
+            return False
+        return None
+
+    def _load_ess_plan_for_surplus_reminder(self) -> dict | None:
+        """Load the atomically-published ESS plan, cached by file modification.
+
+        This read is attempted only after a live surplus opportunity has already
+        qualified. It never calls Tesla, the weather provider, or the optimizer.
+        """
+        configured = retrieve_setting("AI_PLAN_EXPORT_PATH")
+        path = Path(str(configured or "/dev/shm/cerbo_ai_plan.json"))
+        try:
+            mtime_ns = path.stat().st_mtime_ns
+            if (
+                getattr(self, "_pv_surplus_plan_cache_mtime_ns", None)
+                == mtime_ns
+            ):
+                cached = getattr(self, "_pv_surplus_plan_cache", None)
+                return cached if isinstance(cached, dict) else None
+            with path.open(encoding="utf-8") as stream:
+                payload = json.load(stream)
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return None
+        self._pv_surplus_plan_cache_mtime_ns = mtime_ns
+        self._pv_surplus_plan_cache = (
+            payload if isinstance(payload, dict) else None)
+        return self._pv_surplus_plan_cache
+
+    def _forecast_has_sustained_pv_surplus(
+            self, plan: dict, now: datetime.datetime, minutes: float) -> bool:
+        """Require continuous forecast PV-after-house-load for the full window."""
+        if not isinstance(plan, dict) or minutes <= 0:
+            return False
+        generated_at = self._parse_plan_time(plan.get("generated_at"))
+        if generated_at is None:
+            return False
+        age = now.timestamp() - generated_at.timestamp()
+        if age < -300 or age > SMART_PLAN_MAX_AGE_S:
+            return False
+        slot_hours = _num(plan.get("slot_duration_h"), 0.25)
+        if slot_hours <= 0 or slot_hours > 1:
+            return False
+        minimum_kw = (
+            SURPLUS_MIN_AMPS
+            * EV_PV_REMINDER_VOLTS_PER_PHASE
+            * EV_PV_REMINDER_PHASES
+            / 1000.0
+        )
+        target_ts = now.timestamp() + minutes * 60.0
+        cursor = now.timestamp()
+        rows = []
+        for row in plan.get("schedule") or ():
+            if not isinstance(row, dict):
+                continue
+            start = self._parse_plan_time(row.get("time"))
+            if start is not None:
+                rows.append((start.timestamp(), row))
+        for start_ts, row in sorted(rows, key=lambda item: item[0]):
+            end_ts = start_ts + slot_hours * 3600.0
+            if end_ts <= cursor:
+                continue
+            # A missing forecast interval makes "continuous for 45 minutes"
+            # unprovable; fail closed instead of bridging the gap.
+            if start_ts > cursor + 1.0:
+                return False
+            pv_kwh = _num(row.get("pv"), math.nan)
+            load_kwh = _num(
+                row.get("non_ev_load_kwh", row.get("load")), math.nan)
+            if not (math.isfinite(pv_kwh) and math.isfinite(load_kwh)):
+                return False
+            net_pv_kw = (pv_kwh - load_kwh) / slot_hours
+            if net_pv_kw + 0.001 < minimum_kw:
+                return False
+            cursor = min(end_ts, target_ts)
+            if cursor >= target_ts - 1.0:
+                return True
+        return False
+
+    def _maybe_send_pv_surplus_reminder(self, now=None) -> None:
+        """Send one gentle daily nudge for a forecast-sustainable PV opportunity.
+
+        All inputs are free: local PV/ESS state, pushed Fleet Telemetry and the
+        existing ESS plan snapshot. Unknown vehicle state, stale forecast data,
+        insufficient live surplus, or an already-satisfied charge limit suppress
+        the reminder.
+        """
+        if (
+            not is_truthy(
+                retrieve_setting("EV_PV_SURPLUS_REMINDER_ENABLED"), False)
+            or not self._telemetry_on()
+        ):
+            self._pv_surplus_reminder_candidate_since = None
+            return
+        now_dt = now or datetime.datetime.now(datetime.timezone.utc)
+        if now_dt.tzinfo is None:
+            now_dt = now_dt.replace(tzinfo=datetime.timezone.utc)
+
+        home = self._explicit_truth(
+            self._pushed_state_value("tesla_is_home"))
+        plugged = self._explicit_truth(
+            self._pushed_state_value("tesla_is_plugged"))
+        soc = _num(self._pushed_state_value("tesla_soc"), math.nan)
+        limit_soc = _num(
+            self._pushed_state_value("tesla_soc_setpoint"), math.nan)
+        pv_updated_at = _num(
+            self._pushed_state_value("pv_power_updated_at"), 0.0)
+        pv_age = now_dt.timestamp() - pv_updated_at
+        live_candidate = bool(
+            home is True
+            and plugged is False
+            and math.isfinite(soc)
+            and math.isfinite(limit_soc)
+            and soc + 0.05 < limit_soc
+            and pv_updated_at > 0
+            and -5 <= pv_age <= PV_SURPLUS_REMINDER_LIVE_FRESH_S
+            and _num(self.ess_soc) >= self.minimum_ess_soc
+            and _num(self.surplus_amps) >= SURPLUS_MIN_AMPS
+        )
+        if not live_candidate:
+            self._pv_surplus_reminder_candidate_since = None
+            return
+
+        now_ts = now_dt.timestamp()
+        candidate_since = getattr(
+            self, "_pv_surplus_reminder_candidate_since", None)
+        if candidate_since is None or candidate_since > now_ts:
+            self._pv_surplus_reminder_candidate_since = now_ts
+            return
+        confirmation_minutes = max(
+            0.0,
+            _num(
+                retrieve_setting(
+                    "EV_PV_SURPLUS_REMINDER_CONFIRM_MINUTES"), 5.0),
+        )
+        if now_ts - candidate_since < confirmation_minutes * 60.0:
+            return
+
+        forecast_minutes = max(
+            15.0,
+            _num(
+                retrieve_setting(
+                    "EV_PV_SURPLUS_REMINDER_FORECAST_MINUTES"), 45.0),
+        )
+        plan = self._load_ess_plan_for_surplus_reminder()
+        if not self._forecast_has_sustained_pv_surplus(
+                plan, now_dt, forecast_minutes):
+            return
+
+        local_now = now_dt.astimezone(self.tz)
+        reminder_key = f"pv-surplus|{local_now.date().isoformat()}"
+        if not self._claim_plug_reminder(reminder_key, now_dt):
+            return
+        amps = int(math.floor(_num(self.surplus_amps)))
+        title = "Solar available for the car"
+        message = (
+            f"PV surplus looks strong for about {int(round(forecast_minutes))} "
+            f"minutes ({amps} A/phase available). The car is home but unplugged "
+            f"at {int(round(soc))}% with a {int(round(limit_soc))}% limit. "
+            "Plug it in now if you would rather use the solar than export it."
+        )
+
+        def send_reminder():
+            try:
+                pushover_notification(title, message)
+                logging.info(
+                    "EvCharger: sent non-critical PV-surplus plug-in reminder.")
+            except Exception as exc:
+                logging.info(
+                    "EvCharger: PV-surplus reminder could not be sent: %s", exc)
+
+        try:
+            threading.Thread(
+                target=send_reminder,
+                name="ev-pv-surplus-reminder",
+                daemon=True,
+            ).start()
+        except Exception as exc:
+            logging.info(
+                "EvCharger: PV-surplus reminder worker could not start: %s", exc)
 
     def _intent_on(self) -> bool:
         """Whether our GUI's persistent EV Start intent is enabled."""

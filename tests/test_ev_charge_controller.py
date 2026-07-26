@@ -3821,3 +3821,222 @@ def test_plug_reminder_failure_never_escapes_into_control(monkeypatch, tmp_path)
 
     assert c._control_charging(now=now) is False
     assert tesla.calls == []
+
+
+def _pv_surplus_forecast(now, *, net_kw=4.0, minutes=60, generated_at=None):
+    """Build a quarter-hour ESS forecast with a constant PV surplus after house load."""
+    slot_start = now.replace(
+        minute=(now.minute // 15) * 15, second=0, microsecond=0)
+    slot_hours = 0.25
+    rows = []
+    for offset in range(0, minutes, 15):
+        rows.append({
+            "time": (slot_start + timedelta(minutes=offset)).isoformat(),
+            "pv": (net_kw + 1.0) * slot_hours,
+            "non_ev_load_kwh": 1.0 * slot_hours,
+        })
+    return {
+        "generated_at": (generated_at or now).isoformat(),
+        "slot_duration_h": slot_hours,
+        "schedule": rows,
+    }
+
+
+def _pv_reminder_settings(monkeypatch, tmp_path, **overrides):
+    values = {
+        "EV_PV_SURPLUS_REMINDER_ENABLED": "True",
+        "EV_PV_SURPLUS_REMINDER_FORECAST_MINUTES": "45",
+        "EV_PV_SURPLUS_REMINDER_CONFIRM_MINUTES": "5",
+        "TESLA_TELEMETRY_ENABLED": "True",
+        "EV_SMART_CHARGE_CONTROLLER_STATE_PATH": str(
+            tmp_path / "controller-state.json"),
+        "AI_PLAN_EXPORT_PATH": "/not/read/in/unit-tests.json",
+    }
+    values.update(overrides)
+    monkeypatch.setattr(ecc, "retrieve_setting", lambda key: values.get(key))
+
+
+def test_pv_surplus_reminder_is_normal_priority_durable_and_cost_free(
+        monkeypatch, tmp_path):
+    _pv_reminder_settings(monkeypatch, tmp_path)
+    now = datetime(2026, 7, 26, 12, 7, tzinfo=timezone.utc)
+    state = FakeState({
+        "tesla_is_home": "True",
+        "tesla_is_plugged": "False",
+        "tesla_soc": 55,
+        "tesla_soc_setpoint": 80,
+        "pv_power_updated_at": now.timestamp(),
+    })
+    plan = _pv_surplus_forecast(now)
+    notifications = []
+    monkeypatch.setattr(
+        ecc.EvCharger,
+        "_load_ess_plan_for_surplus_reminder",
+        lambda self: plan,
+    )
+    _run_reminder_threads_inline(monkeypatch)
+
+    first_tesla = FakeTesla(is_home=True, is_plugged=False)
+    first = _charger(
+        monkeypatch, first_tesla, state=state,
+        ess_soc=95, surplus_amps=5, surplus_watts=3450)
+    first._pv_surplus_reminder_candidate_since = (
+        now.timestamp() - 5 * 60 - 1)
+
+    # A process restart on the same day must not duplicate the gentle nudge.
+    second_tesla = FakeTesla(is_home=True, is_plugged=False)
+    second = _charger(
+        monkeypatch, second_tesla, state=state,
+        ess_soc=95, surplus_amps=5, surplus_watts=3450)
+    second._pv_surplus_reminder_candidate_since = now.timestamp() - 600
+    monkeypatch.setattr(
+        ecc, "pushover_notification",
+        lambda *args, **kwargs: notifications.append((args, kwargs)),
+    )
+    first._maybe_send_pv_surplus_reminder(now=now)
+    second._maybe_send_pv_surplus_reminder(now=now + timedelta(minutes=1))
+
+    assert len(notifications) == 1
+    assert "solar" in notifications[0][0][0].lower()
+    assert "55%" in notifications[0][0][1]
+    assert "80%" in notifications[0][0][1]
+    assert "45" in notifications[0][0][1]
+    assert first_tesla.calls == second_tesla.calls == []
+
+
+@pytest.mark.parametrize(
+    "state_updates",
+    [
+        {"tesla_is_home": "False"},
+        {"tesla_is_plugged": "True"},
+        {"tesla_soc": 80},
+        {"tesla_soc": None},
+        {"tesla_soc_setpoint": None},
+    ],
+)
+def test_pv_surplus_reminder_requires_explicit_vehicle_eligibility(
+        monkeypatch, tmp_path, state_updates):
+    _pv_reminder_settings(monkeypatch, tmp_path)
+    now = datetime(2026, 7, 26, 12, 7, tzinfo=timezone.utc)
+    state = FakeState({
+        "tesla_is_home": "True",
+        "tesla_is_plugged": "False",
+        "tesla_soc": 55,
+        "tesla_soc_setpoint": 80,
+        "pv_power_updated_at": now.timestamp(),
+        **state_updates,
+    })
+    c = _charger(
+        monkeypatch, FakeTesla(), state=state,
+        ess_soc=95, surplus_amps=5, surplus_watts=3450)
+    c._pv_surplus_reminder_candidate_since = now.timestamp() - 600
+    monkeypatch.setattr(
+        c, "_load_ess_plan_for_surplus_reminder",
+        lambda: _pv_surplus_forecast(now))
+    notifications = []
+    monkeypatch.setattr(
+        ecc, "pushover_notification", lambda *args: notifications.append(args))
+    _run_reminder_threads_inline(monkeypatch)
+
+    c._maybe_send_pv_surplus_reminder(now=now)
+
+    assert notifications == []
+
+
+def test_pv_surplus_reminder_requires_stable_live_surplus_and_resets(
+        monkeypatch, tmp_path):
+    _pv_reminder_settings(monkeypatch, tmp_path)
+    now = datetime(2026, 7, 26, 12, 7, tzinfo=timezone.utc)
+    state = FakeState({
+        "tesla_is_home": "True",
+        "tesla_is_plugged": "False",
+        "tesla_soc": 55,
+        "tesla_soc_setpoint": 80,
+        "pv_power_updated_at": now.timestamp(),
+    })
+    c = _charger(
+        monkeypatch, FakeTesla(), state=state,
+        ess_soc=95, surplus_amps=5, surplus_watts=3450)
+    monkeypatch.setattr(
+        c, "_load_ess_plan_for_surplus_reminder",
+        lambda: _pv_surplus_forecast(now))
+    notifications = []
+    monkeypatch.setattr(
+        ecc, "pushover_notification", lambda *args: notifications.append(args))
+    _run_reminder_threads_inline(monkeypatch)
+
+    c._maybe_send_pv_surplus_reminder(now=now)
+    assert c._pv_surplus_reminder_candidate_since == now.timestamp()
+    assert notifications == []
+
+    almost_ready = now + timedelta(minutes=4, seconds=59)
+    state["pv_power_updated_at"] = almost_ready.timestamp()
+    c._maybe_send_pv_surplus_reminder(now=almost_ready)
+    assert notifications == []
+
+    c.surplus_amps = 0
+    c._maybe_send_pv_surplus_reminder(now=now + timedelta(minutes=5))
+    assert c._pv_surplus_reminder_candidate_since is None
+
+
+def test_pv_surplus_reminder_rejects_retained_stale_pv_power(
+        monkeypatch, tmp_path):
+    _pv_reminder_settings(monkeypatch, tmp_path)
+    now = datetime(2026, 7, 26, 12, 7, tzinfo=timezone.utc)
+    state = FakeState({
+        "tesla_is_home": "True",
+        "tesla_is_plugged": "False",
+        "tesla_soc": 55,
+        "tesla_soc_setpoint": 80,
+        "pv_power_updated_at": (
+            now - timedelta(seconds=ecc.PV_SURPLUS_REMINDER_LIVE_FRESH_S + 1)
+        ).timestamp(),
+    })
+    c = _charger(
+        monkeypatch, FakeTesla(), state=state,
+        ess_soc=95, surplus_amps=5, surplus_watts=3450)
+    c._pv_surplus_reminder_candidate_since = now.timestamp() - 600
+    notifications = []
+    monkeypatch.setattr(
+        ecc, "pushover_notification", lambda *args: notifications.append(args))
+    _run_reminder_threads_inline(monkeypatch)
+
+    c._maybe_send_pv_surplus_reminder(now=now)
+
+    assert c._pv_surplus_reminder_candidate_since is None
+    assert notifications == []
+
+
+@pytest.mark.parametrize("forecast_case", ("weak", "short", "stale"))
+def test_pv_surplus_reminder_requires_fresh_continuous_45_minute_forecast(
+        monkeypatch, tmp_path, forecast_case):
+    _pv_reminder_settings(monkeypatch, tmp_path)
+    now = datetime(2026, 7, 26, 12, 7, tzinfo=timezone.utc)
+    state = FakeState({
+        "tesla_is_home": "True",
+        "tesla_is_plugged": "False",
+        "tesla_soc": 55,
+        "tesla_soc_setpoint": 80,
+        "pv_power_updated_at": now.timestamp(),
+    })
+    c = _charger(
+        monkeypatch, FakeTesla(), state=state,
+        ess_soc=95, surplus_amps=5, surplus_watts=3450)
+    c._pv_surplus_reminder_candidate_since = now.timestamp() - 600
+    if forecast_case == "weak":
+        plan = _pv_surplus_forecast(now, net_kw=0.5)
+    elif forecast_case == "short":
+        plan = _pv_surplus_forecast(now, minutes=30)
+    else:
+        plan = _pv_surplus_forecast(
+            now, generated_at=now - timedelta(minutes=21))
+    monkeypatch.setattr(
+        c, "_load_ess_plan_for_surplus_reminder", lambda: plan)
+    notifications = []
+    monkeypatch.setattr(
+        ecc, "pushover_notification", lambda *args: notifications.append(args))
+    _run_reminder_threads_inline(monkeypatch)
+
+    c._maybe_send_pv_surplus_reminder(now=now)
+
+    assert notifications == []

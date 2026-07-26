@@ -55,6 +55,57 @@ def test_mobile_powerflow_battery_card_budgets_height_for_all_bms_rows():
     assert "height: clamp(560px, 80vh, 650px)" in mobile_css
 
 
+def test_powerflow_cards_surface_grid_accounting_and_house_only_day_energy():
+    powerflow = POWERFLOW_JS.read_text(encoding="utf-8")
+    live = LIVE_PY.read_text(encoding="utf-8")
+
+    assert '"day_energy_last_update": "Tibber/home/energy/day/last_update"' in live
+    assert (
+        '"load_actual_today_wh": '
+        '"Cerbomoticzgx/GlobalState/consumption_total_cumulative"'
+    ) in live
+    assert (
+        '"ev_actual_today_kwh": "Cerbomoticzgx/GlobalState/ev_today_kwh"'
+    ) in live
+    for field in (
+        "pf-grid-import",
+        "pf-grid-export",
+        "pf-grid-updated",
+        "pf-house-today",
+    ):
+        assert field in powerflow
+    assert '["Import", "pf-grid-import-m"]' in powerflow
+    assert '["Export", "pf-grid-export-m"]' in powerflow
+    assert '["Updated", "pf-grid-updated-m"]' in powerflow
+    assert r"(\d{2}:\d{2}:\d{2})" in powerflow
+    assert '["Today", "pf-ev-today"]' in powerflow
+    assert 'V["pf-ev-today"]' in powerflow
+    assert "live.ev_actual_today_kwh" in powerflow
+    assert 'grid:  [["L1", "pf-grid-l1"]' not in powerflow
+    assert "const houseCardH = 128" in powerflow
+    assert "height: clamp(560px, 80vh, 650px)" in MOBILE_CSS.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_desktop_grid_and_house_phase_rows_match_solar_spacing():
+    powerflow = POWERFLOW_JS.read_text(encoding="utf-8")
+
+    assert "const desktopPhaseStep = r.h * 0.062" in powerflow
+    assert (
+        "const y = y0 + r.h * 0.47 + i * desktopPhaseStep"
+        in powerflow
+    )
+    assert (
+        "const y = y0 + r.h * 0.68 + i * desktopPhaseStep"
+        in powerflow
+    )
+    assert (
+        "const y = y0 + r.h * 0.66 + i * desktopPhaseStep"
+        in powerflow
+    )
+
+
 def test_vehicle_tab_warns_only_when_disconnected_during_apparent_charging():
     app = APP_JS.read_text(encoding="utf-8")
     live = LIVE_PY.read_text(encoding="utf-8")
