@@ -1,17 +1,19 @@
-"""Hard spend guard for the Tesla Fleet API.
+"""Durable spend guard and usage estimate for Tesla Fleet API activity.
 
 Tesla bills the Fleet API per call and gives each account a $10/month credit. This
-module makes it *structurally impossible* to exceed that credit: every billable call
-must first pass ``spend(category)``, which atomically checks a per-category daily cap
-and refuses (returns False, records nothing) once the cap is hit.
+module requires normal billable calls to pass ``spend(category)``, which atomically
+checks a per-category daily cap and refuses (returns False, records nothing) once a
+guard is hit. Safety-critical stops may explicitly bypass the guard, and vehicle-pushed
+streaming signals cannot be blocked, so a €0.25 monthly margin is retained.
 
-Caps are sized so the worst case — every cap maxed every day of the longest month —
-stays under a safety ceiling below the $10 credit. If a misconfiguration ever raises
-the caps past that ceiling, they are clamped down automatically, so no config mistake
-(or runaway retry loop) can produce a surprise bill.
+Daily caps are bounded by a separate runaway ceiling, while every normal request is
+also checked against the all-in monthly estimate. Misconfigured daily caps are clamped
+automatically, so one retry loop cannot consume the full monthly allowance at once.
 
 Usage counters roll per UTC day and are persisted to a durable path (the data volume
 on k8s), so a pod restart can't reset the day's budget and let a loop overspend.
+The portal remains authoritative; ``reconcile_usage`` establishes a dated baseline,
+after which paid requests and approximate live streaming signals accumulate locally.
 """
 import os
 import json
@@ -23,8 +25,9 @@ from lib.constants import logging
 # Tesla Fleet API unit prices, USD (2026): commands 1000/$1, data 500/$1, wakes 50/$1.
 UNIT_COST_USD = {"command": 0.001, "data": 0.002, "wake": 0.02}
 
-# Fleet Telemetry "Streaming Signals" - pushed by the car, not requests we make, so this is
-# display-only and never gated by the spend guard below. Tesla bills ~$1 per 150,000 signals.
+# Fleet Telemetry "Streaming Signals" are pushed by the car rather than requested by us.
+# They cannot be blocked individually, but Tesla bills them and their estimated cost must
+# reduce the remaining credit available to commands/data/wakes.
 STREAMING_SIGNAL_COST_USD = 1.0 / 150000
 
 MONTHLY_CREDIT_USD = 10.0          # Tesla's monthly discount
@@ -227,7 +230,11 @@ class TeslaBudget:
 
     def _spent_usd_month(self, d: dict) -> float:
         mc = d.get("month_counts", {}) or {}
-        return sum(UNIT_COST_USD[c] * mc.get(c, 0) for c in UNIT_COST_USD)
+        request_cost = sum(
+            UNIT_COST_USD[c] * mc.get(c, 0) for c in UNIT_COST_USD)
+        streaming_cost = (
+            STREAMING_SIGNAL_COST_USD * mc.get("signals", 0))
+        return request_cost + streaming_cost
 
     def spent_today_usd(self) -> float:
         with self._lock:
@@ -279,10 +286,12 @@ def _save_state(path: str, d: dict) -> None:
 
 
 def usage_snapshot(state_path=None) -> dict:
-    """Read the CURRENT billing cycle's spend counters for DISPLAY (no live guard needed).
-    Returns per-category counts + $ and the month-to-date total, so the dashboard can show
-    Tesla API usage against the $10 monthly credit. Counters roll to zero at the month
-    boundary (UTC calendar month)."""
+    """Read the current billing cycle's local usage estimate for display.
+
+    ``total`` mirrors Tesla's portal-style sum of category values rounded to cents;
+    ``estimated_exact_total`` and ``remaining`` use the unrounded all-in value employed
+    by the guard. Counters roll at the UTC calendar-month boundary.
+    """
     path = state_path or DEFAULT_STATE_PATH
     try:
         with open(path) as f:
@@ -293,29 +302,69 @@ def usage_snapshot(state_path=None) -> dict:
     counts = {}
     if isinstance(d, dict) and d.get("month") == month:
         counts = d.get("month_counts", {}) or {}
-    cats, total = {}, 0.0
+    cats, request_total = {}, 0.0
     for c in UNIT_COST_USD:
         n = int(counts.get(c, 0) or 0)
         cost = round(UNIT_COST_USD[c] * n, 4)
         cats[c] = {"count": n, "cost": cost}
-        total += cost
+        request_total += cost
     sig_count = int(counts.get("signals", 0) or 0)
+    signal_cost = round(sig_count * STREAMING_SIGNAL_COST_USD, 4)
+    exact_total = request_total + sig_count * STREAMING_SIGNAL_COST_USD
+    # Tesla's portal displays each category to cents and builds Application Total from those
+    # displayed values. Keep that portal-style number separate from the unrounded,
+    # conservative total used by the local spend guard.
+    portal_total = sum(
+        round(value["cost"], 2) for value in cats.values()
+    ) + round(signal_cost, 2)
+    reconciliation = (
+        d.get("reconciliation", {}) if isinstance(d, dict) else {})
+    if not isinstance(reconciliation, dict):
+        reconciliation = {}
     return {
         "month": month,
         "categories": cats,                      # command/data/wake -> {count, cost}
-        # Streaming Signals: same durable file/month-roll as the categories above, but priced
-        # and totalled separately (kept OUT of total/remaining) since it's never gated by the
-        # spend guard -- see STREAMING_SIGNAL_COST_USD.
-        "streaming": {"count": sig_count, "cost": round(sig_count * STREAMING_SIGNAL_COST_USD, 4),
+        "streaming": {"count": sig_count, "cost": signal_cost,
                      "approx": True},
-        "total": round(total, 4),
+        "total": round(portal_total, 2),
+        "estimated_exact_total": round(exact_total, 4),
         "unit_cost": dict(UNIT_COST_USD),
         "monthly_credit": MONTHLY_CREDIT_USD,
-        "remaining": round(max(0.0, MONTHLY_CREDIT_USD - total), 2),
+        "remaining": round(max(0.0, MONTHLY_CREDIT_USD - exact_total), 2),
+        "reconciled_at": reconciliation.get("at"),
+        "reconciled_source": reconciliation.get("source"),
         # Tesla localises the developer portal's billing display; this account shows EUR, so
         # match it. The per-call rates are numerically the same as Tesla's published values.
         "currency": "EUR",
     }
+
+
+def reconcile_usage(counts: dict, *, signals=None, state_path=None,
+                    reconciled_at=None,
+                    source="tesla_developer_portal") -> dict:
+    """Align local month counters with one authoritative Tesla portal snapshot.
+
+    Tesla exposes no usage API. This explicit baseline records when and where
+    the figures came from; subsequent locally observed paid requests and live
+    streaming signals continue accumulating from it.
+    """
+    path = state_path or DEFAULT_STATE_PATH
+    with _lock_for(path):
+        d = _load_month_state(path)
+        for category, value in (counts or {}).items():
+            if category in UNIT_COST_USD:
+                d["month_counts"][category] = max(0, int(value or 0))
+        if signals is not None:
+            d["month_counts"]["signals"] = max(0, int(signals or 0))
+        d["reconciliation"] = {
+            "at": str(
+                reconciled_at
+                or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            ),
+            "source": str(source or "tesla_developer_portal"),
+        }
+        _save_state(path, d)
+        return usage_snapshot(path)
 
 
 def seed_month_usage(counts: dict, state_path=None) -> dict:

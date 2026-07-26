@@ -112,6 +112,11 @@ a Domoticz server via its REST API for monitoring and historic tracking
   plugged/charging state; a later explicit public-charging event remains valid while away.
   Known away or unplugged state keeps no-intent PV-surplus control dormant and makes no Tesla
   call, while the telemetry-disabled mode preserves its rate-limited discovery fallback.
+  The bridge counts only live (not retained replay) signals and flushes partial batches during
+  disconnect/shutdown. Tesla's developer portal remains authoritative for billing; use
+  `scripts/tesla_seed_usage.py` to establish one dated portal baseline. The local all-in estimate
+  then includes paid requests and approximate streaming cost when preserving the €0.25 credit
+  margin. Tesla's lightweight vehicle-state endpoint is unpriced and is not counted as Data.
   Fleet OAuth uses Tesla's current
   Fleet Auth host and automatically refreshes and atomically persists rotated access/refresh tokens;
   the runtime `.secrets` file must therefore be writable by the controller process.

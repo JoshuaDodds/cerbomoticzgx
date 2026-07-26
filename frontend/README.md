@@ -203,9 +203,12 @@ sharing the host's `/dev/shm` (so it can read the published plan). Expose
   stops spending commands. A confirmed
   Fleet stop refreshes the retained Vehicle status immediately; if a change-only Tesla status
   remains stale, dedicated EV-meter standby power (≤100 W) is shown as idle in the dashboard.
-  The usage panel reports billable Fleet requests against the $10 monthly credit;
-  non-critical calls are hard-blocked at $9.75, with separate daily runaway caps
-  preventing a defective retry loop from consuming the monthly allowance at once.
+  The usage panel starts from a dated Tesla developer-portal reconciliation and reports paid
+  Fleet requests plus approximate live (not retained MQTT replay) streaming signals against
+  the $10 monthly credit. Tesla's lightweight vehicle-state endpoint is unpriced and is not
+  counted as Data. The unrounded all-in estimate hard-blocks normal calls at $9.75, with
+  separate daily runaway caps preventing a defective retry loop from consuming the monthly
+  allowance at once; safety-critical stops retain their explicit bypass.
   Identical budget-block messages are emitted at most once per 15 minutes.
 - **Weather** (desktop tab): visualizes cached Open-Meteo temperature/cloud patterns
   and shadow-mode HVAC load / GTI summaries with clickable series legends. It is

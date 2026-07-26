@@ -632,21 +632,25 @@ class TeslaApi:
         return response
 
     def _get_vehicle_state(self):
-        # Billable "data" request (vehicle list/state). Gate it; return None if capped.
-        if not self._budget.spend("data"):
-            return None
+        """Return Tesla's lightweight online/asleep state without charging Data usage.
+
+        Tesla's published endpoint schema assigns no pricing category to
+        ``GET /vehicles/{vin}``; only ``vehicle_data`` is Device Data. Passing
+        ``auth_retry_budget=False`` also prevents a 401 token-refresh retry for
+        this free endpoint from being misclassified as a paid Data request.
+        """
         try:
-            response = self._request("GET", f"/api/1/vehicles/{self._vehicle_id}")
+            response = self._request(
+                "GET",
+                f"/api/1/vehicles/{self._vehicle_id}",
+                auth_retry_budget=False,
+            )
         except TeslaAuthenticationError as error:
             self._log_auth_failure("vehicle-state", error)
-            if not error.fleet_response_received:
-                self._budget.refund("data")
             return None
         except requests.exceptions.RequestException:
-            self._budget.refund("data")        # no HTTP response -> not billed
             return None
         if response.status_code >= 500:
-            self._budget.refund("data")        # Tesla does not bill responses >= 500
             return None
         return (response.json().get("response") or {}).get("state")
 

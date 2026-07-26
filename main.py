@@ -123,6 +123,9 @@ def shutdown():
     if retrieve_setting('VICTRON_OPTIMIZED_CHARGING') == '1':
         restore_default_battery_max_voltage()
 
+    if _TESLA_TELEMETRY_BRIDGE is not None:
+        _TESLA_TELEMETRY_BRIDGE.stop()
+
     mqtt_stop()
 
     # publish message to broker that we are shutting down

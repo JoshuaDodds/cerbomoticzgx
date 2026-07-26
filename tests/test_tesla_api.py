@@ -53,6 +53,26 @@ def _bare_api(budget, request_fn):
     return api
 
 
+def test_vehicle_state_read_uses_teslas_unpriced_endpoint_without_budget():
+    budget = _Budget()
+    requests_seen = []
+
+    def request(method, path, **kwargs):
+        requests_seen.append((method, path, kwargs))
+        return _Resp(200, {"response": {"state": "online"}})
+
+    api = _bare_api(budget, request)
+
+    assert api._get_vehicle_state() == "online"
+    assert budget.spent == []
+    assert budget.refunded == []
+    assert requests_seen == [(
+        "GET",
+        "/api/1/vehicles/VID",
+        {"auth_retry_budget": False},
+    )]
+
+
 def _auth_api():
     api = tesla_api.TeslaApi.__new__(tesla_api.TeslaApi)
     api._client_id = "client-id"
@@ -227,6 +247,35 @@ def test_fleet_401_refreshes_token_and_retries_request_once(monkeypatch):
         "Bearer access-old", "Bearer access-new"]
     assert [item[2]["X-Test"] for item in requests_seen] == ["yes", "yes"]
     assert api._budget.spent == ["data"]
+
+
+def test_unpriced_fleet_401_retry_does_not_enter_paid_budget(monkeypatch):
+    api = _auth_api()
+    api._base_url = "https://fleet-api.example"
+    api._access_token = "access-old"
+    api._token_expires_at = time.time() + 3600
+    requests_seen = []
+
+    def request(method, url, *, headers, timeout, **kwargs):
+        requests_seen.append((method, url))
+        return _Resp(401 if len(requests_seen) == 1 else 200, {"response": {}})
+
+    def refresh():
+        api._access_token = "access-new"
+        api._token_expires_at = time.time() + 3600
+
+    monkeypatch.setattr(tesla_api.requests, "request", request)
+    api._refresh_access_token = refresh
+
+    response = api._request(
+        "GET",
+        "/api/1/vehicles/VID",
+        auth_retry_budget=False,
+    )
+
+    assert response.status_code == 200
+    assert len(requests_seen) == 2
+    assert api._budget.spent == []
 
 
 def test_oauth_login_required_is_auth_failure_and_is_backed_off(monkeypatch):

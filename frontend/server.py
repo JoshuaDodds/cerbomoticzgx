@@ -12,7 +12,7 @@ import time
 from datetime import datetime
 from importlib import import_module
 
-from flask import Flask, jsonify, render_template, request, Response, redirect, url_for
+from flask import Flask, cli as flask_cli, jsonify, render_template, request, Response, redirect, url_for
 
 from frontend import data
 from frontend.live import live
@@ -687,6 +687,12 @@ def _debug_enabled() -> bool:
     return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _project_server_banner(debug: bool, app_name: str) -> None:
+    """Route Flask's otherwise unformatted Click banner through project logging."""
+    logging.info("Serving Flask app '%s'.", app_name)
+    logging.info("Flask debug mode: %s.", "on" if debug else "off")
+
+
 def run():
     """Run the server in the foreground (blocking)."""
     # Per-request HTTP logging (werkzeug) is noisy and, when the dashboard runs
@@ -698,7 +704,12 @@ def run():
     host, port = _host_port()
     # threaded=True so concurrent requests don't block each other; the process
     # itself is independent of the main service threads.
-    app.run(host=host, port=port, threaded=True, use_reloader=False)
+    original_banner = flask_cli.show_server_banner
+    flask_cli.show_server_banner = _project_server_banner
+    try:
+        app.run(host=host, port=port, threaded=True, use_reloader=False)
+    finally:
+        flask_cli.show_server_banner = original_banner
 
 
 def run_in_thread() -> threading.Thread:

@@ -263,13 +263,20 @@ class TeslaTelemetryBridge:
         main.py explicitly recreates on every process start, so a signal count kept there was
         silently lost on every restart."""
         self._sig_seen += 1
-        if (self._sig_seen - self._sig_flushed) < _STREAM_FLUSH_EVERY:
+        self._flush_stream_signals()
+
+    def _flush_stream_signals(self, force=False):
+        """Persist the live-signal tail without counting retained MQTT replay."""
+        pending = self._sig_seen - self._sig_flushed
+        if pending <= 0:
+            return
+        if not force and pending < _STREAM_FLUSH_EVERY:
             return
         try:
             from lib.config_retrieval import retrieve_setting
             from lib.tesla_budget import bump_signal_count, DEFAULT_STATE_PATH
             path = retrieve_setting("TESLA_BUDGET_STATE_PATH") or DEFAULT_STATE_PATH
-            bump_signal_count(self._sig_seen - self._sig_flushed, path)
+            bump_signal_count(pending, path)
             self._sig_flushed = self._sig_seen
         except Exception as e:                 # pragma: no cover - counter must never break the loop
             logging.debug("tesla_telemetry_bridge: stream-signal flush failed: %s", e)
@@ -515,6 +522,7 @@ class TeslaTelemetryBridge:
         client.subscribe(f"{self._topic_base}/#")
 
     def _on_disconnect(self, _client, _userdata, _reason_code, *args):
+        self._flush_stream_signals(force=True)
         self._set_bridge_transport("DISCONNECTED")
 
     def _on_message(self, _c, _u, msg):
@@ -532,9 +540,11 @@ class TeslaTelemetryBridge:
                 logging.debug(
                     "tesla_telemetry_bridge: connectivity apply failed: %s", e)
             return
-        if field not in _NON_SIGNAL_FIELDS:      # count only actual vehicle-data signals
-            self._count_stream_signal()
         retained = bool(getattr(msg, "retain", False))
+        # Retained replay reconstructs local state but is not a newly streamed/billed
+        # Tesla signal. Count only live vehicle-data deliveries.
+        if not retained and field not in _NON_SIGNAL_FIELDS:
+            self._count_stream_signal()
         if retained and field in self._live_fields_seen:
             # A retained broker replay is useful only until this process has
             # observed a live value for the same source topic. Never let a
@@ -579,6 +589,23 @@ class TeslaTelemetryBridge:
             logging.warning("tesla_telemetry_bridge: could not connect to broker: %s", e)
             self._started = False
             self._set_bridge_transport("DISCONNECTED")
+
+    def stop(self):
+        """Flush the final signal batch and stop MQTT cleanly."""
+        self._flush_stream_signals(force=True)
+        client = self._client
+        self._client = None
+        self._started = False
+        if client is None:
+            return
+        try:
+            client.loop_stop()
+        except Exception:                       # pragma: no cover - best-effort shutdown
+            pass
+        try:
+            client.disconnect()
+        except Exception:                       # pragma: no cover - best-effort shutdown
+            pass
 
 
 def start_bridge_if_enabled(retrieve_setting):

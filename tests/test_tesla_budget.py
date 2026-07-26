@@ -64,6 +64,23 @@ def test_monthly_guard_allows_exact_ceiling_then_blocks_next_call(tmp_path):
     assert b.spend("command") is False
 
 
+def test_streaming_cost_contributes_to_monthly_guard(tmp_path):
+    path = str(tmp_path / "budget.json")
+    # €9.50 in wakes + €0.25 in streaming reaches the €9.75 safety ceiling.
+    tb.reconcile_usage(
+        {"command": 0, "data": 0, "wake": 475},
+        signals=37_500,
+        state_path=path,
+        reconciled_at="2026-07-26T15:03:00Z",
+    )
+    b = tb.TeslaBudget(
+        caps={"command": 10, "data": 0, "wake": 0},
+        state_path=path,
+    )
+
+    assert b.spend("command") is False
+
+
 def test_daily_runaway_breaker_caps_a_stuck_loop(tmp_path):
     # Even well under the monthly ceiling, a stuck loop can't exceed the per-day cap.
     b = _budget(tmp_path, caps=tb.DEFAULT_DAILY_CAPS)
@@ -157,7 +174,8 @@ def test_usage_snapshot_reports_counts_and_costs(tmp_path):
     assert snap["categories"]["command"] == {"count": 1, "cost": 0.001}
     assert snap["categories"]["data"] == {"count": 2, "cost": 0.004}
     assert snap["categories"]["wake"] == {"count": 1, "cost": 0.02}
-    assert snap["total"] == 0.025
+    assert snap["estimated_exact_total"] == 0.025
+    assert snap["total"] == 0.02
     assert snap["currency"] == "EUR"
 
 
@@ -174,7 +192,8 @@ def test_seed_month_usage_reconciles_and_guard_accumulates(tmp_path):
     assert snap["categories"]["command"]["count"] == 13
     assert snap["categories"]["data"]["count"] == 30
     assert snap["categories"]["wake"]["count"] == 2
-    assert snap["total"] == round(13 * 0.001 + 30 * 0.002 + 2 * 0.02, 4)   # 0.113
+    assert snap["estimated_exact_total"] == round(
+        13 * 0.001 + 30 * 0.002 + 2 * 0.02, 4)   # 0.113
     # The guard keeps counting from the seeded baseline.
     b = tb.TeslaBudget(caps={"command": 100, "data": 100, "wake": 100}, state_path=path)
     assert b.spend("data") is True
@@ -226,16 +245,33 @@ def test_seed_signal_count_sets_absolute_value(tmp_path):
     assert tb.usage_snapshot(path)["streaming"]["count"] == 1340
 
 
-def test_signal_count_never_affects_gated_total_or_remaining(tmp_path):
+def test_signal_count_is_included_in_total_remaining_and_guard_estimate(tmp_path):
     path = str(tmp_path / "budget.json")
     tb.seed_month_usage({"command": 10, "data": 10, "wake": 1}, path)
     before = tb.usage_snapshot(path)
-    tb.seed_signal_count(50000, path)                       # a lot of signals, still ~free
+    tb.seed_signal_count(50_000, path)
     after = tb.usage_snapshot(path)
-    assert after["total"] == before["total"]
-    assert after["remaining"] == before["remaining"]
-    assert after["streaming"]["count"] == 50000
-    assert after["streaming"]["cost"] == round(50000 * tb.STREAMING_SIGNAL_COST_USD, 4)
+    assert after["total"] > before["total"]
+    assert after["estimated_exact_total"] > before["estimated_exact_total"]
+    assert after["remaining"] < before["remaining"]
+    assert after["streaming"]["count"] == 50_000
+    assert after["streaming"]["cost"] == round(
+        50_000 * tb.STREAMING_SIGNAL_COST_USD, 4)
+
+
+def test_portal_reconciliation_matches_tesla_category_rounded_total(tmp_path):
+    path = str(tmp_path / "budget.json")
+    snapshot = tb.reconcile_usage(
+        {"command": 343, "data": 71, "wake": 63},
+        signals=9_719,
+        state_path=path,
+        reconciled_at="2026-07-26T15:03:00Z",
+    )
+
+    assert snapshot["total"] == 1.80
+    assert snapshot["estimated_exact_total"] == 1.8098
+    assert snapshot["reconciled_at"] == "2026-07-26T15:03:00Z"
+    assert snapshot["reconciled_source"] == "tesla_developer_portal"
 
 
 def test_seeding_one_category_does_not_wipe_the_others(tmp_path):

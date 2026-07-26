@@ -2521,7 +2521,8 @@ async function refreshVehicleUsage() {
     const row = (label, key) => cats[key]
       ? `<div class="usage-row"><span>${label}</span><span>${cats[key].count}</span><span>${money(cats[key].cost)}</span></div>`
       : "";
-    // Streaming Signals are pushed by the car (outside the request budget); shown approximately.
+    // Streaming Signals are vehicle-pushed, approximately counted, and included in the
+    // all-in credit guard even though individual signals cannot be blocked.
     const s = u.streaming;
     const streamRow = s
       ? `<div class="usage-row"><span>Streaming signals <span class="muted" style="font-weight:400">≈</span></span><span>${s.count}</span><span>${money(s.cost)}</span></div>`
@@ -2534,7 +2535,10 @@ async function refreshVehicleUsage() {
       streamRow +
       `<div class="usage-row usage-total"><span>Total this month</span><span></span>` +
       `<span>${money(u.total)} <span class="muted" style="font-weight:400">of ${money(u.monthly_credit)}</span></span></div>` +
-      `</div>`;
+      `</div>` +
+      (u.reconciled_at
+        ? `<div class="cfg-note">Portal baseline: ${new Date(u.reconciled_at).toLocaleString()}</div>`
+        : "");
   } catch (e) { /* leave the placeholder */ }
 }
 

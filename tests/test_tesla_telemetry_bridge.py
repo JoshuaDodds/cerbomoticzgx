@@ -523,8 +523,8 @@ def test_delayed_connected_event_cannot_overwrite_newer_disconnect(monkeypatch):
 
 def test_retained_vehicle_field_cannot_overwrite_fresher_live_value(monkeypatch):
     bridge = tb.TeslaTelemetryBridge("broker", vin="VIN")
-    applied = []
-    bridge._count_stream_signal = lambda: None
+    applied, counted = [], []
+    bridge._count_stream_signal = lambda: counted.append(True)
     bridge.apply = lambda field, value, *, retained=False: applied.append(
         (field, value, retained))
 
@@ -539,6 +539,7 @@ def test_retained_vehicle_field_cannot_overwrite_fresher_live_value(monkeypatch)
     bridge._on_message(None, None, Msg(b"68", True))
 
     assert applied == [("Soc", 71, False)]
+    assert counted == [True]
 
 
 def test_bridge_transport_disconnect_invalidates_command_bus_readiness(
@@ -611,6 +612,25 @@ def test_stream_signal_counter_batches_to_durable_file(tmp_path, monkeypatch):
 
     # Surviving a "restart" just means re-reading the same file -- nothing in-memory to lose.
     assert budget_mod.usage_snapshot(path)["streaming"]["count"] == tb._STREAM_FLUSH_EVERY
+
+
+def test_stream_signal_counter_flushes_partial_batch_on_disconnect(
+        tmp_path, monkeypatch):
+    from lib import tesla_budget as budget_mod
+    from lib import config_retrieval
+
+    path = str(tmp_path / "budget.json")
+    monkeypatch.setattr(config_retrieval, "retrieve_setting", lambda key: path)
+    monkeypatch.setattr(
+        tb.TeslaTelemetryBridge, "_set_bridge_transport", lambda *args: None)
+    bridge = tb.TeslaTelemetryBridge("broker")
+    for _ in range(7):
+        bridge._count_stream_signal()
+
+    bridge._on_disconnect(None, None, 1)
+
+    assert budget_mod.usage_snapshot(path)["streaming"]["count"] == 7
+    assert bridge._sig_flushed == bridge._sig_seen == 7
 
 
 def test_unknown_field_is_ignored():
