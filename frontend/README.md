@@ -181,9 +181,14 @@ sharing the host's `/dev/shm` (so it can read the published plan). Expose
   Long-horizon jobs protect gentle daily progress and can advance it with forecast solar when
   that is cheaper than the later energy displaced; shorter jobs remain deadline-first. Pause, resume and
   cancel request an immediate ESS replan. Planning and application have separate gates;
-  the latter uses an application-owned Tesla fallback schedule and never alters unrelated
-  user schedules. Maxem can reduce actual charger power independently without the app
-  chasing the ABB reading with repeated current commands. Preview mode gates only these new
+  a single contiguous block is mirrored exactly as an application-owned Tesla schedule, while
+  multi-block plans show their distinct continuous deadline fallback explicitly. Neither path
+  alters unrelated user schedules. Maxem can reduce actual charger power independently; after
+  an accepted full-rate bootstrap produces more than 5 A of measured delivery, the app releases
+  current regulation instead of chasing Maxem with repeated commands. A newer ABB
+  ramp above 5 A also closes a locally blocked/rejected bootstrap, and an ordinary
+  active block already charging at service startup skips a redundant future-start
+  schedule. Preview mode gates only these new
   smart slots; existing excess-solar Tesla control remains active independently. In apply mode,
   saving or editing a job immediately reconciles its target SoC even before a new optimizer
   snapshot exists and even while the car is away/unplugged. The controller retries at Tesla's
@@ -191,6 +196,10 @@ sharing the host's `/dev/shm` (so it can read the published plan). Expose
   stops spending commands. A confirmed
   Fleet stop refreshes the retained Vehicle status immediately; if a change-only Tesla status
   remains stale, dedicated EV-meter standby power (≤100 W) is shown as idle in the dashboard.
+  The usage panel reports billable Fleet requests against the $10 monthly credit;
+  non-critical calls are hard-blocked at $9.75, with separate daily runaway caps
+  preventing a defective retry loop from consuming the monthly allowance at once.
+  Identical budget-block messages are emitted at most once per 15 minutes.
 - **Weather** (desktop tab): visualizes cached Open-Meteo temperature/cloud patterns
   and shadow-mode HVAC load / GTI summaries with clickable series legends. It is
   observational unless `HVAC_LOAD_APPLY` or `PV_WEATHER_APPLY` are deliberately
@@ -303,7 +312,9 @@ reuses `MOSQUITTO_IP` and `VRM_PORTAL_ID`.
   request which stays latched until confirmation or bounded escalation, so it works when intent
   was already off and suppresses the current smart block. The EV controller uses command-first,
   delayed wake escalation and local-meter stop
-  verification even if pushed location/plug state is stale. Start restores the configured
+  verification even if pushed location/plug state is stale. An accepted stop receives a
+  60-second ABB observation grace before another stop can be sent. Fresh ABB idle power also
+  prevents a stale Tesla charging flag from reopening that completed stop lifecycle. Start restores the configured
   full-rate request (bounded by the configured kW and 1–25 A/phase ceilings), verifies `ChargeCurrentRequest`
   within 60 seconds, and continues guarded reconciliation while the explicit override remains
   active. ABB power is delivery evidence only, so a
@@ -316,10 +327,17 @@ reuses `MOSQUITTO_IP` and `VRM_PORTAL_ID`.
   enabled, the durable job immediately becomes an independently verified Tesla charge-limit
   obligation; fallback-schedule representability cannot postpone it.
 - `DELETE /api/ev/smart-charge` — cancel the job.
-- `POST /api/ev/smart-charge/action` — pause/resume a job; unsupported actions fail closed.
+- `POST /api/ev/smart-charge/action` — pause/resume a job, or execute `run_now` when the
+  applied plan is one contiguous same-day window. Run Now waits for the optimizer's
+  single-writer lock before changing durable intent, rebuilds Vehicle/Timeline costs and
+  enables Grid assist atomically with that replan. Multi-window/multi-day plans do not expose
+  the button.
 - Completed/expired smart jobs are lifecycle-cleaned automatically: the controller removes only
   its deterministic Tesla schedule IDs before deleting the matching job/plan files. This cleanup
   remains allowed after apply is switched off, but cannot start or alter an active shadow plan.
+  Run Now additionally returns the Victron setpoint to 0 W and confirms a 5 A Tesla idle request
+  before its local artifacts disappear. Cancel releases Grid assist immediately when Run Now
+  enabled it, but preserves Grid assist when it was already enabled before Run Now.
 - `POST /api/victron/clear-schedule` — clear the five Victron scheduled-charge slots.
 - `GET /healthz` — liveness.
 

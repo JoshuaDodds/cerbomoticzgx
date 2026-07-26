@@ -29,3 +29,14 @@ if "async_timeout" not in sys.modules:
 
     async_timeout_stub.timeout = timeout
     sys.modules["async_timeout"] = async_timeout_stub
+
+
+ENV_CONTRACT_NODE = (
+    "tests/test_00_env_contract.py::"
+    "test_00_runtime_env_contains_every_example_key"
+)
+
+
+def pytest_collection_modifyitems(items):
+    """Run the environment contract first without reordering other tests."""
+    items.sort(key=lambda item: item.nodeid != ENV_CONTRACT_NODE)

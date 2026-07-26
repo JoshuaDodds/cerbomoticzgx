@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from lib.ev_smart_charge import (
+    activate_run_now,
     clear_job_artifacts,
     clear_job,
     create_job,
@@ -19,7 +20,9 @@ from lib.ev_smart_charge import (
     plan_ev_charge,
     save_job,
     save_plan_snapshot,
+    tesla_schedule_window,
     update_job_status,
+    run_now_eligibility,
 )
 
 
@@ -105,6 +108,193 @@ def test_naive_or_non_future_deadlines_are_rejected():
         create_job(current_soc=20, target_soc=80, ready_by=now.replace(tzinfo=None), now=now)
     with pytest.raises(ValueError, match="future"):
         create_job(current_soc=20, target_soc=80, ready_by=now, now=now)
+
+
+def test_run_now_requires_one_contiguous_single_day_window():
+    now = datetime(2026, 7, 20, 12, tzinfo=timezone.utc)
+    job = _job(now, current=50, target=58, ready_hours=5)
+    eligible = plan_charge(
+        job,
+        _slots(now, [0.10, 0.10, 0.40, 0.40]),
+        now=now,
+        usable_capacity_kwh=100,
+        charge_efficiency=1,
+        requested_ceiling_kw=16,
+        completion_buffer_minutes=0,
+    )
+    assert run_now_eligibility(job, eligible) == (True, "eligible")
+
+    split = dict(eligible)
+    split["slots"] = [dict(eligible["slots"][0]), {
+        **eligible["slots"][-1],
+        "start": (now + timedelta(hours=2)).isoformat(),
+        "end": (now + timedelta(hours=2, minutes=15)).isoformat(),
+    }]
+    assert run_now_eligibility(job, split) == (
+        False, "plan_requires_multiple_windows")
+
+
+def test_activate_run_now_persists_mode_and_shifts_deadline(tmp_path):
+    now = datetime(2026, 7, 20, 12, 7, tzinfo=timezone.utc)
+    job_path = tmp_path / "job.json"
+    plan_path = tmp_path / "plan.json"
+    job = _job(now - timedelta(minutes=7), current=50, target=58, ready_hours=5)
+    save_job(job, path=job_path)
+    plan = plan_charge(
+        job,
+        _slots(now.replace(minute=0), [0.10, 0.10, 0.40, 0.40]),
+        now=now.replace(minute=0),
+        usable_capacity_kwh=100,
+        charge_efficiency=1,
+        requested_ceiling_kw=16,
+        completion_buffer_minutes=30,
+    )
+    save_plan_snapshot(plan, path=plan_path)
+
+    updated = activate_run_now(
+        job_path=job_path, plan_path=plan_path, now=now)
+
+    assert updated["execution_mode"] == "run_now"
+    assert updated["run_now_requested_at"] == now.isoformat()
+    assert updated["run_now_grid_assist_owned"] is True
+    assert datetime.fromisoformat(updated["ready_by"]) > now
+    assert load_job(path=job_path) == updated
+
+
+def test_activate_run_now_records_preexisting_user_grid_assist(tmp_path):
+    now = datetime(2026, 7, 20, 12, 7, tzinfo=timezone.utc)
+    job_path = tmp_path / "job.json"
+    plan_path = tmp_path / "plan.json"
+    job = _job(
+        now - timedelta(minutes=7), current=50, target=58,
+        ready_hours=5,
+    )
+    save_job(job, path=job_path)
+    save_plan_snapshot(
+        plan_charge(
+            job,
+            _slots(
+                now.replace(minute=0),
+                [0.10, 0.10, 0.40, 0.40],
+            ),
+            now=now.replace(minute=0),
+            usable_capacity_kwh=100,
+            charge_efficiency=1,
+            requested_ceiling_kw=16,
+            completion_buffer_minutes=30,
+        ),
+        path=plan_path,
+    )
+
+    updated = activate_run_now(
+        job_path=job_path,
+        plan_path=plan_path,
+        now=now,
+        grid_assist_owned=False,
+    )
+
+    assert updated["run_now_grid_assist_owned"] is False
+
+
+def test_run_now_plan_uses_immediate_consecutive_slots_even_when_later_is_cheaper():
+    now = datetime(2026, 7, 20, 12, tzinfo=timezone.utc)
+    job = _job(now, current=50, target=58, ready_hours=5)
+    job["execution_mode"] = "run_now"
+    job["run_now_requested_at"] = now.isoformat()
+    job["ready_by"] = (now + timedelta(hours=1)).isoformat()
+    plan = plan_charge(
+        job,
+        _slots(now, [0.40, 0.40, 0.01, 0.01]),
+        now=now,
+        usable_capacity_kwh=100,
+        charge_efficiency=1,
+        requested_ceiling_kw=16,
+        completion_buffer_minutes=0,
+    )
+
+    assert plan["planning_strategy"] == "run_now"
+    assert [slot["start"] for slot in plan["slots"]] == [
+        now.isoformat(),
+        (now + timedelta(minutes=15)).isoformat(),
+    ]
+
+
+def test_tesla_schedule_window_mirrors_one_block_and_labels_multi_block_fallback():
+    tz = ZoneInfo("Europe/Amsterdam")
+    now = datetime(2026, 7, 26, 12, 0, tzinfo=tz)
+    one_block = {
+        "blocks": [{
+            "start": "2026-07-26T15:15:00+02:00",
+            "end": "2026-07-26T15:54:32.575000+02:00",
+        }],
+        "ready_by": "2026-07-26T18:00:00+02:00",
+        "required_ac_kwh": 10.4,
+        "expected_delivery_kw": 16,
+        "completion_buffer_minutes": 30,
+    }
+
+    mirrored = tesla_schedule_window(one_block, now=now)
+
+    assert mirrored == {
+        "kind": "selected_block",
+        "start": "2026-07-26T15:15:00+02:00",
+        "end": "2026-07-26T15:55:00+02:00",
+        "installable": True,
+    }
+
+    split = {
+        **one_block,
+        "blocks": [
+            one_block["blocks"][0],
+            {
+                "start": "2026-07-26T17:00:00+02:00",
+                "end": "2026-07-26T17:15:00+02:00",
+            },
+        ],
+    }
+    fallback = tesla_schedule_window(split, now=now)
+    assert fallback["kind"] == "deadline_fallback"
+    assert fallback["start"] == "2026-07-26T16:45:00+02:00"
+    assert fallback["end"] == "2026-07-26T18:00:00+02:00"
+
+
+def test_run_now_pressed_between_quarters_starts_now_and_remains_feasible(
+        tmp_path):
+    boundary = datetime(2026, 7, 20, 12, tzinfo=timezone.utc)
+    pressed_at = boundary + timedelta(minutes=7)
+    job_path = tmp_path / "job.json"
+    plan_path = tmp_path / "plan.json"
+    job = _job(boundary, current=50, target=58, ready_hours=5)
+    save_job(job, path=job_path)
+    original = plan_charge(
+        job,
+        _slots(boundary, [0.10] * 8),
+        now=boundary,
+        usable_capacity_kwh=100,
+        charge_efficiency=1,
+        requested_ceiling_kw=16,
+        completion_buffer_minutes=0,
+    )
+    save_plan_snapshot(original, path=plan_path)
+    updated = activate_run_now(
+        job_path=job_path, plan_path=plan_path, now=pressed_at)
+
+    plan = plan_charge(
+        updated,
+        _slots(boundary, [0.40] * 8),
+        now=pressed_at,
+        usable_capacity_kwh=100,
+        charge_efficiency=1,
+        requested_ceiling_kw=16,
+        completion_buffer_minutes=0,
+    )
+
+    assert plan["status"] == "planned"
+    assert plan["slots"][0]["start"] == pressed_at.isoformat()
+    assert len(plan["blocks"]) == 1
+    assert datetime.fromisoformat(plan["blocks"][0]["end"]) == (
+        pressed_at + timedelta(minutes=30)
+    )
 
 
 def test_corrupt_or_invalid_persisted_job_fails_closed(tmp_path):

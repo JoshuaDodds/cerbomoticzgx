@@ -15,7 +15,12 @@ from lib.tesla_api import TeslaApi
 from lib.global_state import GlobalStateClient
 from lib.helpers import publish_message, is_truthy
 from lib.notifications import pushover_notification, pushover_notification_critical
-from lib.ev_smart_charge import clear_job_artifacts, load_job, load_plan_snapshot
+from lib.ev_smart_charge import (
+    clear_job_artifacts,
+    load_job,
+    load_plan_snapshot,
+    tesla_schedule_window,
+)
 
 
 # Charge-control tuning.
@@ -24,6 +29,9 @@ SURPLUS_LOSS_GRACE_S = 60     # ride out passing clouds before stopping a surplu
 COMMAND_COOLDOWN_S = 60       # min spacing between start/stop/amp commands (anti-chatter + budget)
 AMP_ADJUST_MIN_DELTA = 1      # only re-issue a set-amps command when it moves by >= this
 STOP_RETRY_BACKOFF_S = 60     # retry an unconfirmed safety stop within the required minute
+STOP_CONFIRMATION_GRACE_S = 60  # allow accepted stop + local ABB meter to settle before retry
+ABB_DRAW_FRESH_S = 90         # ABB publishes continuously while the service is healthy
+ABB_IDLE_POWER_W = 250        # charger electronics idle near 4 W; this is below any useful charge
 STOP_ALERT_INTERVAL_S = 900   # min spacing between "could not stop the car" Pushover alerts
 STOP_MAX_RETRIES = 5          # bounded auto-retry attempts before escalating to a human (audit
                                # finding: an uncapped critical-bypass retry loop can blow past
@@ -36,6 +44,10 @@ STALE_STATUS_MAX_AGE_S = 300  # a cached tesla.is_charging older than this is UN
 DISCOVERY_WAKE_INTERVAL_S = 3600     # at most one surplus-discovery wake per hour
 DISCOVERY_AWAY_BACKOFF_S = 10800     # after finding the car NOT HOME, wait 3h before another wake
 DISCOVERY_HOME_UNPLUGGED_BACKOFF_S = 1200  # home but not plugged -> recheck sooner (20m)
+# MQTT wildcard retained messages have no end-of-replay marker. After the
+# bridge first synchronizes, allow the tiny retained batch to finish before the
+# EV worker consumes it and considers any paid command.
+TELEMETRY_HYDRATION_SETTLE_S = 2
 
 # A planner snapshot is refreshed on the normal quarter-hour broker cycle.  A little over one
 # cycle allows ordinary scheduling jitter without permitting an abandoned plan to start a car.
@@ -156,6 +168,7 @@ class EvCharger:
         self._last_stop_alert_ts = 0.0     # rate-limit the "could not stop" Pushover alert
         self._stop_attempt_count = 0       # consecutive failed stop attempts (bounded retry)
         self._stop_escalated = False       # STOP_MAX_RETRIES exhausted -> paused, human alerted
+        self._stop_confirmation_pending = None  # accepted stop awaiting local meter confirmation
         self._manual_stop_active = False   # dashboard Stop stays latched until confirmed/escalated
         self._fresh_stop_request = False   # reset retry state only on the first request tick
         self._last_discovery_wake_ts = 0.0 # rate-limit surplus-driven discovery wakes
@@ -192,6 +205,9 @@ class EvCharger:
         self._smart_remove_failure_attempts = 0
         self._smart_schedule_supported = True
         self._smart_cleanup_requires_stop = False
+        self._smart_run_now_replaced_key = None
+        self._smart_run_now_safe_current_pending = None
+        self._smart_run_now_grid_release_key = None
         self._smart_state_cache = {}
         self._smart_reminder_keys = None
         self._smart_suppressed_blocks = None
@@ -287,6 +303,27 @@ class EvCharger:
             refresh_requested = self._refresh_requested()
             if refresh_requested:
                 self.global_state.set(REFRESH_REQUEST_KEY, False)
+
+            # The telemetry subscriber starts asynchronously before this worker.
+            # Never infer state or spend commands while source hydration is
+            # still racing startup. Local measured charging and fresh stop
+            # requests remain safety-authoritative; manual Refresh is an
+            # explicit request for the guarded fallback read.
+            safety_action = bool(
+                self._fresh_stop_request or _num(self.charging_amps) >= 1
+            )
+            if (
+                not self._telemetry_bridge_hydrated()
+                and not safety_action
+                and not refresh_requested
+            ):
+                self._log_status(
+                    "waiting",
+                    "Fleet telemetry bridge awaiting authoritative source "
+                    "state; remote commands deferred",
+                )
+                self._reschedule(5.0)
+                return
 
             # Engage if something wants a charge OR the user just switched intent off (so we can
             # stop the car) OR a refresh was requested. Otherwise stay dormant and make zero
@@ -394,6 +431,27 @@ class EvCharger:
     def _telemetry_on(self) -> bool:
         return is_truthy(retrieve_setting("TESLA_TELEMETRY_ENABLED"), False)
 
+    def _telemetry_bridge_hydrated(self) -> bool:
+        """Whether pushed source state is safe to use for ordinary commands.
+
+        A missing key preserves polling mode and compatibility with deployments
+        predating bridge-health state. Once the bridge publishes a lifecycle,
+        only SYNCHRONIZED permits non-safety remote work.
+        """
+        if not self._telemetry_on():
+            return True
+        status = self.global_state.get("tesla_telemetry_bridge_status")
+        if status in (None, "", "None", 0):
+            return True
+        if str(status).strip().upper() != "SYNCHRONIZED":
+            return False
+        synchronized_at = _num(
+            self.global_state.get("tesla_telemetry_bridge_updated_at"), 0.0)
+        return not (
+            synchronized_at > 0
+            and time.time() - synchronized_at < TELEMETRY_HYDRATION_SETTLE_S
+        )
+
     def _smart_enabled(self) -> bool:
         return is_truthy(retrieve_setting("EV_SMART_CHARGE_ENABLED"), False)
 
@@ -445,12 +503,11 @@ class EvCharger:
         pending = getattr(self, "_smart_limit_pending", None)
         if isinstance(pending, dict):
             return True
-        observed, observed_at = self._smart_observation(
+        observed, _observed_at = self._smart_observation(
             "tesla_soc_setpoint", "tesla_soc_setpoint_updated_at",
             "vehicle_soc_setpoint", "charge_limit_update_ts")
         if (
-            observed_at > 0
-            and math.isfinite(observed)
+            math.isfinite(observed)
             and int(round(observed)) == target
         ):
             return False
@@ -535,17 +592,63 @@ class EvCharger:
         deadline = self._parse_plan_time(plan.get("ready_by") or job.get("ready_by"))
         target_soc = _num(plan.get("target_soc", job.get("target_soc")), math.nan)
         vehicle_soc = _num(getattr(self.tesla, "vehicle_soc", None), math.nan)
+        run_now = str(
+            job.get("execution_mode")
+            or plan.get("execution_mode")
+            or ""
+        ).lower() == "run_now"
+        run_now_requested = self._parse_plan_time(
+            job.get("run_now_requested_at")
+            or plan.get("run_now_requested_at")
+        )
+        detailed_state = str(
+            self.global_state.get("tesla_detailed_charge_state") or ""
+        ).strip().lower()
+        detailed_state_updated_at = _num(
+            self.global_state.get("tesla_charge_state_updated_at"), 0.0
+        )
+        observed_limit, _ = self._smart_observation(
+            "tesla_soc_setpoint",
+            "tesla_soc_setpoint_updated_at",
+            "vehicle_soc_setpoint",
+            "charge_limit_update_ts",
+        )
+        tesla_target_complete = bool(
+            run_now
+            and run_now_requested is not None
+            and detailed_state == "complete"
+            and detailed_state_updated_at >= run_now_requested.timestamp()
+            and math.isfinite(target_soc)
+            and math.isfinite(observed_limit)
+            and int(round(observed_limit)) == int(round(target_soc))
+        )
         target_reached = (
-            math.isfinite(target_soc)
-            and math.isfinite(vehicle_soc)
-            and vehicle_soc + 0.05 >= target_soc
+            tesla_target_complete
+            or (
+                math.isfinite(target_soc)
+                and math.isfinite(vehicle_soc)
+                and vehicle_soc + 0.05 >= target_soc
+            )
         )
         deadline_elapsed = (
             deadline is not None and now_dt.timestamp() >= deadline.timestamp()
         )
+        run_now_ends = [
+            self._parse_plan_time(slot.get("end"))
+            for slot in (plan.get("slots") or ())
+            if isinstance(slot, dict)
+        ]
+        run_now_ends = [value for value in run_now_ends if value is not None]
+        run_now_elapsed = bool(
+            run_now
+            and run_now_ends
+            and now_dt.timestamp() >= max(
+                value.timestamp() for value in run_now_ends)
+        )
         terminal_status = (
             plan_status if plan_status in {"completed", "expired", "cancelled"}
             else "completed" if target_reached
+            else "expired" if run_now_elapsed
             else "expired" if deadline_elapsed
             else None
         )
@@ -623,6 +726,11 @@ class EvCharger:
                 "schema_version": 1,
                 "sent": sent if isinstance(sent, dict) else {},
                 "suppressed_blocks": suppressed if isinstance(suppressed, dict) else {},
+                "legacy_schedule_ids_removed": [
+                    int(value)
+                    for value in payload.get("legacy_schedule_ids_removed", [])
+                    if isinstance(value, int)
+                ],
                 "owned_fallback": (
                     payload.get("owned_fallback")
                     if isinstance(payload.get("owned_fallback"), dict)
@@ -634,6 +742,7 @@ class EvCharger:
                 "schema_version": 1,
                 "sent": {},
                 "suppressed_blocks": {},
+                "legacy_schedule_ids_removed": [],
                 "owned_fallback": None,
             }
 
@@ -719,6 +828,38 @@ class EvCharger:
         except OSError as exc:
             logging.warning(
                 "EvCharger: could not clear owned Tesla fallback state: %s", exc)
+
+    def _legacy_schedule_cleanup_ids(self) -> set[int]:
+        """Return legacy app-owned schedule IDs already retired on this install."""
+        cached = getattr(self, "_smart_legacy_schedule_cleanup_ids", None)
+        if cached is not None:
+            return set(cached)
+        with _SMART_CONTROLLER_STATE_LOCK:
+            state = self._read_reminder_state(self._controller_state_path())
+        cleaned = set(state.get("legacy_schedule_ids_removed") or ())
+        self._smart_legacy_schedule_cleanup_ids = cleaned
+        return set(cleaned)
+
+    def _mark_legacy_schedule_cleaned(self, schedule_id: int) -> None:
+        """Persist successful one-time migration cleanup across jobs/restarts."""
+        cleaned = self._legacy_schedule_cleanup_ids()
+        if schedule_id in cleaned:
+            return
+        cleaned.add(schedule_id)
+        self._smart_legacy_schedule_cleanup_ids = cleaned
+        path = self._controller_state_path()
+        try:
+            with _SMART_CONTROLLER_STATE_LOCK:
+                state = self._read_reminder_state(path)
+                persisted = set(state.get("legacy_schedule_ids_removed") or ())
+                persisted.add(schedule_id)
+                state["legacy_schedule_ids_removed"] = sorted(persisted)
+                self._atomic_write_reminder_state(path, state)
+        except OSError as exc:
+            logging.warning(
+                "EvCharger: could not persist legacy Tesla schedule cleanup: %s",
+                exc,
+            )
 
     def _restore_durable_owned_fallback(self, job_id: str) -> bool:
         try:
@@ -921,10 +1062,34 @@ class EvCharger:
     def _charging_now(self) -> bool:
         """Is the car actually drawing? Prefer the local charger meter (free, near real-time)
         over the cached Tesla flag, which only refreshes on a (throttled) API read."""
-        return (
-            _num(self.charging_amps) >= 1
-            or (self._vehicle_commandable() and bool(self.tesla.is_charging))
-        )
+        local_draw = self._local_charger_draw()
+        if local_draw is not None:
+            return local_draw
+        return self._vehicle_commandable() and bool(self.tesla.is_charging)
+
+    def _local_charger_draw(self) -> bool | None:
+        """Return fresh ABB evidence of EV draw, or ``None`` if unavailable.
+
+        Tesla charge state is change-driven and can remain ``Charging`` after
+        physical delivery has stopped. The dedicated ABB meter is the
+        authoritative local arbiter when its power sample is fresh. Phase
+        current at or above 1 A always wins; otherwise a fresh sub-250 W sample
+        is the charger's idle electronics, not an active charge.
+        """
+        if _num(self.charging_amps) >= 1:
+            return True
+        updated_at = _num(
+            self.global_state.get("tesla_power_updated_at"), 0.0)
+        age = time.time() - updated_at
+        if updated_at <= 0 or age < -5 or age > ABB_DRAW_FRESH_S:
+            return None
+        try:
+            watts = abs(float(self.global_state.get("tesla_power")))
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(watts):
+            return None
+        return watts >= ABB_IDLE_POWER_W
 
     def _cooldown_ok(self) -> bool:
         return (time.time() - self._last_command_ts) >= COMMAND_COOLDOWN_S
@@ -1545,6 +1710,47 @@ class EvCharger:
             self._smart_current_pending = None
             self._last_commanded_amps = target
             return "confirmed", False
+        delivery_confirms_bootstrap = bool(
+            isinstance(pending, dict)
+            and pending.get("accepted") is True
+            and target > 5
+            and self._charging_now()
+            and _num(self.charging_amps) > 5.0
+        )
+        if delivery_confirms_bootstrap:
+            attempts = int(pending.get("attempts", 0))
+            logging.info(
+                "EvCharger [Tesla API]: confirmed set_charging_amps - "
+                "accepted %d A/phase bootstrap produced %.1f A delivery after "
+                "attempt %d; delivery rose above 5 A; releasing current control "
+                "to Maxem.",
+                target,
+                _num(self.charging_amps),
+                attempts,
+            )
+            self._smart_current_pending = None
+            self._last_commanded_amps = target
+            return "confirmed", False
+        fresh_delivery_confirms_desired_state = bool(
+            isinstance(pending, dict)
+            and target > 5
+            and self._charging_now()
+            and _num(self.charging_amps) > 5.0
+            and _num(
+                self.global_state.get("tesla_power_updated_at"), 0.0
+            ) > _num(pending.get("sent_at"), 0.0)
+        )
+        if fresh_delivery_confirms_desired_state:
+            attempts = int(pending.get("attempts", 0))
+            logging.info(
+                "EvCharger [Tesla API]: set_charging_amps no longer needed - "
+                "fresh ABB delivery rose above 5 A after attempt %d; releasing "
+                "current control to Maxem.",
+                attempts,
+            )
+            self._smart_current_pending = None
+            self._last_commanded_amps = target
+            return "confirmed", False
         if isinstance(pending, dict):
             attempts = int(pending.get("attempts", 0))
             sent_at = _num(pending.get("sent_at"), 0.0)
@@ -1656,6 +1862,64 @@ class EvCharger:
         return datetime.datetime.fromtimestamp(
             fallback_start_ts, tz=deadline.tzinfo)
 
+    @staticmethod
+    def _ceil_schedule_minute(value: datetime.datetime) -> datetime.datetime:
+        """Round an inclusive energy obligation upward to Tesla's minute precision."""
+        rounded = math.ceil(value.timestamp() / 60.0) * 60.0
+        return datetime.datetime.fromtimestamp(rounded, tz=value.tzinfo)
+
+    @staticmethod
+    def _owned_schedule_covers_active_window(
+            signature, *, job_id: str, local_now: datetime.datetime,
+            local_end: datetime.datetime, latitude: float,
+            longitude: float) -> bool:
+        """Whether a durable one-time schedule already covers this active run.
+
+        Run Now may be installed at the next whole minute when the selected
+        block begins mid-minute. Once that minute passes, its durable signature
+        is intentionally kept rather than sliding and billing another schedule
+        update on every controller tick.
+        """
+        if not isinstance(signature, tuple) or len(signature) != 7:
+            return False
+        try:
+            existing_date = datetime.date.fromisoformat(str(signature[1]))
+            existing_start = int(signature[2])
+            existing_end = int(signature[3])
+            existing_day = int(signature[4])
+            existing_lat = float(signature[5])
+            existing_lon = float(signature[6])
+        except (TypeError, ValueError):
+            return False
+        current_minute = local_now.hour * 60 + local_now.minute
+        end_minute = local_end.hour * 60 + local_end.minute
+        if existing_end > existing_start:
+            active_now = bool(
+                local_now.date() == existing_date
+                and existing_start <= current_minute < existing_end
+            )
+        else:
+            active_now = bool(
+                (
+                    local_now.date() == existing_date
+                    and current_minute >= existing_start
+                )
+                or (
+                    local_now.date()
+                    == existing_date + datetime.timedelta(days=1)
+                    and current_minute < existing_end
+                )
+            )
+        expected_day = 1 << ((existing_date.weekday() + 1) % 7)
+        return bool(
+            str(signature[0]) == str(job_id)
+            and active_now
+            and existing_end == end_minute
+            and existing_day == expected_day
+            and round(existing_lat, 5) == round(latitude, 5)
+            and round(existing_lon, 5) == round(longitude, 5)
+        )
+
     def _smart_fallback_is_beyond_tesla_week(self, smart: dict) -> bool:
         """Whether the exact one-time fallback cannot yet identify its calendar week."""
         plan = smart.get("plan") or {}
@@ -1686,7 +1950,7 @@ class EvCharger:
         if not 50 <= target_soc <= 100:
             return "limit_invalid"
         target_limit = int(round(target_soc))
-        observed_limit, observed_limit_at = self._smart_observation(
+        observed_limit, _observed_limit_at = self._smart_observation(
             "tesla_soc_setpoint", "tesla_soc_setpoint_updated_at",
             "vehicle_soc_setpoint", "charge_limit_update_ts")
         pending_limit = getattr(self, "_smart_limit_pending", None)
@@ -1695,13 +1959,8 @@ class EvCharger:
             # target or a transport backoff belonging to the superseded value.
             pending_limit = self._smart_limit_pending = None
             self._smart_limit_retry_after = 0.0
-        pending_sent_at = _num((pending_limit or {}).get("sent_at"), 0.0)
-        if (observed_limit_at > 0 and math.isfinite(observed_limit)
-                and int(round(observed_limit)) == target_limit
-                and (
-                    pending_limit is None
-                    or observed_limit_at >= pending_sent_at > 0
-                )):
+        if (math.isfinite(observed_limit)
+                and int(round(observed_limit)) == target_limit):
             if isinstance(pending_limit, dict):
                 attempts = int(pending_limit.get("attempts", 0))
                 logging.info(
@@ -1736,11 +1995,39 @@ class EvCharger:
                     "attempt %d (until confirmed); target=%d%%, observed=%s.",
                     next_attempt, target_limit, observed_text,
                 )
+            command_started_at = time.monotonic()
             result = self.tesla.set_tesla_charge_limit(target_limit)
+            # The centralized Tesla delivery path may spend up to the complete
+            # implicit-wake/explicit-wake settle sequence before returning.
+            # Start acknowledgement and failure backoff from that return, not
+            # from the stale planner timestamp captured before the blocking
+            # call, or its wake latency can consume the entire retry window.
+            command_completed_at = now_ts + max(
+                0.0, time.monotonic() - command_started_at)
             accepted = self._smart_command_ok(result)
+            category = self._smart_command_category(result)
+            if accepted and category == "already_set":
+                logging.info(
+                    "EvCharger [Tesla API]: confirmed set_charge_limit - "
+                    "Tesla reports ChargeLimitSoc already at %d%%.",
+                    target_limit,
+                )
+                # ``already_set`` is an authoritative idempotent response from
+                # Tesla, not mere transport acceptance. Mirror that confirmed
+                # state so an older retained value cannot trigger another paid
+                # command before Fleet Telemetry publishes its next change.
+                self.global_state.set("tesla_soc_setpoint", target_limit)
+                self.global_state.set(
+                    "tesla_soc_setpoint_updated_at", command_completed_at)
+                self.tesla.vehicle_soc_setpoint = target_limit
+                self.tesla.charge_limit_update_ts = command_completed_at
+                self._smart_limit_signature = target_limit
+                self._smart_limit_pending = None
+                self._smart_limit_retry_after = 0.0
+                return "confirmed"
             self._smart_limit_pending = {
                 "target": target_limit,
-                "sent_at": now_ts,
+                "sent_at": command_completed_at,
                 "attempts": next_attempt,
                 "accepted": accepted,
             }
@@ -1750,7 +2037,8 @@ class EvCharger:
             else:
                 # Transport/auth failures receive their own retry clock. Schedule failure
                 # backoff is deliberately unrelated to this critical limit lifecycle.
-                self._smart_limit_retry_after = now_ts + SMART_COMMAND_RETRY_S
+                self._smart_limit_retry_after = (
+                    command_completed_at + SMART_COMMAND_RETRY_S)
                 return f"limit_{self._smart_command_category(result)}"
 
         pending_limit = getattr(self, "_smart_limit_pending", None)
@@ -1778,6 +2066,26 @@ class EvCharger:
         start = self._parse_plan_time(plan.get("latest_safe_start"))
         deadline = self._parse_plan_time(plan.get("ready_by") or job.get("ready_by"))
         target_soc = _num(plan.get("target_soc", job.get("target_soc")), 0.0)
+        execution_mode = str(
+            job.get("execution_mode")
+            or plan.get("execution_mode")
+            or ""
+        ).lower()
+        shared_window = tesla_schedule_window(plan, now=smart["now"])
+        if isinstance(shared_window, dict):
+            shared_start = self._parse_plan_time(shared_window.get("start"))
+            shared_end = self._parse_plan_time(shared_window.get("end"))
+            if shared_start is not None and shared_end is not None:
+                start, deadline = shared_start, shared_end
+        if execution_mode == "run_now":
+            # Run Now's live plan is recalculated as delivery and prices change.
+            # Those rolling blocks are display/control estimates, not permission
+            # to rewrite an already-active onboard schedule. Keep its end fixed
+            # to the durable job deadline so every optimizer pass cannot create
+            # a new start edge and reset Tesla/EVSE current negotiation to 6 A.
+            durable_deadline = self._parse_plan_time(job.get("ready_by"))
+            if durable_deadline is not None:
+                deadline = durable_deadline
         try:
             latitude = float(retrieve_setting("HOME_ADDRESS_LAT"))
             longitude = float(retrieve_setting("HOME_ADDRESS_LONG"))
@@ -1791,38 +2099,19 @@ class EvCharger:
         # window from the remaining energy and the already-conservative delivery rate instead.
         # This fallback is only meant to protect the deadline if the service disappears; normal
         # low-cost blocks are still started/stopped by the live controller.
-        start = self._smart_continuous_fallback_start(plan, deadline, start)
+        if shared_window is None and execution_mode != "run_now":
+            start = self._smart_continuous_fallback_start(
+                plan, deadline, start)
 
-        # Tesla schedules are wall-clock commands: installing yesterday's/latest-safe minute
-        # can defer until another weekday instead of starting now. If that time has passed,
-        # preserve an active selected block at the next whole minute; otherwise use the first
-        # future selected slot. With no selected future start, use that same near-future minute.
         now = smart["now"]
-        if start.timestamp() <= now.timestamp():
-            next_minute_ts = (math.floor(now.timestamp() / 60.0) + 1) * 60.0
-            next_minute = datetime.datetime.fromtimestamp(next_minute_ts, tz=start.tzinfo)
-            future_starts = []
-            for slot in plan.get("slots") or ():
-                if isinstance(slot, dict):
-                    candidate = self._parse_plan_time(slot.get("start"))
-                    if (candidate and candidate.timestamp() > now.timestamp()
-                            and candidate.timestamp() < deadline.timestamp()):
-                        future_starts.append(candidate)
-            if smart.get("slot") is not None:
-                start = next_minute
-            elif future_starts:
-                start = min(future_starts, key=lambda value: value.timestamp())
-            else:
-                start = next_minute
-        if start.timestamp() >= deadline.timestamp():
-            return "no_future_window"
-
         # Tesla interprets schedule minutes and weekdays in the vehicle's local timezone. Plan
         # timestamps may carry different offsets (the persisted UI deadline is normally UTC),
         # so never take ``.hour`` or ``.date`` directly from their source representation.
         local_start = start.astimezone(self.tz)
-        local_deadline = deadline.astimezone(self.tz)
+        local_deadline = self._ceil_schedule_minute(deadline).astimezone(self.tz)
         local_now = now.astimezone(self.tz)
+        if getattr(self, "_smart_schedule_signature", None) is None:
+            self._restore_durable_owned_fallback(smart["job_id"])
         if local_start.timestamp() - local_now.timestamp() > 7 * 24 * 60 * 60:
             # One-time Tesla schedules carry a weekday, not a calendar date. Sending a start
             # more than seven days away can select the nearer weekday or make an approximated
@@ -1850,6 +2139,17 @@ class EvCharger:
         if limit_status != "confirmed":
             return limit_status
 
+        # The fallback schedule is a means to protect a future start, not the
+        # desired state itself. Fresh local draw inside an authorized block
+        # proves that start already happened. Do not disturb that live session
+        # by installing a future-start schedule on startup/reconciliation.
+        if (
+            execution_mode != "run_now"
+            and smart.get("slot") is not None
+            and self._charging_now()
+        ):
+            return "active_charge_satisfies_fallback"
+
         start_minute = local_start.hour * 60 + local_start.minute
         end_minute = local_deadline.hour * 60 + local_deadline.minute
         signature = (
@@ -1858,6 +2158,77 @@ class EvCharger:
         )
         if getattr(self, "_smart_schedule_signature", None) == signature:
             return limit_status
+        if (
+            execution_mode == "run_now"
+            and start.timestamp() <= now.timestamp()
+            and self._owned_schedule_covers_active_window(
+                getattr(self, "_smart_schedule_signature", None),
+                job_id=smart["job_id"],
+                local_now=local_now,
+                local_end=local_deadline,
+                latitude=latitude,
+                longitude=longitude,
+            )
+        ):
+            return limit_status
+
+        # Tesla schedules are wall-clock commands: installing a past start minute
+        # can defer until the next matching weekday. On the first installation
+        # only, move an already-active window to the next whole minute. The
+        # durable active-window check above then freezes that exact schedule.
+        if start.timestamp() <= now.timestamp():
+            next_minute_ts = (math.floor(now.timestamp() / 60.0) + 1) * 60.0
+            next_minute = datetime.datetime.fromtimestamp(
+                next_minute_ts, tz=start.tzinfo)
+            future_starts = []
+            for slot in plan.get("slots") or ():
+                if isinstance(slot, dict):
+                    candidate = self._parse_plan_time(slot.get("start"))
+                    if (
+                        candidate
+                        and candidate.timestamp() > now.timestamp()
+                        and candidate.timestamp() < deadline.timestamp()
+                    ):
+                        future_starts.append(candidate)
+            if smart.get("slot") is not None:
+                start = next_minute
+            elif future_starts:
+                start = min(
+                    future_starts, key=lambda value: value.timestamp())
+            else:
+                start = next_minute
+            local_start = start.astimezone(self.tz)
+            start_minute = local_start.hour * 60 + local_start.minute
+            signature = (
+                smart["job_id"],
+                local_start.date().isoformat(),
+                start_minute,
+                end_minute,
+                self._tesla_weekday_mask(local_start),
+                round(latitude, 5),
+                round(longitude, 5),
+            )
+            if getattr(self, "_smart_schedule_signature", None) == signature:
+                return limit_status
+        if start.timestamp() >= deadline.timestamp():
+            return "no_future_window"
+        if execution_mode == "run_now":
+            run_key = (
+                smart["job_id"],
+                str(job.get("run_now_requested_at")
+                    or plan.get("run_now_requested_at")
+                    or job.get("ready_by")
+                    or ""),
+            )
+            if getattr(self, "_smart_run_now_replaced_key", None) != run_key:
+                # Run Now deliberately supersedes the prior app-owned deadline
+                # fallback. Delete only our deterministic IDs before installing
+                # the new immediate single-window schedule; user schedules are
+                # never enumerated or touched.
+                removal = self._remove_smart_fallback(smart, force=True)
+                if removal not in {"removed", "not_installed", "unsupported"}:
+                    return f"run_now_{removal}"
+                self._smart_run_now_replaced_key = run_key
         if getattr(self, "_smart_schedule_failure_signature", None) != signature:
             self._smart_schedule_failure_signature = signature
             self._smart_schedule_failure_attempts = 0
@@ -1893,6 +2264,92 @@ class EvCharger:
         self._smart_schedule_retry_after = now_ts + SMART_SCHEDULE_RETRY_S
         return f"failed_{category}"
 
+    def _run_now_terminal_cleanup(self, smart: dict) -> bool:
+        """Release Run Now's grid hold and confirm Tesla's safe idle current."""
+        job = smart.get("job") or {}
+        plan = smart.get("plan") or {}
+        execution_mode = str(
+            job.get("execution_mode")
+            or plan.get("execution_mode")
+            or ""
+        ).lower()
+        if execution_mode != "run_now":
+            return True
+
+        release_key = (
+            str(smart.get("job_id") or ""),
+            str(job.get("run_now_requested_at")
+                or plan.get("run_now_requested_at")
+                or ""),
+        )
+        if getattr(self, "_smart_run_now_grid_release_key", None) != release_key:
+            grid_assist_owned = is_truthy(
+                job.get("run_now_grid_assist_owned"), True)
+            if grid_assist_owned:
+                try:
+                    from lib.victron_integration import ac_power_setpoint
+                    ac_power_setpoint(
+                        watts="0.0",
+                        override_ess_net_mettering=False,
+                        silent=False,
+                    )
+                except Exception as error:
+                    logging.error(
+                        "EvCharger: Run Now cleanup could not release the "
+                        "Victron grid-assist setpoint: %s",
+                        error,
+                    )
+                    return False
+                self.global_state.set("grid_charging_enabled", False)
+                publish_message(
+                    "Cerbomoticzgx/system/grid_charging_enabled",
+                    message="False",
+                    retain=True,
+                )
+                self.global_state.set("ai_grid_assist", "off")
+            self._smart_run_now_grid_release_key = release_key
+
+        now_ts = smart["now"].timestamp()
+        observed, observed_at = self._smart_observation(
+            "tesla_charge_current_request",
+            "tesla_charge_current_request_updated_at",
+            "charging_amp_limit",
+            "charge_current_request_update_ts",
+        )
+        pending = getattr(
+            self, "_smart_run_now_safe_current_pending", None)
+        sent_at = _num((pending or {}).get("sent_at"), 0.0)
+        if (
+            math.isfinite(observed)
+            and int(round(observed)) == 5
+            and (pending is None or observed_at >= sent_at > 0)
+        ):
+            if isinstance(pending, dict):
+                logging.info(
+                    "EvCharger [Tesla API]: confirmed set_charging_amps - "
+                    "Run Now cleanup restored ChargeCurrentRequest=5 A/phase."
+                )
+            self._smart_run_now_safe_current_pending = None
+            self._last_commanded_amps = 5
+            return True
+
+        retry_due = (
+            pending is None
+            or now_ts - sent_at >= SMART_COMMAND_ACK_TIMEOUT_S
+        )
+        if not retry_due or not self._cooldown_ok():
+            return False
+        attempts = int((pending or {}).get("attempts", 0)) + 1
+        accepted = bool(self.tesla.set_tesla_charge_amps(
+            5, installation_ceiling=self._smart_installation_ceiling()))
+        self._smart_run_now_safe_current_pending = {
+            "sent_at": now_ts,
+            "attempts": attempts,
+            "accepted": accepted,
+        }
+        self._mark_command()
+        return False
+
     def _remove_smart_fallback(self, smart: dict, *, force=False) -> str:
         if not getattr(self, "_smart_schedule_supported", True):
             return "unsupported"
@@ -1911,8 +2368,11 @@ class EvCharger:
         if (signature is None and not force) or getattr(
                 self, "_smart_removed_signature", None) == removal_key:
             return "not_installed"
-        schedule_ids = ((SMART_LEGACY_OWNED_SCHEDULE_IDS
-                         + (SMART_OWNED_SCHEDULE_ID,))
+        legacy_ids = tuple(
+            schedule_id for schedule_id in SMART_LEGACY_OWNED_SCHEDULE_IDS
+            if schedule_id not in self._legacy_schedule_cleanup_ids()
+        )
+        schedule_ids = ((legacy_ids + (SMART_OWNED_SCHEDULE_ID,))
                         if force else (SMART_OWNED_SCHEDULE_ID,))
         removed_ids = getattr(self, "_smart_removed_schedule_ids", set())
         for schedule_id in schedule_ids:
@@ -1930,6 +2390,8 @@ class EvCharger:
                 self._smart_removed_existing_owned_schedule = True
             removed_ids.add(schedule_id)
             self._smart_removed_schedule_ids = removed_ids
+            if schedule_id in SMART_LEGACY_OWNED_SCHEDULE_IDS:
+                self._mark_legacy_schedule_cleaned(schedule_id)
         self._smart_schedule_signature = None
         self._clear_durable_owned_fallback()
         self._smart_removed_signature = removal_key
@@ -1981,12 +2443,24 @@ class EvCharger:
                     f"smart-charge job {status}", force=False)
                 if stopped and self._charge_mode is None:
                     self._smart_owns_charge = False
+            cancelled_run = (
+                reason == "durable_job_removed"
+                and str(
+                    (smart.get("job") or {}).get("execution_mode") or ""
+                ).lower() == "run_now"
+            )
             cleanup_terminal = (
                 smart.get("terminal") or status == "cancelled"
+                or cancelled_run
+            )
+            run_now_cleanup_ready = (
+                self._run_now_terminal_cleanup(smart)
+                if cleanup_terminal else True
             )
             cleanup_ready = (
                 fallback in {"removed", "not_installed", "unsupported"}
                 and stopped
+                and run_now_cleanup_ready
             )
             if (cleanup_terminal and cleanup_ready
                     and self._clear_terminal_smart_artifacts(job_id)):
@@ -2368,6 +2842,69 @@ class EvCharger:
         app or physically unplugging the car) — see ``_notify_stop_escalation``.
         """
         now = time.time()
+        pending_confirmation = getattr(
+            self, "_stop_confirmation_pending", None)
+        if isinstance(pending_confirmation, dict):
+            accepted_at = _num(
+                pending_confirmation.get("sent_at"), now)
+            local_draw = self._local_charger_draw()
+            observed_stopped = (
+                local_draw is False
+                or (
+                    _num(self.charging_amps) < 1
+                    and not bool(self.tesla.is_charging)
+                )
+            )
+            if observed_stopped and not pending_confirmation.get(
+                    "observed_stopped", False):
+                pending_confirmation["observed_stopped"] = True
+                logging.info(
+                    "EvCharger [Tesla API]: confirmed charge_stop - local "
+                    "charger meter is below 1 A."
+                )
+            elif (
+                pending_confirmation.get("observed_stopped", False)
+                and _num(self.charging_amps) >= 1
+            ):
+                # Real site current resumed after the accepted stop had been
+                # observed. This is a new unauthorized charge, not a duplicate
+                # acknowledgement tick, so reassert the stop immediately.
+                self._stop_attempt_count = max(
+                    self._stop_attempt_count,
+                    int(pending_confirmation.get("attempts", 0)),
+                )
+                self._stop_confirmation_pending = None
+                pending_confirmation = None
+            if (
+                pending_confirmation is not None
+                and now - accepted_at < STOP_CONFIRMATION_GRACE_S
+            ):
+                # The command itself was accepted, so controller ownership can
+                # be released and terminal cleanup may proceed. The retained
+                # record is an idempotency guard even after zero is observed:
+                # a later stale Tesla flag must not buy another stop. A real
+                # return of local current above has already broken the guard.
+                return True
+            if pending_confirmation is None:
+                pass
+            elif pending_confirmation.get("observed_stopped", False):
+                self._stop_confirmation_pending = None
+                self._low_surplus_since = None
+                self._charge_mode = None
+                self._last_commanded_amps = None
+                self._stop_backoff_until = 0.0
+                self._stop_attempt_count = 0
+                self._stop_escalated = False
+                return True
+            else:
+                # Tesla accepted the prior stop but physical draw never fell.
+                # That is a genuinely unconfirmed stop, so permit the next
+                # bounded attempt only after the full observation grace.
+                self._stop_attempt_count = max(
+                    self._stop_attempt_count,
+                    int(pending_confirmation.get("attempts", 0)),
+                )
+                self._stop_confirmation_pending = None
         if now < self._stop_backoff_until:
             return False
         if not force and not self._cooldown_ok():
@@ -2376,9 +2913,18 @@ class EvCharger:
             # Already exhausted STOP_MAX_RETRIES and alerted for manual intervention. Don't keep
             # spending critical (budget-bypassing) API calls on a car we've told the user about.
             return False
-        # Nothing is drawing and we have a FRESH confirmation it's not charging -> nothing to
-        # stop (no wake cost). A stale/unknown status is never treated as confirmation.
-        if _num(self.charging_amps) < 1 and self._status_confirmed_not_charging():
+        # A fresh idle ABB meter is authoritative even if Tesla's change-driven
+        # charging flag is stale. Without fresh local evidence, retain the
+        # conservative Tesla freshness check.
+        local_draw = self._local_charger_draw()
+        if (
+            local_draw is False
+            or (
+                _num(self.charging_amps) < 1
+                and self._status_confirmed_not_charging()
+            )
+        ):
+            self._stop_confirmation_pending = None
             self._low_surplus_since = None
             self._charge_mode = None
             self._stop_attempt_count = 0
@@ -2390,12 +2936,30 @@ class EvCharger:
         self._low_surplus_since = None
         self._mark_command()
         if status == 'ok':
-            self.update_charging_amp_totals(0)     # confirmed stopped -> reflect zero draw
+            # A successful Fleet response confirms command acceptance, not that
+            # site power has already fallen. Never manufacture a zero in the
+            # ABB-owned meter state. Hold the accepted command for one
+            # observation window and let the next real <1 A sample confirm it.
+            self._stop_confirmation_pending = {
+                "sent_at": now,
+                "attempts": attempt,
+            }
             self._charge_mode = None
-            self._last_commanded_amps = None       # a fresh session re-commands from scratch
+            self._last_commanded_amps = None
             self._stop_backoff_until = 0.0
             self._stop_attempt_count = 0
             self._stop_escalated = False
+            if (
+                _num(self.charging_amps) < 1
+                and not bool(self.tesla.is_charging)
+            ):
+                self._stop_confirmation_pending["observed_stopped"] = True
+                return True
+            logging.info(
+                "EvCharger [Tesla API]: charge_stop accepted; waiting up to "
+                "%ds for the local charger meter to confirm below 1 A.",
+                STOP_CONFIRMATION_GRACE_S,
+            )
             return True
         # NOT confirmed stopped. Do NOT zero the meter — leave it showing the real draw so the
         # next tick detects the car is still charging and re-issues the stop.

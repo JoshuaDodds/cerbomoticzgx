@@ -7,6 +7,8 @@ UI via /api/live so the dashboard can show truly live values instead of only the
 plan snapshot (which updates every optimization cycle).
 """
 import json
+import os
+import socket
 import threading
 import time
 from datetime import datetime
@@ -23,6 +25,15 @@ except Exception:  # paho optional at import time
 # The dedicated ABB/Victron EV meter idles at a few watts even when no energy is being
 # transferred. Keep this aligned with the Power Flow card's existing standby threshold.
 EV_IDLE_POWER_W = 100.0
+
+
+def mqtt_client_id() -> str:
+    """Keep concurrently running dashboard subscribers from evicting each other."""
+    host = "".join(
+        character if character.isalnum() else "-"
+        for character in socket.gethostname().lower()
+    )[:18] or "host"
+    return f"cerbo-live-{host}-{os.getpid()}"
 
 
 def _timestamp_age_seconds(value):
@@ -179,7 +190,8 @@ class MqttLive:
         topics = self._build_topics(sid)
         self._key_by_topic = {t: k for k, t in topics.items()}
 
-        client = mqtt.Client(client_id="cerbo-dashboard-live", reconnect_on_failure=True)
+        client = mqtt.Client(
+            client_id=mqtt_client_id(), reconnect_on_failure=True)
         client.on_connect = self._on_connect
         client.on_message = self._on_message
         client.on_disconnect = self._on_disconnect

@@ -10,8 +10,11 @@ consume PUSHED state instead of polling `vehicle_data`.
 when TESLA_TELEMETRY_ENABLED is on, so this module is inert by default.
 """
 import json
+import os
+import socket
 import threading
 import time
+from datetime import datetime
 
 from lib.constants import logging
 
@@ -28,6 +31,21 @@ _ACK_TIMESTAMP_KEYS = {
 
 
 # --- pure translation (no I/O) --------------------------------------------
+
+def mqtt_client_id() -> str:
+    """Return an instance-unique MQTT client ID for this bridge process.
+
+    Development and deployed services may briefly overlap during testing. A
+    static ID makes the broker evict whichever bridge connected first, which
+    can lose QoS-0 Tesla lifecycle events. Hostname plus PID is stable for one
+    process and distinct for concurrent processes/pods.
+    """
+    host = "".join(
+        character if character.isalnum() else "-"
+        for character in socket.gethostname().lower()
+    )[:18] or "host"
+    return f"cerbo-tesla-{host}-{os.getpid()}"
+
 
 def _num(value):
     try:
@@ -59,7 +77,11 @@ def _detailed_charge_state(value) -> dict:
     plugged = norm != "disconnected"
     charging = norm == "charging"
     result = {
-        "state": {"tesla_is_plugged": str(plugged), "tesla_is_charging": str(charging)},
+        "state": {
+            "tesla_detailed_charge_state": norm,
+            "tesla_is_plugged": str(plugged),
+            "tesla_is_charging": str(charging),
+        },
         "topics": {
             "Tesla/vehicle0/plugged_status": "Plugged" if plugged else "Unplugged",
             "Tesla/vehicle0/is_charging": str(charging),
@@ -229,6 +251,7 @@ class TeslaTelemetryBridge:
         self._home = "unset"          # cached (lat, long); read from settings on first use
         self._sig_seen = 0            # approximate "Streaming Signals" counter (display-only)
         self._sig_flushed = 0
+        self._live_fields_seen = set()
 
     def _count_stream_signal(self):
         """Approximate Tesla's 'Streaming Signals' billing by counting received telemetry
@@ -355,7 +378,60 @@ class TeslaTelemetryBridge:
                 return str(item or "").strip().upper()
         return ""
 
-    def _apply_connectivity(self, value):
+    @staticmethod
+    def _connectivity_created_at(value):
+        if not isinstance(value, dict):
+            return 0.0
+        raw = next((
+            item for key, item in value.items()
+            if str(key).lower() == "createdat"
+        ), None)
+        if not raw:
+            return 0.0
+        try:
+            parsed = datetime.fromisoformat(
+                str(raw).replace("Z", "+00:00"))
+            return parsed.timestamp() if parsed.tzinfo is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _connectivity_id(value):
+        if not isinstance(value, dict):
+            return ""
+        return str(next((
+            item for key, item in value.items()
+            if str(key).lower() == "connectionid"
+        ), "") or "")
+
+    @staticmethod
+    def _set_bridge_transport(status):
+        """Publish subscriber health without altering Tesla's source lifecycle."""
+        from lib.global_state import GlobalStateClient
+        from lib.helpers import publish_message
+
+        normalized = str(status or "").strip().upper()
+        state = GlobalStateClient()
+        get = getattr(state, "get", None)
+        if callable(get):
+            try:
+                current = str(
+                    get("tesla_telemetry_bridge_status") or ""
+                ).strip().upper()
+                if current == normalized:
+                    return
+            except Exception:
+                pass
+        state.set("tesla_telemetry_bridge_status", normalized)
+        state.set("tesla_telemetry_bridge_updated_at", time.time())
+        publish_message(
+            "Tesla/vehicle0/telemetry_bridge_status",
+            payload=f'{{"value": "{normalized}"}}',
+            qos=0,
+            retain=True,
+        )
+
+    def _apply_connectivity(self, value, *, retained=False):
         """Persist Fleet Telemetry's connection lifecycle separately from vehicle signals.
 
         Connectivity records are operational metadata, not billable streaming signals. They
@@ -368,14 +444,78 @@ class TeslaTelemetryBridge:
         from lib.global_state import GlobalStateClient
         from lib.helpers import publish_message
         state = GlobalStateClient()
+        event_at = self._connectivity_created_at(value)
+        connection_id = self._connectivity_id(value)
+        try:
+            current_event_at = float(
+                state.get("tesla_telemetry_connection_event_at") or 0)
+        except (AttributeError, TypeError, ValueError):
+            current_event_at = 0.0
+        current_status = (
+            str(state.get("tesla_telemetry_connection_status") or "")
+            .strip().upper()
+            if hasattr(state, "get") else ""
+        )
+        current_id = (
+            str(state.get("tesla_telemetry_connection_id") or "")
+            if hasattr(state, "get") else ""
+        )
+        if event_at and current_event_at:
+            if event_at < current_event_at:
+                logging.debug(
+                    "tesla_telemetry_bridge: ignored delayed connectivity "
+                    "%s event created at %.3f (current event %.3f).",
+                    status, event_at, current_event_at,
+                )
+                return
+            if (
+                abs(event_at - current_event_at) < 0.001
+                and current_status == "DISCONNECTED"
+                and status == "CONNECTED"
+            ):
+                # Equal-time ambiguity fails closed. A disconnect is safer than
+                # treating command buses as available.
+                return
+            if (
+                abs(event_at - current_event_at) < 0.001
+                and current_status == status
+                and current_id == connection_id
+            ):
+                # Retained lifecycle data is Tesla's authoritative last event.
+                # Its original CreatedAt remains intact, so this hydrates
+                # startup without pretending that a new wake occurred.
+                self._set_bridge_transport("SYNCHRONIZED")
+                return
         state.set("tesla_telemetry_connection_status", status)
-        state.set("tesla_telemetry_connection_updated_at", time.time())
+        source_at = event_at or time.time()
+        state.set("tesla_telemetry_connection_updated_at", source_at)
+        if event_at:
+            state.set("tesla_telemetry_connection_event_at", event_at)
+        if connection_id:
+            state.set("tesla_telemetry_connection_id", connection_id)
+        if status == "DISCONNECTED":
+            state.set("tesla_telemetry_connected_at", 0)
+        elif status == "CONNECTED":
+            # Mirror Tesla's CreatedAt exactly, including retained replay.
+            # Command readiness is gated separately by bridge synchronization,
+            # so this source timestamp is never mistaken for a fresh wake.
+            state.set("tesla_telemetry_connected_at", source_at)
         publish_message(
             "Tesla/vehicle0/telemetry_status",
             payload=f'{{"value": "{status}"}}',
             qos=0,
             retain=True,
         )
+        self._set_bridge_transport("SYNCHRONIZED")
+
+    def _on_connect(self, client, _userdata, _flags, _reason_code, *args):
+        # A broker connection alone does not prove the vehicle stream is
+        # current. Wait for a source lifecycle event before commands trust it.
+        self._set_bridge_transport("AWAITING_SOURCE")
+        client.subscribe(f"{self._topic_base}/#")
+
+    def _on_disconnect(self, _client, _userdata, _reason_code, *args):
+        self._set_bridge_transport("DISCONNECTED")
 
     def _on_message(self, _c, _u, msg):
         parsed = parse_message(msg.topic, msg.payload, self._topic_base)
@@ -386,30 +526,49 @@ class TeslaTelemetryBridge:
             return
         if field == "connectivity":
             try:
-                self._apply_connectivity(value)
+                self._apply_connectivity(
+                    value, retained=bool(getattr(msg, "retain", False)))
             except Exception as e:             # pragma: no cover - subscriber must stay alive
                 logging.debug(
                     "tesla_telemetry_bridge: connectivity apply failed: %s", e)
             return
         if field not in _NON_SIGNAL_FIELDS:      # count only actual vehicle-data signals
             self._count_stream_signal()
+        retained = bool(getattr(msg, "retain", False))
+        if retained and field in self._live_fields_seen:
+            # A retained broker replay is useful only until this process has
+            # observed a live value for the same source topic. Never let a
+            # delayed retained delivery roll a field back afterwards.
+            return
         try:
-            self.apply(field, value, retained=bool(getattr(msg, "retain", False)))
+            self.apply(field, value, retained=retained)
+            if not retained and value is not None:
+                self._live_fields_seen.add(field)
+                # A live vehicle signal proves source hydration even if no
+                # connectivity edge accompanied it.
+                self._set_bridge_transport("SYNCHRONIZED")
         except Exception as e:                 # pragma: no cover - never let a bad msg kill the loop
             logging.debug("tesla_telemetry_bridge: apply failed for %s=%s: %s", field, value, e)
 
     def start(self):
         if self._started:
             return
+        # Publish the startup race synchronously before importing/connecting so
+        # the independently-started EV worker cannot mistake absent bridge state
+        # for permission to issue remote commands.
+        self._set_bridge_transport("CONNECTING")
         try:
             import paho.mqtt.client as mqtt
         except Exception as e:                 # pragma: no cover
             logging.warning("tesla_telemetry_bridge: paho-mqtt unavailable: %s", e)
+            self._set_bridge_transport("DISCONNECTED")
             return
         self._started = True
-        client = mqtt.Client(client_id="cerbo-tesla-telemetry-bridge", reconnect_on_failure=True)
+        client = mqtt.Client(
+            client_id=mqtt_client_id(), reconnect_on_failure=True)
         client.on_message = self._on_message
-        client.on_connect = lambda c, *a: c.subscribe(f"{self._topic_base}/#")
+        client.on_connect = self._on_connect
+        client.on_disconnect = self._on_disconnect
         self._client = client
         try:
             client.connect_async(self._host, self._port, keepalive=45)
@@ -419,6 +578,7 @@ class TeslaTelemetryBridge:
         except Exception as e:                 # pragma: no cover
             logging.warning("tesla_telemetry_bridge: could not connect to broker: %s", e)
             self._started = False
+            self._set_bridge_transport("DISCONNECTED")
 
 
 def start_bridge_if_enabled(retrieve_setting):

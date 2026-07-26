@@ -8,6 +8,7 @@ inject values directly and assert the parsing/None-fallback behaviour.
 """
 import time
 
+from frontend import live
 from frontend.live import MqttLive
 
 # Every key the v2 cards depend on, beyond the pre-existing power/SoC fields.
@@ -18,6 +19,15 @@ V2_FIELDS = (
     "system_state",
     "ev_energy_kwh", "ev_charge_time", "ev_l1_a", "ev_l2_a", "ev_l3_a",
 )
+
+
+def test_dashboard_mqtt_client_id_is_unique_per_runtime_instance(monkeypatch):
+    monkeypatch.setattr(live.socket, "gethostname", lambda: "ESS Dev")
+    monkeypatch.setattr(live.os, "getpid", lambda: 101)
+    assert live.mqtt_client_id() == "cerbo-live-ess-dev-101"
+
+    monkeypatch.setattr(live.os, "getpid", lambda: 102)
+    assert live.mqtt_client_id() == "cerbo-live-ess-dev-102"
 
 
 def _snapshot_with(values):

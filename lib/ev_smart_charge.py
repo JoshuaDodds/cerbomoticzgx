@@ -117,6 +117,9 @@ class EVChargeJob:
     created_at: datetime
     updated_at: datetime
     status: str = "active"
+    execution_mode: str = "scheduled"
+    run_now_requested_at: datetime | None = None
+    run_now_grid_assist_owned: bool = False
 
     @classmethod
     def from_payload(cls, payload: Mapping) -> "EVChargeJob":
@@ -135,6 +138,24 @@ class EVChargeJob:
             raise ValueError("updated_at cannot precede created_at")
         if ready_by.timestamp() <= created_at.timestamp():
             raise ValueError("ready_by must be later than created_at")
+        execution_mode = str(
+            payload.get("execution_mode") or "scheduled").strip().lower()
+        if execution_mode not in {"scheduled", "run_now"}:
+            raise ValueError("execution_mode must be scheduled or run_now")
+        requested_raw = payload.get("run_now_requested_at")
+        requested_at = (
+            _aware_datetime(requested_raw, "run_now_requested_at")
+            if requested_raw else None
+        )
+        if execution_mode == "run_now" and requested_at is None:
+            raise ValueError("run_now_requested_at is required in run_now mode")
+        owned_raw = payload.get("run_now_grid_assist_owned")
+        # Run Now jobs written before this ownership field always enabled Grid
+        # assist themselves, so retain safe cleanup compatibility for them.
+        run_now_grid_assist_owned = bool(
+            execution_mode == "run_now"
+            and (True if owned_raw is None else owned_raw is True)
+        )
         return cls(
             id=job_id,
             current_soc=_soc(payload.get("current_soc"), "current_soc"),
@@ -143,10 +164,13 @@ class EVChargeJob:
             created_at=created_at,
             updated_at=updated_at,
             status=status,
+            execution_mode=execution_mode,
+            run_now_requested_at=requested_at,
+            run_now_grid_assist_owned=run_now_grid_assist_owned,
         )
 
     def to_dict(self) -> dict:
-        return {
+        payload = {
             "schema_version": SCHEMA_VERSION,
             "kind": "ev_charge_job",
             "id": self.id,
@@ -156,7 +180,15 @@ class EVChargeJob:
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
             "status": self.status,
+            "execution_mode": self.execution_mode,
         }
+        if self.run_now_requested_at is not None:
+            payload["run_now_requested_at"] = (
+                self.run_now_requested_at.isoformat())
+        if self.execution_mode == "run_now":
+            payload["run_now_grid_assist_owned"] = (
+                self.run_now_grid_assist_owned)
+        return payload
 
 
 def create_job(
@@ -314,6 +346,185 @@ def update_job_status(action: str, *, path=None, now=None) -> dict:
             raise ValueError("now cannot precede the last job update")
         updated = replace(job, status=statuses[normalised], updated_at=changed_at)
         return save_job(updated, path=path)
+
+
+def run_now_eligibility(job, plan) -> tuple[bool, str]:
+    """Whether one active plan can be represented as one immediate Tesla window."""
+    try:
+        model = EVChargeJob.from_payload(job)
+    except (TypeError, ValueError):
+        return False, "invalid_job"
+    if model.status != "active":
+        return False, "job_not_active"
+    if model.execution_mode == "run_now":
+        return False, "already_running_now"
+    if not isinstance(plan, Mapping):
+        return False, "plan_unavailable"
+    plan_job = plan.get("job") or {}
+    if str(plan_job.get("id") or "") != model.id:
+        return False, "plan_job_mismatch"
+    if plan.get("status") != "planned" or plan.get("feasible") is not True:
+        return False, "plan_not_feasible"
+    parsed = []
+    for raw in plan.get("slots") or ():
+        try:
+            if _number(
+                    raw.get("energy_kwh"), "slot.energy_kwh",
+                    minimum=0.0) <= _EPSILON:
+                continue
+            start = _aware_datetime(raw.get("start"), "slot.start")
+            end = _aware_datetime(raw.get("end"), "slot.end")
+        except (AttributeError, TypeError, ValueError):
+            return False, "invalid_plan_window"
+        if end.timestamp() <= start.timestamp():
+            return False, "invalid_plan_window"
+        parsed.append((start, end))
+    if not parsed:
+        return False, "plan_has_no_charge_window"
+    parsed.sort(key=lambda item: item[0].timestamp())
+    timezone = parsed[0][0].tzinfo
+    dates = {start.astimezone(timezone).date() for start, _end in parsed}
+    if len(dates) != 1:
+        return False, "plan_spans_multiple_days"
+    for previous, current in zip(parsed, parsed[1:]):
+        if abs(previous[1].timestamp() - current[0].timestamp()) > _EPSILON:
+            return False, "plan_requires_multiple_windows"
+    return True, "eligible"
+
+
+def tesla_schedule_window(plan, *, now=None) -> dict | None:
+    """Describe the one application-owned schedule Tesla can represent.
+
+    A single same-day optimizer block is mirrored exactly (with its end rounded
+    upward to Tesla's minute precision). Sparse, multi-block or multi-day plans
+    instead expose the conservative continuous deadline fallback. Returning
+    this in the plan gives the controller and dashboard one shared source of
+    truth for what the Tesla app should show.
+    """
+    if not isinstance(plan, Mapping):
+        return None
+
+    def parsed(value):
+        try:
+            return _aware_datetime(value, "schedule timestamp")
+        except (TypeError, ValueError):
+            return None
+
+    def ceil_minute(value):
+        timestamp = math.ceil(value.timestamp() / 60.0) * 60.0
+        return datetime.fromtimestamp(timestamp, tz=value.tzinfo)
+
+    def numeric(value):
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return None
+        return result if math.isfinite(result) else None
+
+    blocks = [
+        block for block in (plan.get("blocks") or ())
+        if isinstance(block, Mapping)
+    ]
+    if len(blocks) == 1:
+        start = parsed(blocks[0].get("start"))
+        end = parsed(blocks[0].get("end"))
+        if start is not None and end is not None and end.timestamp() > start.timestamp():
+            rounded_end = ceil_minute(end)
+            if start.date() == rounded_end.astimezone(start.tzinfo).date():
+                reference = parsed(now) if now is not None else datetime.now().astimezone()
+                return {
+                    "kind": "selected_block",
+                    "start": start.isoformat(),
+                    "end": rounded_end.isoformat(),
+                    "installable": (
+                        start.timestamp() - reference.timestamp()
+                        <= 7 * 24 * 60 * 60
+                    ),
+                }
+
+    deadline = parsed(plan.get("ready_by"))
+    required_ac_kwh = numeric(plan.get("required_ac_kwh"))
+    delivery_kw = numeric(plan.get("expected_delivery_kw"))
+    buffer_minutes = numeric(plan.get("completion_buffer_minutes"))
+    if (
+        deadline is None
+        or required_ac_kwh is None
+        or required_ac_kwh <= 0
+        or delivery_kw is None
+        or delivery_kw <= 0
+    ):
+        return None
+    duration_seconds = (
+        required_ac_kwh / delivery_kw * 3600.0
+        + max(0.0, buffer_minutes or 0.0) * 60.0
+    )
+    duration_seconds = min(
+        24 * 60 * 60.0, max(15 * 60.0, duration_seconds))
+    start_timestamp = deadline.timestamp() - duration_seconds
+    if duration_seconds < 24 * 60 * 60.0:
+        start_timestamp = (
+            math.floor(start_timestamp / SLOT_SECONDS) * SLOT_SECONDS)
+    start = datetime.fromtimestamp(start_timestamp, tz=deadline.tzinfo)
+    reference = parsed(now) if now is not None else datetime.now().astimezone()
+    return {
+        "kind": "deadline_fallback",
+        "start": start.isoformat(),
+        "end": ceil_minute(deadline).isoformat(),
+        "installable": (
+            start.timestamp() - reference.timestamp()
+            <= 7 * 24 * 60 * 60
+        ),
+    }
+
+
+def activate_run_now(*, job_path=None, plan_path=None, now=None,
+                     grid_assist_owned=True) -> dict:
+    """Shift one eligible contiguous smart-charge job to immediate execution.
+
+    The optimizer will rebuild costs and Timeline metadata from current prices.
+    Only durable job intent is changed here; Tesla and grid-assist effects remain
+    in their guarded controller/server boundaries.
+    """
+    changed_at = _aware_datetime(
+        now or datetime.now().astimezone(), "now")
+    with _LOCK:
+        payload = load_job(path=job_path)
+        plan = load_plan_snapshot(path=plan_path)
+        allowed, reason = run_now_eligibility(payload, plan)
+        if not allowed:
+            raise ValueError(f"Run Now is unavailable: {reason.replace('_', ' ')}")
+        model = EVChargeJob.from_payload(payload)
+        selected = [
+            (
+                _aware_datetime(row["start"], "slot.start"),
+                _aware_datetime(row["end"], "slot.end"),
+            )
+            for row in plan.get("slots") or ()
+            if float(row.get("energy_kwh") or 0.0) > _EPSILON
+        ]
+        selected.sort(key=lambda item: item[0].timestamp())
+        duration_s = max(
+            SLOT_SECONDS,
+            selected[-1][1].timestamp() - selected[0][0].timestamp(),
+        )
+        buffer_s = max(
+            0.0, float(plan.get("completion_buffer_minutes") or 0.0) * 60.0)
+        # The planner accepts quarter-hour candidates but shortens the final
+        # selected interval to the exact energy requirement. Give it the whole
+        # final candidate quarter, otherwise a Run Now pressed between quarter
+        # boundaries can become falsely infeasible by a few minutes.
+        charge_cutoff = _ceil_quarter(
+            _elapsed_add(changed_at, seconds=duration_s))
+        deadline = _elapsed_add(charge_cutoff, seconds=buffer_s)
+        updated = replace(
+            model,
+            ready_by=deadline,
+            updated_at=changed_at,
+            execution_mode="run_now",
+            run_now_requested_at=changed_at,
+            run_now_grid_assist_owned=bool(grid_assist_owned),
+        )
+        return save_job(updated, path=job_path)
 
 
 def save_plan_snapshot(plan: Mapping, *, path=None) -> dict:
@@ -1068,6 +1279,7 @@ def plan_charge(
         return _base_plan(planned_at)
     model = EVChargeJob.from_payload(
         job.to_dict() if isinstance(job, EVChargeJob) else job)
+    run_now = model.execution_mode == "run_now"
     current = model.current_soc if current_soc is None else _soc(current_soc, "current_soc")
     capacity = _number(usable_capacity_kwh, "usable_capacity_kwh", positive=True)
     efficiency = _number(
@@ -1111,6 +1323,11 @@ def plan_charge(
             slot["start_dt"].timestamp() <= planned_at.timestamp()
             < slot["end_dt"].timestamp()
         ):
+            if run_now:
+                # Run Now begins at the button press, not at the already-past
+                # quarter boundary. Keeping the original end makes the first
+                # partial slot join the following quarters without a gap.
+                slot["start_dt"] = planned_at
             remaining_seconds = max(
                 0.0, slot["end_dt"].timestamp() - planned_at.timestamp())
             remaining_fraction = min(1.0, remaining_seconds / SLOT_SECONDS)
@@ -1136,6 +1353,11 @@ def plan_charge(
         "job": {
             "id": model.id,
             "status": model.status,
+            "execution_mode": model.execution_mode,
+            "run_now_requested_at": (
+                model.run_now_requested_at.isoformat()
+                if model.run_now_requested_at is not None else None
+            ),
         },
         "active": True,
         "active_job": True,
@@ -1158,6 +1380,7 @@ def plan_charge(
             slot["start_dt"].isoformat()
             for slot in eligible if slot.get("committed")
         ],
+        "execution_mode": model.execution_mode,
     })
 
     if model.status == "paused":
@@ -1196,7 +1419,10 @@ def plan_charge(
 
     horizon_hours = max(
         0.0, (cutoff.timestamp() - first_start.timestamp()) / 3600.0)
-    daily_paced = horizon_hours > DAILY_PACING_MIN_HORIZON_HOURS
+    daily_paced = (
+        not run_now
+        and horizon_hours > DAILY_PACING_MIN_HORIZON_HOURS
+    )
     committed = []
     remaining_required = ac_required
     for slot in eligible:
@@ -1207,7 +1433,21 @@ def plan_charge(
             committed.append((slot, energy, _slot_cost(slot, energy)))
             remaining_required -= energy
     uncommitted = [slot for slot in eligible if not slot.get("committed")]
-    if daily_paced:
+    if run_now:
+        selected = []
+        shortfall = remaining_required
+        for slot in uncommitted:
+            if shortfall <= _EPSILON:
+                break
+            energy = min(slot["planning_capacity_kwh"], shortfall)
+            if energy <= _EPSILON:
+                # A Run Now job is one continuous command window. Do not skip
+                # an unavailable quarter and manufacture a second block.
+                break
+            selected.append((slot, energy, _slot_cost(slot, energy)))
+            shortfall -= energy
+        shortfall = max(0.0, shortfall)
+    elif daily_paced:
         selected, shortfall = _allocate_daily_paced(
             uncommitted, remaining_required, start_penalty, model.ready_by.tzinfo)
     else:
@@ -1280,11 +1520,13 @@ def plan_charge(
     result.update({
         "status": "infeasible" if infeasible else "planned",
         "reason": "insufficient_energy_capacity_before_deadline" if infeasible else (
+            "run_now" if run_now else
             "daily_paced_tentative" if daily_paced and tentative else
             "daily_paced" if daily_paced else
             "price_optimised_tentative" if tentative else "price_optimised"
         ),
         "planning_strategy": (
+            "run_now" if run_now else
             "daily_paced" if daily_paced else "deadline_optimised"
         ),
         "tentative": tentative,
@@ -1311,6 +1553,8 @@ def plan_charge(
         "estimated_saving_eur": saving,
         "provisional_saving_eur": provisional_saving,
     })
+    result["tesla_schedule"] = tesla_schedule_window(
+        result, now=planned_at)
     return result
 
 
@@ -1362,5 +1606,6 @@ __all__ = [
     "plan_ev_charge",
     "save_job",
     "save_plan_snapshot",
+    "tesla_schedule_window",
     "update_job_status",
 ]

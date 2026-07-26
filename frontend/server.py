@@ -169,14 +169,35 @@ def _save_ev_smart_charge_job(payload):
 
 
 def _delete_ev_smart_charge_job():
+    module = _ev_smart_charge_module()
+    loader = getattr(module, "load_job", None)
+    current = (
+        _ev_call_with_configured_path(
+            loader, setting="EV_SMART_CHARGE_JOB_PATH")
+        if callable(loader) else None
+    )
     fn = _ev_callable("delete_job", "cancel_job", "clear_job")
-    result = _ev_call_with_configured_path(
+    _ev_call_with_configured_path(
         fn, setting="EV_SMART_CHARGE_JOB_PATH")
-    return result
+    return current
 
 
 def _act_on_ev_smart_charge_job(action):
     module = _ev_smart_charge_module()
+    if action == "run_now":
+        fn = getattr(module, "activate_run_now", None)
+        if not callable(fn):
+            raise RuntimeError(
+                "Run Now is unavailable in this service version.")
+        env = data._env()
+        from lib.global_state import GlobalStateClient
+        grid_assist_was_on = _boolish(
+            GlobalStateClient().get("grid_charging_enabled"), False)
+        return fn(
+            job_path=env.get("EV_SMART_CHARGE_JOB_PATH") or None,
+            plan_path=env.get("EV_SMART_CHARGE_PLAN_PATH") or None,
+            grid_assist_owned=not grid_assist_was_on,
+        )
     generic = getattr(module, "set_job_action", None)
     if callable(generic):
         result = generic(action)
@@ -187,7 +208,6 @@ def _act_on_ev_smart_charge_job(action):
         names = {
             "pause": ("pause_job",),
             "resume": ("resume_job",),
-            "charge_now": ("charge_now", "charge_job_now"),
         }
         result = _ev_call_with_configured_path(
             _ev_callable(*names[action]), setting="EV_SMART_CHARGE_JOB_PATH")
@@ -236,7 +256,18 @@ def api_ev_smart_charge_put():
 @app.route("/api/ev/smart-charge", methods=["DELETE"])
 def api_ev_smart_charge_delete():
     try:
-        _delete_ev_smart_charge_job()
+        deleted_job = _delete_ev_smart_charge_job()
+        if (
+            isinstance(deleted_job, dict)
+            and str(deleted_job.get("execution_mode") or "").lower()
+            == "run_now"
+            and _boolish(
+                deleted_job.get("run_now_grid_assist_owned"), True)
+        ):
+            # Run Now enabled this retained toggle, so cancellation must
+            # release it immediately rather than waiting for the EV worker or
+            # the next quarter-hour optimizer cycle.
+            _set_grid_assist_toggle(False)
         return jsonify({"ok": True})
     except (ImportError, RuntimeError, OSError) as e:
         logging.warning("EV smart-charge job delete failed: %s", e)
@@ -246,14 +277,38 @@ def api_ev_smart_charge_delete():
 @app.route("/api/ev/smart-charge/action", methods=["POST"])
 def api_ev_smart_charge_action():
     action = str((request.get_json(silent=True) or {}).get("action") or "").strip().lower()
-    if action not in {"pause", "resume", "charge_now"}:
-        return jsonify({"ok": False, "error": "action must be pause, resume, or charge_now"}), 400
+    if action not in {"pause", "resume", "run_now"}:
+        return jsonify({
+            "ok": False,
+            "error": "action must be pause, resume, or run_now",
+        }), 400
     try:
-        job = _act_on_ev_smart_charge_job(action)
-        return jsonify({"ok": True, "job": job})
-    except (ImportError, RuntimeError, OSError) as e:
+        job = None
+        replanned = False
+        if action == "run_now":
+            from lib.energy_broker import run_ai_optimizer
+
+            def activate():
+                nonlocal job
+                job = _act_on_ev_smart_charge_job(action)
+                _set_grid_assist_toggle(True)
+
+            # Acquire the optimizer's single-writer lock before changing the
+            # durable job or grid state. This avoids a half-activated Run Now
+            # when a scheduled cycle happens to overlap the button press.
+            replanned = run_ai_optimizer(
+                wait_timeout_s=30, before_run=activate)
+            if replanned is False:
+                raise RuntimeError(
+                    "The optimizer is already running; Run Now was not started.")
+        else:
+            job = _act_on_ev_smart_charge_job(action)
+        return jsonify({
+            "ok": True, "job": job, "replanned": bool(replanned)})
+    except (ImportError, RuntimeError, OSError, ValueError) as e:
         logging.warning("EV smart-charge action failed: %s", e)
-        return jsonify({"ok": False, "error": str(e)}), 503
+        status = 400 if isinstance(e, ValueError) else 503
+        return jsonify({"ok": False, "error": str(e)}), status
 
 
 @app.route("/api/history/day")

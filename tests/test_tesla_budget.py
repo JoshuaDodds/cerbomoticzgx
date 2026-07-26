@@ -17,9 +17,12 @@ def _budget(tmp_path, caps=None, clock=None):
 
 # --- the money-safety guarantee -------------------------------------------
 
-def test_ceiling_is_below_the_credit():
-    # There must be real margin between what we allow and what Tesla starts billing.
-    assert tb.MONTHLY_SAFETY_CEILING_USD < tb.MONTHLY_CREDIT_USD
+def test_ceiling_preserves_explicit_25_cent_credit_margin():
+    # Use nearly all of Tesla's credit without risking a rounding-sized overage.
+    assert tb.MONTHLY_SAFETY_CEILING_USD == 9.75
+    assert (
+        tb.MONTHLY_CREDIT_USD - tb.MONTHLY_SAFETY_CEILING_USD
+    ) == 0.25
 
 
 def test_default_caps_under_daily_runaway_ceiling():
@@ -39,12 +42,26 @@ def test_monthly_ceiling_is_the_hard_guard_and_stops_bypass_it(tmp_path):
     # Seed the billing cycle right at the ceiling. A normal call is then blocked, but a
     # safety-critical call (a charge_stop / its wake) is NEVER blocked.
     path = str(tmp_path / "budget.json")
-    wakes_to_ceiling = int(tb.MONTHLY_SAFETY_CEILING_USD / tb.UNIT_COST_USD["wake"])   # 450
-    tb.seed_month_usage({"command": 0, "data": 0, "wake": wakes_to_ceiling}, path)
+    # 487 wakes + 10 commands = exactly $9.75.
+    tb.seed_month_usage({"command": 10, "data": 0, "wake": 487}, path)
     b = tb.TeslaBudget(caps=tb.DEFAULT_DAILY_CAPS, state_path=path)
     assert b.spend("command") is False                    # normal call blocked at the ceiling
     assert b.spend("command", critical=True) is True      # safety-critical stop always goes through
     assert b.spend("wake", critical=True) is True         # ...and the wake to deliver it
+
+
+def test_monthly_guard_allows_exact_ceiling_then_blocks_next_call(tmp_path):
+    path = str(tmp_path / "budget.json")
+    # 487 wakes + 9 commands = $9.749. One final command reaches exactly $9.750.
+    tb.seed_month_usage({"command": 9, "data": 0, "wake": 487}, path)
+    b = tb.TeslaBudget(
+        caps={"command": 20, "data": 0, "wake": 0},
+        state_path=path,
+    )
+
+    assert b.spend("command") is True
+    assert tb.usage_snapshot(path)["total"] == 9.75
+    assert b.spend("command") is False
 
 
 def test_daily_runaway_breaker_caps_a_stuck_loop(tmp_path):
@@ -54,6 +71,25 @@ def test_daily_runaway_breaker_caps_a_stuck_loop(tmp_path):
     while b.spend("command") and n <= 100_000:
         n += 1
     assert n == tb.DEFAULT_DAILY_CAPS["command"]           # blocked at the daily cap (monthly still tiny)
+
+
+def test_repeated_daily_cap_blocks_are_log_rate_limited(tmp_path, caplog):
+    caplog.set_level("INFO")
+    now = {"value": datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc)}
+    b = _budget(
+        tmp_path,
+        caps={"command": 0, "data": 0, "wake": 0},
+        clock=lambda: now["value"],
+    )
+
+    assert b.spend("command") is False
+    assert b.spend("command") is False
+    assert b.spend("command") is False
+    assert caplog.text.count("BLOCKED command") == 1
+
+    now["value"] = now["value"].replace(minute=16)
+    assert b.spend("command") is False
+    assert caplog.text.count("BLOCKED command") == 2
 
 
 def test_projected_cost_math():

@@ -392,6 +392,34 @@ def test_ev_smart_charge_dashboard_hides_orphaned_terminal_plan(monkeypatch):
     assert result["plan"] is None
 
 
+def test_ev_smart_charge_dashboard_advertises_run_now_only_for_eligible_applied_plan(
+        monkeypatch):
+    fake = types.SimpleNamespace(
+        load_job=lambda path=None: {"id": "j1", "status": "active"},
+        run_now_eligibility=lambda job, plan: (
+            bool(plan.get("eligible")), "eligible" if plan.get("eligible")
+            else "plan_requires_multiple_windows"
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "lib.ev_smart_charge", fake)
+    monkeypatch.setattr(data, "_env", lambda: {
+        "EV_SMART_CHARGE_ENABLED": "True",
+        "EV_SMART_CHARGE_APPLY": "True",
+    })
+
+    monkeypatch.setattr(data, "load_raw_plan", lambda: {
+        "ev_smart_charge": {"job": {"id": "j1"}, "eligible": True},
+    })
+    assert data.ev_smart_charge_dashboard()["actions"] == ["run_now"]
+
+    monkeypatch.setattr(data, "load_raw_plan", lambda: {
+        "ev_smart_charge": {"job": {"id": "j1"}, "eligible": False},
+    })
+    result = data.ev_smart_charge_dashboard()
+    assert result["actions"] == []
+    assert result["run_now_reason"] == "plan_requires_multiple_windows"
+
+
 def test_forecast_accuracy_uses_settlement_predicted_and_actuals(monkeypatch, tmp_path):
     monkeypatch.setattr(data, "_env", lambda: {"HISTORY_DIR": str(tmp_path)})
     day = datetime.now().astimezone().replace(hour=10, minute=0, second=0, microsecond=0)

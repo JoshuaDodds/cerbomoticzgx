@@ -28,9 +28,10 @@ UNIT_COST_USD = {"command": 0.001, "data": 0.002, "wake": 0.02}
 STREAMING_SIGNAL_COST_USD = 1.0 / 150000
 
 MONTHLY_CREDIT_USD = 10.0          # Tesla's monthly discount
-MONTHLY_SAFETY_CEILING_USD = 9.0   # HARD guard: the billing cycle's spend never exceeds this
+MONTHLY_SAFETY_CEILING_USD = 9.75  # HARD guard: retain $0.25 margin below the monthly credit
 DAILY_SAFETY_CEILING_USD = 2.0     # per-day runaway breaker (a loop can't burn more than this/day)
 DAYS_PER_MONTH = 31                # for the informational worst-case projection only
+BLOCKED_LOG_INTERVAL_S = 15 * 60   # one actionable guard message, then periodic reminder
 
 # The REAL guard is the monthly ceiling (enforced per-spend). Charging is bursty and infrequent
 # (often only a couple of days a WEEK), so sizing a daily cap as "worst case every single day"
@@ -98,6 +99,7 @@ class TeslaBudget:
         self._caps = clamp_caps_to_ceiling(caps or DEFAULT_DAILY_CAPS)
         self._path = state_path or DEFAULT_STATE_PATH
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._blocked_log_at = {}
         # Shared per-path lock (see _lock_for) -- not a private RLock -- so this instance's
         # spend()/refund() serialize against the module-level seed_month_usage()/
         # bump_signal_count()/seed_signal_count() below when they target the same file.
@@ -164,18 +166,50 @@ class TeslaBudget:
             d = self._load()
             if not critical:
                 if self._spent_usd_month(d) + UNIT_COST_USD[category] * n > MONTHLY_SAFETY_CEILING_USD:
-                    logging.warning("tesla_budget: BLOCKED %s — monthly ceiling $%.2f reached "
-                                    "(spent $%.2f this cycle).", category, MONTHLY_SAFETY_CEILING_USD,
-                                    self._spent_usd_month(d))
+                    if self._should_log_block(category, "monthly", d):
+                        logging.warning(
+                            "tesla_budget: BLOCKED %s — monthly ceiling $%.2f "
+                            "reached (spent $%.2f this cycle). Further identical "
+                            "messages are suppressed for %d minutes.",
+                            category,
+                            MONTHLY_SAFETY_CEILING_USD,
+                            self._spent_usd_month(d),
+                            BLOCKED_LOG_INTERVAL_S // 60,
+                        )
                     return False
                 if (d["counts"].get(category, 0) + n) > self._caps.get(category, 0):
-                    logging.info("tesla_budget: BLOCKED %s — daily runaway cap %d reached (spent $%.3f today).",
-                                 category, self._caps.get(category, 0), self._spent_usd(d))
+                    if self._should_log_block(category, "daily", d):
+                        logging.info(
+                            "tesla_budget: BLOCKED %s — daily runaway cap %d "
+                            "reached (spent $%.3f today). Further identical "
+                            "messages are suppressed for %d minutes.",
+                            category,
+                            self._caps.get(category, 0),
+                            self._spent_usd(d),
+                            BLOCKED_LOG_INTERVAL_S // 60,
+                        )
                     return False
             d["counts"][category] = d["counts"].get(category, 0) + n
             d["month_counts"][category] = d["month_counts"].get(category, 0) + n
             self._save(d)
             return True
+
+    def _should_log_block(self, category: str, reason: str, state: dict) -> bool:
+        """Rate-limit identical local guard messages without hiding state changes."""
+        now_ts = self._clock().timestamp()
+        key = (state.get("date"), category, reason)
+        last = self._blocked_log_at.get(key)
+        if last is not None and now_ts - last < BLOCKED_LOG_INTERVAL_S:
+            return False
+        self._blocked_log_at[key] = now_ts
+        # The key includes the UTC date, so discard yesterday's tiny cache.
+        current_date = state.get("date")
+        self._blocked_log_at = {
+            item: timestamp
+            for item, timestamp in self._blocked_log_at.items()
+            if item[0] == current_date
+        }
+        return True
 
     def refund(self, category: str, n: int = 1) -> None:
         """Reverse a previously-recorded spend that turned out NON-billable. Tesla only bills

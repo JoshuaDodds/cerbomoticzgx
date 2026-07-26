@@ -368,7 +368,7 @@ def test_get_vehicle_data_returns_payload_when_online():
     assert api.get_vehicle_data() == payload["response"]
 
 
-def test_command_blocked_by_budget_returns_false_without_request():
+def test_command_blocked_by_budget_returns_false_without_request(caplog):
     budget = _Budget(allow=False)
     calls = {"n": 0}
 
@@ -380,6 +380,8 @@ def test_command_blocked_by_budget_returns_false_without_request():
     assert api._command("charge_start", "err") is False
     assert calls["n"] == 0
     assert budget.spent == ["command"]
+    assert "EvCharger [Tesla API]: blocked" not in caplog.text
+    assert "monthly command budget ceiling" not in caplog.text
 
 
 def test_stop_charge_robust_tries_passive_retry_before_wake(monkeypatch):
@@ -562,6 +564,30 @@ def test_asleep_smart_command_uses_implicit_wake_grace_before_paid_wake(
     assert "ms - target SoC 80%; retry after implicit wake grace" in caplog.text
 
 
+def test_generic_command_audit_does_not_duplicate_implicit_wake_context(
+        caplog, monkeypatch):
+    caplog.set_level("INFO")
+    monkeypatch.setattr(tesla_api.time, "sleep", lambda _seconds: None)
+    responses = iter((
+        _Resp(200, {
+            "response": {"result": False, "reason": "could_not_wake_buses"},
+        }),
+        _Resp(200, {"response": {"result": True}}),
+    ))
+    api = _bare_api(_Budget(allow=True), lambda *a, **k: next(responses))
+
+    assert api._command_with_wake_escalation(
+        "charge_stop", error_msg="stop charge", critical=True
+    ) == (True, "ok")
+
+    accepted = [
+        record.message for record in caplog.records
+        if "accepted charge_stop" in record.message
+    ]
+    assert len(accepted) == 1
+    assert accepted[0].count("retry after implicit wake grace") == 1
+
+
 def test_set_charge_limit_is_budget_gated_without_fabricating_confirmation():
     budget = _Budget(allow=True)
     calls = []
@@ -590,7 +616,7 @@ def test_set_charge_limit_treats_already_set_as_idempotent_success():
     )
     api.vehicle_soc_setpoint = 80
 
-    assert api.set_tesla_charge_limit(80) == (True, "ok")
+    assert api.set_tesla_charge_limit(80) == (True, "already_set")
     assert budget.spent == ["command"]
 
 
@@ -1169,6 +1195,27 @@ def test_wake_vehicle_skips_billable_read_when_telemetry_is_connected(monkeypatc
     assert reads["n"] == 0                        # no billable pre-command state read
 
 
+def test_vehicle_connected_is_not_trusted_when_bridge_transport_is_down(
+        monkeypatch):
+    monkeypatch.setattr(
+        tesla_api, "retrieve_setting",
+        lambda name: "true" if name == "TESLA_TELEMETRY_ENABLED" else None)
+
+    class State:
+        @staticmethod
+        def get(key):
+            return {
+                "tesla_telemetry_connection_status": "CONNECTED",
+                "tesla_telemetry_bridge_status": "DISCONNECTED",
+            }.get(key)
+
+    monkeypatch.setattr(tesla_api, "STATE", State())
+    api = tesla_api.TeslaApi.__new__(tesla_api.TeslaApi)
+    api.last_update_ts = 0
+
+    assert api._telemetry_considers_online() is False
+
+
 def test_wake_vehicle_falls_back_to_real_check_when_telemetry_disconnected(
         monkeypatch):
     # An explicit disconnect wins even if a vehicle field was received seconds
@@ -1205,24 +1252,79 @@ def test_wake_vehicle_uses_real_check_in_polling_mode(monkeypatch):
 
 
 def test_explicit_wake_waits_for_settle_then_observes_telemetry(monkeypatch):
-    """A wake acknowledgement is not permission to retry the command immediately."""
+    """A fresh CONNECTED event gets a full bus-settle delay of its own."""
     sleeps = []
-    online = iter((False, True))
+    clock = {"now": 100.0}
+    states = iter((
+        ("DISCONNECTED", 0.0),
+        ("CONNECTED", 112.0),
+        ("CONNECTED", 112.0),
+    ))
+    current = {"value": ("DISCONNECTED", 0.0)}
+
+    class State:
+        @staticmethod
+        def get(key):
+            status, connected_at = current["value"]
+            if key == "tesla_telemetry_connection_status":
+                return status
+            if key == "tesla_telemetry_connected_at":
+                return connected_at
+            return None
+
     api = _bare_api(
         _Budget(allow=True),
         lambda *args, **kwargs: _Resp(200, {"response": {"state": "online"}}),
     )
     api._telemetry_on = lambda: True
-    api._telemetry_considers_online = lambda: next(online)
+    monkeypatch.setattr(tesla_api, "STATE", State())
+    monkeypatch.setattr(tesla_api.time, "time", lambda: clock["now"])
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock["now"] += seconds
+        try:
+            current["value"] = next(states)
+        except StopIteration:
+            pass
+
     monkeypatch.setattr(
-        tesla_api.time, "sleep", lambda seconds: sleeps.append(seconds))
+        tesla_api.time, "sleep", sleep)
 
     assert api.wake_vehicle(skip_online_check=True) is True
-    assert sleeps == [
-        tesla_api.WAKE_MIN_SETTLE_S,
-        tesla_api.WAKE_TELEMETRY_POLL_S,
-    ]
+    assert clock["now"] >= 122.0
+    assert sleeps == [10, 5, 5, 2]
     assert api._budget.spent == ["wake"]
+
+
+def test_explicit_wake_does_not_confirm_from_old_retained_connected_event(
+        monkeypatch):
+    """A pre-wake CONNECTED timestamp cannot confirm a newly requested wake."""
+    clock = {"now": 100.0}
+
+    class State:
+        @staticmethod
+        def get(key):
+            return {
+                "tesla_telemetry_bridge_status": "SYNCHRONIZED",
+                "tesla_telemetry_connection_status": "CONNECTED",
+                "tesla_telemetry_connected_at": 50.0,
+            }.get(key)
+
+    api = _bare_api(
+        _Budget(allow=True),
+        lambda *args, **kwargs: _Resp(200, {"response": {"state": "online"}}),
+    )
+    api._telemetry_on = lambda: True
+    monkeypatch.setattr(tesla_api, "STATE", State())
+    monkeypatch.setattr(tesla_api.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(
+        tesla_api.time, "sleep",
+        lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
+    )
+
+    assert api.wake_vehicle(skip_online_check=True) is False
+    assert clock["now"] >= 160.0
 
 
 def test_poll_interval_shorter_while_charging(monkeypatch):

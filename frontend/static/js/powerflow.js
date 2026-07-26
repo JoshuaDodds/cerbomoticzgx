@@ -536,20 +536,37 @@
     const ev = (live.ev_w != null && isFinite(Number(live.ev_w))) ? Number(live.ev_w) : null;
     const gasM3 = today.gas_m3 != null && isFinite(Number(today.gas_m3)) ? Number(today.gas_m3) : null;
     const soc = num(live.soc);
+    const evW = ev != null ? Math.max(0, ev) : 0;
+    const houseLoad = load != null ? Math.max(0, load - evW) : null;
+    const rawEvMeterPhaseAmps = [live.ev_l1_a, live.ev_l2_a, live.ev_l3_a]
+      .map(num).map((amps) => Number.isFinite(amps) ? Math.max(0, amps) : null);
+    const measuredEvAmpTotal = rawEvMeterPhaseAmps.reduce(
+      (total, amps) => total + (Number.isFinite(amps) ? amps : 0), 0,
+    );
+    const rawHousePhaseWatts = [live.load_l1, live.load_l2, live.load_l3].map(num);
+    const validHousePhaseCount = rawHousePhaseWatts.filter(Number.isFinite).length;
+    const housePhaseWatts = rawHousePhaseWatts.map((phaseWatts, index) => {
+      if (!Number.isFinite(phaseWatts)) return null;
+      const measuredPhaseAmps = rawEvMeterPhaseAmps[index];
+      const evShare = measuredEvAmpTotal > 0 && Number.isFinite(measuredPhaseAmps)
+        ? measuredPhaseAmps / measuredEvAmpTotal
+        : (validHousePhaseCount > 0 ? 1 / validHousePhaseCount : 0);
+      return Math.max(0, phaseWatts - evW * evShare);
+    });
 
     // Source-flow decomposition → provenance-coloured particles, and a flow-consistent
     // Inverter↔Battery direction: the link follows the net DC-bus flow (pv − batt_w),
     // NOT raw batt_w — so a solar surplus that's exporting correctly shows the DC bus
     // feeding the inverter *upward*, even while the battery itself trickle-charges.
     const D = decompose(pv || 0, grid || 0, batt || 0, load || 0);
-    const evW = ev != null ? Math.max(0, ev) : 0;
+    const houseShare = load > 0 ? houseLoad / load : 0;
     const invDc = (pv || 0) - (batt || 0);   // + = DC→inverter (up); − = inverter→DC (down, grid-charging)
     const flows = {
       grid: (grid || 0) >= 0
         ? { mag: Math.abs(grid || 0), fwd: true,  sources: [{ c: SRC.grid, m: D.g_house + D.g_batt }] }
         : { mag: Math.abs(grid || 0), fwd: false, sources: [{ c: SRC.solar, m: D.s_grid }, { c: SRC.batt, m: D.b_grid }] },
-      load: { mag: Math.max(0, load || 0), fwd: true,
-              sources: [{ c: SRC.solar, m: D.s_house }, { c: SRC.batt, m: D.b_house }, { c: SRC.grid, m: D.g_house }] },
+      load: { mag: Math.max(0, houseLoad || 0), fwd: true,
+              sources: [{ c: SRC.solar, m: D.s_house * houseShare }, { c: SRC.batt, m: D.b_house * houseShare }, { c: SRC.grid, m: D.g_house * houseShare }] },
       batt: invDc >= 0
         ? { mag: invDc,  fwd: false, sources: [{ c: SRC.solar, m: D.s_house + D.s_grid }, { c: SRC.batt, m: D.b_house + D.b_grid }] }
         : { mag: -invDc, fwd: true,  sources: [{ c: SRC.grid, m: D.g_batt }] },
@@ -557,7 +574,7 @@
       ev:    { mag: evW, fwd: true, sources: [{ c: PALETTE.ev, m: evW }] },
     };
     const active = {
-      grid: A(grid), house: A(load), solar: A(pv) && pv > 0, batt: A(batt),
+      grid: A(grid), house: A(houseLoad), solar: A(pv) && pv > 0, batt: A(batt),
       ev: ev != null && A(ev),
     };
 
@@ -586,8 +603,8 @@
     };
     big("grid", gridBig(grid));
     V["pf-grid-l1"] = fmtWs(num(live.grid_l1)); V["pf-grid-l2"] = fmtWs(num(live.grid_l2)); V["pf-grid-l3"] = fmtWs(num(live.grid_l3));
-    big("house", fmtW(load));
-    V["pf-house-l1"] = fmtWs(num(live.load_l1)); V["pf-house-l2"] = fmtWs(num(live.load_l2)); V["pf-house-l3"] = fmtWs(num(live.load_l3));
+    big("house", fmtW(houseLoad));
+    V["pf-house-l1"] = fmtWs(housePhaseWatts[0]); V["pf-house-l2"] = fmtWs(housePhaseWatts[1]); V["pf-house-l3"] = fmtWs(housePhaseWatts[2]);
     big("solar", fmtW(pv));
     V["pf-solar-sub"] = today.solar_kwh != null ? kwh(today.solar_kwh) + " today" : "";
     V["pf-solar-kwh"] = today.solar_kwh != null ? kwh(today.solar_kwh) : "—";
@@ -637,8 +654,7 @@
       // commands. The canonical topic is the ABB phase average; retaining an
       // average-of-available-phases fallback keeps the card useful during startup.
       const vehicleAmps = num(live.veh_amps);
-      const evMeterPhaseAmps = [live.ev_l1_a, live.ev_l2_a, live.ev_l3_a]
-        .map(num).filter((amps) => Number.isFinite(amps));
+      const evMeterPhaseAmps = rawEvMeterPhaseAmps.filter(Number.isFinite);
       const fallbackPhaseAmps = evMeterPhaseAmps.length
         ? evMeterPhaseAmps.reduce((total, amps) => total + amps, 0) / evMeterPhaseAmps.length
         : null;

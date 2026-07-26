@@ -75,6 +75,17 @@ def test_vehicle_refresh_is_a_primary_action():
     ) in html
 
 
+def test_run_now_is_a_primary_action_with_explicit_style():
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    css = APP_CSS.read_text(encoding="utf-8")
+
+    assert (
+        'class="btn-primary" data-ev-smart-action="run_now">Run Now</button>'
+        in html
+    )
+    assert ".btn-primary { background: var(--accent);" in css
+
+
 def test_abb_event_path_is_only_shared_current_topic_publisher():
     event_handler = EVENT_HANDLER_PY.read_text(encoding="utf-8")
     controller = EV_CONTROLLER_PY.read_text(encoding="utf-8")
@@ -299,7 +310,9 @@ def test_vehicle_tab_contains_smart_charge_job_form_and_readable_daily_plan():
     assert "function renderEvSmartCharge" in js
     assert "function evSmartDailyPlan" in js
     assert "function evSmartPopulateTimeOptions" in js
-    assert "Tesla app shows only the deadline safety fallback" in js
+    assert "the exact Tesla app schedule is shown below" in js
+    assert "Matches the visible charging block" in js
+    assert "Tesla deadline safety fallback" in js
     assert "Solar surplus is used when it costs less than the energy it replaces" in js
     assert 'source === "pending" ? "Source to be chosen"' in js
     assert "ev-charge-day" in js

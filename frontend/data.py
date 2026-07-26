@@ -968,12 +968,21 @@ def ev_smart_charge_dashboard() -> dict:
         apply_enabled = str(env.get("EV_SMART_CHARGE_APPLY", "False")).strip().lower() in {
             "1", "true", "yes", "on",
         }
+        actions = []
+        run_now_reason = "apply_disabled"
+        eligibility = getattr(module, "run_now_eligibility", None)
+        if apply_enabled and job is not None and callable(eligibility):
+            allowed, run_now_reason = eligibility(job, plan)
+            if allowed:
+                actions.append("run_now")
         return {
             "available": True,
             "enabled": bool(enabled()) if callable(enabled) else configured,
             "apply": apply_enabled,
             "job": job,
             "plan": plan,
+            "actions": actions,
+            "run_now_reason": run_now_reason,
         }
     except (ImportError, OSError, RuntimeError, ValueError) as e:
         return {

@@ -72,10 +72,30 @@ a Domoticz server via its REST API for monitoring and historic tracking
   reconciled when they occur during an authorized block. A Tesla-app/onboard stop during an active
   block is likewise reconciled; only this dashboard's **Stop** suppresses that block. Use Vehicle
   **Start** together with **Grid assist** for an intentional immediate grid-backed charge.
+  For an applied plan that fits one contiguous charging window on one day, **Run Now** moves
+  that window to the present, recalculates its cost/Timeline metadata, enables Grid assist,
+  replaces the application-owned Tesla schedule and verifies a configured-ceiling start. The
+  same visible window is installed in Tesla, with only its end rounded upward to minute
+  precision; multi-window plans show their separate continuous deadline fallback explicitly.
+  Once accepted delivery rises above 5 A, the controller releases current regulation to Maxem
+  rather than repeatedly asserting the configured ceiling. The same handoff occurs
+  when a command was locally blocked/rejected but a newer ABB sample proves the
+  requested full-rate ramp happened anyway. On startup, an ordinary authorized
+  block that is already physically charging does not install a redundant future
+  Tesla start schedule; explicit Run Now retains its requested schedule-replacement
+  contract.
+  Completion removes that fallback, releases the Victron grid-assist setpoint, restores a
+  5 A idle request and deletes the finished job only after those cleanup effects succeed.
   Reaching the requested SoC or passing `ready_by` terminates the job. The controller first
   removes its exact Tesla fallback schedule IDs (including the branch's one legacy ID), then
   deletes the matching local job/plan snapshots and returns the Vehicle UI to idle. Failed
   Tesla cleanup retains the terminal marker for bounded retry instead of hiding an old schedule.
+  An accepted stop is observed against the ABB meter for 60 seconds before another stop may be
+  sent, preventing duplicate commands during normal charger ramp-down. Fresh ABB power below
+  250 W is authoritative charger-idle evidence even if Tesla's change-driven charging flag is
+  stale; if the ABB sample is unavailable, the controller falls back conservatively to Tesla.
+  Run Now records whether it enabled Grid assist: cancellation releases a module-owned toggle
+  immediately, while a Grid assist setting that was already enabled by the user is preserved.
 - **Tesla Fleet Telemetry** (`TESLA_TELEMETRY_ENABLED`, off by default): an optional streaming push
   mode where the car reports state via Tesla's Fleet Telemetry instead of REST polling, eliminating
   billable `vehicle_data` reads/wakes for status. `lib/tesla_telemetry_bridge.py` translates the
@@ -83,6 +103,11 @@ a Domoticz server via its REST API for monitoring and historic tracking
   unaffected; falls back to the REST polling path when disabled. The bridge also exposes Tesla's
   connection lifecycle: a disconnected stream is shown on the Vehicle tab, and an explicit
   refresh uses one budget-guarded REST read instead of presenting retained telemetry as fresh.
+  Tesla's connectivity `CreatedAt` is preserved as the source-of-truth event time; broker
+  arrival time never replaces it. The bridge subscriber and dashboard use instance-unique
+  MQTT client IDs, so a development process can overlap the deployed process without either
+  losing QoS-0 lifecycle events. Subscriber transport health is tracked separately and command
+  acknowledgement fails closed until a source lifecycle event synchronizes a reconnected bridge.
   A live home-to-away location transition clears an otherwise impossible retained home-cable
   plugged/charging state; a later explicit public-charging event remains valid while away.
   Known away or unplugged state keeps no-intent PV-surplus control dormant and makes no Tesla
@@ -90,6 +115,10 @@ a Domoticz server via its REST API for monitoring and historic tracking
   Fleet OAuth uses Tesla's current
   Fleet Auth host and automatically refreshes and atomically persists rotated access/refresh tokens;
   the runtime `.secrets` file must therefore be writable by the controller process.
+  Billable requests use burst-safe daily runaway caps (300 commands, 150 data
+  reads and 20 wakes by default) plus a per-call $9.75 hard monthly guard against
+  Tesla's $10 credit. Safety-critical charge stops and the wake needed to deliver
+  them remain exempt from the spend block and are still recorded.
 - Energy Broker module which attempts to buy energy at the lowest possible rate in a 48 hour period and store this in your home battery
 - Tibber graphing module to generate visuals of the upcoming electricity prices (Thanks to [Tibberios](https://github.com/Lef-F/tibberios))
 - Tibber API integration to constantly monitor current energy rates, daily consumption and production, forecasted pricing, etc (Thanks to [Tibber.py](https://github.com/BeatsuDev/tibber.py))

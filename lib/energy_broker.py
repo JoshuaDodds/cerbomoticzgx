@@ -1699,6 +1699,10 @@ def _apply_ev_smart_charge_to_forecast(
         plan_path = retrieve_setting("EV_SMART_CHARGE_PLAN_PATH") or None
         job = ev_smart_charge.load_job(path=job_path)
         previous_plan = ev_smart_charge.load_plan_snapshot(path=plan_path)
+        run_now_job = bool(
+            isinstance(job, dict)
+            and str(job.get("execution_mode") or "").lower() == "run_now"
+        )
 
         # Derive a timezone from the price horizon/job, then use an aware current
         # time.  Frontend-created jobs are required to carry an explicit offset.
@@ -1826,7 +1830,9 @@ def _apply_ev_smart_charge_to_forecast(
                     # Reserve forecast site headroom before the stationary ESS
                     # optimization. Maxem remains the real-time authority, but
                     # the plan must not assume full EV power on top of house load.
-                    "expected_delivery_kw": expected_delivery_kw if allow_ess_discharge else min(
+                    "expected_delivery_kw": expected_delivery_kw if (
+                        allow_ess_discharge or run_now_job
+                    ) else min(
                         expected_delivery_kw,
                         max(0.0, site_import_limit_kw + (pv_part - base_part) / 0.25),
                     ),
@@ -1861,7 +1867,9 @@ def _apply_ev_smart_charge_to_forecast(
                         # use the conservative global delivery assumption and
                         # mark the price/timeline tentative.
                         "expected_delivery_kw": (
-                            expected_delivery_kw if allow_ess_discharge else min(
+                            expected_delivery_kw if (
+                                allow_ess_discharge or run_now_job
+                            ) else min(
                                 expected_delivery_kw,
                                 max(0.0, site_import_limit_kw - unknown_horizon_base_kw),
                             )
@@ -2824,12 +2832,29 @@ def _settle_prior_slot(
         logging.warning(f"AI_ESS: Failed to settle prior slot: {e}")
 
 
-def run_ai_optimizer():
-    """Run the optimizer as a single writer; skip overlapping scheduler/UI calls."""
-    if not _AI_OPTIMIZER_LOCK.acquire(blocking=False):
+def run_ai_optimizer(*, wait_timeout_s=0.0, before_run=None):
+    """Run the optimizer as a single writer.
+
+    Scheduled calls remain non-blocking. A deliberate UI transaction may wait
+    briefly and provide ``before_run``; that callback executes only after this
+    function owns the writer lock, so durable intent cannot change underneath
+    another in-flight plan.
+    """
+    try:
+        wait_s = max(0.0, float(wait_timeout_s or 0.0))
+    except (TypeError, ValueError):
+        wait_s = 0.0
+    acquired = (
+        _AI_OPTIMIZER_LOCK.acquire(timeout=wait_s)
+        if wait_s > 0
+        else _AI_OPTIMIZER_LOCK.acquire(blocking=False)
+    )
+    if not acquired:
         logging.info("AI_ESS: Optimization already running; skipping overlapping request.")
         return False
     try:
+        if before_run is not None:
+            before_run()
         _run_ai_optimizer_once()
         return True
     finally:

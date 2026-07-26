@@ -82,7 +82,7 @@ def test_build_load_forecast_distributes_daily_total(monkeypatch):
 
 def test_ev_smart_forecast_disabled_is_an_exact_noop(monkeypatch):
     """The feature gate must preserve Summer/Winter optimizer input byte-for-byte."""
-    from datetime import datetime, timezone
+    from datetime import datetime, timedelta, timezone
 
     start = datetime(2026, 7, 21, 0, 0, tzinfo=timezone.utc)
     original = {start: 0.42}
@@ -168,6 +168,56 @@ def test_ev_smart_forecast_adds_planned_energy_and_publishes_snapshot(monkeypatc
     # 13 kW site cap - (1.2 kW base - 0.8 kW PV) = 12.6 kW safe EV
     # forecast headroom. The 16 kW request remains only a Maxem-subordinate ceiling.
     assert planner_inputs[0][0][1][0]["expected_delivery_kw"] == pytest.approx(12.6)
+
+
+def test_run_now_reserves_full_expected_ev_delivery_in_ess_forecast(monkeypatch):
+    """Run Now must not be planned at zero power merely because current site headroom is low."""
+    from datetime import datetime, timedelta, timezone
+    from lib import ev_smart_charge
+
+    start = datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc)
+    captured = []
+    settings = {
+        "EV_SMART_CHARGE_ENABLED": "True",
+        "EV_SMART_CHARGE_APPLY": "True",
+        "EV_CHARGER_MAX_KW": "17",
+        "EV_CHARGER_MAX_AMPS": "25",
+        "EV_EXPECTED_DELIVERY_KW": "16",
+        "ESS_MAX_GRID_IMPORT_KW": "13",
+    }
+    monkeypatch.setattr(
+        energy_broker, "retrieve_setting", lambda name: settings.get(name))
+    monkeypatch.setattr(energy_broker, "STATE", DummyState({}))
+    monkeypatch.setattr(
+        ev_smart_charge, "load_job",
+        lambda path=None: {
+            "id": "j1",
+            "status": "active",
+            "execution_mode": "run_now",
+            "ready_by": (start + timedelta(hours=1)).isoformat(),
+        },
+    )
+    monkeypatch.setattr(
+        ev_smart_charge, "load_plan_snapshot", lambda path=None: None)
+    monkeypatch.setattr(
+        ev_smart_charge, "plan_charge",
+        lambda _job, slots, **kwargs: captured.extend(slots) or {
+            "active": True, "status": "planned", "slots": [],
+        },
+    )
+    monkeypatch.setattr(
+        ev_smart_charge, "save_plan_snapshot", lambda *args, **kwargs: None)
+
+    energy_broker._apply_ev_smart_charge_to_forecast(
+        {start: 3.25},
+        {start: 0.0},
+        [{"start": start, "total": 0.20}],
+        slot_duration_h=0.25,
+        current_soc=70,
+        now=start,
+    )
+
+    assert captured[0]["expected_delivery_kw"] == pytest.approx(16.0)
 
 
 def test_ev_replan_rebuilds_and_commits_the_active_previous_quarter(monkeypatch):
@@ -1255,6 +1305,24 @@ def test_run_ai_optimizer_skips_when_optimizer_lock_is_held(monkeypatch, caplog)
 
     runner.assert_not_called()
     assert "Optimization already running" in caplog.text
+
+
+def test_run_ai_optimizer_runs_ui_mutation_inside_single_writer_lock(monkeypatch):
+    calls = []
+
+    def before_run():
+        assert energy_broker._AI_OPTIMIZER_LOCK.locked()
+        calls.append("activate")
+
+    def runner():
+        assert energy_broker._AI_OPTIMIZER_LOCK.locked()
+        calls.append("plan")
+
+    monkeypatch.setattr(energy_broker, "_run_ai_optimizer_once", runner)
+
+    assert energy_broker.run_ai_optimizer(
+        wait_timeout_s=0.1, before_run=before_run) is True
+    assert calls == ["activate", "plan"]
 
 
 def test_ai_optimizer_skips_when_soc_key_missing_but_voltage_exists(monkeypatch, caplog):

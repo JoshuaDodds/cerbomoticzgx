@@ -26,8 +26,76 @@ STATE = GlobalStateClient()
 
 ACTIVE_MODULES = json.loads(retrieve_setting('ACTIVE_MODULES'))
 HOME_CONNECT_APPLIANCE_SCHEDULING = is_truthy(retrieve_setting("HOME_CONNECT_APPLIANCE_SCHEDULING"))
+_EV_CHARGER = None
+_TESLA_TELEMETRY_BRIDGE = None
+_TESLA_TELEMETRY_BRIDGE_STARTING = False
 
-def ev_charge_controller(): EvCharger().main()
+
+def _run_ev_charge_controller():
+    """Own the EV controller lifecycle without delaying unrelated services."""
+    global _EV_CHARGER
+    try:
+        _EV_CHARGER = EvCharger()
+        _EV_CHARGER.main()
+    except Exception as error:
+        logging.error("EV charge controller failed to start: %s", error)
+
+
+def ev_charge_controller():
+    """Start the self-rescheduling EV controller on a daemon worker."""
+    thread = threading.Thread(
+        target=_run_ev_charge_controller,
+        name="ev-charge-controller",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
+def _run_tesla_telemetry_bridge():
+    global _TESLA_TELEMETRY_BRIDGE, _TESLA_TELEMETRY_BRIDGE_STARTING
+    try:
+        from lib.tesla_telemetry_bridge import start_bridge_if_enabled
+        bridge = start_bridge_if_enabled(retrieve_setting)
+        if bridge is not None:
+            _TESLA_TELEMETRY_BRIDGE = bridge
+            logging.info(
+                "Tesla Fleet Telemetry bridge started "
+                "(TESLA_TELEMETRY_ENABLED)."
+            )
+    except Exception as error:
+        STATE.set("tesla_telemetry_bridge_status", "DISCONNECTED")
+        logging.warning(
+            "Tesla telemetry bridge failed to start; EV control will wait "
+            "for authoritative state: %s",
+            error,
+        )
+    finally:
+        _TESLA_TELEMETRY_BRIDGE_STARTING = False
+
+
+def _start_tesla_telemetry_bridge():
+    """Dispatch pushed-state hydration without blocking application startup."""
+    global _TESLA_TELEMETRY_BRIDGE_STARTING
+    if not is_truthy(
+        retrieve_setting("TESLA_TELEMETRY_ENABLED"), default=False
+    ):
+        return None
+    if _TESLA_TELEMETRY_BRIDGE is not None or _TESLA_TELEMETRY_BRIDGE_STARTING:
+        return _TESLA_TELEMETRY_BRIDGE
+
+    # This local write is deliberately synchronous and network-free. It closes
+    # the race before the independent EV worker can inspect startup state.
+    STATE.set("tesla_telemetry_bridge_status", "CONNECTING")
+    STATE.set("tesla_telemetry_bridge_updated_at", time.time())
+    _TESLA_TELEMETRY_BRIDGE_STARTING = True
+    thread = threading.Thread(
+        target=_run_tesla_telemetry_bridge,
+        name="tesla-telemetry-bridge",
+        daemon=True,
+    )
+    thread.start()
+    return thread
 
 def energy_broker(): energybroker()
 
@@ -143,17 +211,6 @@ def post_startup():
 
     threading.Thread(target=_startup_warm_up, name="startup-warmup", daemon=True).start()
 
-    # Start the Tesla Fleet Telemetry bridge if enabled. It subscribes to the in-cluster
-    # fleet-telemetry MQTT firehose and republishes normalized Tesla/vehicle0/* state +
-    # tesla_* GlobalState keys, so the EV controller/GUI read PUSHED data instead of polling
-    # vehicle_data. Fully inert (returns None) when TESLA_TELEMETRY_ENABLED is off.
-    try:
-        from lib.tesla_telemetry_bridge import start_bridge_if_enabled
-        if start_bridge_if_enabled(retrieve_setting):
-            logging.info("Tesla Fleet Telemetry bridge started (TESLA_TELEMETRY_ENABLED).")
-    except Exception as e:
-        logging.warning("Tesla telemetry bridge failed to start; continuing without it: %s", e)
-
     # Start service scheduled tasks + the .env config watcher (independent of the
     # warm-up above, so they come up immediately).
     TaskScheduler()
@@ -166,6 +223,10 @@ def post_startup():
 def main():
     try:
         init()
+
+        # Begin the non-blocking pushed-state subscription before any controller
+        # can infer vehicle state or issue a Tesla command.
+        _start_tesla_telemetry_bridge()
 
         # start sync tasks
         sync_tasks_start()

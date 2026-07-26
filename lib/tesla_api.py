@@ -229,14 +229,22 @@ class TeslaApi:
         self.charging_status = "Charging" if self.is_charging else "Idle"
         connection_status = str(
             _state_value("tesla_telemetry_connection_status") or "").strip().upper()
+        bridge_status = str(
+            _state_value("tesla_telemetry_bridge_status") or "").strip().upper()
+        bridge_synchronized = (
+            not bridge_status or bridge_status == "SYNCHRONIZED"
+        )
         telemetry_updated = _f("tesla_telemetry_last_update_ts")
         self.is_online = (
+            bridge_synchronized
+            and (
             connection_status == "CONNECTED"
             or (
                 connection_status != "DISCONNECTED"
                 and telemetry_updated is not None
                 and (time.time() - telemetry_updated)
                 <= TELEMETRY_CONNECTION_EVENT_GRACE_S
+            )
             )
         )
         self._asleep = not self.is_online
@@ -251,6 +259,11 @@ class TeslaApi:
 
     def _telemetry_stream_healthy(self) -> bool:
         """Whether pushed vehicle state is fresh enough to satisfy an explicit refresh."""
+        bridge_status = str(
+            STATE.get("tesla_telemetry_bridge_status") or ""
+        ).strip().upper()
+        if bridge_status and bridge_status != "SYNCHRONIZED":
+            return False
         status = str(
             STATE.get("tesla_telemetry_connection_status") or "").strip().upper()
         if status == "CONNECTED":
@@ -651,22 +664,33 @@ class TeslaApi:
         elif name == "set_charging_amps":
             detail = f"requested current {body.get('charging_amps')} A/phase"
         elif name == "add_charge_schedule":
+            def clock(minutes):
+                try:
+                    hour, minute = divmod(int(minutes), 60)
+                    return f"{hour:02d}:{minute:02d}"
+                except (TypeError, ValueError):
+                    return "invalid"
             detail = (
                 f"owned schedule {body.get('id')}, days={body.get('days_of_week')}, "
-                f"start={body.get('start_time')} min, end={body.get('end_time')} min"
+                f"start={body.get('start_time')} min ({clock(body.get('start_time'))}), "
+                f"end={body.get('end_time')} min ({clock(body.get('end_time'))})"
             )
         elif name == "remove_charge_schedule":
             detail = f"owned schedule {body.get('id')}"
         else:
             detail = str(error_msg or name.replace("_", " ")).strip()
         context = str(error_msg).lower()
-        if "implicit wake" in context:
+        detail_lower = detail.lower()
+        if (
+            "implicit wake" in context
+            and "retry after implicit wake grace" not in detail_lower
+        ):
             detail = f"{detail}; retry after implicit wake grace"
         elif (
             "explicit vehicle wake" in context
             or "after wake" in context
             or "after vehicle wake" in context
-        ):
+        ) and "retry after vehicle wake" not in detail_lower:
             detail = f"{detail}; retry after vehicle wake"
         return detail
 
@@ -693,9 +717,13 @@ class TeslaApi:
         """
         audit_detail = self._command_audit_detail(name, json_body, error_msg)
         if not self._budget.spend("command", critical=critical):
-            logging.warning(
-                "EvCharger [Tesla API]: blocked %s - %s; monthly command budget "
-                "ceiling reached.",
+            # The authoritative budget layer logs the first block and periodic
+            # reminders with the actual daily/monthly reason. This attempted
+            # command never left the process, so keep its duplicate detail at
+            # debug level rather than emitting a second warning every retry.
+            logging.debug(
+                "EvCharger [Tesla API]: locally blocked %s - %s; Tesla API "
+                "spend guard reached.",
                 name, audit_detail,
             )
             return False, 'budget'
@@ -853,6 +881,11 @@ class TeslaApi:
         """
         if not self._telemetry_on():
             return False
+        bridge_status = str(
+            STATE.get("tesla_telemetry_bridge_status") or ""
+        ).strip().upper()
+        if bridge_status and bridge_status != "SYNCHRONIZED":
+            return False
         status = str(
             STATE.get("tesla_telemetry_connection_status") or ""
         ).strip().upper()
@@ -863,6 +896,15 @@ class TeslaApi:
         return (
             time.time() - (self.last_update_ts or 0)
         ) <= TELEMETRY_CONNECTION_EVENT_GRACE_S
+
+    @staticmethod
+    def _telemetry_connected_at() -> float:
+        try:
+            value = float(
+                STATE.get("tesla_telemetry_connected_at") or 0)
+            return value if math.isfinite(value) and value > 0 else 0.0
+        except (TypeError, ValueError):
+            return 0.0
 
     def wake_vehicle(self, skip_online_check=False, critical=False):
         """Explicitly wake the car after passive command delivery was exhausted.
@@ -881,9 +923,9 @@ class TeslaApi:
                     return True
 
             if not self._budget.spend("wake", critical=critical):
-                logging.warning(
-                    "EvCharger [Tesla API]: blocked wake_up - monthly wake budget "
-                    "ceiling reached.")
+                logging.debug(
+                    "EvCharger [Tesla API]: locally blocked wake_up - Tesla API "
+                    "spend guard reached.")
                 return False
 
             logging.info(
@@ -895,25 +937,50 @@ class TeslaApi:
             # Tesla documents a 10–60 second wake interval. Never retry the
             # original command immediately after the wake endpoint merely says
             # it accepted the request: connectivity and the command buses need
-            # time to become usable.
+            # time to become usable. A fresh Fleet CONNECTED event starts its
+            # own full bus-settle interval.
+            wake_sent_at = time.time()
             time.sleep(WAKE_MIN_SETTLE_S)
             if self._telemetry_on():
-                checks = max(
-                    1,
-                    int(
-                        (WAKE_CONNECT_TIMEOUT_S - WAKE_MIN_SETTLE_S)
-                        / WAKE_TELEMETRY_POLL_S
-                    ) + 1,
-                )
-                for index in range(checks):
+                connection_deadline = wake_sent_at + WAKE_CONNECT_TIMEOUT_S
+                final_deadline = connection_deadline + WAKE_MIN_SETTLE_S
+                while time.time() <= final_deadline:
                     if self._telemetry_considers_online():
-                        logging.info(
-                            "EvCharger [Tesla API]: confirmed wake_up - "
-                            "Fleet Telemetry reports vehicle connected after "
-                            "the wake settle period.")
-                        return True
-                    if index + 1 < checks:
-                        time.sleep(WAKE_TELEMETRY_POLL_S)
+                        connected_at = self._telemetry_connected_at()
+                        # An old retained CONNECTED lifecycle predates this
+                        # explicit wake and cannot acknowledge it.
+                        if connected_at < wake_sent_at:
+                            now_ts = time.time()
+                            if now_ts >= connection_deadline:
+                                break
+                            time.sleep(min(
+                                WAKE_TELEMETRY_POLL_S,
+                                connection_deadline - now_ts,
+                            ))
+                            continue
+                        settle_origin = connected_at
+                        settle_until = settle_origin + WAKE_MIN_SETTLE_S
+                        now_ts = time.time()
+                        if now_ts >= settle_until:
+                            logging.info(
+                                "EvCharger [Tesla API]: confirmed wake_up - "
+                                "Fleet Telemetry connected and command buses "
+                                "received a %ds settle period.",
+                                WAKE_MIN_SETTLE_S,
+                            )
+                            return True
+                        time.sleep(min(
+                            WAKE_TELEMETRY_POLL_S,
+                            max(0.1, settle_until - now_ts),
+                        ))
+                        continue
+                    now_ts = time.time()
+                    if now_ts >= connection_deadline:
+                        break
+                    time.sleep(min(
+                        WAKE_TELEMETRY_POLL_S,
+                        connection_deadline - now_ts,
+                    ))
             else:
                 # Polling-only installations retain a bounded fallback without
                 # turning the wake into rapid repeated vehicle-state reads.
@@ -1084,6 +1151,7 @@ class TeslaApi:
             {'percent': percent},
             f"set Tesla charge limit to {percent}%",
             accepted_reasons=('already_set',),
+            preserve_accepted_reason=True,
         )
         return result
 

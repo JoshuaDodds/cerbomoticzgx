@@ -1566,11 +1566,35 @@ function evSmartDailyPlan(data) {
   ].filter(Boolean).join(", ");
   const policy = "Solar surplus is used when it costs less than the energy it replaces; low-cost grid covers the remaining deadline need.";
   introText.textContent = strategy
-    ? `${totalEnergy == null ? "Energy is" : `${totalEnergy.toFixed(1)} kWh`} planned over ${days.length} days. ${policy}${sourceSummary ? ` Current forecast: ${sourceSummary}.` : ""} Future days update as prices and solar forecasts arrive. These blocks run under live control; the Tesla app shows only the deadline safety fallback.`
+    ? `${totalEnergy == null ? "Energy is" : `${totalEnergy.toFixed(1)} kWh`} planned over ${days.length} days. ${policy}${sourceSummary ? ` Current forecast: ${sourceSummary}.` : ""} Future days update as prices and solar forecasts arrive. These blocks run under live control; the exact Tesla app schedule is shown below.`
     : `${totalEnergy == null ? "Charging is" : `${totalEnergy.toFixed(1)} kWh`} scheduled in the best available windows before ${new Date(job.ready_by).toLocaleString([], {weekday: "short", hour: "2-digit", minute: "2-digit", hour12: false})}. ${policy}${sourceSummary ? ` Current forecast: ${sourceSummary}.` : ""}`;
   intro.appendChild(introTitle);
   intro.appendChild(introText);
   box.appendChild(intro);
+
+  const teslaSchedule = plan.tesla_schedule;
+  if (teslaSchedule && teslaSchedule.start && teslaSchedule.end) {
+    const scheduleStart = dateOf(teslaSchedule.start);
+    const scheduleEnd = dateOf(teslaSchedule.end);
+    if (scheduleStart && scheduleEnd) {
+      const schedule = el("div", "ev-tesla-schedule");
+      const title = el("strong");
+      const detail = el("span", "muted");
+      const range = `${dayLabel(scheduleStart)} ${timeLabel(scheduleStart)}–${timeLabel(scheduleEnd)}`;
+      if (teslaSchedule.kind === "selected_block") {
+        title.textContent = "Tesla app schedule";
+        detail.textContent = `Matches the visible charging block: ${range}.`;
+      } else {
+        title.textContent = "Tesla deadline safety fallback";
+        detail.textContent = teslaSchedule.installable === false
+          ? `${range}. It will be installed once this one-time weekday is within Tesla’s seven-day range.`
+          : `${range}. This continuous backup protects the deadline if live control is unavailable; the lower-cost blocks below remain the normal plan.`;
+      }
+      schedule.appendChild(title);
+      schedule.appendChild(detail);
+      box.appendChild(schedule);
+    }
+  }
 
   const list = el("div", "ev-charge-day-list");
   days.forEach((day) => {
@@ -1712,12 +1736,12 @@ function renderEvSmartCharge(data) {
   const advertisedActions = payload.actions || plan.actions || [];
   actions.querySelectorAll("[data-ev-smart-action]").forEach((btn) => {
     const action = btn.dataset.evSmartAction;
-    const chargeNowAllowed = advertisedActions.includes("charge_now") || plan.charge_now_available === true;
+    const runNowAllowed = advertisedActions.includes("run_now");
     btn.hidden = (action === "pause" && ["paused", "completed"].includes(safeStatus))
       || (action === "resume" && safeStatus !== "paused")
-      || (action === "charge_now" && (safeStatus === "completed" || !chargeNowAllowed));
-    if (action === "charge_now") {
-      btn.disabled = !chargeNowAllowed;
+      || (action === "run_now" && (safeStatus === "completed" || !runNowAllowed));
+    if (action === "run_now") {
+      btn.disabled = !runNowAllowed;
     }
   });
   evSmartDailyPlan(lastEvSmartCharge);
@@ -2719,9 +2743,15 @@ document.querySelectorAll("[data-ev-smart-action]").forEach((btn) => {
       });
       const result = await response.json();
       if (!response.ok || !result.ok) throw new Error(result.error || "Smart-charge action failed");
-      const replanned = await requestEvSmartReplan();
+      const replanned = result.replanned === true
+        ? true
+        : await requestEvSmartReplan();
       await refreshEvSmartCharge();
       await refreshPlan();
+      if (btn.dataset.evSmartAction === "run_now" && message) {
+        message.className = "ev-smart-message";
+        message.textContent = "Run Now is active. Verifying full-rate charging…";
+      }
       if (!replanned && message) {
         message.className = "ev-smart-message muted";
         message.textContent = "Action saved. The charge plan will update on the optimizer’s next cycle.";
