@@ -319,6 +319,10 @@ def test_daily_schedule_has_compact_ev_annotation_hooks():
     assert "planned_ev_kwh" in js
     assert "ev_target_kw" in js
     assert "ev-slot-tag" in js
+    assert "EV battery SoC" in js
+    assert "EV charge rate" in js
+    assert "energy_shortfall_kwh" in js
+    assert "charge_cutoff" in js
 
 
 def test_mobile_non_schedule_navigation_jumps_to_top():

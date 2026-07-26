@@ -154,7 +154,11 @@ def test_selects_cheapest_quarters_at_full_ceiling_with_one_partial_slot():
         (now + timedelta(minutes=120)).isoformat(),
     ]
     assert [slot["energy_kwh"] for slot in plan["slots"]] == [4.0, 4.0, 2.0]
-    assert [slot["requested_power_kw"] for slot in plan["slots"]] == [16.0, 16.0, 8.0]
+    assert [slot["requested_power_kw"] for slot in plan["slots"]] == [16.0, 16.0, 16.0]
+    assert (
+        datetime.fromisoformat(plan["slots"][-1]["end"])
+        - datetime.fromisoformat(plan["slots"][-1]["start"])
+    ).total_seconds() == pytest.approx(7.5 * 60)
     assert len(plan["blocks"]) == 2
     assert plan["blocks"][0]["energy_kwh"] == 8.0
     assert len(plan["timeline_slots"]) == 12
@@ -162,6 +166,67 @@ def test_selects_cheapest_quarters_at_full_ceiling_with_one_partial_slot():
     assert plan["timeline_slots"][0]["grid_price_eur_per_kwh"] == 0.40
     assert plan["slots"][0]["soc_start"] == 50
     assert plan["slots"][-1]["soc_end"] == 60
+
+
+def test_replan_just_after_boundary_keeps_current_quarter_with_remaining_capacity():
+    boundary = datetime(2026, 7, 20, 14, 0, tzinfo=timezone.utc)
+    now = boundary + timedelta(seconds=5)
+    job = create_job(
+        job_id="boundary-job",
+        current_soc=50,
+        target_soc=54,
+        ready_by=boundary + timedelta(hours=1),
+        now=boundary - timedelta(minutes=1),
+    )
+
+    plan = plan_charge(
+        job,
+        _slots(boundary, [0.10, 0.20, 0.30, 0.40]),
+        now=now,
+        usable_capacity_kwh=100,
+        charge_efficiency=1,
+        requested_ceiling_kw=16,
+        conservative_delivery_kw=16,
+        completion_buffer_minutes=0,
+    )
+
+    assert plan["status"] == "planned"
+    assert plan["slots"][0]["start"] == boundary.isoformat()
+    assert plan["slots"][0]["safe_energy_cap_kwh"] == pytest.approx(
+        16 * (895 / 3600), abs=1e-6
+    )
+    assert plan["slots"][0]["requested_power_kw"] == pytest.approx(16, abs=1e-6)
+    assert plan["slots"][1]["energy_kwh"] == pytest.approx(
+        4 - 16 * (895 / 3600), abs=1e-6
+    )
+
+
+def test_current_quarter_commitment_survives_price_reoptimization():
+    boundary = datetime(2026, 7, 20, 14, 0, tzinfo=timezone.utc)
+    now = boundary + timedelta(seconds=5)
+    job = create_job(
+        job_id="committed-job",
+        current_soc=50,
+        target_soc=52,
+        ready_by=boundary + timedelta(hours=1),
+        now=boundary - timedelta(minutes=1),
+    )
+
+    plan = plan_charge(
+        job,
+        _slots(boundary, [0.40, 0.10, 0.20, 0.30]),
+        now=now,
+        usable_capacity_kwh=100,
+        charge_efficiency=1,
+        requested_ceiling_kw=16,
+        conservative_delivery_kw=16,
+        completion_buffer_minutes=0,
+        committed_slot_starts=[boundary],
+    )
+
+    assert plan["slots"][0]["start"] == boundary.isoformat()
+    assert plan["slots"][0]["energy_kwh"] == pytest.approx(2.0)
+    assert plan["committed_slot_starts"] == [boundary.isoformat()]
 
 
 def test_long_horizon_spreads_charge_across_each_day_at_its_cheapest_time():
@@ -454,10 +519,11 @@ def test_partial_energy_is_the_tail_of_a_selected_block():
     )
 
     assert [slot["energy_kwh"] for slot in plan["slots"]] == [4.0, 4.0, 2.0]
-    assert [slot["requested_power_kw"] for slot in plan["slots"]] == [16.0, 16.0, 8.0]
-    assert len(plan["blocks"]) == 2  # partial power is represented separately
+    assert [slot["requested_power_kw"] for slot in plan["slots"]] == [16.0, 16.0, 16.0]
+    assert len(plan["blocks"]) == 1  # one full-rate command, stopped during the tail
     assert plan["blocks"][0]["start"] == now.isoformat()
-    assert plan["blocks"][0]["end"] == (now + timedelta(minutes=30)).isoformat()
+    assert plan["blocks"][0]["end"] == (
+        now + timedelta(minutes=37, seconds=30)).isoformat()
 
 
 def test_contiguous_equal_power_is_one_command_block_across_supply_labels():

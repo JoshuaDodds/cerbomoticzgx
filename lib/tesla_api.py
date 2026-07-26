@@ -39,6 +39,10 @@ TESLA_WEEKDAY_NAMES = ("SUN", "MON", "TUES", "WED", "THURS", "FRI", "SAT")
 DEFAULT_POLL_INTERVAL_MIN = 15
 DEFAULT_POLL_INTERVAL_CHARGING_MIN = 10
 DEFAULT_POLL_INTERVAL_ASLEEP_MIN = 30
+COMMAND_IMPLICIT_WAKE_GRACE_S = 10
+WAKE_MIN_SETTLE_S = 10
+WAKE_CONNECT_TIMEOUT_S = 60
+WAKE_TELEMETRY_POLL_S = 5
 # Connectivity events, not unchanged field ages, determine whether Fleet Telemetry
 # is online. This short grace applies only before the first connectivity event (or
 # during its delivery race): a just-received signal proves the socket was online.
@@ -103,8 +107,11 @@ class TeslaApi:
         self.charging_amp_limit = 0
         self.is_charging = False
         self.is_supercharging = False
-        self.is_plugged = False
-        self.is_home = False
+        # These are unknown until retained MQTT/Fleet Telemetry state is hydrated.
+        # Defaulting either to False produces a misleading "away/unplugged" state
+        # during the first controller tick after process startup.
+        self.is_plugged = None
+        self.is_home = None
         self.is_full = False
         self.time_until_full = "N/A"
         self.charging_status = "Unknown"
@@ -144,9 +151,26 @@ class TeslaApi:
         """Telemetry mode: the fleet-telemetry bridge pushes fresh state onto the tesla_* STATE
         keys, so we read those instead of making a billable vehicle_data call. NO REST, NO wake,
         zero cost. Commands (start/stop/set amps) still go via the Fleet API."""
+        def _state_value(key):
+            """Return None for an absent GlobalState key.
+
+            GlobalStateClient.get() historically returns integer 0 for both a
+            missing row and a real zero value. During startup that ambiguity
+            incorrectly turned unknown home/plug state into explicit False
+            before retained MQTT hydration completed.
+            """
+            has = getattr(STATE, "has", None)
+            try:
+                if callable(has) and not has(key):
+                    return None
+                return STATE.get(key)
+            except Exception:
+                return None
+
         def _f(key):
             try:
-                return float(STATE.get(key))
+                value = _state_value(key)
+                return None if value is None else float(value)
             except (TypeError, ValueError):
                 return None
 
@@ -170,14 +194,21 @@ class TeslaApi:
         if state_updated is not None:
             self.charge_state_update_ts = state_updated
 
-        self.is_charging = lib.helpers.is_truthy(STATE.get("tesla_is_charging"), False)
-        self.is_plugged = lib.helpers.is_truthy(STATE.get("tesla_is_plugged"), False)
-        self.is_supercharging = lib.helpers.is_truthy(STATE.get("tesla_is_supercharging"), False)
+        self.is_charging = lib.helpers.is_truthy(
+            _state_value("tesla_is_charging"), False)
+        plugged = _state_value("tesla_is_plugged")
+        self.is_plugged = (
+            None
+            if plugged in (None, "", "None")
+            else lib.helpers.is_truthy(plugged, False)
+        )
+        self.is_supercharging = lib.helpers.is_truthy(
+            _state_value("tesla_is_supercharging"), False)
         # is_home may be genuinely unknown until the car streams a Location; keep None so the
         # controller stays conservative rather than assuming home.
-        home = STATE.get("tesla_is_home")
+        home = _state_value("tesla_is_home")
         self.is_home = None if home in (None, "", "None") else lib.helpers.is_truthy(home, False)
-        ttf = STATE.get("tesla_time_to_full")
+        ttf = _state_value("tesla_time_to_full")
         if self.is_charging and ttf:
             self.time_until_full = ttf
         else:
@@ -190,10 +221,14 @@ class TeslaApi:
                     "Tesla/vehicle0/time_until_full",
                     payload='{"value": "N/A"}', qos=0, retain=True)
 
-        self.plugged_status = "Plugged" if self.is_plugged else "Unplugged"
+        self.plugged_status = (
+            "Unknown"
+            if self.is_plugged is None
+            else ("Plugged" if self.is_plugged else "Unplugged")
+        )
         self.charging_status = "Charging" if self.is_charging else "Idle"
         connection_status = str(
-            STATE.get("tesla_telemetry_connection_status") or "").strip().upper()
+            _state_value("tesla_telemetry_connection_status") or "").strip().upper()
         telemetry_updated = _f("tesla_telemetry_last_update_ts")
         self.is_online = (
             connection_status == "CONNECTED"
@@ -496,12 +531,12 @@ class TeslaApi:
         self._last_auth_log_ts = now
         if error.error_code == "login_required":
             logging.error(
-                "tesla_api: %s authentication failed (login_required); Tesla account "
+                "EvCharger [Tesla API]: %s authentication failed (login_required); Tesla account "
                 "reauthorization is required if this persists on the Fleet Auth endpoint.",
                 context)
         else:
             logging.error(
-                "tesla_api: %s authentication failed (%s, HTTP %s).",
+                "EvCharger [Tesla API]: %s authentication failed (%s, HTTP %s).",
                 context, error.error_code, error.status_code or "unknown")
 
     def _get_access_token(self):
@@ -569,6 +604,12 @@ class TeslaApi:
                     "tesla_api: authenticated %s retry blocked by budget guard.",
                     auth_retry_budget)
                 return response
+            if "/command/" in path:
+                logging.info(
+                    "EvCharger [Tesla API]: sent %s - authenticated retry after "
+                    "HTTP 401.",
+                    path.rsplit("/", 1)[-1],
+                )
             return self._request(
                 method, path, retry_on_auth_failure=False,
                 auth_retry_budget=auth_retry_budget,
@@ -597,8 +638,37 @@ class TeslaApi:
         return (response.json().get("response") or {}).get("state")
 
     def _command(self, name, error_msg, json_body=None):
-        ok, _cat = self._command_ex(name, json_body=json_body, error_msg=error_msg)
+        ok, _cat = self._command_with_wake_escalation(
+            name, json_body=json_body, error_msg=error_msg)
         return ok
+
+    @staticmethod
+    def _command_audit_detail(name, json_body=None, error_msg=""):
+        """Return a concise, non-secret description for one Tesla write command."""
+        body = json_body if isinstance(json_body, dict) else {}
+        if name == "set_charge_limit":
+            detail = f"target SoC {body.get('percent')}%"
+        elif name == "set_charging_amps":
+            detail = f"requested current {body.get('charging_amps')} A/phase"
+        elif name == "add_charge_schedule":
+            detail = (
+                f"owned schedule {body.get('id')}, days={body.get('days_of_week')}, "
+                f"start={body.get('start_time')} min, end={body.get('end_time')} min"
+            )
+        elif name == "remove_charge_schedule":
+            detail = f"owned schedule {body.get('id')}"
+        else:
+            detail = str(error_msg or name.replace("_", " ")).strip()
+        context = str(error_msg).lower()
+        if "implicit wake" in context:
+            detail = f"{detail}; retry after implicit wake grace"
+        elif (
+            "explicit vehicle wake" in context
+            or "after wake" in context
+            or "after vehicle wake" in context
+        ):
+            detail = f"{detail}; retry after vehicle wake"
+        return detail
 
     def _command_ex(self, name, json_body=None, error_msg="", critical=False,
                     accepted_reasons=(), preserve_accepted_reason=False):
@@ -621,9 +691,17 @@ class TeslaApi:
           'unsupported' — this vehicle/firmware does not support the command;
           'error'    — some other rejection.
         """
+        audit_detail = self._command_audit_detail(name, json_body, error_msg)
         if not self._budget.spend("command", critical=critical):
-            logging.info(f"tesla_api: command '{name}' blocked by budget guard (monthly ceiling reached). {error_msg}")
+            logging.warning(
+                "EvCharger [Tesla API]: blocked %s - %s; monthly command budget "
+                "ceiling reached.",
+                name, audit_detail,
+            )
             return False, 'budget'
+        started_at = time.monotonic()
+        logging.info(
+            "EvCharger [Tesla API]: sent %s - %s.", name, audit_detail)
         try:
             response = self._request(
                 "POST", f"/api/1/vehicles/{self._vehicle_id}/command/{name}",
@@ -633,17 +711,31 @@ class TeslaApi:
             self._log_auth_failure(f"command '{name}'", error)
             if not error.fleet_response_received:
                 self._budget.refund("command")
+            logging.warning(
+                "EvCharger [Tesla API]: %s not delivered - authentication failed "
+                "after %.0f ms.",
+                name, (time.monotonic() - started_at) * 1000.0,
+            )
             return False, 'auth'
         except requests.exceptions.RequestException as e:
-            logging.info(f"tesla_api: command '{name}' network error: {e}. {error_msg}")
             self._budget.refund("command")     # no HTTP response -> Tesla did not bill it
+            logging.warning(
+                "EvCharger [Tesla API]: network failure for %s after %.0f ms - "
+                "%s; %s.",
+                name, (time.monotonic() - started_at) * 1000.0, audit_detail, e,
+            )
             return False, 'network'
+        elapsed_ms = (time.monotonic() - started_at) * 1000.0
         try:
             data = response.json()
         except ValueError:
             data = {}
         result = data.get("response") or {}
         if response.status_code == 200 and result.get("result"):
+            logging.info(
+                "EvCharger [Tesla API]: accepted %s in %.0f ms - %s.",
+                name, elapsed_ms, audit_detail,
+            )
             return True, 'ok'
         reason = str(result.get('reason') or data.get('error') or '').lower()
         normalized_reason = reason.replace('-', '_').replace(' ', '_')
@@ -652,10 +744,18 @@ class TeslaApi:
             for value in accepted_reasons
         }
         if response.status_code == 200 and normalized_reason in normalized_accepted:
+            logging.info(
+                "EvCharger [Tesla API]: accepted %s in %.0f ms - %s; %s.",
+                name, elapsed_ms, audit_detail, normalized_reason,
+            )
             return True, (normalized_reason if preserve_accepted_reason else 'ok')
         # Not "failed" per se — the command wasn't delivered. Whether that matters depends on the
         # caller (e.g. an asleep bus on charge_stop just means the car isn't charging).
-        logging.info(f"tesla_api: command '{name}' not delivered ({reason or response.status_code}). {error_msg}")
+        logging.warning(
+            "EvCharger [Tesla API]: rejected %s in %.0f ms - %s; %s.",
+            name, elapsed_ms, audit_detail,
+            reason or f"HTTP {response.status_code}",
+        )
         if response.status_code >= 500:
             self._budget.refund("command")     # Tesla does not bill responses >= 500
             return False, 'network'
@@ -666,17 +766,68 @@ class TeslaApi:
             return False, 'unsupported'
         return False, 'error'
 
+    def _command_with_wake_escalation(
+            self, name, json_body=None, error_msg="", critical=False,
+            accepted_reasons=(), preserve_accepted_reason=False):
+        """Deliver one stateful command with the cheapest wake strategy first.
+
+        A command is attempted without a paid wake. If Tesla reports an asleep
+        command bus, allow that first request ten seconds to bring the vehicle
+        online, then retry the inexpensive command once. Only a second asleep
+        rejection spends an explicit wake. After waking, wait for the documented
+        10–60 second connection window before the final command attempt.
+        """
+        if not accepted_reasons:
+            # Tesla documents these as idempotent desired-state outcomes, not
+            # delivery failures. Normalizing them here prevents every wrapper
+            # from independently retrying an already-satisfied command.
+            accepted_reasons = {
+                "charge_start": ("is_charging", "requested"),
+                "charge_stop": ("not_charging",),
+            }.get(name, ())
+        kwargs = {
+            "json_body": json_body,
+            "critical": critical,
+            "accepted_reasons": accepted_reasons,
+            "preserve_accepted_reason": preserve_accepted_reason,
+        }
+        result = self._command_ex(name, error_msg=error_msg, **kwargs)
+        if result[1] != "asleep":
+            return result
+
+        logging.info(
+            "EvCharger [Tesla API]: %s reached sleeping command buses; "
+            "waiting %ds for the command's implicit wake before retrying.",
+            name, COMMAND_IMPLICIT_WAKE_GRACE_S,
+        )
+        time.sleep(COMMAND_IMPLICIT_WAKE_GRACE_S)
+        result = self._command_ex(
+            name,
+            error_msg=f"{error_msg}; retry after implicit wake grace",
+            **kwargs,
+        )
+        if result[1] != "asleep":
+            return result
+
+        if not self.wake_vehicle(
+                skip_online_check=True, critical=critical):
+            return result
+        return self._command_ex(
+            name,
+            error_msg=f"{error_msg}; retry after explicit vehicle wake",
+            **kwargs,
+        )
+
     # Command Wrappers
     def set_charge(self, amps, error_msg):
-        self.wake_vehicle()
-        success = self._command("set_charging_amps", error_msg, {"charging_amps": amps})
+        success = self._command(
+            "set_charging_amps", error_msg, {"charging_amps": amps})
         if success:
             self.charging_amp_limit = amps
             self.update_mqtt_and_domoticz()
         return success
 
     def send_command(self, cmd, error_msg):
-        self.wake_vehicle()
         fleet_command = {"START_CHARGE": "charge_start", "STOP_CHARGE": "charge_stop"}.get(cmd, cmd)
         success = self._command(fleet_command, error_msg)
 
@@ -714,7 +865,7 @@ class TeslaApi:
         ) <= TELEMETRY_CONNECTION_EVENT_GRACE_S
 
     def wake_vehicle(self, skip_online_check=False, critical=False):
-        """Wake the car — used before a command, never just to read status.
+        """Explicitly wake the car after passive command delivery was exhausted.
 
         A wake is the most expensive call ($0.02), so it is budget-gated and the confirm
         polls are bounded. ``skip_online_check`` forces a wake_up even when the car reports
@@ -730,18 +881,55 @@ class TeslaApi:
                     return True
 
             if not self._budget.spend("wake", critical=critical):
-                logging.info("tesla_api: wake blocked by budget guard (monthly ceiling reached).")
+                logging.warning(
+                    "EvCharger [Tesla API]: blocked wake_up - monthly wake budget "
+                    "ceiling reached.")
                 return False
 
+            logging.info(
+                "EvCharger [Tesla API]: sent wake_up - wake vehicle command buses.")
             resp = self._request("POST", f"/api/1/vehicles/{self._vehicle_id}/wake_up")
             if getattr(resp, "status_code", 0) >= 500:
                 self._budget.refund("wake")        # Tesla does not bill responses >= 500
 
-            for _ in range(3):   # bounded confirm-polls (each a gated data call)
-                time.sleep(3)
-                if self._get_vehicle_state() == "online":
-                    return True
+            # Tesla documents a 10–60 second wake interval. Never retry the
+            # original command immediately after the wake endpoint merely says
+            # it accepted the request: connectivity and the command buses need
+            # time to become usable.
+            time.sleep(WAKE_MIN_SETTLE_S)
+            if self._telemetry_on():
+                checks = max(
+                    1,
+                    int(
+                        (WAKE_CONNECT_TIMEOUT_S - WAKE_MIN_SETTLE_S)
+                        / WAKE_TELEMETRY_POLL_S
+                    ) + 1,
+                )
+                for index in range(checks):
+                    if self._telemetry_considers_online():
+                        logging.info(
+                            "EvCharger [Tesla API]: confirmed wake_up - "
+                            "Fleet Telemetry reports vehicle connected after "
+                            "the wake settle period.")
+                        return True
+                    if index + 1 < checks:
+                        time.sleep(WAKE_TELEMETRY_POLL_S)
+            else:
+                # Polling-only installations retain a bounded fallback without
+                # turning the wake into rapid repeated vehicle-state reads.
+                for delay in (0, 20, 30):
+                    if delay:
+                        time.sleep(delay)
+                    if self._get_vehicle_state() == "online":
+                        logging.info(
+                            "EvCharger [Tesla API]: confirmed wake_up - vehicle online.")
+                        return True
 
+            logging.warning(
+                "EvCharger [Tesla API]: wake_up not confirmed within %ds - "
+                "vehicle did not report online.",
+                WAKE_CONNECT_TIMEOUT_S,
+            )
             return False
 
         except TeslaAuthenticationError as error:
@@ -788,17 +976,11 @@ class TeslaApi:
         """
         # A stop is safety-essential: bypass the spend guard for the command AND the wake needed
         # to deliver it, so the budget can never leave the car charging.
-        ok, cat = self._command_ex('charge_stop', error_msg="stop charge", critical=True)
+        ok, cat = self._command_with_wake_escalation(
+            'charge_stop', error_msg="stop charge", critical=True)
         if ok:
             self._on_charge_stopped()
             return 'ok'
-        if cat == 'asleep':
-            if self.wake_vehicle(skip_online_check=True, critical=True):
-                ok, cat = self._command_ex('charge_stop', error_msg="stop charge (after wake)", critical=True)
-                if ok:
-                    self._on_charge_stopped()
-                    return 'ok'
-            return 'network' if cat == 'network' else 'failed'
         return 'network' if cat == 'network' else 'failed'
 
     def _on_charge_started(self):
@@ -808,17 +990,11 @@ class TeslaApi:
 
     def start_charge_robust(self):
         """Start charging with the same asleep-bus escalation as stop. Returns 'ok'|'network'|'failed'."""
-        ok, cat = self._command_ex('charge_start', error_msg="start charge")
+        ok, cat = self._command_with_wake_escalation(
+            'charge_start', error_msg="start charge")
         if ok:
             self._on_charge_started()
             return 'ok'
-        if cat == 'asleep':
-            if self.wake_vehicle(skip_online_check=True):
-                ok, cat = self._command_ex('charge_start', error_msg="start charge (after wake)")
-                if ok:
-                    self._on_charge_started()
-                    return 'ok'
-            return 'network' if cat == 'network' else 'failed'
         return 'network' if cat == 'network' else 'failed'
 
     # Commands
@@ -835,12 +1011,21 @@ class TeslaApi:
         """Push a Fleet Telemetry config to the vehicle(s) so they stream to our receiver.
         One-off setup call (billable as a command); returns the parsed response or None."""
         if not self._budget.spend("command"):
-            logging.info("tesla_api: fleet_telemetry_config blocked by budget guard (daily cap reached).")
+            logging.warning(
+                "EvCharger [Tesla API]: blocked fleet_telemetry_config - command "
+                "budget ceiling reached.")
             return None
         try:
+            logging.info(
+                "EvCharger [Tesla API]: sent fleet_telemetry_config - update "
+                "vehicle streaming configuration.")
             resp = self._request(
                 "POST", "/api/1/vehicles/fleet_telemetry_config", json=config)
-            return resp.json()
+            payload = resp.json()
+            logging.info(
+                "EvCharger [Tesla API]: received fleet_telemetry_config response "
+                "- HTTP %s.", getattr(resp, "status_code", "unknown"))
+            return payload
         except TeslaAuthenticationError as error:
             self._log_auth_failure("Fleet Telemetry configuration", error)
             if not error.fleet_response_received:
@@ -868,27 +1053,17 @@ class TeslaApi:
 
     def _smart_charge_command(self, name, json_body, error_msg,
                               accepted_reasons=(), preserve_accepted_reason=False):
-        """Issue one planned-charge command, waking/retrying only after an asleep rejection.
+        """Issue one planned-charge command through centralized wake escalation.
 
         Fleet Telemetry is the state source, so these adapters never add a vehicle-data read.
-        A first-attempt command avoids the billable wake/read sequence when the command bus is
-        already available. An explicit asleep response gets at most one wake and one retry.
+        A first-attempt command avoids a paid wake when the command bus is already available.
+        Two asleep-bus rejections, separated by a passive grace interval, are required before
+        one explicit wake and one final post-settle command attempt.
         """
-        result = self._command_ex(
+        return self._command_with_wake_escalation(
             name,
             json_body=json_body,
             error_msg=error_msg,
-            accepted_reasons=accepted_reasons,
-            preserve_accepted_reason=preserve_accepted_reason,
-        )
-        if result[1] != 'asleep':
-            return result
-        if not self.wake_vehicle(skip_online_check=True):
-            return result
-        return self._command_ex(
-            name,
-            json_body=json_body,
-            error_msg=f"{error_msg} (after wake)",
             accepted_reasons=accepted_reasons,
             preserve_accepted_reason=preserve_accepted_reason,
         )

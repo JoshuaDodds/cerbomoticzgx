@@ -23,6 +23,11 @@ forecast blocks are capped to live surplus; mixed/grid blocks retain their plann
 The blue **Refresh data** action requests one explicit vehicle status check. Normal
 no-intent PV-surplus ticks remain dormant when pushed state says the car is away or
 unplugged; Fleet API discovery is retained only when Fleet Telemetry is disabled.
+Completed EV charging does not disappear when the forward plan is rebuilt: settled
+Timeline quarters show ABB-measured delivered kWh, average kW, EV SoC endpoints, and
+the portion of measured grid import/cost proportionally attributed to EV load. The
+remaining energy is labelled PV/home-battery rather than incorrectly described as
+free energy.
 On mobile, the Power Flow diagram uses content-budgeted detail rows and a capped
 Battery-card height so expanded BMS telemetry neither crosses the card border on
 short screens nor leaves an oversized empty tail on tall screens.
@@ -161,7 +166,12 @@ sharing the host's `/dev/shm` (so it can read the published plan). Expose
   *settled* schedule (`/api/history/day`) for a continuous 2–3 day view; past-day
   consumption is derived from the cumulative load counter in the cycle records.
   On phones, the wide table reflows into stacked hour cards and the current hour
-  starts expanded.
+  starts expanded. Closed rows are labelled and coloured from measured outcomes;
+  the prior plan remains backend comparison data only. EV energy is sourced from
+  the ABB totalizer. New sessions show ABB-observed start/stop times, while older
+  records without transition events say that energy was measured within the
+  displayed 15-minute interval instead of presenting the interval boundary as an
+  exact charging start.
 - **Victron Schedule** (tab): mirrors the five Victron/CerboGX scheduled-charge
   slots from the published optimizer plan. The **Clear schedule** button calls the
   same broker helper used internally to disable those five Victron slots.
@@ -174,7 +184,11 @@ sharing the host's `/dev/shm` (so it can read the published plan). Expose
   the latter uses an application-owned Tesla fallback schedule and never alters unrelated
   user schedules. Maxem can reduce actual charger power independently without the app
   chasing the ABB reading with repeated current commands. Preview mode gates only these new
-  smart slots; existing excess-solar Tesla control remains active independently. A confirmed
+  smart slots; existing excess-solar Tesla control remains active independently. In apply mode,
+  saving or editing a job immediately reconciles its target SoC even before a new optimizer
+  snapshot exists and even while the car is away/unplugged. The controller retries at Tesla's
+  60-second acknowledgement interval until pushed `ChargeLimitSoc` confirms the target, then
+  stops spending commands. A confirmed
   Fleet stop refreshes the retained Vehicle status immediately; if a change-only Tesla status
   remains stale, dedicated EV-meter standby power (≤100 W) is shown as idle in the dashboard.
 - **Weather** (desktop tab): visualizes cached Open-Meteo temperature/cloud patterns
@@ -280,18 +294,27 @@ reuses `MOSQUITTO_IP` and `VRM_PORTAL_ID`.
 - `POST /api/control/ai-override` — toggle AI ESS override; enabling idles Victron once
   and makes the optimizer stand down until toggled off.
 - `POST /api/control/grid-assist` — toggle the existing manual grid-assist/retain mode
-  (`grid_charging_enabled`) so grid covers loads and the battery is held. This is the
-  house-battery hold only — it no longer starts/stops the car.
+  (`grid_charging_enabled`) so grid covers loads and the battery is held. Grid assist alone
+  never starts the car; together with Vehicle **Start**, it authorizes an immediate full-rate
+  grid-backed EV charge.
 - `POST /api/control/ev-charge` — manual EV **Start/Stop** (Vehicle tab). Sets the dedicated
-  `ev_charge_requested` intent (decoupled from grid-assist). Stop also records an imperative
+  `ev_charge_requested` intent. Start alone does not bypass schedule/PV gates: immediate
+  grid-backed charging requires Grid assist to be on as well. Stop records an imperative
   request which stays latched until confirmation or bounded escalation, so it works when intent
-  was already off; the EV controller uses bounded wake escalation and local-meter stop
+  was already off and suppresses the current smart block. The EV controller uses command-first,
+  delayed wake escalation and local-meter stop
   verification even if pushed location/plug state is stale. Start restores the configured
   full-rate request (bounded by the configured kW and 1–25 A/phase ceilings), verifies `ChargeCurrentRequest`
-  within 60 seconds, and permits exactly one retry. ABB power is delivery evidence only, so a
+  within 60 seconds, and continues guarded reconciliation while the explicit override remains
+  active. ABB power is delivery evidence only, so a
   Maxem reduction cannot cause repeated Fleet current commands.
+  While home and plugged, Tesla-app/onboard starts and stops are observations rather than
+  overrides: unauthorized starts are stopped, authorized starts are adopted, and an external
+  stop inside an active block is reconciled. Only the dashboard Stop suppresses that block.
 - `GET /api/ev/smart-charge` — current durable EV charge job and matching plan snapshot.
-- `PUT /api/ev/smart-charge` — create/replace the job with `{target_soc, ready_by}`.
+- `PUT /api/ev/smart-charge` — create/replace the job with `{target_soc, ready_by}`. With apply
+  enabled, the durable job immediately becomes an independently verified Tesla charge-limit
+  obligation; fallback-schedule representability cannot postpone it.
 - `DELETE /api/ev/smart-charge` — cancel the job.
 - `POST /api/ev/smart-charge/action` — pause/resume a job; unsupported actions fail closed.
 - Completed/expired smart jobs are lifecycle-cleaned automatically: the controller removes only

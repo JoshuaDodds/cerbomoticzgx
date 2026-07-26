@@ -90,7 +90,7 @@
   const fmtHM = (s) => { s = Math.max(0, Math.round(Number(s))); return Math.floor(s / 3600) + "h " + String(Math.floor((s % 3600) / 60)).padStart(2, "0") + "m"; };
   const gridBig = (w) => {
     if (w == null || !isFinite(w)) return "—";
-    const ar = w > 15 ? "► " : (w < -15 ? "◄ " : "");
+    const ar = w > 15 ? "►" : (w < -15 ? "◄" : "");
     return ar + fmtW(Math.abs(w));
   };
   function durFor(mag) {

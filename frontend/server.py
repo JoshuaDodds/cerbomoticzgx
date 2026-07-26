@@ -438,10 +438,11 @@ def api_control_grid_assist():
 
 def _set_ev_charge_requested(enabled: bool):
     """Manual EV Start/Stop. Sets the DEDICATED ev_charge_requested intent flag the EV controller
-    reads (fully decoupled from grid-assist). Starts use home+plugged+non-supercharging checks;
-    Stop is latched through bounded wake escalation and local-meter verification even if those
-    pushed fields are stale. Publishing the retained control topic keeps persistent intent in
-    sync and survives a restart via the state restore."""
+    reads. Immediate grid-backed Start requires grid-assist too; schedule and protected-PV
+    authority remain independent. Stop is latched through bounded wake escalation, suppresses
+    the current smart block, and uses local-meter verification even if pushed fields are stale.
+    Publishing the retained control topic keeps persistent intent in sync and survives a restart
+    via the state restore."""
     from lib.global_state import GlobalStateClient
     state = GlobalStateClient()
     state.set("ev_charge_requested", bool(enabled))

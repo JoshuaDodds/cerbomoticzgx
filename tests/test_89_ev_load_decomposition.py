@@ -220,7 +220,7 @@ def test_cycle_load_classification_requires_coherent_meter_data():
 def test_cycle_history_records_measurement_provenance(monkeypatch, tmp_path):
     monkeypatch.setattr(energy_broker, "retrieve_setting",
                         lambda name: str(tmp_path) if name == "HISTORY_DIR" else None)
-    monkeypatch.setattr(energy_broker, "STATE", DummyState({}))
+    monkeypatch.setattr(energy_broker, "STATE", DummyState({"ev_today_kwh": 12.345}))
     result = {"schedule": [], "control_action": "IDLE", "mode": "hold",
               "reason_code": "TEST", "weather_context": {}}
 
@@ -234,6 +234,7 @@ def test_cycle_history_records_measurement_provenance(monkeypatch, tmp_path):
     assert rec["ev_w"] == 16000.0
     assert rec["base_load_w"] == 1000.0
     assert rec["load_decomposition_quality"] == "measured"
+    assert rec["ev_actual_today_kwh"] == 12.345
 
 
 def test_cycle_history_records_projected_final_net_for_current_day(monkeypatch, tmp_path):
@@ -301,6 +302,7 @@ def test_settlement_splits_ev_and_base(monkeypatch, tmp_path):
     state = DummyState({
         "consumption_total_cumulative": 10000.0,   # Wh
         "tesla_charge_energy_forward": 100.0,       # kWh lifetime
+        "tesla_soc": 61.0,
         "c1_daily_yield": 0.0, "c2_daily_yield": 0.0,
     })
     monkeypatch.setattr(energy_broker, "STATE", state)
@@ -311,13 +313,18 @@ def test_settlement_splits_ev_and_base(monkeypatch, tmp_path):
                 "slot_duration_h": 0.25, "control_action": "IDLE", "weather_context": {}}
 
     t0 = datetime(2026, 7, 16, 12, 0, 0).astimezone()
-    energy_broker._settle_prior_slot(_result(), batt_soc=50.0, today_actuals={}, now=t0)
+    energy_broker._settle_prior_slot(
+        _result(), batt_soc=50.0,
+        today_actuals={"imp_kwh": 10.0, "imp_cost": 2.0}, now=t0)
 
     # Next slot: +3 kWh total consumption, +2.8 kWh of it EV charge.
     state.set("consumption_total_cumulative", 13000.0)
     state.set("tesla_charge_energy_forward", 102.8)
+    state.set("tesla_soc", 64.0)
     t1 = t0 + timedelta(minutes=15)
-    energy_broker._settle_prior_slot(_result(), batt_soc=50.0, today_actuals={}, now=t1)
+    energy_broker._settle_prior_slot(
+        _result(), batt_soc=50.0,
+        today_actuals={"imp_kwh": 12.0, "imp_cost": 2.5}, now=t1)
 
     path = hist_dir / f"ess-{t1.strftime('%Y-%m-%d')}.ndjson"
     settlement = [json.loads(l) for l in path.read_text().splitlines()][-1]
@@ -325,6 +332,13 @@ def test_settlement_splits_ev_and_base(monkeypatch, tmp_path):
     assert abs(settlement["actual_load_kwh"] - 3.0) < 1e-6
     assert abs(settlement["ev_charge_kwh"] - 2.8) < 1e-6
     assert abs(settlement["base_load_kwh"] - 0.2) < 1e-6
+    assert settlement["ev_average_kw"] == 11.2
+    assert settlement["ev_soc_start"] == 61.0
+    assert settlement["ev_soc_end"] == 64.0
+    assert settlement["ev_grid_import_kwh"] == 1.867
+    assert settlement["ev_non_grid_kwh"] == 0.933
+    assert settlement["ev_grid_cost_eur"] == 0.4667
+    assert settlement["ev_cost_quality"] == "proportional_site_load"
 
 
 def test_settlement_base_clamped_non_negative(monkeypatch, tmp_path):
@@ -418,15 +432,22 @@ def test_settlement_does_not_classify_implausible_total_load_jump(monkeypatch, t
                             "price": 0.2, "sell": 0.2, "pv": 0, "load": 0}],
               "slot_duration_h": 0.25, "control_action": "IDLE", "weather_context": {}}
     t0 = datetime(2026, 7, 16, 12, 0).astimezone()
-    energy_broker._settle_prior_slot(result, batt_soc=50, today_actuals={}, now=t0)
+    energy_broker._settle_prior_slot(
+        result, batt_soc=50,
+        today_actuals={"imp_kwh": 0.0, "imp_cost": 0.0}, now=t0)
 
     # Mirrors the historical July 11 VRM recovery artifact: a daily counter jumps
     # by 23.4 kWh while only one 15-minute interval elapsed.
     state.set("consumption_total_cumulative", 23400.0)
+    state.set("tesla_charge_energy_forward", 101.0)
     t1 = t0 + timedelta(minutes=15)
-    energy_broker._settle_prior_slot(result, batt_soc=50, today_actuals={}, now=t1)
+    energy_broker._settle_prior_slot(
+        result, batt_soc=50,
+        today_actuals={"imp_kwh": 1.0, "imp_cost": 0.2}, now=t1)
 
     rec = json.loads((hist_dir / f"ess-{t1:%Y-%m-%d}.ndjson").read_text().splitlines()[-1])
     assert rec["actual_load_kwh"] == 23.4  # raw accounting stays additive/unchanged
     assert rec["base_load_kwh"] is None
     assert rec["load_meter_quality"] == "implausible_delta"
+    assert rec["ev_grid_cost_eur"] is None
+    assert rec["ev_cost_quality"] == "insufficient_site_data"

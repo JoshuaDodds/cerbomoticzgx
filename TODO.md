@@ -57,16 +57,6 @@
     Collect and evaluate at least 7–14 complete winter-mode days with meaningful
     heating demand before selecting `HVAC_ALPHA_HEAT` or enabling winter HVAC apply.
 
-## AI Advisor
-- Phase 2 — approve-to-apply for tunables only. Each setting has hard min/max bounds;
-  on approval the system runs a dry-run backtest, shows projected EUR, writes .env
-  (hot-reloads, no restart), and auto-reverts if the next day underperforms. Bounded
-  numbers can't crash the controller — this is the safe sweet spot.
-
-- Phase 3 — code changes via PR, not hot-patch. Let the model propose a diff + tests;
-  the "apply" button opens a PR/branch for human review and your normal pytest gate.
-  Keep a human on the actual diff before anything restarts a 16 kW controller.
-
 ## EV smart-charge scheduling — operator validation / learning follow-up
 
 Phase 2 implementation is complete on `optimized-ev-charging`: one durable
@@ -87,18 +77,23 @@ have been completed:
 
 - With an applied job waiting outside a selected block and no usable PV surplus, insert
   the cable once. Tesla may begin its normal immediate charge, but the controller must
-  identify the paired live plug/start edges and stop it on the next control tick; ABB
-  draw must fall to standby and the state should report
-  `automatic_plug_start_outside_block`. Repeat inside a selected block and confirm the
-  already-running session is adopted at the planned current. A later deliberate
-  Tesla-app start while the cable is already connected must remain a manual override;
-  Vehicle **Start** remains the explicit immediate-charge intent.
+  stop it on the next control tick and ABB draw must fall to standby. Repeat with a
+  Tesla-app/onboard start while still home and plugged: it must also be stopped because
+  external Tesla behavior is observation, not controller authority. Repeat inside a
+  selected block and confirm the already-running session is adopted at the planned current.
+- Verify the manual authority matrix explicitly: Grid assist alone never starts the EV;
+  Vehicle **Start** alone cannot force charging outside a smart/PV window; Vehicle
+  **Start** plus Grid assist starts and maintains a full-rate grid-backed charge; disabling
+  Grid assist then stops that manual session. Vehicle **Stop** must stop immediately and
+  suppress the current smart block even after a service restart or lost process ownership.
+  A Tesla-app/onboard stop inside an active smart block must instead be reconciled.
 - After a surplus-PV session has left the Tesla request at 5 A or below, press Vehicle
-  **Start** once. Confirm one full-rate request bounded by the live Tesla ceiling, a fresh pushed
-  `ChargeCurrentRequest` acknowledgement within 60 seconds, and normally ABB delivery above 5 A.
-  If acknowledgement is absent, confirm exactly one retry and no third command. If Maxem holds
-  actual delivery low after the request is confirmed, expect `delivery_limited` status/a warning
-  and no repeated current increases.
+  **Start** once. Confirm one full-rate request at the configured 1–25 A/phase installation
+  ceiling, a fresh pushed `ChargeCurrentRequest` acknowledgement within 60 seconds, and normally
+  ABB delivery above 5 A. If acknowledgement is absent, confirm one guarded retry per
+  acknowledgement interval while the request remains active and an `at_risk` state after the
+  initial attempts. Once a newer pushed request confirms the ceiling, Maxem may hold or later
+  reduce actual delivery without causing command chasing.
 - During a planned EV/grid block that overlaps an ESS BUY window, compare each quarter-hour's
   actual grid import, PV, ABB EV energy and ESS SoC delta with the dashboard plan. The displayed
   simultaneous ESS rise is valid only from the residual
@@ -122,17 +117,27 @@ have been completed:
   forecast, and the next replan moves any undelivered energy into later mixed/grid capacity while
   preserving the ready-by target.
 - Run an attended applied job with Fleet Telemetry fresh. Confirm only block-edge
-  commands occur, sub-5 A requests are sent twice, no duplicate Tesla schedule is
-  created, and an ABB/Maxem throttle does not cause repeated current increases.
+  commands occur after fresh acknowledgement, a distinct later block sends its own initial
+  ceiling command, sub-5 A solar requests are sent twice, no duplicate Tesla schedule is
+  created, and an ABB/Maxem throttle after confirmation does not cause repeated current
+  increases. If a current or start command is accepted but not observed, confirm guarded
+  60-second retries continue only through that active block.
 - After restarting onto the Fleet Auth fix, confirm the expired access token refreshes
   without an `auth.tesla.com` 401. Change the job target/current during an attended slot:
   the UI/controller state should move from pending to confirmed from pushed telemetry
-  within 60 seconds. A missing or contradictory acknowledgement may cause at most three
-  logical attempts; it must not recur every 15 minutes. Maxem-reduced ABB delivery is not
-  a failed requested-current acknowledgement.
+  within 60 seconds. A missing or contradictory current/start acknowledgement becomes
+  visibly `at_risk` after the initial attempts and continues guarded retries while the
+  selected block remains active; it must reset at the block boundary rather than leaking
+  acknowledgement state into the next block. Maxem-reduced ABB delivery after a fresh
+  requested-current acknowledgement is not a failed command.
 - During the applied charge, confirm all ABB `Ac/L{1,2,3}/Current` values are
   populated and already in amperes, and compare planned kWh/SoC with ABB settled
   `ev_charge_kwh` and actual SoC increase.
+- After a completed charge crosses at least two quarter-hour boundaries, confirm
+  its settled Timeline rows continue to show actual EV kWh/average kW after the
+  forward plan is regenerated. After midnight, verify the Advisor's completed-day
+  `ev_charge_kwh` matches the ABB/Domoticz daily total and that attributed grid
+  cost is marked partial whenever a service gap left settlement coverage incomplete.
 - Turn off/interrupt the service before the latest-safe start and confirm the
   onboard Tesla safety schedule uses local vehicle time and a continuous remaining-
   energy window ending at the deadline (it intentionally does not mirror the daily
@@ -141,48 +146,28 @@ have been completed:
   fallback is installed yet; once the exact start is within seven days, confirm it appears
   on the intended local date with a non-zero interval. Then resume and confirm both known
   application-owned IDs are reconciled without touching user schedules. Repeat once with
-  the car deeply asleep: one explicit unavailable response
-  may cause one wake and one retry, while a generic schedule error must not cause wakes.
+  the car deeply asleep: the first asleep-bus rejection must wait 10 seconds and retry the
+  command without an explicit wake. Only a second asleep-bus rejection may send one wake;
+  the post-wake command must wait until at least the 10-second settle period and a connected
+  vehicle signal (bounded by Tesla's 60-second wake window). Generic schedule errors must
+  not cause wakes.
 - While charge intent is already off, begin a charge outside a selected smart block using the
   temporary branch-created Tesla fallback, then press Vehicle **Stop** once. Confirm a stop
   command is attempted on the next controller tick (normally within 30 seconds), ABB current
   falls to zero, the Vehicle card changes to **Idle** at EV-meter standby draw (normally only a
   few watts), its ETA disappears, and the stale fallback no longer appears in the Tesla app.
   Repeat with stale home/plug telemetry if that condition can be reproduced safely.
-- Stop one optimizer-started block manually in the Tesla app and confirm it is not
-  restarted within that block; a later distinct block may resume.
+- Stop one optimizer-started block in the Tesla app and confirm the controller reconciles
+  it while the block remains active. Then stop it with the dashboard Vehicle **Stop** and
+  confirm it remains suppressed for the rest of that block; a later distinct block may resume.
 - Leave the car unplugged through the reminder lead time and confirm exactly one
   normal-priority Pushover notification survives a service restart without spam.
 - Collect several completed sessions before tuning `EV_BATTERY_USABLE_KWH`,
   `EV_CHARGE_EFFICIENCY`, `EV_EXPECTED_DELIVERY_KW`, startup delay, or high-SoC
   taper. Do not auto-learn/apply these from one session.
 
+## Onecta module for data and control of Daikin Airco units
+- Investigate and plan work on new hvac module for richer insight and schedule setting of airco units in home
+
 # Bugs / Testing
-
-## MEDIUM — wrong behaviour / cost leak, not dangerous
-
-### M1 — evcharger per-phase amps: verify on the bus
-The `evcharger/42` device is a real **ABB B23/B24** 3-phase meter (confirmed on
-the bus: genuine per-phase `L{1,2,3}/Current` + total `Ac/Power` /
-`Ac/Energy/Forward`). The shared current metric remains per-phase for control and
-the Vehicle tab. Only the powerflow EV card shows the requested sum across active
-phases. Remaining task: sanity-check during an active charge that all three
-`L{n}/Current` registers are populated (not just L1) so the per-phase control
-value is right. Not a code change. See `docs/EV_LOAD_DECOMPOSITION.md`.
-
-## LOW
-
-- **L3 — Two `update_charging_amp_totals` implementations** (in
-  `event_handler` and `ev_charge_controller`) both set
-  `tesla_charging_amps_total`. Same value, but duplicated logic —
-  consolidate to one source to avoid future drift.
-
-## Verify operationally (not a bug)
-
-- During an active charge, confirm all three corrected ABB topics
-  (`Ac/L{1,2,3}/Current`) track the physical phases. Values are already amperes;
-  the ABB dbus driver applies the Modbus register scale and no additional `/100`
-  or `/1000` conversion belongs in consumers.
-- Confirm `retained: true` on the fleet-telemetry dispatcher persists
-  across receiver restarts (so the bridge always snapshots current state on
-  connect).
+- None known at this time

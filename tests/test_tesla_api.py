@@ -382,33 +382,65 @@ def test_command_blocked_by_budget_returns_false_without_request():
     assert budget.spent == ["command"]
 
 
-def test_stop_charge_robust_wakes_and_retries_when_asleep():
-    # 'could_not_wake_buses' can occur while the car IS still charging, so we must NOT assume it
-    # means stopped: force a wake and retry. First stop asleep -> wake -> retry ok.
+def test_stop_charge_robust_tries_passive_retry_before_wake(monkeypatch):
+    # A stop gets two command-first attempts before paying for one explicit
+    # wake, then retries once after the documented wake settle period.
+    monkeypatch.setattr(tesla_api.time, "sleep", lambda _seconds: None)
     api = tesla_api.TeslaApi.__new__(tesla_api.TeslaApi)
-    seq = [(False, "asleep"), (True, "ok")]
+    seq = [(False, "asleep"), (False, "asleep"), (True, "ok")]
     calls = {"cmd": 0, "wake": 0, "stopped": 0}
-    api._command_ex = lambda name, json_body=None, error_msg="", critical=False: (calls.__setitem__("cmd", calls["cmd"] + 1), seq.pop(0))[1]
+    api._command_ex = lambda *args, **kwargs: (
+        calls.__setitem__("cmd", calls["cmd"] + 1), seq.pop(0))[1]
     api.wake_vehicle = lambda skip_online_check=False, critical=False: (calls.__setitem__("wake", calls["wake"] + 1), True)[1]
     api._on_charge_stopped = lambda: calls.__setitem__("stopped", calls["stopped"] + 1)
     assert api.stop_charge_robust() == "ok"
-    assert calls == {"cmd": 2, "wake": 1, "stopped": 1}
+    assert calls == {"cmd": 3, "wake": 1, "stopped": 1}
 
 
-def test_start_charge_robust_wakes_and_retries_when_asleep():
+def test_start_charge_robust_tries_passive_retry_before_wake(monkeypatch):
+    monkeypatch.setattr(tesla_api.time, "sleep", lambda _seconds: None)
     api = tesla_api.TeslaApi.__new__(tesla_api.TeslaApi)
-    seq = [(False, "asleep"), (True, "ok")]
+    seq = [(False, "asleep"), (False, "asleep"), (True, "ok")]
     calls = {"cmd": 0, "wake": 0, "started": 0}
-    api._command_ex = lambda name, json_body=None, error_msg="", critical=False: (calls.__setitem__("cmd", calls["cmd"] + 1), seq.pop(0))[1]
+    api._command_ex = lambda *args, **kwargs: (
+        calls.__setitem__("cmd", calls["cmd"] + 1), seq.pop(0))[1]
     api.wake_vehicle = lambda skip_online_check=False, critical=False: (calls.__setitem__("wake", calls["wake"] + 1), True)[1]
     api._on_charge_started = lambda: calls.__setitem__("started", calls["started"] + 1)
     assert api.start_charge_robust() == "ok"
-    assert calls == {"cmd": 2, "wake": 1, "started": 1}
+    assert calls == {"cmd": 3, "wake": 1, "started": 1}
+
+
+@pytest.mark.parametrize(
+    ("command", "reason"),
+    (("charge_start", "is_charging"),
+     ("charge_start", "requested"),
+     ("charge_stop", "not_charging")),
+)
+def test_charge_commands_accept_documented_idempotent_state(command, reason):
+    api = _bare_api(
+        _Budget(allow=True),
+        lambda *args, **kwargs: _Resp(
+            200, {"response": {"result": False, "reason": reason}}),
+    )
+    state_updates = {"start": 0, "stop": 0}
+    api._on_charge_started = lambda: state_updates.__setitem__(
+        "start", state_updates["start"] + 1)
+    api._on_charge_stopped = lambda: state_updates.__setitem__(
+        "stop", state_updates["stop"] + 1)
+
+    result = (
+        api.start_charge_robust()
+        if command == "charge_start" else api.stop_charge_robust()
+    )
+
+    assert result == "ok"
+    assert state_updates["start" if command == "charge_start" else "stop"] == 1
+    assert api._budget.spent == ["command"]
 
 
 def test_stop_charge_robust_reports_network_failure():
     api = tesla_api.TeslaApi.__new__(tesla_api.TeslaApi)
-    api._command_ex = lambda name, json_body=None, error_msg="", critical=False: (False, "network")
+    api._command_ex = lambda *args, **kwargs: (False, "network")
     api.wake_vehicle = lambda skip_online_check=False, critical=False: True
     api._on_charge_stopped = lambda: None
     assert api.stop_charge_robust() == "network"
@@ -468,6 +500,66 @@ def test_command_ex_always_refunds_and_classifies_5xx_as_network():
 
     assert api._command_ex("add_charge_schedule") == (False, "network")
     assert api._budget.refunded == ["command"]
+
+
+def test_command_audit_log_records_sent_and_accepted_write(caplog):
+    caplog.set_level("INFO")
+    api = _bare_api(
+        _Budget(allow=True),
+        lambda *a, **k: _Resp(200, {"response": {"result": True}}),
+    )
+
+    assert api.set_tesla_charge_limit(80) == (True, "ok")
+
+    assert (
+        "EvCharger [Tesla API]: sent set_charge_limit - target SoC 80%"
+        in caplog.text
+    )
+    assert "EvCharger [Tesla API]: accepted set_charge_limit in " in caplog.text
+    assert "ms - target SoC 80%" in caplog.text
+
+
+def test_command_audit_log_records_rejected_write_reason(caplog):
+    caplog.set_level("INFO")
+    api = _bare_api(
+        _Budget(allow=True),
+        lambda *a, **k: _Resp(
+            200, {"response": {"result": False, "reason": "disconnected"}}),
+    )
+
+    assert api._command_ex(
+        "charge_start", error_msg="start planned EV charge") == (False, "error")
+
+    assert (
+        "EvCharger [Tesla API]: sent charge_start - start planned EV charge"
+        in caplog.text
+    )
+    assert "EvCharger [Tesla API]: rejected charge_start in " in caplog.text
+    assert "ms - start planned EV charge; disconnected" in caplog.text
+
+
+def test_asleep_smart_command_uses_implicit_wake_grace_before_paid_wake(
+        caplog, monkeypatch):
+    caplog.set_level("INFO")
+    monkeypatch.setattr(tesla_api.time, "sleep", lambda _seconds: None)
+    responses = iter((
+        _Resp(200, {
+            "response": {"result": False, "reason": "could_not_wake_buses"},
+        }),
+        _Resp(200, {"response": {"result": True}}),
+    ))
+    api = _bare_api(_Budget(allow=True), lambda *a, **k: next(responses))
+    api.wake_vehicle = lambda **kwargs: True
+
+    assert api.set_tesla_charge_limit(80) == (True, "ok")
+
+    assert caplog.text.count(
+        "EvCharger [Tesla API]: sent set_charge_limit - target SoC 80%"
+    ) == 2
+    assert "implicit wake" in caplog.text
+    assert "wake_up" not in caplog.text
+    assert "EvCharger [Tesla API]: accepted set_charge_limit in " in caplog.text
+    assert "ms - target SoC 80%; retry after implicit wake grace" in caplog.text
 
 
 def test_set_charge_limit_is_budget_gated_without_fabricating_confirmation():
@@ -668,7 +760,8 @@ def test_charge_schedule_command_surfaces_unsupported_capability():
     assert api.remove_owned_charge_schedule(123) == (False, "unsupported")
 
 
-def test_smart_charge_command_retries_once_only_after_asleep_response():
+def test_smart_charge_command_retries_once_before_explicit_wake(monkeypatch):
+    monkeypatch.setattr(tesla_api.time, "sleep", lambda _seconds: None)
     api = tesla_api.TeslaApi.__new__(tesla_api.TeslaApi)
     sequence = [(False, "asleep"), (True, "ok")]
     calls = {"command": 0, "wake": 0}
@@ -683,7 +776,27 @@ def test_smart_charge_command_retries_once_only_after_asleep_response():
     )
 
     assert api.set_tesla_charge_limit(80) == (True, "ok")
-    assert calls == {"command": 2, "wake": 1}
+    assert calls == {"command": 2, "wake": 0}
+
+
+def test_smart_charge_command_wakes_only_after_two_asleep_rejections(
+        monkeypatch):
+    monkeypatch.setattr(tesla_api.time, "sleep", lambda _seconds: None)
+    api = tesla_api.TeslaApi.__new__(tesla_api.TeslaApi)
+    sequence = [(False, "asleep"), (False, "asleep"), (True, "ok")]
+    calls = {"command": 0, "wake": 0}
+
+    def command(*args, **kwargs):
+        calls["command"] += 1
+        return sequence.pop(0)
+
+    api._command_ex = command
+    api.wake_vehicle = lambda **kwargs: (
+        calls.__setitem__("wake", calls["wake"] + 1) or True
+    )
+
+    assert api.set_tesla_charge_limit(80) == (True, "ok")
+    assert calls == {"command": 3, "wake": 1}
 
 
 def test_smart_charge_command_does_not_wake_for_generic_vehicle_error():
@@ -791,6 +904,60 @@ def test_update_vehicle_status_reads_telemetry_and_skips_rest(monkeypatch):
     assert api.is_full is False                    # 62 < 80
     assert api.charging_amp_limit == 12.0
     assert api.time_until_full == "1 hr 5 min"
+
+
+def test_telemetry_refresh_preserves_unknown_home_and_plugged_state(
+        monkeypatch):
+    monkeypatch.setattr(
+        tesla_api,
+        "retrieve_setting",
+        lambda name: "true" if name == "TESLA_TELEMETRY_ENABLED" else None,
+    )
+    monkeypatch.setattr(
+        tesla_api,
+        "STATE",
+        type("S", (), {"get": staticmethod(lambda _key: None)})(),
+    )
+    api = tesla_api.TeslaApi.__new__(tesla_api.TeslaApi)
+
+    api._refresh_from_telemetry()
+
+    assert api.is_home is None
+    assert api.is_plugged is None
+    assert api.plugged_status == "Unknown"
+
+
+def test_telemetry_refresh_does_not_treat_missing_global_state_zero_as_away(
+        monkeypatch):
+    """GlobalState.get() returns 0 for absent rows; has() disambiguates it."""
+    monkeypatch.setattr(
+        tesla_api,
+        "retrieve_setting",
+        lambda name: "true" if name == "TESLA_TELEMETRY_ENABLED" else None,
+    )
+
+    class EmptyState:
+        @staticmethod
+        def has(_key):
+            return False
+
+        @staticmethod
+        def get(_key):
+            return 0
+
+    monkeypatch.setattr(tesla_api, "STATE", EmptyState())
+    api = tesla_api.TeslaApi.__new__(tesla_api.TeslaApi)
+    api.vehicle_soc = 0
+    api.vehicle_soc_setpoint = 0
+    api.last_update_ts = 0
+
+    api._refresh_from_telemetry()
+
+    assert api.is_home is None
+    assert api.is_plugged is None
+    assert api.vehicle_soc == 0
+    assert api.vehicle_soc_setpoint == 0
+    assert api.plugged_status == "Unknown"
 
 
 def test_forced_refresh_uses_one_rest_fallback_when_telemetry_disconnected(
@@ -1035,6 +1202,27 @@ def test_wake_vehicle_uses_real_check_in_polling_mode(monkeypatch):
     api._get_vehicle_state = lambda: (reads.__setitem__("n", reads["n"] + 1), "online")[1]
     assert api.wake_vehicle() is True
     assert reads["n"] == 1
+
+
+def test_explicit_wake_waits_for_settle_then_observes_telemetry(monkeypatch):
+    """A wake acknowledgement is not permission to retry the command immediately."""
+    sleeps = []
+    online = iter((False, True))
+    api = _bare_api(
+        _Budget(allow=True),
+        lambda *args, **kwargs: _Resp(200, {"response": {"state": "online"}}),
+    )
+    api._telemetry_on = lambda: True
+    api._telemetry_considers_online = lambda: next(online)
+    monkeypatch.setattr(
+        tesla_api.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    assert api.wake_vehicle(skip_online_check=True) is True
+    assert sleeps == [
+        tesla_api.WAKE_MIN_SETTLE_S,
+        tesla_api.WAKE_TELEMETRY_POLL_S,
+    ]
+    assert api._budget.spent == ["wake"]
 
 
 def test_poll_interval_shorter_while_charging(monkeypatch):

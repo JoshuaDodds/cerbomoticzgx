@@ -4,12 +4,24 @@ Built via __new__ to skip __init__ (which constructs a TeslaApi + MQTT client). 
 a fake Tesla that records commands, a dict-like state, and shadow the dynamic bus
 properties with plain instance attributes.
 """
+import json
 import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from lib import ev_charge_controller as ecc
+
+_TEST_CONTROLLER_STATE_PATH = None
+
+
+@pytest.fixture(autouse=True)
+def _isolate_controller_state(tmp_path):
+    """Never let controller tests write suppression/reminder state into data/."""
+    global _TEST_CONTROLLER_STATE_PATH
+    _TEST_CONTROLLER_STATE_PATH = str(tmp_path / "controller-state.json")
+    yield
+    _TEST_CONTROLLER_STATE_PATH = None
 
 
 class FakeTesla:
@@ -78,6 +90,7 @@ def _charger(monkeypatch, tesla, state=None, **attrs):
     c._intent_off_edge = False
     c._intent_was_on = False
     c._charge_mode = attrs.get("charge_mode", None)
+    c._smart_owns_charge = False
     c._stop_backoff_until = 0.0
     c._last_stop_alert_ts = 0.0
     c._stop_attempt_count = 0
@@ -102,6 +115,7 @@ def _smart_settings(monkeypatch, **overrides):
         "TESLA_TELEMETRY_ENABLED": "True",
         "EV_CHARGER_MAX_AMPS": "24",
         "EV_PLUG_REMINDER_ENABLED": "False",
+        "EV_SMART_CHARGE_CONTROLLER_STATE_PATH": _TEST_CONTROLLER_STATE_PATH,
         "HOME_ADDRESS_LAT": "52.1",
         "HOME_ADDRESS_LONG": "5.1",
     }
@@ -159,6 +173,29 @@ def _run_reminder_threads_inline(monkeypatch):
 
     monkeypatch.setattr(ecc.threading, "Thread", ImmediateThread)
     return created
+
+
+def test_dormant_reason_does_not_report_unknown_startup_state_as_away(
+        monkeypatch):
+    tesla = FakeTesla(is_home=None, is_plugged=None)
+    charger = _charger(monkeypatch, tesla, surplus_amps=0)
+
+    assert charger._dormant_reason() == (
+        "vehicle state awaiting telemetry; no charge intent"
+    )
+
+
+def test_dormant_reason_reports_only_explicit_vehicle_availability(
+        monkeypatch):
+    away = _charger(
+        monkeypatch, FakeTesla(is_home=False, is_plugged=None), surplus_amps=0
+    )
+    unplugged = _charger(
+        monkeypatch, FakeTesla(is_home=True, is_plugged=False), surplus_amps=0
+    )
+
+    assert away._dormant_reason() == "vehicle away; no charge intent"
+    assert unplugged._dormant_reason() == "vehicle unplugged; no charge intent"
 
 
 def test_starts_surplus_charge_when_home_plugged_and_surplus(monkeypatch):
@@ -360,7 +397,9 @@ def test_cooldown_blocks_immediate_restart(monkeypatch):
 def test_surplus_loss_waits_grace_then_stops(monkeypatch):
     # Charging, but surplus and intent are both gone.
     tesla = FakeTesla(is_charging=True)
-    c = _charger(monkeypatch, tesla, surplus_amps=0, charging_amps=8)
+    c = _charger(
+        monkeypatch, tesla, surplus_amps=0, charging_amps=8,
+        charge_mode="surplus")
     # First tick: opens the grace window, does NOT stop yet (ride out a passing cloud).
     assert c._control_charging() is True
     assert tesla.calls == []
@@ -374,7 +413,9 @@ def test_surplus_loss_waits_grace_then_stops(monkeypatch):
 
 def test_surplus_recovery_cancels_pending_stop(monkeypatch):
     tesla = FakeTesla(is_charging=True)
-    c = _charger(monkeypatch, tesla, surplus_amps=0, charging_amps=8)
+    c = _charger(
+        monkeypatch, tesla, surplus_amps=0, charging_amps=8,
+        charge_mode="surplus")
     c._control_charging()                        # opens grace window
     assert c._low_surplus_since is not None
     c.surplus_amps = 6                           # surplus came back
@@ -407,9 +448,8 @@ def test_discovery_wake_is_rate_limited(monkeypatch):
 
 
 def test_intent_follows_dedicated_flag_not_grid_assist(monkeypatch):
-    # Regression (decoupling): intent must follow the DEDICATED ev_charge_requested flag only.
-    # Grid-assist (grid_charging_enabled) controls the house battery and must NOT touch the car;
-    # our own tesla_charge_requested latch must also be ignored.
+    # Intent remains dedicated; grid-assist is a required authorization gate,
+    # not an alternate source of EV intent.
     state = FakeState({"grid_charging_enabled": "True", "tesla_charge_requested": "True",
                        "ev_charge_requested": "False"})
     c = _charger(monkeypatch, FakeTesla(is_charging=False), state=state, surplus_amps=0, charging_amps=0)
@@ -417,16 +457,59 @@ def test_intent_follows_dedicated_flag_not_grid_assist(monkeypatch):
     assert c._local_engagement_signal() is False        # grid-assist on does NOT engage the car
     state["ev_charge_requested"] = "True"
     assert c._intent_on() is True
+    assert c._manual_grid_override_on() is True
 
 
 def test_grid_assist_toggle_never_commands_the_car(monkeypatch):
     # Toggling grid-assist on with a home+plugged car and no surplus must issue NO commands:
-    # EV charging is fully decoupled from grid-assist.
+    # it is permission for a manual override, never EV intent by itself.
     state = FakeState({"grid_charging_enabled": "True", "ev_charge_requested": "False"})
     tesla = FakeTesla(is_charging=False)
     c = _charger(monkeypatch, tesla, state=state, surplus_amps=0, charging_amps=0)
     assert c._control_charging() is False
     assert tesla.calls == []
+
+
+def test_grid_assist_alone_does_not_authorize_external_charge(monkeypatch):
+    state = FakeState({
+        "grid_charging_enabled": "True",
+        "ev_charge_requested": "False",
+    })
+    tesla = FakeTesla(is_charging=True)
+    c = _charger(
+        monkeypatch, tesla, state=state, surplus_amps=0,
+        charging_amps=16, sun=False)
+
+    assert c._control_charging() is False
+    assert tesla.calls == ["stop"]
+
+
+def test_ev_start_without_grid_assist_cannot_force_charge(monkeypatch):
+    state = FakeState({
+        "grid_charging_enabled": "False",
+        "ev_charge_requested": "True",
+    })
+    tesla = FakeTesla(is_charging=False)
+    c = _charger(
+        monkeypatch, tesla, state=state, surplus_amps=0,
+        charging_amps=0, sun=False)
+
+    assert c._control_charging() is False
+    assert tesla.calls == []
+
+
+def test_disabling_grid_assist_stops_manual_ev_override(monkeypatch):
+    state = FakeState({
+        "grid_charging_enabled": "False",
+        "ev_charge_requested": "True",
+    })
+    tesla = FakeTesla(is_charging=True)
+    c = _charger(
+        monkeypatch, tesla, state=state, surplus_amps=0,
+        charging_amps=16, sun=False, charge_mode="grid")
+
+    assert c._control_charging() is False
+    assert tesla.calls == ["stop"]
 
 
 @pytest.mark.parametrize(
@@ -453,7 +536,10 @@ def test_ev_charge_request_charges_full_and_ignores_surplus(
     original_setting = ecc.retrieve_setting
     monkeypatch.setattr(
         ecc, "retrieve_setting", lambda key: values.get(key, original_setting(key)))
-    state = FakeState({"ev_charge_requested": "True"})
+    state = FakeState({
+        "ev_charge_requested": "True",
+        "grid_charging_enabled": "True",
+    })
     tesla = FakeTesla(is_charging=False)
     c = _charger(monkeypatch, tesla, state=state, surplus_amps=0, charging_amps=0)
     assert c._control_charging() is True
@@ -516,7 +602,10 @@ def test_ev_current_ceiling_is_hard_bounded_to_25_amps(monkeypatch):
 def test_ev_charge_request_does_not_stop_on_low_surplus(monkeypatch):
     # Charging under an EV-charge request while surplus is negative must NOT trigger a
     # surplus-loss stop.
-    state = FakeState({"ev_charge_requested": "True"})
+    state = FakeState({
+        "ev_charge_requested": "True",
+        "grid_charging_enabled": "True",
+    })
     tesla = FakeTesla(is_charging=True)
     c = _charger(monkeypatch, tesla, state=state, surplus_amps=0, charging_amps=16)
     assert c._control_charging() is True
@@ -720,7 +809,7 @@ def test_manual_stop_stays_latched_until_a_retry_is_confirmed(monkeypatch):
     c.main()
 
     assert tesla.calls.count("stop") == 2
-    assert tesla.calls.count(("update_vehicle_status", True, True)) == 1
+    assert tesla.calls.count(("update_vehicle_status", True, False)) == 1
     assert tesla.calls.count(("update_vehicle_status", False, False)) == 1
     assert state["vehicle_stop_requested"] is False
     assert c._stop_attempt_count == 0
@@ -812,17 +901,18 @@ def test_smart_apply_false_issues_no_smart_commands(monkeypatch):
     assert tesla.calls == []
 
 
-def test_disabling_apply_relinquishes_owned_charge_without_a_command(monkeypatch):
+@pytest.mark.parametrize("charge_mode", ("smart", "smart_solar", "smart_surplus"))
+def test_disabling_apply_stops_previously_owned_smart_charge(
+        monkeypatch, charge_mode):
     _smart_settings(monkeypatch, EV_SMART_CHARGE_APPLY="False")
     tesla = FakeTesla(is_charging=True)
     c = _charger(monkeypatch, tesla, surplus_amps=0, charging_amps=16)
-    c._charge_mode = "smart"
+    c._charge_mode = charge_mode
     c._smart_owns_charge = True
 
-    assert c._control_charging() is True
-    assert tesla.calls == []
-    assert c._smart_owns_charge is False
-    assert c._charge_mode == "smart_released"
+    assert c._control_charging() is False
+    assert tesla.calls == ["stop"]
+    assert c._charge_mode is None
 
 
 def test_smart_feature_off_preserves_legacy_surplus_path(monkeypatch):
@@ -898,7 +988,8 @@ def test_applied_smart_job_never_steals_surplus_below_home_battery_target(monkey
     assert "start" not in tesla.calls
 
 
-def test_applied_smart_job_does_not_adjust_external_charge_for_surplus(monkeypatch):
+def test_applied_smart_job_adopts_external_charge_when_surplus_authorizes_it(
+        monkeypatch):
     _smart_settings(monkeypatch)
     now = datetime.now(timezone.utc)
     tesla = FakeTesla(is_charging=True)
@@ -909,8 +1000,11 @@ def test_applied_smart_job_does_not_adjust_external_charge_for_surplus(monkeypat
     c._smart_plan = _smart_plan(now, active=False)
 
     assert c._control_charging(now=now) is True
-    assert not any(isinstance(call, tuple) and call[0] == "amps" for call in tesla.calls)
-    assert c.global_state["ev_smart_charge_controller_reason"] == "external_charge_in_progress"
+    assert c._smart_owns_charge is True
+    assert c._charge_mode == "smart_surplus"
+    assert c.global_state["ev_smart_charge_controller_reason"] == (
+        "opportunistic_solar_surplus"
+    )
 
 
 def test_manual_stop_suppresses_owned_between_block_solar(monkeypatch, tmp_path):
@@ -986,7 +1080,8 @@ def test_forecast_solar_slot_caps_request_to_live_surplus(monkeypatch):
     assert state["ev_smart_charge_controller_reason"] == "forecast_solar_surplus"
 
 
-def test_external_start_stop_suppresses_cloudy_solar_slot(monkeypatch, tmp_path):
+def test_external_start_during_cloudy_solar_slot_is_stopped(
+        monkeypatch, tmp_path):
     _smart_settings(
         monkeypatch,
         EV_SMART_CHARGE_CONTROLLER_STATE_PATH=str(tmp_path / "controller-state.json"),
@@ -1003,15 +1098,11 @@ def test_external_start_stop_suppresses_cloudy_solar_slot(monkeypatch, tmp_path)
     })
     c._smart_plan = plan
 
-    assert c._control_charging(now=now) is True
-    assert tesla.calls == []
-
-    tesla.is_charging = False
-    c.charging_amps = 0
-    c.surplus_amps = 6
-    assert c._control_charging(now=now + timedelta(minutes=1)) is False
-    assert "start" not in tesla.calls
-    assert c.global_state["ev_smart_charge_controller_reason"] == "charge_block_suppressed"
+    assert c._control_charging(now=now) is False
+    assert tesla.calls == ["stop"]
+    assert c.global_state["ev_smart_charge_controller_reason"] == (
+        "unauthorized_charge_stopped"
+    )
 
 
 def test_applied_smart_job_fails_closed_when_fleet_telemetry_is_disabled(monkeypatch):
@@ -1030,15 +1121,18 @@ def test_manual_charge_request_has_priority_over_active_smart_block(monkeypatch)
     _smart_settings(monkeypatch)
     now = datetime.now(timezone.utc)
     tesla = FakeTesla(is_charging=False)
-    state = FakeState({"ev_charge_requested": "True"})
+    state = FakeState({
+        "ev_charge_requested": "True",
+        "grid_charging_enabled": "True",
+    })
     c = _charger(monkeypatch, tesla, state=state, surplus_amps=0, charging_amps=0)
     c._smart_plan = _smart_plan(now, target_kw=3.0)
 
     assert c._control_charging() is True
     assert "start" in tesla.calls
-    # Manual grid charging restores the configured 16 kW ceiling instead of
-    # inheriting a prior 1-5 A solar request. At 3x230 V that is 23 A/phase.
-    assert ("amps", 23, 24.0) in tesla.calls
+    # Manual grid charging restores the configured installation ceiling instead
+    # of inheriting a prior 1-5 A solar request. Maxem owns delivered current.
+    assert ("amps", 24, 24.0) in tesla.calls
     assert not any(isinstance(call, tuple) and call[0] in {"schedule", "limit"}
                    for call in tesla.calls)
     assert c._charge_mode == "grid"
@@ -1050,6 +1144,7 @@ def test_manual_grid_override_raises_existing_five_amp_solar_session(monkeypatch
     tesla = FakeTesla(is_charging=True)
     state = FakeState({
         "ev_charge_requested": "True",
+        "grid_charging_enabled": "True",
         "tesla_charger_phases": 3,
         "tesla_charger_voltage": 230,
         "tesla_charge_current_max": 24,
@@ -1062,7 +1157,7 @@ def test_manual_grid_override_raises_existing_five_amp_solar_session(monkeypatch
     )
 
     assert c._control_charging(now=now) is True
-    assert tesla.calls == [("amps", 23, 24.0)]
+    assert tesla.calls == [("amps", 24, 24.0)]
     assert c._charge_mode == "grid"
     assert state["ev_grid_charge_current_status"] == "confirmation_pending"
 
@@ -1074,6 +1169,7 @@ def test_manual_grid_session_sends_initial_current_even_if_retained_value_matche
     tesla = FakeTesla(is_charging=False)
     state = FakeState({
         "ev_charge_requested": "True",
+        "grid_charging_enabled": "True",
         "tesla_charger_phases": 3,
         "tesla_charger_voltage": 230,
         "tesla_charge_current_max": 24,
@@ -1086,17 +1182,18 @@ def test_manual_grid_session_sends_initial_current_even_if_retained_value_matche
 
     c._control_charging(now=now)
 
-    assert tesla.calls.count(("amps", 23, 24.0)) == 1
+    assert tesla.calls.count(("amps", 24, 24.0)) == 1
     assert tesla.calls.count("start") == 1
     assert state["ev_grid_charge_current_status"] == "confirmation_pending"
 
 
-def test_manual_grid_current_retries_once_after_tesla_telemetry_timeout(monkeypatch):
+def test_manual_grid_current_retries_until_tesla_telemetry_confirms(monkeypatch):
     _smart_settings(monkeypatch)
     now = datetime.now(timezone.utc)
     tesla = FakeTesla(is_charging=False)
     state = FakeState({
         "ev_charge_requested": "True",
+        "grid_charging_enabled": "True",
         "tesla_charger_phases": 3,
         "tesla_charger_voltage": 230,
         "tesla_charge_current_max": 24,
@@ -1106,20 +1203,20 @@ def test_manual_grid_current_retries_once_after_tesla_telemetry_timeout(monkeypa
     c = _charger(monkeypatch, tesla, state=state, surplus_amps=0, charging_amps=0)
 
     assert c._control_charging(now=now) is True
-    assert tesla.calls.count(("amps", 23, 24.0)) == 1
+    assert tesla.calls.count(("amps", 24, 24.0)) == 1
     assert tesla.calls.count("start") == 1
 
     c._control_charging(now=now + timedelta(seconds=59))
-    assert tesla.calls.count(("amps", 23, 24.0)) == 1
+    assert tesla.calls.count(("amps", 24, 24.0)) == 1
 
     c._last_command_ts = 0
     c._control_charging(now=now + timedelta(seconds=61))
-    assert tesla.calls.count(("amps", 23, 24.0)) == 2
+    assert tesla.calls.count(("amps", 24, 24.0)) == 2
 
     c._last_command_ts = 0
     c._control_charging(now=now + timedelta(seconds=122))
-    assert tesla.calls.count(("amps", 23, 24.0)) == 2
-    assert state["ev_grid_charge_current_status"] == "unconfirmed"
+    assert tesla.calls.count(("amps", 24, 24.0)) == 3
+    assert state["ev_grid_charge_current_status"] == "confirmation_pending"
 
 
 def test_manual_grid_delivery_below_five_does_not_fight_maxem_after_ack(monkeypatch):
@@ -1128,6 +1225,7 @@ def test_manual_grid_delivery_below_five_does_not_fight_maxem_after_ack(monkeypa
     tesla = FakeTesla(is_charging=True)
     state = FakeState({
         "ev_charge_requested": "True",
+        "grid_charging_enabled": "True",
         "tesla_charger_phases": 3,
         "tesla_charger_voltage": 230,
         "tesla_charge_current_max": 24,
@@ -1137,9 +1235,9 @@ def test_manual_grid_delivery_below_five_does_not_fight_maxem_after_ack(monkeypa
     c = _charger(monkeypatch, tesla, state=state, charging_amps=4)
 
     c._control_charging(now=now)
-    assert tesla.calls.count(("amps", 23, 24.0)) == 1
+    assert tesla.calls.count(("amps", 24, 24.0)) == 1
 
-    state["tesla_charge_current_request"] = 23
+    state["tesla_charge_current_request"] = 24
     state["tesla_charge_current_request_updated_at"] = (now + timedelta(seconds=5)).timestamp()
     c._last_command_ts = 0
     c._control_charging(now=now + timedelta(seconds=65))
@@ -1147,7 +1245,7 @@ def test_manual_grid_delivery_below_five_does_not_fight_maxem_after_ack(monkeypa
 
     # Requested current was confirmed, so low ABB delivery is Maxem/ramp
     # observation only and never causes another Fleet current command.
-    assert tesla.calls.count(("amps", 23, 24.0)) == 1
+    assert tesla.calls.count(("amps", 24, 24.0)) == 1
     assert state["ev_grid_charge_current_status"] == "delivery_limited"
 
 
@@ -1159,6 +1257,7 @@ def test_manual_grid_does_not_accept_an_unstamped_local_command_shadow(monkeypat
     tesla.charge_current_request_update_ts = 0
     state = FakeState({
         "ev_charge_requested": "True",
+        "grid_charging_enabled": "True",
         "tesla_charger_phases": 3,
         "tesla_charger_voltage": 230,
         "tesla_charge_current_max": 24,
@@ -1167,7 +1266,7 @@ def test_manual_grid_does_not_accept_an_unstamped_local_command_shadow(monkeypat
 
     c._control_charging(now=now)
 
-    assert ("amps", 23, 24.0) in tesla.calls
+    assert ("amps", 24, 24.0) in tesla.calls
     assert state["ev_grid_charge_current_status"] == "confirmation_pending"
 
 
@@ -1193,6 +1292,39 @@ def test_active_smart_block_ignores_ephemeral_maxem_ceiling_then_starts(monkeypa
     assert state["ev_smart_charge_controller_status"] == "starting"
 
 
+def test_partial_grid_smart_block_still_requests_full_installation_current(
+        monkeypatch):
+    _smart_settings(monkeypatch, EV_CHARGER_MAX_AMPS="25")
+    now = datetime.now(timezone.utc)
+    tesla = FakeTesla(is_charging=False)
+    state = FakeState({
+        "tesla_charger_phases": 3,
+        "tesla_charger_voltage": 236,
+    })
+    c = _charger(monkeypatch, tesla, state=state, surplus_amps=0, charging_amps=0)
+    c._smart_plan = _smart_plan(now, target_kw=2.0)
+
+    assert c._control_charging(now=now) is True
+    assert ("amps", 25, 25.0) in tesla.calls
+    assert "start" in tesla.calls
+
+
+def test_smart_session_sends_initial_current_even_if_retained_value_matches(
+        monkeypatch):
+    _smart_settings(monkeypatch, EV_CHARGER_MAX_AMPS="25")
+    now = datetime.now(timezone.utc)
+    tesla = FakeTesla(is_charging=False)
+    state = FakeState({
+        "tesla_charge_current_request": 25,
+        "tesla_charge_current_request_updated_at": now.timestamp() - 600,
+    })
+    c = _charger(monkeypatch, tesla, state=state, surplus_amps=0, charging_amps=0)
+    c._smart_plan = _smart_plan(now, target_kw=2.0)
+
+    assert c._control_charging(now=now) is True
+    assert tesla.calls.count(("amps", 25, 25.0)) == 1
+
+
 def test_charge_limit_retries_within_one_minute_until_telemetry_confirms(monkeypatch):
     _smart_settings(monkeypatch)
     now = datetime.now(timezone.utc)
@@ -1206,6 +1338,16 @@ def test_charge_limit_retries_within_one_minute_until_telemetry_confirms(monkeyp
     c._smart_plan = _smart_plan(now, active=False)
 
     c._control_charging(now=now)
+    assert limit_calls == [80]
+    assert not any(isinstance(call, tuple) and call[0] == "schedule"
+                   for call in tesla.calls)
+
+    # A newer mismatching event is useful evidence, but it must not collapse the
+    # acknowledgement window into an immediate command-spending retry.
+    state["tesla_soc_setpoint"] = 70
+    state["tesla_soc_setpoint_updated_at"] = (
+        now + timedelta(seconds=10)).timestamp()
+    c._control_charging(now=now + timedelta(seconds=10))
     assert limit_calls == [80]
 
     c._control_charging(now=now + timedelta(seconds=59))
@@ -1221,9 +1363,161 @@ def test_charge_limit_retries_within_one_minute_until_telemetry_confirms(monkeyp
     assert limit_calls == [80, 80]
     assert c._smart_limit_pending is None
     assert c._smart_limit_signature == 80
+    assert any(isinstance(call, tuple) and call[0] == "schedule"
+               for call in tesla.calls)
 
 
-def test_unconfirmed_charge_limit_stops_after_three_attempts(monkeypatch):
+def test_stale_matching_charge_limit_does_not_confirm_a_newer_command(monkeypatch):
+    _smart_settings(monkeypatch)
+    now = datetime.now(timezone.utc)
+    tesla = FakeTesla(is_charging=False)
+    tesla.vehicle_soc_setpoint = 70
+    tesla.charge_limit_update_ts = now.timestamp() - 10
+    state = FakeState()
+    limit_calls = []
+    tesla.set_tesla_charge_limit = lambda value: (
+        limit_calls.append(value) or (True, "ok"))
+    c = _charger(
+        monkeypatch, tesla, state=state, surplus_amps=0, charging_amps=0)
+    c._smart_plan = _smart_plan(now, active=False)
+
+    c._control_charging(now=now)
+    state["tesla_soc_setpoint"] = 80
+    state["tesla_soc_setpoint_updated_at"] = now.timestamp() - 1
+    c._control_charging(now=now + timedelta(seconds=30))
+
+    assert c._smart_limit_pending is not None
+    assert c._smart_limit_signature is None
+    assert limit_calls == [80]
+
+    c._control_charging(now=now + timedelta(seconds=61))
+    assert limit_calls == [80, 80]
+
+
+def test_far_deadline_reconciles_charge_limit_before_deferring_owned_schedule(
+        monkeypatch):
+    """A calendar-unrepresentable fallback must not postpone the job's SoC limit."""
+    _smart_settings(monkeypatch)
+    now = datetime(2026, 7, 21, 8, 0, tzinfo=timezone.utc)
+    tesla = FakeTesla(is_charging=False)
+    tesla.vehicle_soc_setpoint = 70
+    tesla.charge_limit_update_ts = now.timestamp() - 10
+    limit_calls = []
+    tesla.set_tesla_charge_limit = lambda value: (
+        limit_calls.append(value) or (True, "ok"))
+    c = _charger(monkeypatch, tesla, surplus_amps=0, charging_amps=0)
+    plan = _smart_plan(now, active=False)
+    deadline = now + timedelta(days=20)
+    plan["ready_by"] = deadline.isoformat()
+    plan["job"]["ready_by"] = deadline.isoformat()
+    plan["latest_safe_start"] = (deadline - timedelta(hours=7)).isoformat()
+    c._smart_plan = plan
+
+    c._control_charging(now=now)
+
+    assert limit_calls == [80]
+    assert ("remove_schedule", ecc.SMART_OWNED_SCHEDULE_ID) in tesla.calls
+    assert not any(isinstance(call, tuple) and call[0] == "schedule"
+                   for call in tesla.calls)
+
+
+def test_far_deadline_stops_limit_commands_after_fresh_telemetry_confirmation(
+        monkeypatch):
+    _smart_settings(monkeypatch)
+    now = datetime(2026, 7, 21, 8, 0, tzinfo=timezone.utc)
+    tesla = FakeTesla(is_charging=False)
+    tesla.vehicle_soc_setpoint = 70
+    tesla.charge_limit_update_ts = now.timestamp() - 10
+    state = FakeState()
+    limit_calls = []
+    tesla.set_tesla_charge_limit = lambda value: (
+        limit_calls.append(value) or (True, "ok"))
+    c = _charger(
+        monkeypatch, tesla, state=state, surplus_amps=0, charging_amps=0)
+    plan = _smart_plan(now, active=False)
+    deadline = now + timedelta(days=20)
+    plan["ready_by"] = deadline.isoformat()
+    plan["job"]["ready_by"] = deadline.isoformat()
+    plan["latest_safe_start"] = (deadline - timedelta(hours=7)).isoformat()
+    c._smart_plan = plan
+
+    c._control_charging(now=now)
+    state["tesla_soc_setpoint"] = 80
+    state["tesla_soc_setpoint_updated_at"] = (
+        now + timedelta(seconds=20)).timestamp()
+    c._control_charging(now=now + timedelta(seconds=30))
+    c._control_charging(now=now + timedelta(seconds=95))
+
+    assert limit_calls == [80]
+    assert c._smart_limit_pending is None
+    assert c._smart_limit_signature == 80
+
+
+def test_charge_limit_target_edit_replaces_pending_target_immediately(monkeypatch):
+    _smart_settings(monkeypatch)
+    now = datetime.now(timezone.utc)
+    tesla = FakeTesla(is_charging=False)
+    tesla.vehicle_soc_setpoint = 70
+    tesla.charge_limit_update_ts = now.timestamp() - 10
+    limit_calls = []
+    tesla.set_tesla_charge_limit = lambda value: (
+        limit_calls.append(value) or (True, "ok"))
+    c = _charger(monkeypatch, tesla, surplus_amps=0, charging_amps=0)
+    c._smart_plan = _smart_plan(now, active=False)
+
+    c._control_charging(now=now)
+    edited = _smart_plan(now + timedelta(seconds=10), active=False)
+    edited["target_soc"] = 85
+    edited["job"]["target_soc"] = 85
+    c._smart_plan = edited
+    c._control_charging(now=now + timedelta(seconds=10))
+
+    assert limit_calls == [80, 85]
+    assert c._smart_limit_pending["target"] == 85
+    assert c._smart_limit_pending["attempts"] == 1
+
+
+def test_durable_gui_job_reconciles_limit_without_plan_or_chargeable_vehicle(
+        monkeypatch):
+    """The GUI's durable job is sufficient; planning/home/plug state must not gate the limit."""
+    _smart_settings(monkeypatch)
+    now = datetime.now(timezone.utc)
+    tesla = FakeTesla(is_home=False, is_plugged=False, is_charging=False)
+    tesla.vehicle_soc_setpoint = 70
+    tesla.charge_limit_update_ts = now.timestamp() - 10
+    state = FakeState({
+        "tesla_soc_setpoint": 70,
+        "tesla_soc_setpoint_updated_at": now.timestamp() - 10,
+    })
+    c = _charger(
+        monkeypatch, tesla, state=state, surplus_amps=0,
+        charging_amps=0, sun=False)
+    c._smart_plan = None
+    c._smart_job_loaded = True
+    c._smart_job = {
+        "id": "gui-job",
+        "status": "active",
+        "target_soc": 85,
+        "ready_by": (now + timedelta(days=9)).isoformat(),
+    }
+
+    assert c._local_engagement_signal() is True
+    assert c._control_charging(now=now) is False
+
+    assert ("limit", 85) in tesla.calls
+    assert c._smart_limit_pending["target"] == 85
+
+    state["tesla_soc_setpoint"] = 85
+    state["tesla_soc_setpoint_updated_at"] = (
+        now + timedelta(seconds=10)).timestamp()
+    c._control_charging(now=now + timedelta(seconds=20))
+
+    assert c._smart_limit_pending is None
+    assert c._smart_limit_signature == 85
+    assert c._local_engagement_signal() is False
+
+
+def test_unconfirmed_charge_limit_keeps_retrying_until_telemetry_confirms(monkeypatch):
     _smart_settings(monkeypatch)
     now = datetime.now(timezone.utc)
     tesla = FakeTesla(is_charging=False)
@@ -1234,14 +1528,21 @@ def test_unconfirmed_charge_limit_stops_after_three_attempts(monkeypatch):
     c = _charger(monkeypatch, tesla, surplus_amps=0, charging_amps=0)
     c._smart_plan = _smart_plan(now, active=False)
 
-    for seconds in (0, 61, 122):
+    for seconds in (0, 61, 122, 183):
         c._control_charging(now=now + timedelta(seconds=seconds))
 
-    assert limit_calls == [80, 80, 80]
+    assert limit_calls == [80, 80, 80, 80]
     assert c.global_state["ev_smart_charge_fallback_status"] == "limit_pending"
 
-    c._control_charging(now=now + timedelta(seconds=183))
-    assert c.global_state["ev_smart_charge_fallback_status"] == "limit_unconfirmed"
+    c.global_state["tesla_soc_setpoint"] = 80
+    c.global_state["tesla_soc_setpoint_updated_at"] = (
+        now + timedelta(seconds=190)).timestamp()
+    c._control_charging(now=now + timedelta(seconds=195))
+    c._control_charging(now=now + timedelta(seconds=260))
+
+    assert limit_calls == [80, 80, 80, 80]
+    assert c._smart_limit_pending is None
+    assert c._smart_limit_signature == 80
 
 
 def test_rejected_charge_limit_retries_in_one_minute_and_never_installs_schedule(
@@ -1260,10 +1561,11 @@ def test_rejected_charge_limit_retries_in_one_minute_and_never_installs_schedule
     for seconds in (0, 59, 61, 122, 183):
         c._control_charging(now=now + timedelta(seconds=seconds))
 
-    assert limit_calls == [80, 80, 80]
+    assert limit_calls == [80, 80, 80, 80]
     assert not any(isinstance(call, tuple) and call[0] == "schedule"
                    for call in tesla.calls)
-    assert c.global_state["ev_smart_charge_fallback_status"] == "limit_unconfirmed"
+    assert c._smart_limit_pending["attempts"] == 4
+    assert c.global_state["ev_smart_charge_fallback_status"] == "limit_network"
 
 
 def test_schedule_backoff_does_not_delay_charge_limit_acknowledgement_retry(
@@ -1282,10 +1584,15 @@ def test_schedule_backoff_does_not_delay_charge_limit_acknowledgement_retry(
     c = _charger(monkeypatch, tesla, surplus_amps=0, charging_amps=0)
     c._smart_plan = _smart_plan(now, active=False)
 
+    state = c.global_state
     c._control_charging(now=now)
-    c._control_charging(now=now + timedelta(seconds=61))
+    state["tesla_soc_setpoint"] = 80
+    state["tesla_soc_setpoint_updated_at"] = (
+        now + timedelta(seconds=10)).timestamp()
+    c._control_charging(now=now + timedelta(seconds=20))
+    c._control_charging(now=now + timedelta(seconds=81))
 
-    assert limit_calls == [80, 80]
+    assert limit_calls == [80]
     assert len(schedule_calls) == 2
 
 
@@ -1321,7 +1628,7 @@ def test_current_command_retries_from_requested_current_not_maxem_delivery(monke
     c._smart_plan = _smart_plan(now, target_kw=11.04)
 
     c._control_charging(now=now)
-    assert tesla.calls.count(("amps", 16, 24.0)) == 1
+    assert tesla.calls.count(("amps", 24, 24.0)) == 1
 
     # A newer Maxem-reduced request does not trigger an immediate command fight.
     c.charging_amps = 5
@@ -1330,25 +1637,60 @@ def test_current_command_retries_from_requested_current_not_maxem_delivery(monke
         now + timedelta(seconds=10)).timestamp()
     c._last_command_ts = 0
     c._control_charging(now=now + timedelta(seconds=10))
-    assert tesla.calls.count(("amps", 16, 24.0)) == 1
+    assert tesla.calls.count(("amps", 24, 24.0)) == 1
 
     # ABB delivery remains only 5 A because Maxem is throttling, but the lack of a pushed
-    # requested-current acknowledgement—not delivered current—permits one retry after 60 s.
+    # requested-current acknowledgement—not delivered current—permits a guarded retry after 60 s.
     c._last_command_ts = 0
     c._control_charging(now=now + timedelta(seconds=61))
-    assert tesla.calls.count(("amps", 16, 24.0)) == 2
+    assert tesla.calls.count(("amps", 24, 24.0)) == 2
 
-    state["tesla_charge_current_request"] = 16
+    state["tesla_charge_current_request"] = 24
     state["tesla_charge_current_request_updated_at"] = (
         now + timedelta(seconds=70)).timestamp()
     c._last_command_ts = 0
     c._control_charging(now=now + timedelta(seconds=75))
 
-    assert tesla.calls.count(("amps", 16, 24.0)) == 2
+    assert tesla.calls.count(("amps", 24, 24.0)) == 2
     assert c._smart_current_pending is None
 
 
-def test_rejected_current_command_gets_one_retry_and_never_starts(monkeypatch):
+def test_smart_current_and_start_confirmation_are_auditable(monkeypatch, caplog):
+    caplog.set_level("INFO")
+    _smart_settings(monkeypatch, EV_CHARGER_MAX_AMPS="25")
+    now = datetime.now(timezone.utc)
+    state = FakeState()
+    tesla = FakeTesla(is_charging=False)
+    tesla.charge_state_update_ts = now.timestamp() - 60
+    c = _charger(
+        monkeypatch, tesla, state=state, surplus_amps=0, charging_amps=0)
+    c._smart_plan = _smart_plan(now, target_kw=2.0)
+
+    c._control_charging(now=now)
+    state.update({
+        "tesla_charge_current_request": 25,
+        "tesla_charge_current_request_updated_at": (
+            now + timedelta(seconds=5)).timestamp(),
+        "tesla_is_charging": "True",
+        "tesla_charge_state_updated_at": (
+            now + timedelta(seconds=6)).timestamp(),
+    })
+    c.charging_amps = 8
+    c._control_charging(now=now + timedelta(seconds=10))
+
+    assert (
+        "EvCharger [Tesla API]: confirmed set_charging_amps - "
+        "ChargeCurrentRequest=25 A/phase after attempt 1."
+        in caplog.text
+    )
+    assert (
+        "EvCharger [Tesla API]: confirmed charge_start - charging observed "
+        "after attempt 1."
+        in caplog.text
+    )
+
+
+def test_rejected_current_command_retries_throughout_block_and_never_starts(monkeypatch):
     _smart_settings(monkeypatch)
     now = datetime.now(timezone.utc)
     state = FakeState({
@@ -1368,10 +1710,11 @@ def test_rejected_current_command_gets_one_retry_and_never_starts(monkeypatch):
         c._last_command_ts = 0
         c._control_charging(now=now + timedelta(seconds=seconds))
 
-    assert tesla.calls.count(("amps", 16, 24.0)) == 2
+    assert tesla.calls.count(("amps", 24, 24.0)) == 4
     assert "start" not in tesla.calls
+    assert c.global_state["ev_smart_charge_controller_status"] == "at_risk"
     assert c.global_state["ev_smart_charge_controller_reason"] == (
-        "set_current_unconfirmed")
+        "set_current_rejected_retrying")
 
 
 def test_second_accepted_current_command_gets_full_acknowledgement_window(monkeypatch):
@@ -1391,15 +1734,16 @@ def test_second_accepted_current_command_gets_full_acknowledgement_window(monkey
     for seconds in (0, 61):
         c._last_command_ts = 0
         c._control_charging(now=now + timedelta(seconds=seconds))
-    assert tesla.calls.count(("amps", 16, 24.0)) == 2
+    assert tesla.calls.count(("amps", 24, 24.0)) == 2
 
     c._last_command_ts = 0
     c._control_charging(now=now + timedelta(seconds=90))
-    assert c.global_state["ev_smart_charge_controller_reason"] == "set_current_pending"
+    assert c.global_state["ev_smart_charge_controller_reason"] == (
+        "set_current_pending_at_risk")
 
     c._control_charging(now=now + timedelta(seconds=122))
     assert c.global_state["ev_smart_charge_controller_reason"] == (
-        "set_current_unconfirmed")
+        "set_current_retry_due_at_risk")
 
 
 def test_accepted_start_waits_for_power_flow_before_bounded_retry(monkeypatch):
@@ -1425,14 +1769,34 @@ def test_accepted_start_waits_for_power_flow_before_bounded_retry(monkeypatch):
     assert c.global_state["ev_smart_charge_controller_reason"] == "start_confirmation_retry"
 
 
-def test_rejected_start_is_retried_in_one_minute_then_suppresses_block(monkeypatch):
+def test_accepted_api_start_does_not_manufacture_physical_confirmation(monkeypatch):
+    _smart_settings(monkeypatch, EV_CHARGER_MAX_AMPS="25")
+    now = datetime.now(timezone.utc)
+    tesla = FakeTesla(is_charging=False)
+    tesla.charge_state_update_ts = now.timestamp() - 60
+    state = FakeState()
+    c = _charger(monkeypatch, tesla, state=state, surplus_amps=0, charging_amps=0)
+    c._smart_plan = _smart_plan(now, target_kw=2.0)
+
+    c._control_charging(now=now)
+    assert tesla.calls.count("start") == 1
+    assert tesla.is_charging is True  # API wrapper's optimistic local shadow
+
+    c._last_command_ts = 0
+    c._control_charging(now=now + timedelta(seconds=61))
+
+    assert tesla.calls.count("start") == 2
+    assert state["ev_smart_charge_controller_reason"] == "start_confirmation_retry"
+
+
+def test_rejected_start_remains_at_risk_and_retries_throughout_block(monkeypatch):
     _smart_settings(monkeypatch)
     now = datetime.now(timezone.utc)
     state = FakeState({
         "tesla_charger_phases": 3,
         "tesla_charger_voltage": 230,
         "tesla_charge_current_max": 24,
-        "tesla_charge_current_request": 16,
+        "tesla_charge_current_request": 24,
         "tesla_charge_current_request_updated_at": now.timestamp(),
     })
     tesla = FakeTesla(is_charging=False)
@@ -1444,18 +1808,92 @@ def test_rejected_start_is_retried_in_one_minute_then_suppresses_block(monkeypat
     c._suppress_smart_block = lambda smart, at: suppressed.append(at)
     c._smart_block_is_suppressed = lambda smart: bool(suppressed)
 
-    for seconds in (0, 30, 61, 122, 183):
+    for seconds in (0, 30, 61, 122, 183, 244):
         c._last_command_ts = 0
         c._control_charging(now=now + timedelta(seconds=seconds))
 
-    assert len(starts) == 3
-    assert len(suppressed) == 1
-    assert c._smart_start_pending is None
-    assert c.global_state["ev_smart_charge_controller_status"] == "manual_override"
+    assert len(starts) == 5
+    assert suppressed == []
+    assert c._smart_start_pending["attempts"] == 5
+    assert c.global_state["ev_smart_charge_controller_status"] == "at_risk"
+    assert c.global_state["ev_smart_charge_controller_reason"] == (
+        "start_not_confirmed_retrying"
+    )
 
 
-def test_smart_sub_five_amp_target_calls_existing_setter_only_once(monkeypatch):
-    """TeslaApi itself owns the documented deliberate double-send workaround."""
+def test_owned_fallback_start_inside_its_window_is_adopted_and_set_to_full_rate(
+        monkeypatch):
+    _smart_settings(monkeypatch, EV_CHARGER_MAX_AMPS="25")
+    observed = datetime.now(timezone.utc)
+    now = observed.replace(
+        minute=(observed.minute // 15) * 15, second=0, microsecond=0)
+    state = FakeState({
+        "tesla_charge_started_ts": now.timestamp() + 1,
+        "tesla_charge_current_request": 6,
+        "tesla_charge_current_request_updated_at": now.timestamp(),
+    })
+    tesla = FakeTesla(is_charging=True)
+    c = _charger(
+        monkeypatch, tesla, state=state, surplus_amps=0, charging_amps=6,
+    )
+    plan = _smart_plan(now, active=True, target_kw=2.0)
+    plan["latest_safe_start"] = now.isoformat()
+    plan["required_ac_kwh"] = 80.0
+    plan["expected_delivery_kw"] = 16.0
+    plan["completion_buffer_minutes"] = 0
+    c._smart_plan = plan
+    c._smart_schedule_signature = ("installed",)
+
+    assert c._control_charging(now=now + timedelta(seconds=5)) is True
+    assert c._smart_owns_charge is True
+    assert c._charge_mode == "smart"
+    assert ("amps", 25, 25.0) in tesla.calls
+    assert state["ev_smart_charge_controller_reason"] != "external_charge_in_progress"
+
+
+def test_owned_fallback_ownership_survives_controller_restart(
+        monkeypatch, tmp_path):
+    state_path = tmp_path / "controller-state.json"
+    _smart_settings(
+        monkeypatch,
+        EV_CHARGER_MAX_AMPS="25",
+        EV_SMART_CHARGE_CONTROLLER_STATE_PATH=str(state_path),
+    )
+    observed = datetime.now(timezone.utc)
+    now = observed.replace(
+        minute=(observed.minute // 15) * 15, second=0, microsecond=0)
+    state_path.write_text(json.dumps({
+        "schema_version": 1,
+        "sent": {},
+        "suppressed_blocks": {},
+        "owned_fallback": {
+            "job_id": "job-1",
+            "signature": ["job-1", now.date().isoformat(), 0, 0, 0, 52.1, 5.1],
+        },
+    }))
+    state = FakeState({
+        "tesla_charge_started_ts": now.timestamp() + 1,
+        "tesla_charge_current_request": 6,
+        "tesla_charge_current_request_updated_at": now.timestamp(),
+    })
+    tesla = FakeTesla(is_charging=True)
+    c = _charger(
+        monkeypatch, tesla, state=state, surplus_amps=0, charging_amps=6,
+    )
+    plan = _smart_plan(now, active=True, target_kw=2.0)
+    plan["latest_safe_start"] = now.isoformat()
+    plan["required_ac_kwh"] = 80.0
+    plan["expected_delivery_kw"] = 16.0
+    plan["completion_buffer_minutes"] = 0
+    c._smart_plan = plan
+
+    assert c._control_charging(now=now + timedelta(seconds=5)) is True
+    assert c._smart_owns_charge is True
+    assert ("amps", 25, 25.0) in tesla.calls
+
+
+def test_partial_smart_block_uses_full_current_not_a_sub_five_request(monkeypatch):
+    """Partial energy changes duration, not the initial grid-charge current."""
     _smart_settings(monkeypatch, EV_CHARGER_MAX_AMPS="24")
     now = datetime.now(timezone.utc)
     state = FakeState({
@@ -1465,11 +1903,34 @@ def test_smart_sub_five_amp_target_calls_existing_setter_only_once(monkeypatch):
     })
     tesla = FakeTesla(is_charging=False)
     c = _charger(monkeypatch, tesla, state=state, surplus_amps=0, charging_amps=0)
-    c._smart_plan = _smart_plan(now, target_kw=2.8)  # floor(2800 / 690) = 4 A
+    c._smart_plan = _smart_plan(now, target_kw=2.8)
 
     c._control_charging()
 
-    assert tesla.calls.count(("amps", 4, 24.0)) == 1
+    assert tesla.calls.count(("amps", 24, 24.0)) == 1
+    assert "start" in tesla.calls
+
+
+def test_distinct_smart_block_sends_and_verifies_a_fresh_current_command(monkeypatch):
+    """A confirmed prior block must never make the next block skip its max-current command."""
+    _smart_settings(monkeypatch, EV_CHARGER_MAX_AMPS="25")
+    now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    tesla = FakeTesla(is_charging=False)
+    c = _charger(monkeypatch, tesla, surplus_amps=0, charging_amps=0)
+    c._last_commanded_amps = 25
+    c._smart_current_pending = None
+
+    # Observe one between-block tick; it resets command acknowledgement ownership.
+    c._smart_plan = _smart_plan(now, active=False)
+    c._control_charging(now=now)
+    assert c._last_commanded_amps is None
+
+    # The following distinct block issues both a new ceiling and a start.
+    c._smart_plan = _smart_plan(now + timedelta(minutes=15), active=True)
+    c._last_command_ts = 0
+    c._control_charging(now=now + timedelta(minutes=15))
+
+    assert ("amps", 25, 25.0) in tesla.calls
     assert "start" in tesla.calls
 
 
@@ -1482,7 +1943,7 @@ def test_smart_target_amps_rejects_implausible_phase_voltage_telemetry(monkeypat
     })
     c = _charger(monkeypatch, FakeTesla(), state=state)
 
-    assert c._smart_target_amps({"requested_power_kw": 16.0}) == 23
+    assert c._smart_target_amps({"requested_power_kw": 16.0}) == 24
 
 
 def test_smart_target_amps_does_not_follow_dynamic_available_current(monkeypatch):
@@ -1494,11 +1955,11 @@ def test_smart_target_amps_does_not_follow_dynamic_available_current(monkeypatch
     })
     c = _charger(monkeypatch, FakeTesla(), state=state)
 
-    assert c._smart_target_amps({"requested_power_kw": 16.0}) == 23
+    assert c._smart_target_amps({"requested_power_kw": 16.0}) == 24
     assert c._smart_target_amps({"target_amps": 24}) == 24
 
 
-def test_positive_partial_tail_uses_one_amp_instead_of_being_treated_as_stopped(monkeypatch):
+def test_positive_partial_tail_uses_full_grid_current(monkeypatch):
     _smart_settings(monkeypatch, EV_CHARGER_MAX_AMPS="24")
     state = FakeState({
         "tesla_charger_phases": 3,
@@ -1507,7 +1968,7 @@ def test_positive_partial_tail_uses_one_amp_instead_of_being_treated_as_stopped(
     })
     c = _charger(monkeypatch, FakeTesla(), state=state)
 
-    assert c._smart_target_amps({"requested_power_kw": 0.1}) == 1
+    assert c._smart_target_amps({"requested_power_kw": 0.1}) == 24
 
 
 def test_smart_controller_does_not_chase_maxem_throttled_meter(monkeypatch):
@@ -1518,7 +1979,7 @@ def test_smart_controller_does_not_chase_maxem_throttled_meter(monkeypatch):
     c._smart_plan = _smart_plan(now, target_kw=11.04)  # 16 A at 3x230 V
     c._charge_mode = "smart"
     c._smart_owns_charge = True
-    c._last_commanded_amps = 16
+    c._last_commanded_amps = 24
     c._last_command_ts = 0
 
     assert c._control_charging() is True
@@ -1533,7 +1994,7 @@ def test_smart_controller_does_not_chase_maxem_available_current_oscillation(
         "tesla_charger_phases": 3,
         "tesla_charger_voltage": 230,
         "tesla_charge_current_max": 24,
-        "tesla_charge_current_request": 16,
+        "tesla_charge_current_request": 24,
         "tesla_charge_current_request_updated_at": now.timestamp(),
     })
     tesla = FakeTesla(is_charging=True)
@@ -1541,7 +2002,7 @@ def test_smart_controller_does_not_chase_maxem_available_current_oscillation(
     c._smart_plan = _smart_plan(now, target_kw=11.04)
     c._charge_mode = "smart"
     c._smart_owns_charge = True
-    c._last_commanded_amps = 16
+    c._last_commanded_amps = 24
     c._last_command_ts = 0
 
     assert c._control_charging(now=now) is True
@@ -1557,7 +2018,7 @@ def test_smart_controller_does_not_chase_maxem_available_current_oscillation(
 
     # It later releases the site constraint. Neither edge is a new command intent.
     state["tesla_charge_current_max"] = 24
-    state["tesla_charge_current_request"] = 16
+    state["tesla_charge_current_request"] = 24
     state["tesla_charge_current_request_updated_at"] = (
         now + timedelta(seconds=20)).timestamp()
     c.charging_amps = 16
@@ -1568,17 +2029,19 @@ def test_smart_controller_does_not_chase_maxem_available_current_oscillation(
                    for call in tesla.calls)
 
 
-def test_external_charge_outside_smart_block_is_never_stopped(monkeypatch):
+def test_external_charge_outside_smart_block_is_stopped(monkeypatch):
     _smart_settings(monkeypatch)
     now = datetime.now(timezone.utc)
     tesla = FakeTesla(is_charging=True)
     c = _charger(monkeypatch, tesla, surplus_amps=0, charging_amps=12)
     c._smart_plan = _smart_plan(now, active=False)
 
-    assert c._control_charging() is True
-    assert "stop" not in tesla.calls
-    assert tesla.calls == []
-    assert c.global_state["ev_smart_charge_controller_status"] == "manual_override"
+    assert c._control_charging() is False
+    assert tesla.calls == ["stop"]
+    assert c.global_state["ev_smart_charge_controller_status"] == "waiting"
+    assert c.global_state["ev_smart_charge_controller_reason"] == (
+        "unauthorized_charge_stopped"
+    )
 
 
 def test_plug_triggered_charge_outside_smart_block_is_stopped(monkeypatch):
@@ -1601,9 +2064,7 @@ def test_plug_triggered_charge_outside_smart_block_is_stopped(monkeypatch):
     assert c._control_charging(now=now + timedelta(seconds=5)) is False
     assert tesla.calls == ["stop"]
     assert state["ev_smart_charge_controller_status"] == "waiting"
-    assert state["ev_smart_charge_controller_reason"] == (
-        "automatic_plug_start_outside_block"
-    )
+    assert state["ev_smart_charge_controller_reason"] == "unauthorized_charge_stopped"
 
 
 def test_plug_triggered_charge_inside_smart_block_is_adopted(monkeypatch):
@@ -1634,7 +2095,7 @@ def test_plug_triggered_charge_inside_smart_block_is_adopted(monkeypatch):
     assert c._charge_mode == "smart"
 
 
-def test_later_manual_start_while_still_plugged_remains_external(monkeypatch):
+def test_later_tesla_app_start_while_still_plugged_is_stopped(monkeypatch):
     _smart_settings(monkeypatch)
     now = datetime.now(timezone.utc)
     state = FakeState({
@@ -1653,11 +2114,11 @@ def test_later_manual_start_while_still_plugged_remains_external(monkeypatch):
     )
     c._smart_plan = _smart_plan(now, active=False)
 
-    assert c._control_charging(now=now + timedelta(seconds=5)) is True
-    assert tesla.calls == []
-    assert state["ev_smart_charge_controller_status"] == "manual_override"
+    assert c._control_charging(now=now + timedelta(seconds=5)) is False
+    assert tesla.calls == ["stop"]
+    assert state["ev_smart_charge_controller_status"] == "waiting"
     assert state["ev_smart_charge_controller_reason"] == (
-        "external_charge_in_progress"
+        "unauthorized_charge_stopped"
     )
 
 
@@ -1687,12 +2148,10 @@ def test_plug_triggered_charge_during_unavailable_solar_slot_is_stopped(
 
     assert c._control_charging(now=now + timedelta(seconds=5)) is False
     assert tesla.calls == ["stop"]
-    assert state["ev_smart_charge_controller_reason"] == (
-        "automatic_plug_start_outside_block"
-    )
+    assert state["ev_smart_charge_controller_reason"] == "unauthorized_charge_stopped"
 
 
-def test_external_start_then_stop_is_not_reversed_in_same_smart_block(
+def test_tesla_app_stop_is_reversed_inside_authorized_smart_block(
         monkeypatch, tmp_path):
     _smart_settings(
         monkeypatch,
@@ -1704,15 +2163,15 @@ def test_external_start_then_stop_is_not_reversed_in_same_smart_block(
     c._smart_plan = _smart_plan(now, active=True)
 
     assert c._control_charging(now=now) is True
-    assert tesla.calls == []
+    assert c._smart_owns_charge is True
+    tesla.calls.clear()
 
-    # The user stops their externally-started charge. The same selected block is durably
-    # suppressed, so automation cannot send current/start and reverse that manual stop.
+    # A Tesla-app stop does not outrank the active controller block.
     tesla.is_charging = False
     c.charging_amps = 0
-    assert c._control_charging(now=now + timedelta(minutes=1)) is False
-    assert tesla.calls == []
-    assert c.global_state["ev_smart_charge_controller_reason"] == "charge_block_suppressed"
+    c._last_command_ts = 0
+    assert c._control_charging(now=now + timedelta(minutes=1)) is True
+    assert "start" in tesla.calls
 
 
 def test_owned_smart_charge_stops_after_block_transition(monkeypatch):
@@ -2176,7 +2635,7 @@ def test_removing_invalid_owned_fallback_stops_charge_it_started(monkeypatch):
     assert "stop" in tesla.calls
 
 
-def test_far_fallback_cleanup_does_not_stop_manual_charge_when_owned_ids_absent(
+def test_far_fallback_cleanup_stops_unauthorized_charge_when_owned_ids_absent(
         monkeypatch):
     _smart_settings(monkeypatch)
     now = datetime(2026, 7, 21, 8, 0, tzinfo=timezone.utc)
@@ -2196,10 +2655,11 @@ def test_far_fallback_cleanup_does_not_stop_manual_charge_when_owned_ids_absent(
     plan["completion_buffer_minutes"] = 30
     c._smart_plan = plan
 
-    assert c._control_charging(now=now) is True
+    assert c._control_charging(now=now) is False
 
-    assert "stop" not in tesla.calls
-    assert c.global_state["ev_smart_charge_controller_status"] == "manual_override"
+    assert ("remove_schedule", ecc.SMART_OWNED_SCHEDULE_ID) in tesla.calls
+    assert "stop" in tesla.calls
+    assert c.global_state["ev_smart_charge_controller_status"] == "waiting"
 
 
 def test_invalid_fallback_cleanup_keeps_stop_ownership_until_retry_succeeds(
@@ -2375,7 +2835,8 @@ def test_refresh_loads_plan_and_durable_job_from_configured_paths(monkeypatch):
     assert c._smart_job_loaded is True
 
 
-def test_user_stop_during_owned_active_block_is_not_restarted(monkeypatch, tmp_path):
+def test_tesla_app_stop_during_owned_active_block_is_restarted(
+        monkeypatch, tmp_path):
     state_path = tmp_path / "controller-state.json"
     _smart_settings(monkeypatch, EV_SMART_CHARGE_CONTROLLER_STATE_PATH=str(state_path))
     now = datetime.now(timezone.utc)
@@ -2384,20 +2845,16 @@ def test_user_stop_during_owned_active_block_is_not_restarted(monkeypatch, tmp_p
     c._smart_plan = _smart_plan(now)
     c._charge_mode = "smart"
     c._smart_owns_charge = True
-    c._last_commanded_amps = 16
+    c._last_commanded_amps = 24
 
-    assert c._control_charging(now=now) is False
-    assert tesla.calls == []
-    assert c._smart_owns_charge is False
-    assert c.global_state["ev_smart_charge_controller_status"] == "manual_override"
-
-    # Still inside the same slot: no current/start retry, even after process-local ownership
-    # was relinquished.
-    c._control_charging(now=now + timedelta(minutes=1))
-    assert tesla.calls == []
+    assert c._control_charging(now=now) is True
+    assert ("amps", 24, 24.0) in tesla.calls
+    assert "start" in tesla.calls
+    assert c._smart_owns_charge is True
 
 
-def test_stopped_owned_block_suppression_survives_controller_restart(monkeypatch, tmp_path):
+def test_our_gui_stop_block_suppression_survives_controller_restart(
+        monkeypatch, tmp_path):
     state_path = tmp_path / "controller-state.json"
     _smart_settings(monkeypatch, EV_SMART_CHARGE_CONTROLLER_STATE_PATH=str(state_path))
     now = datetime.now(timezone.utc)
@@ -2408,6 +2865,8 @@ def test_stopped_owned_block_suppression_survives_controller_restart(monkeypatch
     first._smart_plan = plan
     first._charge_mode = "smart"
     first._smart_owns_charge = True
+    first._intent_off_edge = True
+    first._fresh_stop_request = True
     first._control_charging(now=now)
 
     restarted_tesla = FakeTesla(is_charging=False)
@@ -2419,7 +2878,28 @@ def test_stopped_owned_block_suppression_survives_controller_restart(monkeypatch
     assert restarted.global_state["ev_smart_charge_controller_status"] == "manual_override"
 
 
-def test_distinct_later_block_can_resume_after_prior_block_suppression(monkeypatch, tmp_path):
+def test_our_gui_stop_suppresses_active_block_without_process_ownership(
+        monkeypatch, tmp_path):
+    """An explicit dashboard Stop wins even after ownership state was lost."""
+    state_path = tmp_path / "controller-state.json"
+    _smart_settings(monkeypatch, EV_SMART_CHARGE_CONTROLLER_STATE_PATH=str(state_path))
+    now = datetime.now(timezone.utc)
+    tesla = FakeTesla(is_charging=True)
+    c = _charger(monkeypatch, tesla, surplus_amps=0, charging_amps=16)
+    c._smart_plan = _smart_plan(now)
+    c._smart_owns_charge = False
+    c._charge_mode = None
+    c._intent_off_edge = True
+    c._fresh_stop_request = True
+
+    c._control_charging(now=now)
+
+    assert "stop" in tesla.calls
+    assert c._smart_block_is_suppressed(c._smart_plan_context(now=now)) is True
+
+
+def test_distinct_later_block_can_resume_after_our_gui_stop_suppression(
+        monkeypatch, tmp_path):
     state_path = tmp_path / "controller-state.json"
     _smart_settings(monkeypatch, EV_SMART_CHARGE_CONTROLLER_STATE_PATH=str(state_path))
     now = datetime.now(timezone.utc)
@@ -2428,7 +2908,11 @@ def test_distinct_later_block_can_resume_after_prior_block_suppression(monkeypat
     c._smart_plan = _smart_plan(now)
     c._charge_mode = "smart"
     c._smart_owns_charge = True
-    c._control_charging(now=now)  # records the first-block manual/no-power stop
+    c._intent_off_edge = True
+    c._fresh_stop_request = True
+    c._control_charging(now=now)
+    c._intent_off_edge = False
+    c._fresh_stop_request = False
     tesla.calls.clear()
 
     later = now + timedelta(minutes=20)
@@ -2436,7 +2920,7 @@ def test_distinct_later_block_can_resume_after_prior_block_suppression(monkeypat
     c._last_command_ts = 0
     c._control_charging(now=later)
 
-    assert ("amps", 10, 24.0) in tesla.calls
+    assert ("amps", 24, 24.0) in tesla.calls
     assert "start" in tesla.calls
 
 

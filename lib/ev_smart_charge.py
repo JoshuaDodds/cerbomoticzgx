@@ -395,6 +395,8 @@ def _normalise_slots(slots: Sequence[Mapping], provisional_price: float,
             "provisional_price": provisional_price,
             "safe_capacity_kwh": max(0.0, safe_capacity),
             "planning_capacity_kwh": max(0.0, safe_capacity),
+            "available_duration_h": SLOT_MINUTES / 60.0,
+            "committed": False,
             # Price and supply horizons are independent. A future quarter may
             # have a provisional grid price while its PV/source is not forecast
             # yet; never present that uncertainty as a confirmed grid choice.
@@ -734,7 +736,22 @@ def _allocate_daily_paced(candidates: list[dict], required_kwh: float,
 def _serialise_slots(selected):
     result = []
     for slot, energy, costing in selected:
-        requested_power = energy / (SLOT_MINUTES / 60.0)
+        available_duration_h = max(
+            _EPSILON, float(slot.get("available_duration_h") or SLOT_MINUTES / 60.0))
+        safe_power = slot["planning_capacity_kwh"] / available_duration_h
+        # Grid/mixed blocks are executed at the full expected site-safe rate,
+        # with a shorter final interval when only a partial quarter's energy is
+        # required. This matches the controller's one-time max-current request
+        # and avoids presenting a fictitious low-current tail in the Timeline.
+        # Solar-only blocks retain the whole forecast quarter because their live
+        # current follows whatever protected surplus is actually available.
+        operation_duration_h = available_duration_h
+        if costing["supply"] != "solar" and safe_power > _EPSILON:
+            operation_duration_h = min(
+                available_duration_h, energy / safe_power)
+        requested_power = energy / max(_EPSILON, operation_duration_h)
+        end_dt = _elapsed_add(
+            slot["start_dt"], seconds=operation_duration_h * 3600.0)
         known_unit_cost = (
             costing["estimated_cost"] / energy
             if costing["estimated_cost"] is not None else None
@@ -742,13 +759,13 @@ def _serialise_slots(selected):
         provisional_unit_cost = costing["provisional_cost"] / energy
         result.append({
             "start": slot["start_dt"].isoformat(),
-            "end": slot["end_dt"].isoformat(),
+            "end": end_dt.isoformat(),
             "energy_kwh": round(energy, 6),
             "planned_ev_kwh": round(energy, 6),
             "requested_power_kw": round(requested_power, 6),
             "safe_energy_cap_kwh": round(slot["planning_capacity_kwh"], 6),
-            "safe_power_cap_kw": round(
-                slot["planning_capacity_kwh"] / (SLOT_MINUTES / 60.0), 6),
+            "safe_power_cap_kw": round(safe_power, 6),
+            "committed": bool(slot.get("committed")),
             "pv_energy_kwh": round(costing["pv_kwh"], 6),
             "grid_energy_kwh": round(costing["grid_kwh"], 6),
             "grid_price_eur_per_kwh": slot["grid_price"],
@@ -930,7 +947,13 @@ def _build_timeline_slots(candidates, selected_slots, initial_soc,
                 "requested_power_kw": 0.0,
                 "safe_energy_cap_kwh": round(slot_capacity, 6),
                 "safe_power_cap_kw": round(
-                    slot_capacity / (SLOT_MINUTES / 60.0), 6),
+                    slot_capacity / max(
+                        _EPSILON,
+                        float(candidate.get("available_duration_h")
+                              or SLOT_MINUTES / 60.0),
+                    ),
+                    6,
+                ),
                 "grid_price_eur_per_kwh": candidate["grid_price"],
                 "pv_opportunity_cost_eur_per_kwh": candidate["pv_opportunity_cost"],
                 "effective_cost_eur_per_kwh": (
@@ -1030,6 +1053,7 @@ def plan_charge(
     completion_buffer_minutes=DEFAULT_COMPLETION_BUFFER_MINUTES,
     block_start_penalty_eur=DEFAULT_BLOCK_START_PENALTY_EUR,
     unknown_price_eur_per_kwh=None,
+    committed_slot_starts=(),
 ) -> dict:
     """Build the minimum-cost quarter-hour EV load plan before a deadline.
 
@@ -1075,14 +1099,34 @@ def plan_charge(
     global_slot_capacity = delivery * SLOT_MINUTES / 60.0
     normalised_slots = _normalise_slots(
         slots, fallback_price, global_slot_capacity)
+    current_start = _floor_quarter(planned_at)
+    committed_timestamps = set()
+    for value in committed_slot_starts or ():
+        committed_timestamps.add(round(
+            _aware_datetime(value, "committed_slot_starts").timestamp()))
+    for slot in normalised_slots:
+        if round(slot["start_dt"].timestamp()) in committed_timestamps:
+            slot["committed"] = True
+        if (
+            slot["start_dt"].timestamp() <= planned_at.timestamp()
+            < slot["end_dt"].timestamp()
+        ):
+            remaining_seconds = max(
+                0.0, slot["end_dt"].timestamp() - planned_at.timestamp())
+            remaining_fraction = min(1.0, remaining_seconds / SLOT_SECONDS)
+            slot["available_duration_h"] = remaining_seconds / 3600.0
+            slot["safe_capacity_kwh"] *= remaining_fraction
+            slot["planning_capacity_kwh"] *= remaining_fraction
+            slot["pv_surplus_kwh"] *= remaining_fraction
 
     stored_required = max(0.0, (model.target_soc - current) / 100.0 * capacity)
     ac_required = stored_required / efficiency
     cutoff = _elapsed_add(model.ready_by, seconds=-buffer_minutes * 60.0)
-    first_start = _ceil_quarter(planned_at)
+    first_start = current_start
     eligible = [
         slot for slot in normalised_slots
         if slot["start_dt"].timestamp() >= first_start.timestamp()
+        and slot["end_dt"].timestamp() > planned_at.timestamp() + _EPSILON
         and slot["end_dt"].timestamp() <= cutoff.timestamp() + _EPSILON
     ]
     latest_safe = _latest_capacity_safe_start(eligible, ac_required, first_start)
@@ -1110,6 +1154,10 @@ def plan_charge(
         "required_stored_kwh": round(stored_required, 6),
         "required_ac_kwh": round(ac_required, 6),
         "unknown_price_assumption_eur_per_kwh": round(fallback_price, 6),
+        "committed_slot_starts": [
+            slot["start_dt"].isoformat()
+            for slot in eligible if slot.get("committed")
+        ],
     })
 
     if model.status == "paused":
@@ -1149,11 +1197,26 @@ def plan_charge(
     horizon_hours = max(
         0.0, (cutoff.timestamp() - first_start.timestamp()) / 3600.0)
     daily_paced = horizon_hours > DAILY_PACING_MIN_HORIZON_HOURS
+    committed = []
+    remaining_required = ac_required
+    for slot in eligible:
+        if not slot.get("committed") or remaining_required <= _EPSILON:
+            continue
+        energy = min(slot["planning_capacity_kwh"], remaining_required)
+        if energy > _EPSILON:
+            committed.append((slot, energy, _slot_cost(slot, energy)))
+            remaining_required -= energy
+    uncommitted = [slot for slot in eligible if not slot.get("committed")]
     if daily_paced:
         selected, shortfall = _allocate_daily_paced(
-            eligible, ac_required, start_penalty, model.ready_by.tzinfo)
+            uncommitted, remaining_required, start_penalty, model.ready_by.tzinfo)
     else:
-        selected, shortfall = _allocate(eligible, ac_required, start_penalty)
+        selected, shortfall = _allocate(
+            uncommitted, remaining_required, start_penalty)
+    selected = sorted(
+        committed + selected,
+        key=lambda item: item[0]["start_dt"].timestamp(),
+    )
     serialised_slots = _serialise_slots(selected)
     timeline_slots = _build_timeline_slots(
         eligible,

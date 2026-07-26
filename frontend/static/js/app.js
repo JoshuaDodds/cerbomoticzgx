@@ -2,8 +2,8 @@
 
 // Canonical control action (what we COMMAND): IDLE / RETAIN / BUY / SELL.
 // One label everywhere so the console, UI and history agree.
-const CONTROL_CLASS = { IDLE: "mode-idle", RETAIN: "mode-retain", BUY: "mode-buy", SELL: "mode-sell" };
-const CONTROL_COLORVAR = { IDLE: "idle", RETAIN: "retain", BUY: "buy", SELL: "sell" };
+const CONTROL_CLASS = { IDLE: "mode-idle", RETAIN: "mode-retain", BUY: "mode-buy", SELL: "mode-sell", UNKNOWN: "mode-unknown" };
+const CONTROL_COLORVAR = { IDLE: "idle", RETAIN: "retain", BUY: "buy", SELL: "sell", UNKNOWN: "unknown" };
 const CONTROL_BATTERY = {
   IDLE: "Victron-managed (self-consume / charge surplus PV / export when full)",
   RETAIN: "held — house load covered from the grid",
@@ -811,15 +811,66 @@ function timelineBar(hour) {
   return bar;
 }
 
+function evObservedTiming(s) {
+  const observedFrom = s && s.actual_ev_observed_from;
+  const observedUntil = s && s.actual_ev_observed_until;
+  const timingQuality = String((s && s.actual_ev_timing_quality) || "");
+  if (observedFrom && timingQuality === "meter_transition") {
+    return `${hm24(observedFrom)}–${observedUntil ? hm24(observedUntil) : "stop not observed"} · ABB power transitions`;
+  }
+  if (observedFrom && timingQuality === "first_active_observation") {
+    return `Active when first observed at ${hm24(observedFrom)}${observedUntil ? `; stopped ${hm24(observedUntil)}` : ""}`;
+  }
+  if (observedFrom && timingQuality === "first_idle_observation") {
+    return `Charging began ${hm24(observedFrom)}; already idle when the service next observed it${observedUntil ? ` at ${hm24(observedUntil)}` : ""}`;
+  }
+  if (observedFrom && observedUntil) {
+    return `Energy measured during ${hm24(observedFrom)}–${hm24(observedUntil)}; exact start/stop was not recorded`;
+  }
+  return "Exact charging time unavailable";
+}
+
 function slotDetail(s) {
   const d = el("div", "slot-detail");
+  const settled = !!s.settled;
+  const evEnergy = Number(settled ? s.actual_ev_kwh : s.planned_ev_kwh);
+  const evKw = Number(settled ? s.actual_ev_avg_kw : s.ev_target_kw);
+  const evSocStart = s.ev_soc_start == null ? NaN : Number(s.ev_soc_start);
+  const evSocEnd = s.ev_soc_end == null ? NaN : Number(s.ev_soc_end);
+  const evSupply = escapeHtml(String(s.ev_supply || "grid"));
+  const evGrid = Number(s.actual_ev_grid_kwh);
+  const evNonGrid = Number(s.actual_ev_non_grid_kwh);
+  const evCost = Number(s.actual_ev_grid_cost_eur);
+  let evDetail = "";
+  const evVisible = Number.isFinite(evEnergy)
+    && evEnergy > (settled ? 0.02 : 0.001);
+  if (evVisible) {
+    if (settled) {
+      const source = Number.isFinite(evGrid) && Number.isFinite(evNonGrid)
+        ? `${evGrid.toFixed(2)} kWh grid · ${evNonGrid.toFixed(2)} kWh PV/home battery`
+        : "Source attribution unavailable";
+      const timing = evObservedTiming(s);
+      evDetail = `<div><small>EV energy delivered</small>${evEnergy.toFixed(2)} kWh actual</div>
+        <div><small>EV observed timing</small>${timing}</div>
+        <div><small>EV average charge rate</small>${Number.isFinite(evKw) ? `${evKw.toFixed(1)} kW` : "—"}</div>
+        <div><small>EV supply attribution</small>${source}</div>
+        <div><small>EV grid cost attributed</small>${Number.isFinite(evCost) ? `€${evCost.toFixed(2)}` : "—"}</div>
+        <div><small>EV battery SoC</small>${Number.isFinite(evSocStart) && Number.isFinite(evSocEnd)
+          ? `${evSocStart.toFixed(1)}% → ${evSocEnd.toFixed(1)}%` : "—"}</div>`;
+    } else {
+      evDetail = `<div><small>EV charge rate</small>${evKw.toFixed(1)} kW · ${evSupply}</div>
+        <div><small>EV battery SoC</small>${Number.isFinite(evSocStart) && Number.isFinite(evSocEnd)
+          ? `${evSocStart.toFixed(1)}% → ${evSocEnd.toFixed(1)}%` : "—"}</div>`;
+    }
+  }
   d.innerHTML = `<div><b>${chipFor(caOf(s))}</b> &nbsp; ${s.reason || ""}</div>
     <div class="grid">
       <div><small>buy / sell</small>€${Number(s.price || 0).toFixed(4)} / €${Number(s.sell || s.price || 0).toFixed(4)}</div>
-      <div><small>SoC</small>${socPair(s.soc_start, s.soc_end)}</div>
+      <div><small>Home battery SoC</small>${socPair(s.soc_start, s.soc_end)}</div>
       <div><small>grid (+imp/−exp)</small>${fmtGrid(s.grid_energy)} kWh</div>
       <div><small>production</small>${s.pv != null ? Number(s.pv).toFixed(2) + " kWh" : "—"}</div>
       <div><small>consumption</small>${s.load != null ? Number(s.load).toFixed(2) + " kWh" : "—"}</div>
+      ${evDetail}
       <div><small>reason code</small>${s.reason_code || "—"}</div>
     </div>`;
   return d;
@@ -859,14 +910,18 @@ function jumpToMobileViewTop(behavior = "smooth") {
 function hourRowInner(h) {
   const nowTag = h.is_current ? '<span class="now-tag">NOW</span>' : "";
   const evEnergy = Number(h.planned_ev_kwh || 0);
+  const actualEvEnergy = Number(h.actual_ev_kwh || 0);
   const evKw = Number(h.ev_target_kw || 0);
   const evSupply = ["solar", "mixed", "grid"].includes(String(h.ev_supply || "").toLowerCase())
     ? String(h.ev_supply).toLowerCase() : "grid";
+  const actualEvTag = actualEvEnergy > 0.02
+    ? `<span class="ev-hour-tag ev-actual" title="${actualEvEnergy.toFixed(2)} kWh measured EV energy">EV ${actualEvEnergy.toFixed(2)} kWh actual</span>`
+    : "";
   const evTag = evEnergy > 0.001
     ? `<span class="ev-hour-tag ev-supply-${evSupply}${h.ev_tentative ? " ev-tentative" : ""}" title="${evEnergy.toFixed(2)} kWh planned EV energy">EV ${evKw > 0 ? `${evKw.toFixed(1)} kW` : `${evEnergy.toFixed(2)} kWh`}</span>`
     : "";
   return (
-    `<span class="col-time"><span class="caret">▸</span>${h.label}${nowTag}${evTag}</span>` +
+    `<span class="col-time"><span class="caret">▸</span>${h.label}${nowTag}${actualEvTag}${evTag}</span>` +
     `<span class="col-bar"></span>` +
     `<span class="col-num">€${h.avg_price.toFixed(3)}</span>` +
     `<span class="col-num">${fmtGrid(h.grid_kwh)}</span>` +
@@ -926,12 +981,17 @@ function makeSlotRow(s) {
     : imp * Number(s.price) - projExp * sell;
   const gridStr = fmtGrid(g);
   const gridCell = idleStore ? `<span class='muted'>${gridStr}</span>` : gridStr;
-  const evEnergy = Number(s.planned_ev_kwh || 0);
-  const evKw = Number(s.ev_target_kw || 0);
+  const evEnergy = Number(settled ? s.actual_ev_kwh : s.planned_ev_kwh);
+  const evKw = Number(settled ? s.actual_ev_avg_kw : s.ev_target_kw);
   const evSupply = ["solar", "mixed", "grid"].includes(String(s.ev_supply || "").toLowerCase())
     ? String(s.ev_supply).toLowerCase() : "grid";
-  const evTag = evEnergy > 0.001
-    ? `<span class="ev-slot-tag ev-supply-${evSupply}${s.ev_tentative ? " ev-tentative" : ""}">EV ${evKw > 0 ? `${evKw.toFixed(1)} kW` : `${evEnergy.toFixed(2)} kWh`}</span>`
+  const actualTimingTitle = settled && s.actual_ev_observed_from
+    ? (s.actual_ev_timing_quality === "settlement_interval"
+      ? `Measured during ${hm24(s.actual_ev_observed_from)}–${hm24(s.actual_ev_observed_until)}; exact transition time unavailable`
+      : `ABB observed ${hm24(s.actual_ev_observed_from)}–${s.actual_ev_observed_until ? hm24(s.actual_ev_observed_until) : "active"}`)
+    : "Measured EV energy";
+  const evTag = evEnergy > (settled ? 0.02 : 0.001)
+    ? `<span class="ev-slot-tag ${settled ? "ev-actual" : `ev-supply-${evSupply}${s.ev_tentative ? " ev-tentative" : ""}`}" title="${settled ? actualTimingTitle : "Planned EV energy"}">EV ${settled ? `${evEnergy.toFixed(2)} kWh actual` : evKw > 0 ? `${evKw.toFixed(1)} kW` : `${evEnergy.toFixed(2)} kWh`}</span>`
     : "";
   sr.innerHTML =
     `<span><span class="slot-dot" style="background:var(--${slotColorVar(s)})"></span>${s.time.slice(11, 16)}</span>` +
@@ -1590,7 +1650,14 @@ function renderEvSmartCharge(data) {
   else if (payload.apply !== true && job && !message.textContent) {
     message.textContent = "Preview only — these planned times will not control the car. Existing excess-solar charging remains active.";
   }
-  else if (safeStatus === "infeasible") message.textContent = "The target cannot be reached in the available slots. Choose a later deadline or lower target.";
+  else if (safeStatus === "infeasible") {
+    const shortfall = evSmartNumber(plan, ["energy_shortfall_kwh"]);
+    const cutoff = plan.charge_cutoff ? new Date(plan.charge_cutoff) : null;
+    const cutoffText = cutoff && !Number.isNaN(cutoff.getTime())
+      ? cutoff.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", hour12: false})
+      : null;
+    message.textContent = `At risk — ${shortfall == null ? "some required energy" : `${shortfall.toFixed(1)} kWh`} cannot be scheduled${cutoffText ? ` before the ${cutoffText} safety cutoff` : " before the deadline"}. Charging all remaining available time.`;
+  }
   else if (safeStatus === "completed") message.textContent = "The requested charge target has been reached.";
   else if (safeStatus === "waiting_for_plug") message.textContent = "Connect the car by the plug-in time shown below to protect the deadline.";
 
@@ -1622,12 +1689,22 @@ function renderEvSmartCharge(data) {
     const provisionalCost = evSmartNumber(plan, ["provisional_incremental_cost_eur"]);
     const saving = evSmartNumber(plan, ["estimated_saving_eur", "estimated_saving", "estimated_savings_eur"]);
     const provisionalSaving = evSmartNumber(plan, ["provisional_saving_eur"]);
+    const cutoff = plan.charge_cutoff ? new Date(plan.charge_cutoff) : null;
     evSmartAddMetric(grid, "Battery goal", targetSoc == null ? null : `${currentSoc == null ? "" : `${currentSoc.toFixed(0)}% → `}${targetSoc.toFixed(0)}%`);
     evSmartAddMetric(grid, "Energy needed", energy == null ? null : `${energy.toFixed(1)} kWh`);
     evSmartAddMetric(grid, "Expected cost", cost != null ? `€${cost.toFixed(2)}`
       : provisionalCost == null ? null : `about €${provisionalCost.toFixed(2)}`);
     evSmartAddMetric(grid, "Saving vs now", saving != null ? `€${saving.toFixed(2)}`
       : provisionalSaving == null ? null : `about €${provisionalSaving.toFixed(2)}`);
+    evSmartAddMetric(
+      grid,
+      "Safety cutoff",
+      cutoff && !Number.isNaN(cutoff.getTime())
+        ? cutoff.toLocaleString([], {
+          weekday: "short", hour: "2-digit", minute: "2-digit", hour12: false,
+        })
+        : null,
+    );
     summary.appendChild(grid);
   }
 
@@ -2562,8 +2639,8 @@ async function refreshWeather() {
   } catch (e) { /* leave the placeholder */ }
 }
 
-// EV manual Start/Stop charge: sets the dedicated ev_charge_requested intent (independent of
-// grid assist); the controller then starts/stops the car with its safety checks.
+// EV manual Start/Stop: Start plus Grid assist is the explicit immediate grid-charge override.
+// Schedule and protected-PV authority remain independent; Stop is always imperative.
 document.querySelectorAll("[data-ev-charge]").forEach((btn) => {
   btn.addEventListener("click", async () => {
     const enabled = btn.getAttribute("data-ev-charge") === "start";

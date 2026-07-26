@@ -131,21 +131,140 @@ def test_settled_slots_for_today_are_schedule_shaped(monkeypatch, tmp_path):
         "actual_reward": 0.09,
         "actual_net_eur": 0.07,
         "actual_pv_kwh": 0.4,
+        "actual_load_kwh": 1.0,
+        "ev_charge_kwh": 0.6,
+        "ev_average_kw": 2.4,
+        "ev_grid_import_kwh": 0.06,
+        "ev_non_grid_kwh": 0.54,
+        "ev_grid_cost_eur": 0.012,
+        "ev_cost_quality": "proportional_site_load",
+        "ev_meter_quality": "measured",
+        "ev_soc_start": 40.0,
+        "ev_soc_end": 41.0,
         "soc_start": 10.0,
         "soc_end": 11.0,
         "price_buy": 0.2,
         "price_sell": 0.3,
     }
-    path.write_text(json.dumps(rec) + "\n")
+    cycle = {
+        "kind": "cycle",
+        "ts": (now + timedelta(minutes=15) - timedelta(milliseconds=50)).isoformat(),
+        "control_action": "SELL",
+        "realized_action": "IDLE",
+    }
+    path.write_text(json.dumps(cycle) + "\n" + json.dumps(rec) + "\n")
 
     slots = data.settled_slots_for_today((now + timedelta(hours=1)).isoformat())
 
     assert len(slots) == 1
     slot = slots[0]
     assert slot["settled"] is True
+    assert slot["control_action"] == "IDLE"
+    assert slot["planned_control_action"] == "IDLE"
+    assert slot["actual_action_quality"] == "cycle_observation"
     assert slot["grid_energy"] == -0.19999999999999998
     assert slot["pv"] == 0.4
     assert slot["actual_net_eur"] == 0.07
+    assert slot["actual_ev_kwh"] == 0.6
+    assert slot["actual_ev_avg_kw"] == 2.4
+    assert slot["actual_ev_grid_kwh"] == 0.06
+    assert slot["actual_ev_non_grid_kwh"] == 0.54
+    assert slot["actual_ev_grid_cost_eur"] == 0.012
+    assert slot["ev_soc_start"] == 40.0
+    assert slot["ev_soc_end"] == 41.0
+    assert slot["actual_ev_timing_quality"] == "settlement_interval"
+    assert slot["actual_ev_observed_from"] == now.isoformat()
+    assert slot["actual_ev_observed_until"] == (
+        now + timedelta(minutes=15)
+    ).isoformat()
+
+
+def test_settled_ev_history_uses_meter_session_boundaries_not_plan(
+        monkeypatch, tmp_path):
+    monkeypatch.setattr(data, "_env", lambda: {"HISTORY_DIR": str(tmp_path)})
+    now = datetime.now().astimezone().replace(
+        hour=11, minute=45, second=0, microsecond=0
+    )
+    records = [
+        {
+            "kind": "ev_charge_transition",
+            "ts": (now + timedelta(minutes=8)).isoformat(),
+            "event": "started",
+            "source": "abb_meter",
+            "timing_quality": "meter_transition",
+            "ev_w": 3540.0,
+        },
+        {
+            "kind": "cycle",
+            "ts": (now + timedelta(minutes=15, milliseconds=-50)).isoformat(),
+            "control_action": "BUY",
+            "realized_action": "IDLE",
+        },
+        {
+            "kind": "settlement",
+            "slot_start": now.isoformat(),
+            "slot_end": (now + timedelta(minutes=15)).isoformat(),
+            "predicted_control_action": "BUY",
+            "predicted_ev_charge_kwh": 4.0,
+            "ev_charge_kwh": 0.41,
+            "ev_meter_quality": "measured",
+            "actual_load_kwh": 0.5,
+        },
+        {
+            "kind": "ev_charge_transition",
+            "ts": (now + timedelta(minutes=49)).isoformat(),
+            "event": "stopped",
+            "source": "abb_meter",
+            "timing_quality": "meter_transition",
+            "ev_w": 4.0,
+        },
+    ]
+    path = tmp_path / f"ess-{now.date().isoformat()}.ndjson"
+    path.write_text("".join(json.dumps(record) + "\n" for record in records))
+
+    slot = data.settled_slots_for_today(
+        (now + timedelta(hours=1)).isoformat()
+    )[0]
+
+    assert slot["actual_ev_kwh"] == 0.41
+    assert "planned_ev_kwh" not in slot
+    assert slot["control_action"] == "IDLE"
+    assert slot["planned_control_action"] == "BUY"
+    assert slot["actual_ev_observed_from"] == (
+        now + timedelta(minutes=8)
+    ).isoformat()
+    assert slot["actual_ev_observed_until"] == (
+        now + timedelta(minutes=49)
+    ).isoformat()
+    assert slot["actual_ev_timing_quality"] == "meter_transition"
+
+
+def test_settled_slots_derive_ev_rate_and_cost_for_existing_history(monkeypatch, tmp_path):
+    monkeypatch.setattr(data, "_env", lambda: {"HISTORY_DIR": str(tmp_path)})
+    now = datetime.now().astimezone().replace(hour=1, minute=0, second=0, microsecond=0)
+    path = tmp_path / f"ess-{now.date().isoformat()}.ndjson"
+    path.write_text(json.dumps({
+        "kind": "settlement",
+        "slot_start": now.isoformat(),
+        "slot_end": (now + timedelta(minutes=15)).isoformat(),
+        "actual_import_kwh": 2.0,
+        "actual_cost": 0.4,
+        "actual_load_kwh": 2.0,
+        "ev_charge_kwh": 1.0,
+        "ev_meter_quality": "measured",
+        "price_buy": 0.2,
+    }) + "\n")
+
+    slot = data.settled_slots_for_today(
+        (now + timedelta(hours=1)).isoformat()
+    )[0]
+
+    assert slot["actual_ev_kwh"] == 1.0
+    assert slot["actual_ev_avg_kw"] == 4.0
+    assert slot["actual_ev_grid_kwh"] == 1.0
+    assert slot["actual_ev_non_grid_kwh"] == 0.0
+    assert slot["actual_ev_grid_cost_eur"] == 0.2
+    assert slot["ev_cost_quality"] == "proportional_site_load"
 
 
 def test_group_by_hour_aggregates_settled_actuals(monkeypatch, tmp_path):
@@ -192,6 +311,8 @@ def test_group_by_hour_exposes_compact_ev_schedule_annotations():
             "load": 4.3,
             "planned_ev_kwh": ev_kwh,
             "ev_target_kw": target_kw,
+            "ev_soc_start": 40.0 + offset / 15,
+            "ev_soc_end": 41.0 + offset / 15,
         }
         for offset, ev_kwh, target_kw in ((0, 4.0, 16.0), (15, 2.0, 8.0))
     ]
@@ -205,6 +326,8 @@ def test_group_by_hour_exposes_compact_ev_schedule_annotations():
     assert hour["ev_target_kw"] == 16.0
     assert hour["ev_supply"] == "solar"
     assert hour["ev_tentative"] is True
+    assert hour["ev_soc_start"] == 40.0
+    assert hour["ev_soc_end"] == 42.0
 
 
 def test_plan_exposes_ev_smart_charge_snapshot(monkeypatch, tmp_path):

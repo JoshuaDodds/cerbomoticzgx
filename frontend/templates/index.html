@@ -154,9 +154,11 @@
             <button id="ev-start" type="button" class="btn" data-ev-charge="start">Start charge</button>
             <button id="ev-stop" type="button" class="btn" data-ev-charge="stop">Stop charge</button>
           </div>
-          <p class="cfg-note">Manually request or stop an EV charge. This sets the dedicated
-            EV-charge intent (independent of grid assist); the controller then starts/stops the car
-            with its safety checks (only acts when the car is home and plugged in).</p>
+          <p class="cfg-note"><strong>Start charge</strong> plus <strong>Grid assist</strong>
+            authorizes an immediate grid-backed charge. A smart block or protected solar surplus
+            can charge independently. <strong>Stop charge</strong> always stops the car and
+            suppresses the current smart block (only acts when the car is home and plugged in,
+            except a safety stop may use confirmed local charger draw).</p>
         </div>
         <div class="card ev-smart-card">
           <div class="vehicle-card-head">
