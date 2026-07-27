@@ -1,5 +1,28 @@
 # TODO / roadmap
 
+- **Daikin ONECTA HVAC shadow validation** — Phase 1 now reads all four units in
+  one request every 20 minutes, publishes retained `hvac/#` state, and stores
+  correctly separated today/yesterday cumulative heating and cooling energy.
+  It is observational and off by default; do not use the data to alter the load
+  forecast until these future-data checks pass:
+
+  - Compare combined `today_total_kwh` with the ONECTA mobile app several times
+    over at least 7 complete cooling days and later 7 complete heating days.
+  - Verify midnight rollover moves the prior day's final total into
+    `yesterday_total_kwh` without combining the two 12-bucket halves.
+  - Confirm OAuth refresh remains unattended, the collector stays below the
+    200-call daily limit, and restarts do not duplicate fresh API reads.
+  - Correlate cumulative HVAC increments, powered modes, outdoor temperature and
+    AC base-load settlements; quantify reporting delay and shared-outdoor-unit
+    effects before fitting forecast features.
+  - Measure whether ONECTA's 0.1 kWh reporting resolution, two-hour source
+    buckets, and cloud delay are reliable enough for intraday correction or
+    only for next-day/model calibration. Never reinterpret cumulative energy
+    deltas as instantaneous HVAC power.
+  - Compare weather-only versus weather-plus-ONECTA holdout error. Apply no HVAC
+    forecast correction until multiple complete days show a material improvement
+    in both aggregate daily load and 15-minute settlement forecasts.
+
 - **Daily-net forecast calibration** — The Trends chart now treats intraday values as
   time-ordered forecast revisions rather than independent statistical samples: one latest
   value per 15-minute period, full observed range without outlier labels, complete-day
@@ -14,8 +37,21 @@
     `forecast_remaining_export_reward_eur`.
   - Recalculate error by time-to-settlement and attribute the positive bias to predicted
     import cost, export reward, or both. Check EV/appliance days separately.
+  - Investigate the repeatable intraday shape observed by the operator: the projected
+    final net starts highly profitable, falls roughly in step with realized grid cost
+    during scheduled BUY/charging, then rises again after buying finishes while the
+    system waits to SELL. For every forecast snapshot, verify the accounting identity
+    `projected final net = settled net so far + remaining export reward -
+    remaining import cost` and determine whether realized import/export is replacing
+    its corresponding forecast exactly once or being omitted/double-counted.
+  - Replay BUY, waiting, and SELL periods with fixed day-ahead prices and record
+    settled import cost/reward, remaining import cost/reward, SoC, PV/load revisions,
+    and optimizer plan changes separately. Distinguish legitimate forecast changes
+    caused by new load/PV/SoC evidence from a ledger/display bug that merely follows
+    cumulative spend or reward.
   - Tune the underlying forecast only after the component history identifies the source;
-    require lower morning/midday MAE without degrading the approximately €0.23 closing MAE.
+    require lower morning/midday MAE, smoother convergence through BUY/SELL settlement,
+    and no degradation of the approximately €0.23 closing MAE.
 
 - **Weather forecast validation / apply tuning** — The first 21-full-day validation
   found the original apply model harmful: load MAE was 0.2163 kWh/slot with weather
@@ -167,7 +203,18 @@ have been completed:
   taper. Do not auto-learn/apply these from one session.
 
 ## Onecta module for data and control of Daikin Airco units
-- Investigate and plan work on new hvac module for richer insight and schedule setting of airco units in home
+- Phase 0 discovery and Phase 1 monitoring are implemented. The four real units,
+  cumulative cooling/heating energy and retained `hvac/#` state are available.
+- A top-level HVAC page and separately gated, capability-driven manual controls
+  are implemented. Keep `ONECTA_CONTROL_ENABLED=False` until the disabled/read-only
+  presentation and each desired real-unit command have been reviewed manually.
+- Complete one real-unit command matrix for power, mode, setpoint, fan,
+  horizontal/vertical airflow, and Powerful; verify accepted commands converge
+  in the cached UI without manual refresh and remain within the daily API reserve.
+- Streamer is not advertised by any installed unit's official API capabilities;
+  revisit only if Daikin adds a readable/settable purification characteristic.
+- Continue multi-day shadow validation before allowing ONECTA data to alter load
+  forecasts. Scheduling and comfort-aware optimizer orchestration remain future work.
 
 # Bugs / Testing
 - None known at this time

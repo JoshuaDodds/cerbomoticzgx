@@ -6,6 +6,7 @@ INDEX_HTML = ROOT / "frontend" / "templates" / "index.html"
 APP_JS = ROOT / "frontend" / "static" / "js" / "app.js"
 APP_CSS = ROOT / "frontend" / "static" / "css" / "app.css"
 MOBILE_CSS = ROOT / "frontend" / "static" / "css" / "app.mobile.css"
+HVAC_JS = ROOT / "frontend" / "static" / "js" / "hvac.js"
 POWERFLOW_JS = ROOT / "frontend" / "static" / "js" / "powerflow.js"
 LIVE_PY = ROOT / "frontend" / "live.py"
 EVENT_HANDLER_PY = ROOT / "lib" / "event_handler.py"
@@ -106,6 +107,41 @@ def test_desktop_grid_and_house_phase_rows_match_solar_spacing():
     )
 
 
+def test_hvac_dashboard_uses_capability_driven_compact_controls():
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    js = HVAC_JS.read_text(encoding="utf-8")
+    css = APP_CSS.read_text(encoding="utf-8")
+    mobile_css = MOBILE_CSS.read_text(encoding="utf-8")
+
+    assert 'id="hvac-dashboard"' in html
+    assert "hvac-energy-rail" in js
+    assert "hvac-ring" in js
+    assert "hvac-segments" in js
+    assert "Reduces humidity while preserving room temperature" in js
+    assert "Circulates room air without heating or cooling" in js
+    assert "Automatically chooses heating or cooling" in js
+    assert 'title="${escapeHtml(help[value])}"' in js
+    assert "unit.cloud_connected === false" in js
+    assert 'status = "Offline"' in js
+    assert 'status = "Error"' in js
+    assert 'status = "Warning"' in js
+    assert "controlEnabled && unit.cloud_connected !== false" in js
+    assert "data-hvac-temp-step" in js
+    assert "temperatureSpec(unit)" in js
+    assert "spec.speed_modes" in js
+    assert 'spec[`${direction}_modes`]' in js
+    assert 'airflowControl(unit, unitControlEnabled, "horizontal")' in js
+    assert 'airflowControl(unit, unitControlEnabled, "vertical")' in js
+    assert 'send(card.dataset.hvacUnit, "temperature", next, null)' in js
+    assert "}, 700)" in js
+    assert 'fetch("/api/hvac", {cache: "no-store"})' in js
+    assert "/api/hvac/units/" in js
+    assert 'hour12: false' in js
+    assert ".hvac-unit.is-off:hover" in css
+    assert ".hvac-control-grid" in css
+    assert ".hvac-control-grid { grid-template-columns: 1fr;" in mobile_css
+
+
 def test_vehicle_tab_warns_only_when_disconnected_during_apparent_charging():
     app = APP_JS.read_text(encoding="utf-8")
     live = LIVE_PY.read_text(encoding="utf-8")
@@ -199,7 +235,7 @@ def test_overview_entry_precedes_ess_and_desktop_uses_power_flow_default():
 
     assert 'data-app-view="overview">Overview</a>' in html
     assert html.index('data-app-view="overview"') < html.index('data-app-view="ess"')
-    assert 'const APP_VIEWS = ["overview", "ess", "battery", "live"]' in js
+    assert 'const APP_VIEWS = ["overview", "ess", "battery", "hvac", "live"]' in js
     assert 'return "overview"' in js
     assert 'if (view === "overview" && !isMobileLayout()) activateTab("live")' in js
     assert 'body[data-app-view="ess"] .overview' in css

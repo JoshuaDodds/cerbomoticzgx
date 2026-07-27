@@ -20,6 +20,7 @@
         <a href="#overview" class="app-nav-link active" data-app-view="overview">Overview</a>
         <a href="#ess" class="app-nav-link" data-app-view="ess">ESS</a>
         <a href="#battery" class="app-nav-link" data-app-view="battery">Battery</a>
+        <a href="#hvac" id="hvac-nav-link" class="app-nav-link" data-app-view="hvac" hidden>HVAC</a>
         <a href="#live" class="app-nav-link" data-app-view="live">Victron</a>
       </nav>
     </div>
@@ -142,11 +143,11 @@
                     title="Force an on-demand status check now (healthy Fleet Telemetry is free; a disconnected or stale stream uses one budget-capped Fleet API read and may wake the car)">Refresh data</button>
           </div>
           <div id="vehicle"><span class="muted">waiting for vehicle status…</span></div>
-          <p class="cfg-note">Live status mirrored from the MQTT bus — read-only, no Tesla API cost.
+          <!-- <p class="cfg-note">Live status mirrored from the MQTT bus — read-only, no Tesla API cost.
             The controller only contacts the car when it needs to act (see the Tesla cost controls).
             <strong>Refresh data</strong> forces an on-demand status check now. Healthy Fleet
             Telemetry remains free; if its stream is disconnected or stale, one budget-capped
-            Fleet API read is used instead and may wake the car.</p>
+            Fleet API read is used instead and may wake the car.</p> -->
         </div>
         <div class="card">
           <h3 style="margin:2px 0 10px">Charge control</h3>
@@ -154,11 +155,11 @@
             <button id="ev-start" type="button" class="btn" data-ev-charge="start">Start charge</button>
             <button id="ev-stop" type="button" class="btn" data-ev-charge="stop">Stop charge</button>
           </div>
-          <p class="cfg-note"><strong>Start charge</strong> plus <strong>Grid assist</strong>
+          <!-- <p class="cfg-note"><strong>Start charge</strong> plus <strong>Grid assist</strong>
             authorizes an immediate grid-backed charge. A smart block or protected solar surplus
             can charge independently. <strong>Stop charge</strong> always stops the car and
             suppresses the current smart block (only acts when the car is home and plugged in,
-            except a safety stop may use confirmed local charger draw).</p>
+            except a safety stop may use confirmed local charger draw).</p> -->
         </div>
         <div class="card ev-smart-card">
           <div class="vehicle-card-head">
@@ -198,19 +199,19 @@
             <button type="button" class="btn-secondary" data-ev-smart-edit>Edit</button>
             <button type="button" class="btn-secondary btn-danger" data-ev-smart-cancel>Cancel job</button>
           </div>
-          <p class="cfg-note ev-smart-footnote">Smart-charge control uses the Tesla Fleet API only
+          <!-- <p class="cfg-note ev-smart-footnote">Smart-charge control uses the Tesla Fleet API only
             when its control toggle is enabled. Preview mode does not act on planned times; the
             existing excess-solar charging remains independent. Maxem always controls the actual
-            current available to the car.</p>
+            current available to the car.</p> -->
         </div>
         <div class="card">
           <h3 style="margin:2px 0 10px">Tesla API usage — this billing cycle (local estimate)</h3>
           <div id="vehicle-usage"><span class="muted">loading…</span></div>
-          <p class="cfg-note">Counted locally to <em>enforce</em> a hard spend cap (Tesla has no
+          <!-- <p class="cfg-note">Counted locally to <em>enforce</em> a hard spend cap (Tesla has no
             usage API — its Billing &amp; Usage page is authoritative). The estimate starts at
             the most recent portal reconciliation and then adds paid requests plus approximate
             live streaming signals. Its unrounded all-in estimate limits normal requests to
-            preserve a €0.25 margin below the monthly credit.</p>
+            preserve a €0.25 margin below the monthly credit.</p> -->
         </div>
       </section>
 
@@ -271,6 +272,12 @@
     </div>
   </section>
 
+  <section id="hvac-view" class="app-view hvac-view" aria-label="Daikin HVAC">
+    <div id="hvac-dashboard" class="hvac-dashboard">
+      <div class="card"><span class="muted">Loading HVAC state…</span></div>
+    </div>
+  </section>
+
   <section id="live-view" class="app-view live-view" aria-label="CerboGx">
     <div class="card live-frame-card">
       <iframe class="live-frame" src="https://venus.hs.mfis.net/gui-v2/" title="CerboGX system view"></iframe>
@@ -308,6 +315,7 @@
       </div>
       <div class="mobile-menu-group" aria-label="Application sections">
         <button type="button" data-mobile-app-view="battery">Battery</button>
+        <button type="button" id="hvac-mobile-link" data-mobile-app-view="hvac" hidden>HVAC</button>
         <button type="button" data-mobile-app-view="live">Victron</button>
       </div>
       <div class="mobile-menu-group" aria-label="Dashboard tabs">
@@ -327,6 +335,7 @@
        calls them defensively (try/catch) so a failure here can't break the rest. -->
   <script src="{{ url_for('static', filename='js/powerflow.js') }}"></script>
   <script src="{{ url_for('static', filename='js/charts.js') }}"></script>
+  <script src="{{ url_for('static', filename='js/hvac.js') }}"></script>
   <script src="{{ url_for('static', filename='js/app.js') }}"></script>
 </body>
 </html>

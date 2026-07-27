@@ -145,7 +145,7 @@ document.querySelectorAll(".tab").forEach((t) => {
 let firstRender = true;
 
 // ---- Top-level app views ----
-const APP_VIEWS = ["overview", "ess", "battery", "live"];
+const APP_VIEWS = ["overview", "ess", "battery", "hvac", "live"];
 function defaultAppViewName() {
   return "overview";
 }

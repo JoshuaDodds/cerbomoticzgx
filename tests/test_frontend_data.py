@@ -91,12 +91,31 @@ def test_numeric_config_writes_reject_values_outside_schema_bounds(tmp_path):
 
 
 def test_weather_behavior_toggles_are_first_in_weather_config_group():
-    weather = next(group for group in CONFIG_SCHEMA if group["group"] == "Weather Forecast")
+    weather = next(
+        group
+        for group in CONFIG_SCHEMA
+        if group["group"] == "Weather & HVAC Forecasting"
+    )
     keys = [setting["key"] for setting in weather["settings"]]
 
-    assert keys[:3] == ["WEATHER_ENABLED", "HVAC_LOAD_APPLY", "PV_WEATHER_APPLY"]
+    assert keys[:7] == [
+        "ONECTA_ENABLED",
+        "ONECTA_CONTROL_ENABLED",
+        "ONECTA_POLL_INTERVAL_MIN",
+        "ONECTA_EXPECTED_UNITS",
+        "WEATHER_ENABLED",
+        "HVAC_LOAD_APPLY",
+        "PV_WEATHER_APPLY",
+    ]
     assert "ADVISOR_CLI_CMD" not in keys
     assert "CLAUDE_CONFIG_DIR" not in keys
+    poll = next(
+        setting for setting in weather["settings"]
+        if setting["key"] == "ONECTA_POLL_INTERVAL_MIN"
+    )
+    assert "20" in poll["desc"]
+    assert "72" in poll["desc"]
+    assert "96" not in poll["desc"]
 
 
 def test_removed_grid_charge_price_caps_are_not_user_tunable():

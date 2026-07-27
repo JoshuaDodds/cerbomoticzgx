@@ -108,6 +108,45 @@ def api_weather():
     return jsonify(data.weather_dashboard())
 
 
+def _hvac_dashboard():
+    return import_module("lib.onecta_control").hvac_dashboard()
+
+
+def _hvac_control_command(unit_key, command, value):
+    module = import_module("lib.onecta_control")
+    return module.get_control_service().command(unit_key, command, value)
+
+
+@app.route("/api/hvac")
+def api_hvac():
+    """Return cached ONECTA state only; rendering the page never calls Daikin."""
+    return jsonify(_hvac_dashboard())
+
+
+@app.route("/api/hvac/units/<unit_key>/control", methods=["POST"])
+def api_hvac_control(unit_key):
+    """Apply one capability-validated command behind the separate control gate."""
+    payload = request.get_json(silent=True) or {}
+    command = str(payload.get("command") or "").strip()
+    if not command or "value" not in payload:
+        return jsonify({"ok": False, "error": "command and value are required"}), 400
+    try:
+        result = _hvac_control_command(unit_key, command, payload["value"])
+        return jsonify({"ok": True, "result": result}), (
+            202 if result.get("status") == "accepted" else 200
+        )
+    except ValueError as error:
+        return jsonify({"ok": False, "error": str(error)}), 400
+    except Exception as error:
+        module = import_module("lib.onecta_control")
+        if isinstance(error, module.OnectaControlDisabled):
+            return jsonify({"ok": False, "error": str(error)}), 403
+        if isinstance(error, module.OnectaControlBusy):
+            return jsonify({"ok": False, "error": str(error)}), 409
+        logging.warning("ONECTA dashboard control failed: %s", error)
+        return jsonify({"ok": False, "error": str(error)}), 503
+
+
 @app.route("/api/tesla/usage")
 def api_tesla_usage():
     """Today's Tesla Fleet API spend (counts + cost per category + total)."""
