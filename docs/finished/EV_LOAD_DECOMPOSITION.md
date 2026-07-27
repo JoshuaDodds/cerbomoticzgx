@@ -41,6 +41,12 @@ rather than being converted to zero. `ev_meter_quality` and
 unchanged for accounting compatibility; invalid data is not promoted into
 `base_load_kwh`.
 
+The high-frequency ABB power feed is also reduced to durable
+`ev_charge_transition` start/stop records using start/stop hysteresis. These are
+observational only and never participate in charge control. They let historical
+views distinguish an exact observed transition from a legacy 15-minute
+settlement interval; predictions are not used as historical charging activity.
+
 ## Learning from history
 
 `_historical_load_by_slot`:

@@ -9,6 +9,7 @@ from lib.config_retrieval import retrieve_setting
 from lib.victron_integration import regulate_battery_max_voltage, ac_power_setpoint
 from lib.global_state import GlobalStateClient
 from lib.notifications import pushover_notification_critical
+from lib.ev_history import record_ev_power_observation
 from lib.event_handler_appliances import handle_dryer_event, handle_dishwasher_event
 from lib.energy_broker import (
     manage_sale_of_stored_energy_to_the_grid,
@@ -159,6 +160,17 @@ class Event:
     def tesla_power(self):
         _value = round(self.value)
         self.gs_client.set("tesla_power_updated_at", time.time())
+        try:
+            record_ev_power_observation(
+                self.value,
+                history_dir=retrieve_setting("HISTORY_DIR") or "data/history",
+            )
+        except (OSError, ValueError, TypeError) as e:
+            # History is observational only: a storage failure must never
+            # interrupt live EV/load control.
+            logging.warning(
+                f"EvCharger: unable to record ABB power transition: {e}"
+            )
         self.adjust_ac_out_power()
         publish_message("Tesla/vehicle0/charging_watts", message=f"{_value}", retain=True)
         publish_message("Tesla/vehicle0/Ac/tesla_load", message=f"{_value}", retain=True)
@@ -209,6 +221,20 @@ class Event:
 
     def tesla_l3_current(self):
         self.update_charging_amp_totals()
+
+    def tesla_plug_status(self):
+        """Hydrate the controller-facing plug flag from the retained UI topic.
+
+        Fleet Telemetry's raw charge fields can legitimately be null while the
+        car sleeps. The normalized retained Plugged/Unplugged topic is therefore
+        the restart-safe last-known state and must rebuild ``tesla_is_plugged``
+        after GlobalState's tmpfs database is recreated.
+        """
+        normalised = str(self.value).strip().lower()
+        if normalised == "plugged":
+            self.gs_client.set("tesla_is_plugged", "True")
+        elif normalised == "unplugged":
+            self.gs_client.set("tesla_is_plugged", "False")
 
     #
     # calculation and helper methods

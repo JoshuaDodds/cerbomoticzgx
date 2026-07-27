@@ -429,6 +429,111 @@ def test_ev_smart_charge_delete_and_actions_delegate_to_control_module(monkeypat
     assert calls == ["delete", "pause"]
 
 
+def test_cancel_run_now_immediately_releases_module_owned_grid_assist(
+        monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        server,
+        "_delete_ev_smart_charge_job",
+        lambda: {
+            "id": "run-1",
+            "execution_mode": "run_now",
+            "run_now_grid_assist_owned": True,
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_set_grid_assist_toggle",
+        lambda enabled: calls.append(enabled),
+    )
+
+    response = server.app.test_client().delete("/api/ev/smart-charge")
+
+    assert response.status_code == 200
+    assert calls == [False]
+
+
+def test_cancel_run_now_preserves_preexisting_user_grid_assist(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        server,
+        "_delete_ev_smart_charge_job",
+        lambda: {
+            "id": "run-1",
+            "execution_mode": "run_now",
+            "run_now_grid_assist_owned": False,
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "_set_grid_assist_toggle",
+        lambda enabled: calls.append(enabled),
+    )
+
+    response = server.app.test_client().delete("/api/ev/smart-charge")
+
+    assert response.status_code == 200
+    assert calls == []
+
+
+def test_run_now_action_replans_and_enables_grid_assist(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        server,
+        "_act_on_ev_smart_charge_job",
+        lambda action: calls.append(("action", action)) or {
+            "id": "j1", "execution_mode": "run_now"},
+    )
+    monkeypatch.setattr(
+        server, "_set_grid_assist_toggle",
+        lambda enabled: calls.append(("grid", enabled)))
+    monkeypatch.setitem(
+        sys.modules,
+        "lib.energy_broker",
+        types.SimpleNamespace(
+            run_ai_optimizer=lambda **kwargs: (
+                kwargs["before_run"](),
+                calls.append(("replan",)),
+                True,
+            )[-1]),
+    )
+    response = server.app.test_client().post(
+        "/api/ev/smart-charge/action", json={"action": "run_now"})
+
+    assert response.status_code == 200
+    assert response.get_json()["replanned"] is True
+    assert calls == [
+        ("action", "run_now"),
+        ("grid", True),
+        ("replan",),
+    ]
+
+
+def test_run_now_does_not_mutate_job_or_grid_when_optimizer_remains_busy(
+        monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        server,
+        "_act_on_ev_smart_charge_job",
+        lambda action: calls.append(("action", action)),
+    )
+    monkeypatch.setattr(
+        server, "_set_grid_assist_toggle",
+        lambda enabled: calls.append(("grid", enabled)))
+    monkeypatch.setitem(
+        sys.modules,
+        "lib.energy_broker",
+        types.SimpleNamespace(
+            run_ai_optimizer=lambda **kwargs: False),
+    )
+
+    response = server.app.test_client().post(
+        "/api/ev/smart-charge/action", json={"action": "run_now"})
+
+    assert response.status_code == 503
+    assert calls == []
+
+
 def test_ev_smart_charge_save_uses_canonical_job_factory_and_live_soc(monkeypatch):
     calls = []
     fake = types.SimpleNamespace(

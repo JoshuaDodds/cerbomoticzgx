@@ -55,6 +55,57 @@ def test_mobile_powerflow_battery_card_budgets_height_for_all_bms_rows():
     assert "height: clamp(560px, 80vh, 650px)" in mobile_css
 
 
+def test_powerflow_cards_surface_grid_accounting_and_house_only_day_energy():
+    powerflow = POWERFLOW_JS.read_text(encoding="utf-8")
+    live = LIVE_PY.read_text(encoding="utf-8")
+
+    assert '"day_energy_last_update": "Tibber/home/energy/day/last_update"' in live
+    assert (
+        '"load_actual_today_wh": '
+        '"Cerbomoticzgx/GlobalState/consumption_total_cumulative"'
+    ) in live
+    assert (
+        '"ev_actual_today_kwh": "Cerbomoticzgx/GlobalState/ev_today_kwh"'
+    ) in live
+    for field in (
+        "pf-grid-import",
+        "pf-grid-export",
+        "pf-grid-updated",
+        "pf-house-today",
+    ):
+        assert field in powerflow
+    assert '["Import", "pf-grid-import-m"]' in powerflow
+    assert '["Export", "pf-grid-export-m"]' in powerflow
+    assert '["Updated", "pf-grid-updated-m"]' in powerflow
+    assert r"(\d{2}:\d{2}:\d{2})" in powerflow
+    assert '["Today", "pf-ev-today"]' in powerflow
+    assert 'V["pf-ev-today"]' in powerflow
+    assert "live.ev_actual_today_kwh" in powerflow
+    assert 'grid:  [["L1", "pf-grid-l1"]' not in powerflow
+    assert "const houseCardH = 128" in powerflow
+    assert "height: clamp(560px, 80vh, 650px)" in MOBILE_CSS.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_desktop_grid_and_house_phase_rows_match_solar_spacing():
+    powerflow = POWERFLOW_JS.read_text(encoding="utf-8")
+
+    assert "const desktopPhaseStep = r.h * 0.062" in powerflow
+    assert (
+        "const y = y0 + r.h * 0.47 + i * desktopPhaseStep"
+        in powerflow
+    )
+    assert (
+        "const y = y0 + r.h * 0.68 + i * desktopPhaseStep"
+        in powerflow
+    )
+    assert (
+        "const y = y0 + r.h * 0.66 + i * desktopPhaseStep"
+        in powerflow
+    )
+
+
 def test_vehicle_tab_warns_only_when_disconnected_during_apparent_charging():
     app = APP_JS.read_text(encoding="utf-8")
     live = LIVE_PY.read_text(encoding="utf-8")
@@ -73,6 +124,17 @@ def test_vehicle_refresh_is_a_primary_action():
         '<button id="vehicle-refresh" type="button" class="btn" '
         "data-vehicle-refresh"
     ) in html
+
+
+def test_run_now_is_a_primary_action_with_explicit_style():
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    css = APP_CSS.read_text(encoding="utf-8")
+
+    assert (
+        'class="btn-primary" data-ev-smart-action="run_now">Run Now</button>'
+        in html
+    )
+    assert ".btn-primary { background: var(--accent);" in css
 
 
 def test_abb_event_path_is_only_shared_current_topic_publisher():
@@ -299,7 +361,9 @@ def test_vehicle_tab_contains_smart_charge_job_form_and_readable_daily_plan():
     assert "function renderEvSmartCharge" in js
     assert "function evSmartDailyPlan" in js
     assert "function evSmartPopulateTimeOptions" in js
-    assert "Tesla app shows only the deadline safety fallback" in js
+    assert "the exact Tesla app schedule is shown below" in js
+    assert "Matches the visible charging block" in js
+    assert "Tesla deadline safety fallback" in js
     assert "Solar surplus is used when it costs less than the energy it replaces" in js
     assert 'source === "pending" ? "Source to be chosen"' in js
     assert "ev-charge-day" in js
@@ -319,6 +383,10 @@ def test_daily_schedule_has_compact_ev_annotation_hooks():
     assert "planned_ev_kwh" in js
     assert "ev_target_kw" in js
     assert "ev-slot-tag" in js
+    assert "EV battery SoC" in js
+    assert "EV charge rate" in js
+    assert "energy_shortfall_kwh" in js
+    assert "charge_cutoff" in js
 
 
 def test_mobile_non_schedule_navigation_jumps_to_top():

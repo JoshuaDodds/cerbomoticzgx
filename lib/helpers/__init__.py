@@ -2,6 +2,7 @@ import json
 import math
 import logging
 import time
+import uuid
 import paho.mqtt.client as mqtt
 
 from datetime import datetime
@@ -99,7 +100,10 @@ def get_current_value_from_mqtt(topic: str, timeout: float = 1.0, raw: bool = Fa
         completed = True
 
     # Initialize a new temporary MQTT client
-    temp_client = mqtt.Client(client_id="helper-message-retrieval-client")
+    # Multiple service instances may perform a retained-value read at the same
+    # time. A static ID makes Mosquitto evict one temporary reader.
+    temp_client = mqtt.Client(
+        client_id=f"cerbo-read-{uuid.uuid4().hex[:12]}")
     temp_client.on_connect = on_connect
     temp_client.on_message = on_message
 

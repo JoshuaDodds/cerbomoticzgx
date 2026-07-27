@@ -222,6 +222,7 @@
   .ev-smart-actions button { min-height: 40px; }
 
   .ev-charge-day { grid-template-columns: 1fr; gap: 8px; padding: 11px; }
+  .ev-tesla-schedule { grid-template-columns: 1fr; }
 
   .ev-charge-day-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 

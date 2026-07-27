@@ -73,6 +73,35 @@ def test_day_summary_normalises_pv_load_units():
     assert s["load_actual_kwh"] == 30.0
 
 
+def test_day_summary_includes_measured_ev_energy_and_attributed_grid_cost():
+    recs = [
+        {
+            "kind": "cycle",
+            "control_action": "IDLE",
+            "ev_actual_today_kwh": 4.2,
+        },
+        {
+            "kind": "settlement",
+            "slot_start": "2026-07-25T12:00:00+02:00",
+            "slot_end": "2026-07-25T12:15:00+02:00",
+            "ev_charge_kwh": 2.0,
+            "ev_meter_quality": "measured",
+            "ev_grid_import_kwh": 1.0,
+            "ev_non_grid_kwh": 1.0,
+            "ev_grid_cost_eur": 0.15,
+            "ev_cost_quality": "proportional_site_load",
+        },
+    ]
+
+    summary = _day_summary(recs)
+
+    assert summary["ev_charge_kwh"] == 4.2
+    assert summary["ev_grid_import_kwh_attributed"] == 1.0
+    assert summary["ev_non_grid_kwh_attributed"] == 1.0
+    assert summary["ev_grid_cost_eur_attributed"] == 0.15
+    assert summary["ev_sessions"] == 1
+
+
 def test_load_days_preserves_every_requested_summary_when_detail_budget_is_exhausted(monkeypatch):
     def fake_read_day(day):
         return [{

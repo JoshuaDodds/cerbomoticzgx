@@ -32,11 +32,15 @@ Current Features include:
 a Domoticz server via its REST API for monitoring and historic tracking
 - Modular - Individual modules can be enabled or disabled in the ```.env``` file    
 - Included a custom module which can be installed on a cerbo gx to read out ABB B2x kWh meters
-- EV Charge Controller - Tesla vehicle charging at lowest rates or using only excess solar energy,
-  with a dedicated manual **Start/Stop** control decoupled from the house-battery grid-assist toggle
-  (toggling grid-assist never starts or stops the car). Manual/grid starts first restore the
+- EV Charge Controller - Tesla vehicle charging at lowest rates or using only excess solar energy.
+  While the car is home and plugged in, this controller is authoritative: charging is permitted
+  only during an applied smart block, from protected PV surplus, or by the explicit combination
+  of Vehicle **Start** plus **Grid assist**. Neither manual flag starts the car by itself, and
+  Tesla-app/onboard starts cannot bypass those gates. Vehicle **Stop** is imperative and suppresses
+  the current smart block so the controller cannot immediately restart it. Manual/grid starts restore the
   configured full-rate request, bounded by the configured kW and per-phase ceilings, then confirm the pushed
-  requested-current state within 60 seconds and retry only once. Actual ABB delivery is observed
+  requested-current state within 60 seconds and continue guarded reconciliation while the
+  explicit override remains active. Actual ABB delivery is observed
   but never used to fight Maxem throttling; Maxem's transient
   `ChargeCurrentRequestMax` availability also does not rewrite the durable plan target.
 - **Deadline-aware EV smart charging** (off by default): create one target-SoC/ready-by job on
@@ -50,19 +54,48 @@ a Domoticz server via its REST API for monitoring and historic tracking
   battery up to `MINIMUM_ESS_SOC` before it is offered to the EV; unknown future sources remain
   visibly pending rather than being labelled as grid. Shorter jobs remain deadline-first.
   Live smart control requires Fleet Telemetry and confirms charge limit, requested current, and
-  charging state within 60 seconds. Current requests get one bounded retry; the less frequent
-  limit/schedule/start operations allow at most three attempts. ABB delivery is observed for
-  actual power flow but never used to fight Maxem throttling. While an applied job waits between
-  planned blocks, the established excess-PV path may advance it after the home battery reaches
+  charging state against pushed data. Saving or editing an applied job immediately makes its
+  target SoC a controller obligation, independently of the optimizer plan and Tesla fallback
+  schedule. The controller retries the limit at 60-second acknowledgement intervals until
+  `ChargeLimitSoc` confirms it; confirmed values are not resent. Current/start requests likewise
+  remain visibly `at_risk` and continue guarded reconciliation while their intent is active,
+  while owned schedule mutations remain bounded. ABB delivery is observed for actual power flow
+  but never used to fight Maxem throttling. Every Tesla write records a concise
+  `EvCharger [Tesla API]` sent/result line, with pushed confirmation logged separately. A command
+  rejected because the vehicle buses are asleep gets a 10-second passive grace and one command
+  retry before the controller spends an explicit wake; after that wake, command delivery waits
+  for Tesla's 10–60 second connection window instead of retrying immediately. While an
+  applied job waits between planned blocks, the established excess-PV path may advance it after the home battery reaches
   `MINIMUM_ESS_SOC`. A solar-only planned block is likewise capped to live surplus rather than
-  silently becoming a full-power grid block. A later manual/external start remains untouched;
-  Tesla's immediate charge-on-plug transition is stopped while an applied job is waiting, or
-  adopted when it occurs inside the selected block. Use the Vehicle-tab **Start** control for
-  unambiguous charge-now intent.
+  silently becoming a full-power grid block. Tesla's immediate charge-on-plug, app and onboard
+  starts are stopped whenever controller conditions do not authorize charging, or adopted and
+  reconciled when they occur during an authorized block. A Tesla-app/onboard stop during an active
+  block is likewise reconciled; only this dashboard's **Stop** suppresses that block. Use Vehicle
+  **Start** together with **Grid assist** for an intentional immediate grid-backed charge.
+  For an applied plan that fits one contiguous charging window on one day, **Run Now** moves
+  that window to the present, recalculates its cost/Timeline metadata, enables Grid assist,
+  replaces the application-owned Tesla schedule and verifies a configured-ceiling start. The
+  same visible window is installed in Tesla, with only its end rounded upward to minute
+  precision; multi-window plans show their separate continuous deadline fallback explicitly.
+  Once accepted delivery rises above 5 A, the controller releases current regulation to Maxem
+  rather than repeatedly asserting the configured ceiling. The same handoff occurs
+  when a command was locally blocked/rejected but a newer ABB sample proves the
+  requested full-rate ramp happened anyway. On startup, an ordinary authorized
+  block that is already physically charging does not install a redundant future
+  Tesla start schedule; explicit Run Now retains its requested schedule-replacement
+  contract.
+  Completion removes that fallback, releases the Victron grid-assist setpoint, restores a
+  5 A idle request and deletes the finished job only after those cleanup effects succeed.
   Reaching the requested SoC or passing `ready_by` terminates the job. The controller first
   removes its exact Tesla fallback schedule IDs (including the branch's one legacy ID), then
   deletes the matching local job/plan snapshots and returns the Vehicle UI to idle. Failed
   Tesla cleanup retains the terminal marker for bounded retry instead of hiding an old schedule.
+  An accepted stop is observed against the ABB meter for 60 seconds before another stop may be
+  sent, preventing duplicate commands during normal charger ramp-down. Fresh ABB power below
+  250 W is authoritative charger-idle evidence even if Tesla's change-driven charging flag is
+  stale; if the ABB sample is unavailable, the controller falls back conservatively to Tesla.
+  Run Now records whether it enabled Grid assist: cancellation releases a module-owned toggle
+  immediately, while a Grid assist setting that was already enabled by the user is preserved.
 - **Tesla Fleet Telemetry** (`TESLA_TELEMETRY_ENABLED`, off by default): an optional streaming push
   mode where the car reports state via Tesla's Fleet Telemetry instead of REST polling, eliminating
   billable `vehicle_data` reads/wakes for status. `lib/tesla_telemetry_bridge.py` translates the
@@ -70,13 +103,27 @@ a Domoticz server via its REST API for monitoring and historic tracking
   unaffected; falls back to the REST polling path when disabled. The bridge also exposes Tesla's
   connection lifecycle: a disconnected stream is shown on the Vehicle tab, and an explicit
   refresh uses one budget-guarded REST read instead of presenting retained telemetry as fresh.
+  Tesla's connectivity `CreatedAt` is preserved as the source-of-truth event time; broker
+  arrival time never replaces it. The bridge subscriber and dashboard use instance-unique
+  MQTT client IDs, so a development process can overlap the deployed process without either
+  losing QoS-0 lifecycle events. Subscriber transport health is tracked separately and command
+  acknowledgement fails closed until a source lifecycle event synchronizes a reconnected bridge.
   A live home-to-away location transition clears an otherwise impossible retained home-cable
   plugged/charging state; a later explicit public-charging event remains valid while away.
   Known away or unplugged state keeps no-intent PV-surplus control dormant and makes no Tesla
   call, while the telemetry-disabled mode preserves its rate-limited discovery fallback.
+  The bridge counts only live (not retained replay) signals and flushes partial batches during
+  disconnect/shutdown. Tesla's developer portal remains authoritative for billing; use
+  `scripts/tesla_seed_usage.py` to establish one dated portal baseline. The local all-in estimate
+  then includes paid requests and approximate streaming cost when preserving the €0.25 credit
+  margin. Tesla's lightweight vehicle-state endpoint is unpriced and is not counted as Data.
   Fleet OAuth uses Tesla's current
   Fleet Auth host and automatically refreshes and atomically persists rotated access/refresh tokens;
   the runtime `.secrets` file must therefore be writable by the controller process.
+  Billable requests use burst-safe daily runaway caps (300 commands, 150 data
+  reads and 20 wakes by default) plus a per-call $9.75 hard monthly guard against
+  Tesla's $10 credit. Safety-critical charge stops and the wake needed to deliver
+  them remain exempt from the spend block and are still recorded.
 - Energy Broker module which attempts to buy energy at the lowest possible rate in a 48 hour period and store this in your home battery
 - Tibber graphing module to generate visuals of the upcoming electricity prices (Thanks to [Tibberios](https://github.com/Lef-F/tibberios))
 - Tibber API integration to constantly monitor current energy rates, daily consumption and production, forecasted pricing, etc (Thanks to [Tibber.py](https://github.com/BeatsuDev/tibber.py))
@@ -116,8 +163,10 @@ Note: The name of this project is a nod to both Victron Energy & the Domoticz pr
   - `EV_SMART_CHARGE_ENABLED=False` / `EV_SMART_CHARGE_APPLY=False`: separate plan and control gates for one target-SoC/ready-by EV job. Enable planning first and validate the Vehicle-tab schedule before enabling Fleet commands.
   - `EV_CHARGER_MAX_KW` is the requested power ceiling; `EV_EXPECTED_DELIVERY_KW` is the conservative sustained rate used to calculate feasibility/latest-safe-start when Maxem or taper reduces delivery. `EV_CHARGER_MAX_AMPS` accepts 1–25 A/phase (decimal values are floored to Tesla's whole-amp command) and is the durable command ceiling. Fleet Telemetry is read-only: `ChargeCurrentRequest` confirms the sent command, while the last valid change-driven `ChargeCurrentRequestMax` is used only as a conservative live-PV cap. Maxem availability never rewrites grid/smart-plan targets.
     Per-slot EV energy is further capped to forecast grid headroom after house load/PV, so a 16 kW request is never modelled as 16 kW on top of other site demand.
+    Once a selected block begins it remains committed through quarter-hour replans. Grid/mixed blocks send the full configured current ceiling and represent a partial final energy allocation as a shorter full-rate interval. Command acceptance is not treated as physical success: current requires a newer matching Fleet signal, while charge start requires a newer Fleet charging edge or local ABB delivery; missing acknowledgement receives guarded retries during the active block. Retained normalized `Tesla/vehicle0/*` state survives application restarts; raw `telemetry/<VIN>/v/*` nulls are receiver-owned change-driven signals and are never rewritten by this service.
   - `EV_CHARGE_BLOCK_START_PENALTY_EUR` is a small virtual optimization penalty per charging block, preventing needless start/stop cycles for tiny price differences without changing the reported electricity cost.
   - `EV_ALLOW_ESS_DISCHARGE=False`: hold stationary-battery SoC flat during planned EV slots so grid/PV supplies the flexible load. Set true only when deliberately allowing the home battery to charge the car.
+  - `EV_PV_SURPLUS_REMINDER_ENABLED=True`: send at most one normal-priority Pushover nudge per local day when pushed Fleet state explicitly says the car is home, unplugged, and below `ChargeLimitSoc`; protected live surplus must persist for `EV_PV_SURPLUS_REMINDER_CONFIRM_MINUTES` and the existing ESS forecast must show at least `EV_PV_SURPLUS_REMINDER_FORECAST_MINUTES` of continuous PV remaining after normal house load. The check uses no Tesla API calls and fails closed on unknown vehicle state or a stale/incomplete forecast.
   - `BATTERY_CAPACITY_KWH`: Your battery capacity in kWh (default 42.0).
   - `AC_DC_CHARGE_EFFICIENCY`: Efficiency of charging (e.g. 0.90).
   - `AC_DC_DISCHARGE_EFFICIENCY`: Efficiency of discharging (e.g. 0.90).
@@ -166,6 +215,19 @@ robust on network/hostpath (Gluster) storage — no daemon and no mutable DB fil
 — and makes cross-zone migration a plain file copy (`history_store.latest_ts` /
 `store_status` identify the freshest zone). All readers go through `lib/history_store.py`,
 which serves either format transparently. Roll up cold months with:
+
+EV charging is retained in the same ledger. Cycle rows capture instantaneous
+`ev_w` and the ABB meter's `ev_actual_today_kwh`; settlement rows record measured
+`ev_charge_kwh`, average charge kW, EV SoC endpoints, meter quality, and an explicitly
+labelled proportional attribution of site grid import/cost to the EV. The attributed
+cost does not pretend that PV or home-battery energy is free—it reports only the
+measured grid cost assigned to the EV's share of simultaneous site load. Completed
+EV intervals therefore remain available to the Timeline and Advisor after the live
+charge plan advances or the job is removed. Settled Timeline actions use measured
+outcomes, never the stored prediction. ABB power start/stop transitions are persisted
+as lightweight `ev_charge_transition` rows so new sessions show observed start/stop
+times; older data without those events is explicitly shown as a 15-minute measurement
+interval rather than an invented exact start time.
 
 ```
 python scripts/compact_history.py --status     # what's stored, in which format

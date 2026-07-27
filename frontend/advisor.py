@@ -29,6 +29,7 @@ from frontend.config_schema import CONFIG_SCHEMA
 from lib.config_paths import env_path, secrets_path
 from frontend import data as _data
 from lib import history_store as _hist
+from lib.ev_history import summarize_ev_day
 
 # Current Claude models (override via ADVISOR_MODEL). Sonnet is the sensible
 # default for this analysis; Haiku is cheaper/faster for lighter use.
@@ -681,11 +682,17 @@ def _compact_tunables(conf) -> dict:
 # Cumulative day_* totals and net live in the day summary, not per slot.
 _CYCLE_FIELDS = ("ts", "control_action", "realized_action", "reason_code", "soc",
                  "price_buy", "price_sell", "applied_setpoint_w", "grid_w", "pv_w",
-                 "batt_w", "load_w", "pv_actual_today_kwh", "load_actual_today_wh")
+                 "batt_w", "load_w", "ev_w", "base_load_w",
+                 "pv_actual_today_kwh", "load_actual_today_wh",
+                 "ev_actual_today_kwh")
 # actual_pv_kwh = per-slot realized PV; predicted_grid_kwh = predicted import/export.
-_SETTLE_FIELDS = ("ts", "predicted_control_action", "predicted_grid_kwh",
+_SETTLE_FIELDS = ("ts", "predicted_control_action", "actual_control_action",
+                  "predicted_grid_kwh",
                   "predicted_net_eur", "actual_net_eur", "actual_import_kwh",
-                  "actual_export_kwh", "actual_pv_kwh", "soc_start", "soc_end",
+                  "actual_export_kwh", "actual_pv_kwh", "actual_load_kwh",
+                  "ev_charge_kwh", "ev_average_kw", "ev_soc_start", "ev_soc_end",
+                  "ev_grid_import_kwh", "ev_non_grid_kwh", "ev_grid_cost_eur",
+                  "ev_meter_quality", "ev_cost_quality", "soc_start", "soc_end",
                   "price_buy", "cost_basis_eur_per_kwh")
 
 
@@ -752,6 +759,7 @@ def _day_summary(recs, is_today: bool = False) -> dict:
         "load_forecast_kwh": ld_fc,
         "load_actual_kwh": ld_act,
     }
+    out.update(summarize_ev_day(recs))
     if is_today:
         # Cumulative-so-far day: give the fair "expected by now" baseline and a flag.
         exp_so_far = (round(pv_fc - pv_remaining, 2)
@@ -853,8 +861,9 @@ def _history_manifest() -> dict:
         "record_schema": {
             "cycle_fields": list(_CYCLE_FIELDS),
             "settlement_fields": list(_SETTLE_FIELDS),
-            "note": "one JSON object per line; kind=cycle (a 15-min decision) or "
-                    "kind=settlement (predicted vs actual for the slot that closed).",
+            "note": "one JSON object per line; kind=cycle (a decision plus measured "
+                    "outcome), kind=settlement (prediction vs actual for the closed "
+                    "slot), or kind=ev_charge_transition (ABB-observed start/stop).",
         },
     }
 
@@ -1955,7 +1964,11 @@ because history_manifest says files exist. For daily totals, `performance.daily_
 is authoritative: AC/house load totals are
 `performance.daily_summaries[date].load_actual_kwh`, PV totals are `pv_actual_kwh`,
 grid import is `day_import_kwh`, grid export is `day_export_kwh`, and economics are
-`realized_net_eur`. Say data is missing only when the date/field is absent from the
+`realized_net_eur`. EV delivered energy is `ev_charge_kwh`;
+`ev_grid_cost_eur_attributed` is only the measured grid-import cost proportionally
+attributed to EV load, not a claim that PV/home-battery energy was free. Check
+`ev_history_quality` before treating EV slot coverage as complete. Say data is
+missing only when the date/field is absent from the
 user prompt, conversation_context, and inline data.
 
 DEEPER HISTORY: `history_manifest.available_ranges` identifies every day available

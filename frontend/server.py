@@ -12,7 +12,7 @@ import time
 from datetime import datetime
 from importlib import import_module
 
-from flask import Flask, jsonify, render_template, request, Response, redirect, url_for
+from flask import Flask, cli as flask_cli, jsonify, render_template, request, Response, redirect, url_for
 
 from frontend import data
 from frontend.live import live
@@ -169,14 +169,35 @@ def _save_ev_smart_charge_job(payload):
 
 
 def _delete_ev_smart_charge_job():
+    module = _ev_smart_charge_module()
+    loader = getattr(module, "load_job", None)
+    current = (
+        _ev_call_with_configured_path(
+            loader, setting="EV_SMART_CHARGE_JOB_PATH")
+        if callable(loader) else None
+    )
     fn = _ev_callable("delete_job", "cancel_job", "clear_job")
-    result = _ev_call_with_configured_path(
+    _ev_call_with_configured_path(
         fn, setting="EV_SMART_CHARGE_JOB_PATH")
-    return result
+    return current
 
 
 def _act_on_ev_smart_charge_job(action):
     module = _ev_smart_charge_module()
+    if action == "run_now":
+        fn = getattr(module, "activate_run_now", None)
+        if not callable(fn):
+            raise RuntimeError(
+                "Run Now is unavailable in this service version.")
+        env = data._env()
+        from lib.global_state import GlobalStateClient
+        grid_assist_was_on = _boolish(
+            GlobalStateClient().get("grid_charging_enabled"), False)
+        return fn(
+            job_path=env.get("EV_SMART_CHARGE_JOB_PATH") or None,
+            plan_path=env.get("EV_SMART_CHARGE_PLAN_PATH") or None,
+            grid_assist_owned=not grid_assist_was_on,
+        )
     generic = getattr(module, "set_job_action", None)
     if callable(generic):
         result = generic(action)
@@ -187,7 +208,6 @@ def _act_on_ev_smart_charge_job(action):
         names = {
             "pause": ("pause_job",),
             "resume": ("resume_job",),
-            "charge_now": ("charge_now", "charge_job_now"),
         }
         result = _ev_call_with_configured_path(
             _ev_callable(*names[action]), setting="EV_SMART_CHARGE_JOB_PATH")
@@ -236,7 +256,18 @@ def api_ev_smart_charge_put():
 @app.route("/api/ev/smart-charge", methods=["DELETE"])
 def api_ev_smart_charge_delete():
     try:
-        _delete_ev_smart_charge_job()
+        deleted_job = _delete_ev_smart_charge_job()
+        if (
+            isinstance(deleted_job, dict)
+            and str(deleted_job.get("execution_mode") or "").lower()
+            == "run_now"
+            and _boolish(
+                deleted_job.get("run_now_grid_assist_owned"), True)
+        ):
+            # Run Now enabled this retained toggle, so cancellation must
+            # release it immediately rather than waiting for the EV worker or
+            # the next quarter-hour optimizer cycle.
+            _set_grid_assist_toggle(False)
         return jsonify({"ok": True})
     except (ImportError, RuntimeError, OSError) as e:
         logging.warning("EV smart-charge job delete failed: %s", e)
@@ -246,14 +277,38 @@ def api_ev_smart_charge_delete():
 @app.route("/api/ev/smart-charge/action", methods=["POST"])
 def api_ev_smart_charge_action():
     action = str((request.get_json(silent=True) or {}).get("action") or "").strip().lower()
-    if action not in {"pause", "resume", "charge_now"}:
-        return jsonify({"ok": False, "error": "action must be pause, resume, or charge_now"}), 400
+    if action not in {"pause", "resume", "run_now"}:
+        return jsonify({
+            "ok": False,
+            "error": "action must be pause, resume, or run_now",
+        }), 400
     try:
-        job = _act_on_ev_smart_charge_job(action)
-        return jsonify({"ok": True, "job": job})
-    except (ImportError, RuntimeError, OSError) as e:
+        job = None
+        replanned = False
+        if action == "run_now":
+            from lib.energy_broker import run_ai_optimizer
+
+            def activate():
+                nonlocal job
+                job = _act_on_ev_smart_charge_job(action)
+                _set_grid_assist_toggle(True)
+
+            # Acquire the optimizer's single-writer lock before changing the
+            # durable job or grid state. This avoids a half-activated Run Now
+            # when a scheduled cycle happens to overlap the button press.
+            replanned = run_ai_optimizer(
+                wait_timeout_s=30, before_run=activate)
+            if replanned is False:
+                raise RuntimeError(
+                    "The optimizer is already running; Run Now was not started.")
+        else:
+            job = _act_on_ev_smart_charge_job(action)
+        return jsonify({
+            "ok": True, "job": job, "replanned": bool(replanned)})
+    except (ImportError, RuntimeError, OSError, ValueError) as e:
         logging.warning("EV smart-charge action failed: %s", e)
-        return jsonify({"ok": False, "error": str(e)}), 503
+        status = 400 if isinstance(e, ValueError) else 503
+        return jsonify({"ok": False, "error": str(e)}), status
 
 
 @app.route("/api/history/day")
@@ -438,10 +493,11 @@ def api_control_grid_assist():
 
 def _set_ev_charge_requested(enabled: bool):
     """Manual EV Start/Stop. Sets the DEDICATED ev_charge_requested intent flag the EV controller
-    reads (fully decoupled from grid-assist). Starts use home+plugged+non-supercharging checks;
-    Stop is latched through bounded wake escalation and local-meter verification even if those
-    pushed fields are stale. Publishing the retained control topic keeps persistent intent in
-    sync and survives a restart via the state restore."""
+    reads. Immediate grid-backed Start requires grid-assist too; schedule and protected-PV
+    authority remain independent. Stop is latched through bounded wake escalation, suppresses
+    the current smart block, and uses local-meter verification even if pushed fields are stale.
+    Publishing the retained control topic keeps persistent intent in sync and survives a restart
+    via the state restore."""
     from lib.global_state import GlobalStateClient
     state = GlobalStateClient()
     state.set("ev_charge_requested", bool(enabled))
@@ -631,6 +687,12 @@ def _debug_enabled() -> bool:
     return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _project_server_banner(debug: bool, app_name: str) -> None:
+    """Route Flask's otherwise unformatted Click banner through project logging."""
+    logging.info("Serving Flask app '%s'.", app_name)
+    logging.info("Flask debug mode: %s.", "on" if debug else "off")
+
+
 def run():
     """Run the server in the foreground (blocking)."""
     # Per-request HTTP logging (werkzeug) is noisy and, when the dashboard runs
@@ -642,7 +704,12 @@ def run():
     host, port = _host_port()
     # threaded=True so concurrent requests don't block each other; the process
     # itself is independent of the main service threads.
-    app.run(host=host, port=port, threaded=True, use_reloader=False)
+    original_banner = flask_cli.show_server_banner
+    flask_cli.show_server_banner = _project_server_banner
+    try:
+        app.run(host=host, port=port, threaded=True, use_reloader=False)
+    finally:
+        flask_cli.show_server_banner = original_banner
 
 
 def run_in_thread() -> threading.Thread:

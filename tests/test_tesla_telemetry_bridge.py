@@ -1,4 +1,6 @@
 """Tests for the pure translation core of the Tesla Fleet Telemetry bridge."""
+from datetime import datetime
+
 import pytest
 
 from lib import tesla_telemetry_bridge as tb
@@ -6,6 +8,7 @@ from lib import tesla_telemetry_bridge as tb
 
 def test_detailed_charge_state_charging():
     out = tb.translate("DetailedChargeState", "DetailedChargeStateCharging")
+    assert out["state"]["tesla_detailed_charge_state"] == "charging"
     assert out["state"]["tesla_is_plugged"] == "True"
     assert out["state"]["tesla_is_charging"] == "True"
     assert out["topics"]["Tesla/vehicle0/plugged_status"] == "Plugged"
@@ -35,6 +38,9 @@ def test_detailed_charge_state_plugged_not_charging():
     # Stopped/Complete/NoPower -> plugged in but not charging.
     for st in ("DetailedChargeStateStopped", "DetailedChargeStateComplete", "DetailedChargeStateNoPower"):
         out = tb.translate("DetailedChargeState", st)
+        assert out["state"]["tesla_detailed_charge_state"] in {
+            "stopped", "complete", "nopower",
+        }
         assert out["state"]["tesla_is_plugged"] == "True"
         assert out["state"]["tesla_is_charging"] == "False"
         assert out["state"]["tesla_time_to_full"] == "N/A"
@@ -392,11 +398,15 @@ def test_connectivity_record_is_persisted_and_published_without_counting_signal(
     class Msg:
         topic = "telemetry/VIN/connectivity"
         payload = b'{"Status":"DISCONNECTED","CreatedAt":"2026-07-23T11:09:30Z"}'
+        retain = False
 
     bridge._on_message(None, None, Msg())
 
     assert stored["tesla_telemetry_connection_status"] == "DISCONNECTED"
-    assert stored["tesla_telemetry_connection_updated_at"] == 1234.5
+    assert stored["tesla_telemetry_connection_updated_at"] == pytest.approx(
+        datetime.fromisoformat(
+            "2026-07-23T11:09:30+00:00").timestamp())
+    assert stored["tesla_telemetry_connected_at"] == 0
     assert any(
         topic == "Tesla/vehicle0/telemetry_status"
         and '"DISCONNECTED"' in kwargs["payload"]
@@ -405,13 +415,193 @@ def test_connectivity_record_is_persisted_and_published_without_counting_signal(
     )
 
 
+def test_connected_event_mirrors_source_timestamp_and_retained_source_synchronizes(
+        monkeypatch):
+    stored = {}
+
+    class State:
+        def set(self, key, value):
+            stored[key] = value
+
+    monkeypatch.setattr("lib.global_state.GlobalStateClient", lambda: State())
+    monkeypatch.setattr("lib.helpers.publish_message", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tb.time, "time", lambda: 4321.5)
+    bridge = tb.TeslaTelemetryBridge("broker", vin="VIN")
+
+    class Msg:
+        topic = "telemetry/VIN/connectivity"
+        payload = b'{"Status":"CONNECTED","CreatedAt":"2026-07-26T09:08:12Z"}'
+        retain = False
+
+    bridge._on_message(None, None, Msg())
+    assert stored["tesla_telemetry_connection_status"] == "CONNECTED"
+    source_at = datetime.fromisoformat(
+        "2026-07-26T09:08:12+00:00").timestamp()
+    assert stored["tesla_telemetry_connection_updated_at"] == source_at
+    assert stored["tesla_telemetry_connected_at"] == source_at
+    assert stored["tesla_telemetry_connection_event_at"] == pytest.approx(
+        datetime.fromisoformat(
+            "2026-07-26T09:08:12+00:00").timestamp())
+
+    stored.clear()
+    Msg.retain = True
+    bridge._on_message(None, None, Msg())
+    assert stored["tesla_telemetry_connection_status"] == "CONNECTED"
+    assert stored["tesla_telemetry_connected_at"] == source_at
+    assert stored["tesla_telemetry_bridge_status"] == "SYNCHRONIZED"
+
+
+def test_live_vehicle_signal_synchronizes_bridge_without_connectivity_edge(
+        monkeypatch):
+    stored = {}
+
+    class State:
+        def set(self, key, value):
+            stored[key] = value
+
+    monkeypatch.setattr("lib.global_state.GlobalStateClient", lambda: State())
+    monkeypatch.setattr("lib.helpers.publish_message", lambda *args, **kwargs: None)
+    bridge = tb.TeslaTelemetryBridge("broker", vin="VIN")
+    bridge._count_stream_signal = lambda: None
+
+    class Msg:
+        topic = "telemetry/VIN/v/Soc"
+        payload = b"72"
+        retain = False
+
+    bridge._on_message(None, None, Msg())
+
+    assert stored["tesla_telemetry_bridge_status"] == "SYNCHRONIZED"
+
+
+def test_mqtt_client_id_is_unique_per_runtime_instance(monkeypatch):
+    monkeypatch.setattr(tb.socket, "gethostname", lambda: "Cerbo Dev/Worker")
+    monkeypatch.setattr(tb.os, "getpid", lambda: 31415)
+
+    assert tb.mqtt_client_id() == "cerbo-tesla-cerbo-dev-worker-31415"
+
+    monkeypatch.setattr(tb.os, "getpid", lambda: 31416)
+    assert tb.mqtt_client_id() == "cerbo-tesla-cerbo-dev-worker-31416"
+
+
+def test_delayed_connected_event_cannot_overwrite_newer_disconnect(monkeypatch):
+    stored = {}
+    published = []
+
+    class State:
+        def get(self, key):
+            return stored.get(key, 0)
+
+        def set(self, key, value):
+            stored[key] = value
+
+    monkeypatch.setattr("lib.global_state.GlobalStateClient", lambda: State())
+    monkeypatch.setattr(
+        "lib.helpers.publish_message",
+        lambda topic, **kwargs: published.append((topic, kwargs)),
+    )
+    bridge = tb.TeslaTelemetryBridge("broker", vin="VIN")
+
+    bridge._apply_connectivity({
+        "ConnectionId": "new-disconnect",
+        "CreatedAt": "2026-07-26T09:24:57Z",
+        "Status": "DISCONNECTED",
+    })
+    bridge._apply_connectivity({
+        "ConnectionId": "old-connect",
+        "CreatedAt": "2026-07-26T09:20:00Z",
+        "Status": "CONNECTED",
+    })
+
+    assert stored["tesla_telemetry_connection_status"] == "DISCONNECTED"
+    assert stored["tesla_telemetry_connected_at"] == 0
+    assert len([
+        item for item in published
+        if item[0] == "Tesla/vehicle0/telemetry_status"
+    ]) == 1
+
+
+def test_retained_vehicle_field_cannot_overwrite_fresher_live_value(monkeypatch):
+    bridge = tb.TeslaTelemetryBridge("broker", vin="VIN")
+    applied, counted = [], []
+    bridge._count_stream_signal = lambda: counted.append(True)
+    bridge.apply = lambda field, value, *, retained=False: applied.append(
+        (field, value, retained))
+
+    class Msg:
+        topic = "telemetry/VIN/v/Soc"
+
+        def __init__(self, payload, retain):
+            self.payload = payload
+            self.retain = retain
+
+    bridge._on_message(None, None, Msg(b"71", False))
+    bridge._on_message(None, None, Msg(b"68", True))
+
+    assert applied == [("Soc", 71, False)]
+    assert counted == [True]
+
+
+def test_bridge_transport_disconnect_invalidates_command_bus_readiness(
+        monkeypatch):
+    stored = {}
+    published = []
+
+    class State:
+        def set(self, key, value):
+            stored[key] = value
+
+    monkeypatch.setattr("lib.global_state.GlobalStateClient", lambda: State())
+    monkeypatch.setattr(
+        "lib.helpers.publish_message",
+        lambda topic, **kwargs: published.append((topic, kwargs)),
+    )
+    bridge = tb.TeslaTelemetryBridge("broker", vin="VIN")
+
+    bridge._on_disconnect(None, None, 1)
+
+    assert stored["tesla_telemetry_bridge_status"] == "DISCONNECTED"
+    assert "tesla_telemetry_connection_status" not in stored
+    assert "tesla_telemetry_connected_at" not in stored
+    assert any(
+        topic == "Tesla/vehicle0/telemetry_bridge_status"
+        and '"DISCONNECTED"' in kwargs["payload"]
+        for topic, kwargs in published
+    )
+
+
+def test_bridge_connect_subscribes_and_starts_unknown_until_source_event(
+        monkeypatch):
+    stored = {}
+
+    class State:
+        def set(self, key, value):
+            stored[key] = value
+
+    monkeypatch.setattr("lib.global_state.GlobalStateClient", lambda: State())
+    monkeypatch.setattr("lib.helpers.publish_message", lambda *args, **kwargs: None)
+    subscriptions = []
+    bridge = tb.TeslaTelemetryBridge("broker", vin="VIN")
+
+    class Client:
+        def subscribe(self, topic):
+            subscriptions.append(topic)
+
+    bridge._on_connect(Client(), None, None, 0)
+
+    assert subscriptions == ["telemetry/#"]
+    assert stored["tesla_telemetry_bridge_status"] == "AWAITING_SOURCE"
+    assert "tesla_telemetry_connection_status" not in stored
+
+
 def test_stream_signal_counter_batches_to_durable_file(tmp_path, monkeypatch):
     # Durable (tesla_budget state file), not GlobalState (SQLite on tmpfs, wiped every restart
     # by main.py's GlobalStateDatabase.__init__) -- a pod restart must not lose this count.
     from lib import tesla_budget as budget_mod
+    from lib import config_retrieval
 
     path = str(tmp_path / "budget.json")
-    monkeypatch.setattr("lib.config_retrieval.retrieve_setting", lambda k: path)
+    monkeypatch.setattr(config_retrieval, "retrieve_setting", lambda k: path)
 
     b = tb.TeslaTelemetryBridge("broker")
     for _ in range(tb._STREAM_FLUSH_EVERY - 1):
@@ -422,6 +612,25 @@ def test_stream_signal_counter_batches_to_durable_file(tmp_path, monkeypatch):
 
     # Surviving a "restart" just means re-reading the same file -- nothing in-memory to lose.
     assert budget_mod.usage_snapshot(path)["streaming"]["count"] == tb._STREAM_FLUSH_EVERY
+
+
+def test_stream_signal_counter_flushes_partial_batch_on_disconnect(
+        tmp_path, monkeypatch):
+    from lib import tesla_budget as budget_mod
+    from lib import config_retrieval
+
+    path = str(tmp_path / "budget.json")
+    monkeypatch.setattr(config_retrieval, "retrieve_setting", lambda key: path)
+    monkeypatch.setattr(
+        tb.TeslaTelemetryBridge, "_set_bridge_transport", lambda *args: None)
+    bridge = tb.TeslaTelemetryBridge("broker")
+    for _ in range(7):
+        bridge._count_stream_signal()
+
+    bridge._on_disconnect(None, None, 1)
+
+    assert budget_mod.usage_snapshot(path)["streaming"]["count"] == 7
+    assert bridge._sig_flushed == bridge._sig_seen == 7
 
 
 def test_unknown_field_is_ignored():
