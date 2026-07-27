@@ -855,6 +855,18 @@ def test_publish_plan_json_serializes_weather_datetime_maps(monkeypatch, tmp_pat
             "pv_shadow_forecast": {slot_start: 0.2},
             "slots": {slot_start: {"time": slot_start, "temp_forecast_c": 24.0}},
         },
+        "onecta_hvac": {
+            "enabled": True,
+            "available": True,
+            "fresh": True,
+            "fetched_at": slot_start,
+            "summary": {
+                "today_total_kwh": 1.2,
+                "today_cooling_kwh": 1.2,
+                "today_heating_kwh": 0.0,
+                "powered_units": 2,
+            },
+        },
         "planning_policy": {
             "selected": "today_first",
             "reason_code": "DAILY_SETTLEMENT_PROTECTED",
@@ -890,6 +902,8 @@ def test_publish_plan_json_serializes_weather_datetime_maps(monkeypatch, tmp_pat
     assert payload["weather"]["summary"]["fetched_at"] == slot_start.isoformat()
     assert payload["weather"]["load_adjustments"][slot_start.isoformat()] == 0.1
     assert payload["weather"]["slots"][slot_start.isoformat()]["time"] == slot_start.isoformat()
+    assert payload["hvac"]["fetched_at"] == slot_start.isoformat()
+    assert payload["hvac"]["summary"]["today_total_kwh"] == 1.2
     assert payload["pv_remaining_wh"] == 1234.0
     assert payload["pv_remaining_raw_wh"] == 1234.0
     assert payload["pv_remaining_raw_source"] == "VRM forecast"

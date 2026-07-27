@@ -155,12 +155,41 @@
   .overview,
   main,
   .battery-view,
+  .hvac-view,
   .live-view {
     width: 100%;
     max-width: none;
     padding-left: 10px;
     padding-right: 10px;
   }
+
+  .hvac-view { padding-left: 10px; padding-right: 10px; }
+  .hvac-page-head { align-items: flex-start; margin-top: 2px; }
+  .hvac-page-head h1 { font-size: 22px; }
+  .hvac-page-head p { font-size: 12px; }
+  .hvac-energy-rail { gap: 12px; padding: 13px; }
+  .hvac-rail-total { min-width: 100px; }
+  .hvac-rail-total b { font-size: 23px; }
+  .hvac-rail-split { min-width: 190px; }
+  .hvac-split-legend { gap: 10px 14px; }
+  .hvac-unit { padding: 14px 12px; }
+  .hvac-unit-head {
+    display: grid;
+    grid-template-columns: 80px minmax(0, 1fr) 50px;
+    align-items: flex-start;
+    gap: 11px;
+  }
+  .hvac-ring { flex-basis: 80px; }
+  .hvac-ring svg { width: 80px; height: 80px; }
+  .hvac-unit-identity { min-width: 0; }
+  .hvac-unit-title > span:first-child { font-size: 16px; }
+  .hvac-master-switch { width: 50px; height: 29px; }
+  .hvac-master-switch span { width: 23px; height: 23px; }
+  .hvac-master-switch[aria-pressed="true"] span { transform: translateX(21px); }
+  .hvac-mode-row { min-width: 0; }
+  .hvac-segments { gap: 4px; }
+  .hvac-segments button { min-height: 36px; font-size: 11.5px; }
+  .hvac-control-grid { grid-template-columns: 1fr; gap: 13px; }
 
   .overview {
     padding-top: 10px;

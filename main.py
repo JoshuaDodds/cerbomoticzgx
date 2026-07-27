@@ -29,6 +29,7 @@ HOME_CONNECT_APPLIANCE_SCHEDULING = is_truthy(retrieve_setting("HOME_CONNECT_APP
 _EV_CHARGER = None
 _TESLA_TELEMETRY_BRIDGE = None
 _TESLA_TELEMETRY_BRIDGE_STARTING = False
+_ONECTA_MONITOR_THREAD = None
 
 
 def _run_ev_charge_controller():
@@ -126,6 +127,12 @@ def shutdown():
     if _TESLA_TELEMETRY_BRIDGE is not None:
         _TESLA_TELEMETRY_BRIDGE.stop()
 
+    try:
+        from lib.onecta_monitor import stop_onecta_monitor
+        stop_onecta_monitor()
+    except Exception as error:
+        logging.warning("ONECTA: monitor shutdown was incomplete: %s", error)
+
     mqtt_stop()
 
     # publish message to broker that we are shutting down
@@ -159,6 +166,7 @@ def init():
 
 
 def post_startup():
+    global _ONECTA_MONITOR_THREAD
     time.sleep(1)
 
     if HOME_CONNECT_APPLIANCE_SCHEDULING:
@@ -213,6 +221,18 @@ def post_startup():
         logging.info("post_startup(): warm-up complete.")
 
     threading.Thread(target=_startup_warm_up, name="startup-warmup", daemon=True).start()
+
+    # ONECTA cloud I/O owns a separate daemon thread. It reuses a recent durable
+    # snapshot at startup and otherwise follows the rate-conscious 20-minute
+    # cadence, so Daikin latency cannot hold up startup or the shared scheduler.
+    try:
+        from lib.onecta_monitor import start_onecta_monitor_if_enabled
+        _ONECTA_MONITOR_THREAD = start_onecta_monitor_if_enabled()
+    except Exception as error:
+        logging.warning(
+            "ONECTA: read-only monitor failed to start; ESS control continues: %s",
+            error,
+        )
 
     # Start service scheduled tasks + the .env config watcher (independent of the
     # warm-up above, so they come up immediately).

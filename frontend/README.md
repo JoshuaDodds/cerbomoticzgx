@@ -93,6 +93,9 @@ sharing the host's `/dev/shm` (so it can read the published plan). Expose
 | `FRONTEND_HOST` | `0.0.0.0` | bind address |
 | `FRONTEND_PORT` | `8080` | bind port |
 | `EV_SMART_CHARGE_ENABLED` | `False` | publish shadow target/deadline plans without vehicle commands |
+| `ONECTA_ENABLED` | `False` | start read-only Daikin HVAC state/energy monitoring and retained `hvac/#` publishing |
+| `ONECTA_CONTROL_ENABLED` | `False` | enable guarded manual controls on the top-level HVAC page; read-only unit cards remain visible while disabled |
+| `ONECTA_POLL_INTERVAL_MIN` | `20` | all-unit refresh cadence (about 72 reads/day); startup reuses cached data younger than 19 minutes |
 | `EV_SMART_CHARGE_APPLY` | `False` | allow the main EV controller to reconcile the reviewed plan through Fleet API; requires Fleet Telemetry for command acknowledgement |
 | `EV_PV_SURPLUS_REMINDER_ENABLED` | `True` | send one daily, normal-priority Pushover nudge when an eligible unplugged car could use forecast-sustainable protected PV |
 
@@ -104,6 +107,13 @@ sharing the host's `/dev/shm` (so it can read the published plan). Expose
   settled daily totals (`Σ export_reward − Σ import_cost` from the history).
   If the backend stops responding, an accessible **Server Offline** banner appears
   after the live-feed grace period while the dashboard retains its last good values.
+- **HVAC**: appears between Battery and Victron when ONECTA monitoring has a valid
+  snapshot. Its daily energy rail separates heating and cooling; each always-visible
+  unit card combines room/target temperature, operating state, and only the controls
+  that unit currently advertises. Temperature taps are coalesced into one write after
+  a short pause, and operating-mode buttons explain their behavior on hover/focus.
+  When ONECTA control is disabled, the same data remains visible and every control
+  is disabled.
   On phones, `app.mobile.css` compacts the header into logo + action/SoC pill + clock
   with the full status strip as a horizontal swipe row; the current price chip sits at
   the end of that swipe row. External Battery/Venus iframe views are scaled to 90%

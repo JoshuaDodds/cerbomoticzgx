@@ -11,6 +11,17 @@ def test_favicon_route_redirects_to_brand_icon():
     assert response.headers["Location"].endswith("/static/img/logo.svg")
 
 
+def test_hvac_top_level_navigation_sits_between_battery_and_victron():
+    body = server.app.test_client().get("/").get_data(as_text=True)
+
+    battery = body.index('data-app-view="battery"')
+    hvac = body.index('data-app-view="hvac"')
+    victron = body.index('data-app-view="live"')
+    assert battery < hvac < victron
+    assert 'id="hvac-dashboard"' in body
+    assert 'id="hvac-mobile-link"' in body
+
+
 def test_config_route_uses_curated_advisor_model_selector_for_builtin_provider(monkeypatch):
     groups = [{
         "group": "AI Advisor",
@@ -343,6 +354,52 @@ def test_weather_route_returns_weather_dashboard_data(monkeypatch):
     assert response.status_code == 200
     assert response.get_json()["available"] is True
     assert calls == ["weather"]
+
+
+def test_hvac_route_reads_cached_dashboard_without_refresh(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_hvac_dashboard",
+        lambda: {
+            "enabled": True,
+            "available": True,
+            "control_enabled": False,
+            "units": [{"unit": "unit-one"}],
+        },
+    )
+
+    response = server.app.test_client().get("/api/hvac")
+
+    assert response.status_code == 200
+    assert response.get_json()["units"] == [{"unit": "unit-one"}]
+
+
+def test_hvac_control_route_validates_and_forwards_one_command(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        server,
+        "_hvac_control_command",
+        lambda unit, command, value: calls.append((unit, command, value))
+        or {"status": "accepted", "id": "command-1"},
+    )
+
+    response = server.app.test_client().post(
+        "/api/hvac/units/unit-one/control",
+        json={"command": "temperature", "value": 25.5},
+    )
+
+    assert response.status_code == 202
+    assert calls == [("unit-one", "temperature", 25.5)]
+
+
+def test_hvac_control_route_rejects_incomplete_request(monkeypatch):
+    response = server.app.test_client().post(
+        "/api/hvac/units/unit-one/control",
+        json={"command": "power"},
+    )
+
+    assert response.status_code == 400
+    assert response.get_json()["ok"] is False
 
 
 def test_ev_smart_charge_get_is_available_when_control_module_is_missing(monkeypatch):

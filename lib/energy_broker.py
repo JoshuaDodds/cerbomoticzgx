@@ -2242,6 +2242,7 @@ def _publish_plan_json(result, *, batt_soc, price_points, pv_remaining,
             'today_actuals': today_actuals,
             'today': today_block,
             'weather': _json_safe(weather_context),
+            'hvac': _json_safe(result.get('onecta_hvac') or {}),
             'appliance_reservations': _json_safe(
                 result.get('appliance_reservations') or {}
             ),
@@ -2505,6 +2506,30 @@ def _append_history(result, *, batt_soc, applied_setpoint, today_actuals, realiz
                 "weather_max_temp_c": weather_summary.get("max_temp_c"),
                 "weather_pv_shadow_abs_delta_kwh": weather_summary.get("pv_shadow_abs_delta_kwh"),
             })
+        hvac_context = result.get("onecta_hvac") or {}
+        hvac_summary = hvac_context.get("summary") or {}
+        record.update({
+            "hvac_onecta_enabled": bool(hvac_context.get("enabled", False)),
+            "hvac_onecta_available": bool(hvac_context.get("available", False)),
+            "hvac_onecta_fresh": bool(hvac_context.get("fresh", False)),
+            "hvac_onecta_fetched_at": hvac_context.get("fetched_at"),
+            "hvac_onecta_source_updated_at": hvac_context.get(
+                "source_updated_at"
+            ),
+            "hvac_onecta_today_kwh": _num(
+                hvac_summary.get("today_total_kwh")
+            ),
+            "hvac_onecta_today_cooling_kwh": _num(
+                hvac_summary.get("today_cooling_kwh")
+            ),
+            "hvac_onecta_today_heating_kwh": _num(
+                hvac_summary.get("today_heating_kwh")
+            ),
+            "hvac_onecta_powered_units": int(
+                hvac_summary.get("powered_units") or 0
+            ),
+            "hvac_onecta_modes": hvac_summary.get("powered_modes") or [],
+        })
         appliance_context = result.get('appliance_reservations') or {}
         record.update({
             "appliance_reservations_enabled": bool(
@@ -2915,6 +2940,25 @@ def _run_ai_optimizer_once():
             'ev_meter_fresh': ev_meter_fresh,
         }
 
+        # The rate-conscious monitor normally keeps a <=19-minute snapshot. If
+        # its refresh is in flight, wait only briefly for that single request.
+        # Daikin latency/failure must never indefinitely delay critical ESS
+        # control, and the context remains observational.
+        try:
+            from lib.onecta_monitor import hvac_context_for_optimizer
+            onecta_hvac = hvac_context_for_optimizer()
+        except Exception as error:
+            logging.warning(
+                "ONECTA: optimizer context unavailable; continuing without it: %s",
+                error,
+            )
+            onecta_hvac = {
+                "enabled": True,
+                "available": False,
+                "fresh": False,
+                "last_error": type(error).__name__,
+            }
+
         prices = get_all_price_points()
         if not prices:
             logging.warning("AI_ESS: No prices available.")
@@ -3028,6 +3072,7 @@ def _run_ai_optimizer_once():
         # The startup selector is authoritative. Publishing this on every plan
         # makes the active engine observable without inferring it from behavior.
         result['optimizer_mode'] = OPTIMIZER_MODE
+        result['onecta_hvac'] = onecta_hvac
         result['ev_smart_charge'] = ev_context
         _annotate_result_with_ev_plan(result, ev_context)
         STATE.set('ai_optimizer_mode', OPTIMIZER_MODE)
