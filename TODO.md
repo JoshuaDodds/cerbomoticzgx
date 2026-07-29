@@ -40,7 +40,13 @@
   - Investigate the repeatable intraday shape observed by the operator: the projected
     final net starts highly profitable, falls roughly in step with realized grid cost
     during scheduled BUY/charging, then rises again after buying finishes while the
-    system waits to SELL. For every forecast snapshot, verify the accounting identity
+    system waits to SELL. The BUY-period reduction has also been observed to jump back
+    up when the optimizer runs, suggesting a sawtooth where live settled cost is
+    subtracted from a stale remaining-cost forecast and only reconciled on the next
+    optimizer cycle. For every forecast snapshot and intervening live UI update, verify
+    whether the displayed value comes from the persisted optimizer projection or is
+    recomputed by mixing live settlement with stale forecast components. Verify the
+    accounting identity
     `projected final net = settled net so far + remaining export reward -
     remaining import cost` and determine whether realized import/export is replacing
     its corresponding forecast exactly once or being omitted/double-counted.
