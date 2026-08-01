@@ -137,6 +137,9 @@ def test_hvac_dashboard_uses_capability_driven_compact_controls():
     assert 'fetch("/api/hvac", {cache: "no-store"})' in js
     assert "/api/hvac/units/" in js
     assert 'hour12: false' in js
+    assert 'API calls' in js
+    assert 'limit_day' in js
+    assert 'remaining_day' in js
     assert ".hvac-unit.is-off:hover" in css
     assert ".hvac-control-grid" in css
     assert ".hvac-control-grid { grid-template-columns: 1fr;" in mobile_css

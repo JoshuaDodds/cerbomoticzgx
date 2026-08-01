@@ -273,9 +273,14 @@
     const stamp = new Date(data.fetched_at).toLocaleTimeString([], {
       hour: "2-digit", minute: "2-digit", hour12: false,
     });
+    const apiLimit = number((data.rate_limits || {}).limit_day);
+    const apiRemaining = number((data.rate_limits || {}).remaining_day);
+    const apiUsage = apiLimit != null && apiRemaining != null
+      ? ` · ${Math.max(0, Math.round(apiLimit - apiRemaining))} of ${Math.round(apiLimit)} API calls`
+      : "";
     root.innerHTML = `<div class="hvac-page-head">
         <div><h1>HVAC</h1><p>Daikin ONECTA · ${summary.device_count || data.units.length} units · ${summary.powered_units || 0} running</p></div>
-        <span>Updated ${escapeHtml(stamp)}</span>
+        <span>Updated ${escapeHtml(stamp)}${escapeHtml(apiUsage)}</span>
       </div>
       ${data.control_enabled ? "" : `<div class="hvac-readonly-note"><strong>Read-only mode.</strong> Controls are disabled in Configuration; monitoring and energy history remain active.</div>`}
       ${summaryRail(data)}
