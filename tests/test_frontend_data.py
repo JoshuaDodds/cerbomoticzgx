@@ -9,6 +9,14 @@ from frontend import data
 from frontend.config_schema import CONFIG_SCHEMA
 
 
+class _MidMonthDateTime(datetime):
+    """Keep completed-day monthly-history assertions valid on the first day."""
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls(2026, 7, 15, 12, 0, 0, tzinfo=tz)
+
+
 def _schema_keys():
     return {
         setting["key"]
@@ -527,7 +535,8 @@ def test_monthly_history_adds_projected_today_profit_from_current_plan(monkeypat
 
 
 def test_monthly_history_hides_box_plot_for_too_few_forecast_samples(monkeypatch, tmp_path):
-    today = datetime.now().astimezone().date()
+    monkeypatch.setattr(data, "datetime", _MidMonthDateTime)
+    today = _MidMonthDateTime.now().date()
     day = today - timedelta(days=1)
     records = [
         {"kind": "cycle", "ts": f"{day.isoformat()}T08:00:00+02:00",
@@ -577,7 +586,8 @@ def test_forecast_box_stats_requires_two_samples_per_quartile():
 
 def test_monthly_history_deduplicates_replans_into_latest_quarter_snapshot(
         monkeypatch, tmp_path):
-    today = datetime.now().astimezone().date()
+    monkeypatch.setattr(data, "datetime", _MidMonthDateTime)
+    today = _MidMonthDateTime.now().date()
     day = today - timedelta(days=1)
     records = []
     for index in range(96):
@@ -620,7 +630,8 @@ def test_monthly_history_deduplicates_replans_into_latest_quarter_snapshot(
 
 def test_monthly_history_does_not_claim_full_day_stats_from_midday_cluster(
         monkeypatch, tmp_path):
-    today = datetime.now().astimezone().date()
+    monkeypatch.setattr(data, "datetime", _MidMonthDateTime)
+    today = _MidMonthDateTime.now().date()
     day = today - timedelta(days=1)
     records = [{
         "kind": "cycle",
