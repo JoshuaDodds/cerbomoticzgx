@@ -659,6 +659,17 @@ class OptimizationEngine:
         sell_prices = [self._sell_price(b) for b in buy_prices]
         net_loads = [p['load'] - p['pv'] for p in future_prices]
 
+        # A reserve breach may be caused by live-meter/BMS drift rather than a
+        # deliberate discharge.  In that state we may safely retain only when a
+        # genuinely cheaper known import slot remains; otherwise recovery is
+        # still immediate.  Compute this once rather than repeatedly scanning
+        # the horizon inside the DP state loop.
+        cheaper_buy_ahead = [False] * len(buy_prices)
+        lowest_later_buy = float('inf')
+        for index in range(len(buy_prices) - 1, -1, -1):
+            cheaper_buy_ahead[index] = lowest_later_buy < buy_prices[index] - EPS
+            lowest_later_buy = min(lowest_later_buy, buy_prices[index])
+
         grid_charge_soc_cap = max(self.min_soc, min(100.0, self.max_grid_charge_soc))
 
         # DP tables. dp[t][soc] = minimum cost to reach soc at slot boundary t.
@@ -689,8 +700,17 @@ class OptimizationEngine:
                     continue
 
                 for nsoc in self.soc_states:
-                    # Never discharge below the seasonal reserve.
-                    if nsoc < self.min_soc - EPS:
+                    # Never discharge further below the seasonal reserve. A
+                    # live/BMS SoC can already sit just below that threshold.
+                    # Then allow RETAIN (same SoC) only while a known cheaper
+                    # buy lies ahead; otherwise recover the reserve now. This
+                    # prevents an uneconomic high-price precharge without
+                    # turning the reserve into an indefinite soft target.
+                    below_reserve = nsoc < self.min_soc - EPS
+                    retaining_below_reserve = below_reserve and abs(nsoc - soc) <= EPS
+                    if (below_reserve and (
+                            nsoc < soc - EPS
+                            or (retaining_below_reserve and not cheaper_buy_ahead[t]))):
                         continue
 
                     dc_change_kwh = (nsoc - soc) / 100.0 * cap

@@ -23,14 +23,28 @@
     forecast correction until multiple complete days show a material improvement
     in both aggregate daily load and 15-minute settlement forecasts.
 
-- **Daily-net forecast calibration** — The Trends chart now treats intraday values as
-  time-ordered forecast revisions rather than independent statistical samples: one latest
-  value per 15-minute period, full observed range without outlier labels, complete-day
-  coverage checks, and a comparable latest-full-day marker for today. Five complete
-  2026-07-18–22 days show that the final forecast is already close (about €0.23 MAE), but
-  earlier forecasts are optimistic: approximately €2.40–€2.48 MAE from midnight through
-  18:00 with +€1.02 to +€2.48 profit bias. New history rows separately persist remaining
-  forecast import cost and export reward so this can be attributed instead of guessed.
+- **Daily-net forecast calibration** — The Trends chart correctly preserves one latest
+  forecast revision per 15-minute period, so it must not hide the Aug 2–3 divergence as a
+  chart-only artefact. Investigation found 38 (Aug 2) and 36 (Aug 3)
+  `BUY`/`PRECHARGE_FOR_PEAK` cycles whose measured action was `RETAIN`: the optimizer
+  hardware's RETAIN was the correct response to an uneconomic plan. When live SoC was slightly
+  below the seasonal reserve, the DP prohibited the neutral below-reserve state and so
+  forced an immediate BUY merely to cross its discretized reserve boundary—even at
+  €0.30–€0.36/kWh while a €0.13/kWh daytime window was known. The reserve now prevents
+  further discharge below the floor but permits RETAIN there only while a strictly cheaper
+  known buy remains; otherwise it still recovers immediately. This is an optimizer control
+  fix, not PV/load tuning. Historical box plots should retain the pre-fix misses as useful
+  evidence. The closing forecast was already close in earlier validation (about €0.23 MAE),
+  but earlier forecasts require fresh validation after this repair.
+
+  - Observe at least 3 low-SoC mornings after deployment. Before the genuinely cheap
+    window, expected control is `RETAIN`/`RESERVE_POLICY` (grid covers house load but no
+    forced battery charge); only an economically justified scheduled window may become
+    `BUY`.
+  - Compare forecast error by time-to-settlement before and after the repair. Treat a
+    planned BUY that actually executes as RETAIN as an execution incident only after
+    verifying the planned BUY itself is economical; inspect the reserve state and planned
+    buy price before changing PV/load assumptions.
 
   - Collect at least 7 complete days, preferably 14, with
     `forecast_remaining_import_cost_eur` and
