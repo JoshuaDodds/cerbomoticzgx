@@ -182,7 +182,7 @@ main { padding: 12px 16px 80px; max-width: 1100px; margin: 0 auto; }
 .hvac-small-switch[aria-pressed="true"] span { transform: translateX(20px); background: var(--text); }
 .hvac-command-status { margin-top: 13px; color: var(--accent); font-size: 12px; }
 .hvac-dashboard button:focus-visible { outline: 2px solid var(--hvac-cool); outline-offset: 2px; }
-.battery-frame-card, .live-frame-card { --frame-scrollbar-mask: 48px; padding: 0; overflow: hidden; margin: 0; }
+.battery-frame-card, .live-frame-card { --frame-scrollbar-mask: 0px; padding: 0; overflow: hidden; margin: 0; }
 .battery-frame, .live-frame {
   display: block; width: calc(100% + var(--frame-scrollbar-mask)); height: calc(100vh - 94px); min-height: 720px;
   margin-right: calc(-1 * var(--frame-scrollbar-mask)); border: 0; background: #fff;

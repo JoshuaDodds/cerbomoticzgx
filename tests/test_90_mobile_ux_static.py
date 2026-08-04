@@ -94,7 +94,7 @@ def test_desktop_grid_and_house_phase_rows_match_solar_spacing():
 
     assert "const desktopPhaseStep = r.h * 0.062" in powerflow
     assert (
-        "const y = y0 + r.h * 0.47 + i * desktopPhaseStep"
+        "const y = y0 + r.h * (firefoxDesktop ? 0.51 : 0.47) + i * desktopPhaseStep"
         in powerflow
     )
     assert (
@@ -102,9 +102,21 @@ def test_desktop_grid_and_house_phase_rows_match_solar_spacing():
         in powerflow
     )
     assert (
-        "const y = y0 + r.h * 0.66 + i * desktopPhaseStep"
+        "const y = y0 + r.h * (firefoxDesktop ? 0.70 : 0.66) + i * desktopPhaseStep"
         in powerflow
     )
+
+
+def test_firefox_desktop_powerflow_reserves_extra_svg_header_space_only_there():
+    powerflow = POWERFLOW_JS.read_text(encoding="utf-8")
+
+    assert "const IS_FIREFOX" in powerflow
+    assert "const firefoxDesktop = !mobile && IS_FIREFOX" in powerflow
+    assert "const rowH = (IS_FIREFOX ? 0.45 : 0.36) * H" in powerflow
+    assert "firefoxDesktop ? 0.37 : 0.31" in powerflow
+    assert "firefoxDesktop ? 0.40 : 0.34" in powerflow
+    assert "firefoxDesktop ? 0.37 : 0.33" in powerflow
+    assert "firefoxDesktop ? 0.36 : 0.26" in powerflow
 
 
 def test_hvac_dashboard_uses_capability_driven_compact_controls():
@@ -287,9 +299,11 @@ def test_mobile_css_is_scoped_to_phone_breakpoint():
     assert "display: none" in css
     assert ".battery-frame-card" in css
     assert ".live-frame-card" in css
-    assert "--mobile-frame-scale: 0.9" in css
-    assert "--mobile-frame-fit: 111.111%" in css
-    assert "transform: scale(var(--mobile-frame-scale))" in css
+    assert "--battery-frame-scale: 0.9" in css
+    assert "--battery-frame-fit: 111.111%" in css
+    assert "transform: scale(var(--battery-frame-scale))" in css
+    assert "--victron-frame-scale: 0.48" in css
+    assert "transform: scale(var(--victron-frame-scale))" in css
     assert "env(safe-area-inset-bottom)" in css
 
 
@@ -463,27 +477,37 @@ def test_solar_card_shows_adjusted_remaining_and_vrm_source():
     assert "adjusted remaining" in js
 
 
-def test_external_frames_hide_scrollbars_in_desktop_and_mobile():
+def test_external_frames_do_not_crop_desktop_content_or_mobile_scrollbars():
     html = INDEX_HTML.read_text(encoding="utf-8")
     css = APP_CSS.read_text(encoding="utf-8")
     mobile_css = MOBILE_CSS.read_text(encoding="utf-8")
 
     assert 'scrolling="no"' not in html
-    assert "--frame-scrollbar-mask: 48px" in css
+    assert "--frame-scrollbar-mask: 0px" in css
     assert "width: calc(100% + var(--frame-scrollbar-mask))" in css
     assert "margin-right: calc(-1 * var(--frame-scrollbar-mask))" in css
-    # The external Battery/Live iframes specifically must use the mask technique above, not
-    # scrollbar-width/-ms-overflow-style (those only affect same-origin content and can't reach
-    # into a cross-origin iframe's own scrollbar). Scoped to the frame rule itself — other,
-    # same-origin elements (e.g. the tabs bar) may legitimately use scrollbar-width elsewhere.
+    # Desktop frames deliberately expose their whole cross-origin viewport; CSS scrollbar
+    # properties cannot control an iframe's own scrollbar and a mask would crop real content.
     frame_rule_start = css.index(".battery-frame, .live-frame")
     frame_rule = css[frame_rule_start:css.index("}", frame_rule_start)]
     assert "scrollbar-width: none" not in frame_rule
     assert "-ms-overflow-style: none" not in frame_rule
     assert ".battery-frame::-webkit-scrollbar" not in css
     assert "--frame-scrollbar-mask: 48px" in mobile_css
-    assert "width: calc(var(--mobile-frame-fit) + var(--frame-scrollbar-mask))" in mobile_css
-    assert "overscroll-behavior: none" in mobile_css
+    assert "--battery-frame-scale: 0.9" in mobile_css
+    assert "--victron-frame-width: 768px" in mobile_css
+    assert "--victron-frame-scale: 0.48" in mobile_css
+    assert "width: var(--victron-frame-width)" in mobile_css
+    assert "aspect-ratio: 4 / 5" in mobile_css
+    assert "overscroll-behavior: contain" in mobile_css
+
+
+def test_mobile_victron_view_keeps_the_parent_document_pinned():
+    js = APP_JS.read_text(encoding="utf-8")
+
+    assert "function keepMobileLiveViewPinned()" in js
+    assert 'window.addEventListener("scroll", keepMobileLiveViewPinned' in js
+    assert 'window.scrollTo({ top: 0, left: 0, behavior: "auto" })' in js
 
 
 def test_desktop_logo_and_clear_schedule_js_hooks_exist():

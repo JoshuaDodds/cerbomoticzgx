@@ -161,7 +161,26 @@ function setAppView(viewName) {
   if (link) link.classList.add("active");
   if (view === "overview" && !isMobileLayout()) activateTab("live");
   syncMobileNavState();
+  if (view === "live" && isMobileLayout()) {
+    // A cross-origin iframe can otherwise hand Safari a scroll gesture that
+    // leaves the parent dashboard offset with no useful way back to its top.
+    requestAnimationFrame(() => window.scrollTo({ top: 0, left: 0, behavior: "auto" }));
+  }
 }
+
+let liveViewPinScheduled = false;
+function keepMobileLiveViewPinned() {
+  if (!isMobileLayout() || document.body.dataset.appView !== "live" || window.scrollY === 0) return;
+  if (liveViewPinScheduled) return;
+  liveViewPinScheduled = true;
+  requestAnimationFrame(() => {
+    liveViewPinScheduled = false;
+    if (isMobileLayout() && document.body.dataset.appView === "live" && window.scrollY !== 0) {
+      window.scrollTo({ top: 0, left: 0, behavior: "auto" });
+    }
+  });
+}
+window.addEventListener("scroll", keepMobileLiveViewPinned, { passive: true });
 
 function appRouteFromHash() {
   const raw = (window.location.hash || "").replace(/^#/, "");
