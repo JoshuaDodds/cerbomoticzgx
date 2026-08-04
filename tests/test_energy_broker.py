@@ -4,6 +4,8 @@ import json
 import types
 from unittest.mock import MagicMock
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 stub_tibber_api = types.ModuleType("lib.tibber_api")
@@ -17,6 +19,7 @@ stub_victron_integration = types.ModuleType("lib.victron_integration")
 stub_victron_integration.ac_power_setpoint = MagicMock()
 stub_victron_integration.limit_grid_feed_in = MagicMock()
 stub_victron_integration.set_minimum_ess_soc = MagicMock()
+stub_victron_integration.regulate_battery_max_voltage = MagicMock()
 sys.modules.setdefault("lib.victron_integration", stub_victron_integration)
 
 stub_config_retrieval = types.ModuleType("lib.config_retrieval")
@@ -75,6 +78,351 @@ def test_build_load_forecast_distributes_daily_total(monkeypatch):
     assert abs(sum(forecast.values()) - 20.0) < 1e-6
     # Evening consumption greater than overnight.
     assert forecast[datetime(2026, 6, 13, 19, 0, 0)] > forecast[datetime(2026, 6, 13, 3, 0, 0)]
+
+
+def test_ev_smart_forecast_disabled_is_an_exact_noop(monkeypatch):
+    """The feature gate must preserve Summer/Winter optimizer input byte-for-byte."""
+    from datetime import datetime, timedelta, timezone
+
+    start = datetime(2026, 7, 21, 0, 0, tzinfo=timezone.utc)
+    original = {start: 0.42}
+    monkeypatch.setattr(
+        energy_broker,
+        "retrieve_setting",
+        lambda name: "False" if name == "EV_SMART_CHARGE_ENABLED" else None,
+    )
+
+    overlaid, context = energy_broker._apply_ev_smart_charge_to_forecast(
+        original,
+        {start: 0.1},
+        [{"start": start, "total": 0.20}],
+        slot_duration_h=0.25,
+        current_soc=20,
+        now=start,
+    )
+
+    assert overlaid is original
+    assert context["enabled"] is False
+    assert context["active"] is False
+
+
+def test_ev_smart_forecast_adds_planned_energy_and_publishes_snapshot(monkeypatch):
+    """An active job is an explicit load overlay, never learned as base load."""
+    from datetime import datetime, timedelta, timezone
+    from lib import ev_smart_charge
+
+    start = datetime(2026, 7, 21, 0, 0, tzinfo=timezone.utc)
+    starts = [start + timedelta(minutes=15 * i) for i in range(2)]
+    baseline = {starts[0]: 0.3, starts[1]: 0.4}
+    saved = []
+    planner_inputs = []
+    fake_plan = {
+        "available": True,
+        "active": True,
+        "status": "planned",
+        "slots": [
+            {"start": starts[0].isoformat(), "energy_kwh": 1.0, "target_kw": 4.0},
+            {"start": starts[1].isoformat(), "energy_kwh": 0.0, "target_kw": 0.0},
+        ],
+    }
+
+    settings = {
+        "EV_SMART_CHARGE_ENABLED": "True",
+        "EV_SMART_CHARGE_APPLY": "True",
+        "EV_BATTERY_USABLE_KWH": "100",
+        "EV_CHARGE_EFFICIENCY": "0.9",
+        "EV_CHARGER_MAX_KW": "16",
+        "EV_DEADLINE_BUFFER_MINUTES": "30",
+        "EV_SMART_CHARGE_JOB_PATH": "/tmp/test-job.json",
+        "EV_SMART_CHARGE_PLAN_PATH": "/tmp/test-plan.json",
+    }
+    # Maxem can temporarily advertise only 5 A as currently available. That
+    # real-time protection must not rewrite the durable plan ceiling.
+    monkeypatch.setattr(
+        energy_broker, "STATE",
+        DummyState({"tesla_charge_current_max": 5}),
+    )
+    monkeypatch.setattr(energy_broker, "retrieve_setting", lambda name: settings.get(name))
+    monkeypatch.setattr(ev_smart_charge, "load_job", lambda path=None: {"status": "active"})
+    monkeypatch.setattr(ev_smart_charge, "load_plan_snapshot", lambda path=None: None)
+    monkeypatch.setattr(
+        ev_smart_charge, "plan_charge",
+        lambda *args, **kwargs: planner_inputs.append((args, kwargs)) or fake_plan)
+    monkeypatch.setattr(ev_smart_charge, "save_plan_snapshot", lambda plan, path=None: saved.append((plan, path)))
+
+    overlaid, context = energy_broker._apply_ev_smart_charge_to_forecast(
+        baseline,
+        {starts[0]: 0.2, starts[1]: 0.0},
+        [{"start": starts[0], "total": 0.20}, {"start": starts[1], "total": 0.30}],
+        slot_duration_h=0.25,
+        current_soc=20,
+        now=start,
+    )
+
+    assert overlaid[starts[0]] == pytest.approx(1.3)
+    assert overlaid[starts[1]] == pytest.approx(0.4)
+    assert baseline[starts[0]] == pytest.approx(0.3)  # caller input was not mutated
+    assert context["active"] is True
+    assert saved == [(fake_plan, "/tmp/test-plan.json")]
+    assert planner_inputs[0][1]["requested_ceiling_kw"] == pytest.approx(16.0)
+    # 13 kW site cap - (1.2 kW base - 0.8 kW PV) = 12.6 kW safe EV
+    # forecast headroom. The 16 kW request remains only a Maxem-subordinate ceiling.
+    assert planner_inputs[0][0][1][0]["expected_delivery_kw"] == pytest.approx(12.6)
+
+
+def test_run_now_reserves_full_expected_ev_delivery_in_ess_forecast(monkeypatch):
+    """Run Now must not be planned at zero power merely because current site headroom is low."""
+    from datetime import datetime, timedelta, timezone
+    from lib import ev_smart_charge
+
+    start = datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc)
+    captured = []
+    settings = {
+        "EV_SMART_CHARGE_ENABLED": "True",
+        "EV_SMART_CHARGE_APPLY": "True",
+        "EV_CHARGER_MAX_KW": "17",
+        "EV_CHARGER_MAX_AMPS": "25",
+        "EV_EXPECTED_DELIVERY_KW": "16",
+        "ESS_MAX_GRID_IMPORT_KW": "13",
+    }
+    monkeypatch.setattr(
+        energy_broker, "retrieve_setting", lambda name: settings.get(name))
+    monkeypatch.setattr(energy_broker, "STATE", DummyState({}))
+    monkeypatch.setattr(
+        ev_smart_charge, "load_job",
+        lambda path=None: {
+            "id": "j1",
+            "status": "active",
+            "execution_mode": "run_now",
+            "ready_by": (start + timedelta(hours=1)).isoformat(),
+        },
+    )
+    monkeypatch.setattr(
+        ev_smart_charge, "load_plan_snapshot", lambda path=None: None)
+    monkeypatch.setattr(
+        ev_smart_charge, "plan_charge",
+        lambda _job, slots, **kwargs: captured.extend(slots) or {
+            "active": True, "status": "planned", "slots": [],
+        },
+    )
+    monkeypatch.setattr(
+        ev_smart_charge, "save_plan_snapshot", lambda *args, **kwargs: None)
+
+    energy_broker._apply_ev_smart_charge_to_forecast(
+        {start: 3.25},
+        {start: 0.0},
+        [{"start": start, "total": 0.20}],
+        slot_duration_h=0.25,
+        current_soc=70,
+        now=start,
+    )
+
+    assert captured[0]["expected_delivery_kw"] == pytest.approx(16.0)
+
+
+def test_ev_replan_rebuilds_and_commits_the_active_previous_quarter(monkeypatch):
+    """The optimizer's +seconds cycle must not move an already-started EV block forward."""
+    from datetime import datetime, timedelta, timezone
+    from lib import ev_smart_charge
+
+    quarter = datetime(2026, 7, 25, 9, 0, tzinfo=timezone.utc)
+    now = quarter + timedelta(seconds=5)
+    next_quarter = quarter + timedelta(minutes=15)
+    deadline = quarter + timedelta(hours=2)
+    job = {
+        "id": "job-1",
+        "status": "active",
+        "target_soc": 70,
+        "ready_by": deadline.isoformat(),
+    }
+    previous = {
+        "job": {"id": "job-1"},
+        "expected_delivery_kw": 14,
+        "slots": [{
+            "start": quarter.isoformat(),
+            "end": next_quarter.isoformat(),
+            "energy_kwh": 3.5,
+            "grid_price_eur_per_kwh": 0.10,
+            "pv_energy_kwh": 0,
+            "safe_power_cap_kw": 14,
+        }],
+    }
+    captured = {}
+    settings = {
+        "EV_SMART_CHARGE_ENABLED": "True",
+        "EV_SMART_CHARGE_APPLY": "True",
+        "EV_BATTERY_USABLE_KWH": "100",
+        "EV_CHARGE_EFFICIENCY": "0.9",
+        "EV_CHARGER_MAX_KW": "16",
+        "EV_CHARGER_MAX_AMPS": "25",
+        "EV_EXPECTED_DELIVERY_KW": "14",
+        "EV_DEADLINE_BUFFER_MINUTES": "0",
+        "EV_SMART_CHARGE_JOB_PATH": "/tmp/job.json",
+        "EV_SMART_CHARGE_PLAN_PATH": "/tmp/plan.json",
+    }
+    monkeypatch.setattr(energy_broker, "STATE", DummyState({}))
+    monkeypatch.setattr(
+        energy_broker, "retrieve_setting", lambda name: settings.get(name))
+    monkeypatch.setattr(ev_smart_charge, "load_job", lambda path=None: job)
+    monkeypatch.setattr(
+        ev_smart_charge, "load_plan_snapshot", lambda path=None: previous)
+    monkeypatch.setattr(
+        ev_smart_charge,
+        "plan_charge",
+        lambda loaded_job, slots, **kwargs: (
+            captured.update(job=loaded_job, slots=slots, kwargs=kwargs)
+            or {"available": True, "active": True, "status": "planned", "slots": []}
+        ),
+    )
+    monkeypatch.setattr(ev_smart_charge, "save_plan_snapshot", lambda *a, **k: None)
+
+    energy_broker._apply_ev_smart_charge_to_forecast(
+        {next_quarter: 0.25},
+        {next_quarter: 0.0},
+        [{"start": next_quarter, "total": 0.20}],
+        slot_duration_h=0.25,
+        current_soc=60,
+        now=now,
+    )
+
+    assert captured["kwargs"]["committed_slot_starts"] == [quarter]
+    rebuilt = next(
+        row for row in captured["slots"] if row["start"] == quarter)
+    assert rebuilt["grid_price_eur_per_kwh"] == pytest.approx(0.10)
+
+
+def test_shadow_terminal_ev_job_publishes_cleanup_marker_for_controller(
+        monkeypatch):
+    from datetime import datetime, timezone
+    from lib import ev_smart_charge
+
+    start = datetime(2026, 7, 21, 0, 0, tzinfo=timezone.utc)
+    baseline = {start: 0.3}
+    settings = {
+        "EV_SMART_CHARGE_ENABLED": "True",
+        "EV_SMART_CHARGE_APPLY": "False",
+        "EV_SMART_CHARGE_JOB_PATH": "/tmp/shadow-job.json",
+        "EV_SMART_CHARGE_PLAN_PATH": "/tmp/shadow-plan.json",
+    }
+    terminal = {
+        "available": True,
+        "active": False,
+        "status": "completed",
+        "reason": "target_soc_reached",
+        "job": {"id": "job-1", "status": "active"},
+        "slots": [],
+        "planned_ac_kwh": 0,
+    }
+    saved = []
+    monkeypatch.setattr(energy_broker, "STATE", DummyState({}))
+    monkeypatch.setattr(
+        energy_broker, "retrieve_setting", lambda name: settings.get(name))
+    monkeypatch.setattr(
+        ev_smart_charge, "load_job",
+        lambda path=None: {
+            "id": "job-1",
+            "status": "active",
+            "ready_by": (start.replace(hour=2)).isoformat(),
+        },
+    )
+    monkeypatch.setattr(ev_smart_charge, "load_plan_snapshot", lambda path=None: None)
+    monkeypatch.setattr(
+        ev_smart_charge, "plan_charge", lambda *args, **kwargs: terminal)
+    monkeypatch.setattr(
+        ev_smart_charge, "save_plan_snapshot",
+        lambda plan, path=None: saved.append((plan, path)),
+    )
+
+    result, context = energy_broker._apply_ev_smart_charge_to_forecast(
+        baseline,
+        {start: 0.0},
+        [{"start": start, "total": 0.20}],
+        slot_duration_h=0.25,
+        current_soc=80,
+        now=start,
+    )
+
+    assert result is baseline
+    assert context["status"] == "completed"
+    assert context["plan"] is terminal
+    assert saved == [(terminal, "/tmp/shadow-plan.json")]
+
+
+def test_ev_smart_forecast_reserves_surplus_for_protected_home_battery(monkeypatch):
+    """Forecast PV is EV surplus only after the existing ESS target is supplied."""
+    from datetime import datetime, timedelta, timezone
+    from lib import ev_smart_charge
+
+    start = datetime(2026, 7, 21, 10, 0, tzinfo=timezone.utc)
+    starts = [start + timedelta(minutes=15 * index) for index in range(4)]
+    captured = []
+    settings = {
+        "EV_SMART_CHARGE_ENABLED": "True",
+        "EV_SMART_CHARGE_APPLY": "False",
+        "MINIMUM_ESS_SOC": "90",
+        "BATTERY_CAPACITY_KWH": "40",
+        "AC_DC_CHARGE_EFFICIENCY": "1",
+    }
+    monkeypatch.setattr(energy_broker, "STATE", DummyState({}))
+    monkeypatch.setattr(energy_broker, "retrieve_setting", lambda name: settings.get(name))
+    monkeypatch.setattr(ev_smart_charge, "load_job", lambda path=None: {"status": "active"})
+    monkeypatch.setattr(ev_smart_charge, "load_plan_snapshot", lambda path=None: None)
+    monkeypatch.setattr(
+        ev_smart_charge,
+        "plan_charge",
+        lambda _job, slots, **_kwargs: captured.extend(slots) or {
+            "active": True, "status": "planned", "slots": [],
+        },
+    )
+    monkeypatch.setattr(ev_smart_charge, "save_plan_snapshot", lambda *args, **kwargs: None)
+
+    energy_broker._apply_ev_smart_charge_to_forecast(
+        {slot: 0.0 for slot in starts},
+        {slot: 1.0 for slot in starts},
+        [{"start": slot, "total": 0.20} for slot in starts],
+        slot_duration_h=0.25,
+        current_soc=30,
+        ess_soc=80,
+        now=start,
+    )
+
+    # Raising a 40 kWh stationary pack from 80% to 90% consumes all 4 kWh.
+    assert sum(slot["pv_reserved_for_ess_kwh"] for slot in captured) == pytest.approx(4.0)
+    assert sum(slot["pv_surplus_kwh"] for slot in captured) == pytest.approx(0.0)
+    assert all(slot["supply_forecast_known"] is True for slot in captured)
+
+
+def test_ev_smart_shadow_plans_but_does_not_change_ess_load(monkeypatch):
+    from datetime import datetime, timezone
+    from lib import ev_smart_charge
+
+    start = datetime(2026, 7, 21, 0, 0, tzinfo=timezone.utc)
+    baseline = {start: 0.3}
+    fake_plan = {
+        "active": True, "status": "planned",
+        "slots": [{"start": start.isoformat(), "energy_kwh": 1.0,
+                   "requested_power_kw": 4.0}],
+    }
+    settings = {
+        "EV_SMART_CHARGE_ENABLED": "True",
+        "EV_SMART_CHARGE_APPLY": "False",
+    }
+    monkeypatch.setattr(energy_broker, "STATE", DummyState({}))
+    monkeypatch.setattr(energy_broker, "retrieve_setting", lambda name: settings.get(name))
+    monkeypatch.setattr(ev_smart_charge, "load_job", lambda path=None: {"status": "active"})
+    monkeypatch.setattr(ev_smart_charge, "load_plan_snapshot", lambda path=None: None)
+    monkeypatch.setattr(ev_smart_charge, "plan_charge", lambda *args, **kwargs: fake_plan)
+    monkeypatch.setattr(ev_smart_charge, "save_plan_snapshot", lambda *args, **kwargs: None)
+
+    forecast, context = energy_broker._apply_ev_smart_charge_to_forecast(
+        baseline, {start: 0.0}, [{"start": start, "total": 0.2}],
+        slot_duration_h=0.25, current_soc=20, now=start,
+    )
+
+    assert forecast is baseline
+    assert context["active"] is True
+    assert context["apply"] is False
+    assert context["ess_overlay_applied"] is False
 
 
 def test_pv_forecast_uses_learned_shape(monkeypatch):
@@ -244,6 +592,62 @@ def test_pv_nowcast_does_not_lower_on_missing_gti(monkeypatch):
 
     far = slots[-1]["start"]   # >1h ahead, no GTI -> must be left at baseline
     assert adjusted[far] == base[far]
+
+
+def test_pv_nowcast_accepts_fresh_zero_watts_as_sunset_evidence(monkeypatch):
+    from datetime import datetime, timezone
+
+    now = datetime(2026, 7, 19, 21, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        energy_broker,
+        "STATE",
+        DummyState({
+            "pv_power": 0.0,
+            "pv_power_updated_at": now.timestamp(),
+        }),
+    )
+    monkeypatch.setattr(
+        energy_broker,
+        "_latest_settled_pv_slot_kwh",
+        lambda slot_h, now=None: 0.8,
+    )
+
+    anchor = energy_broker._pv_nowcast_anchor_kwh(0.25, now=now)
+
+    assert anchor["source"] == "live_drop"
+    assert anchor["slot_kwh"] == 0.0
+    assert anchor["drop_ratio"] == 0.0
+
+
+def test_confirmed_zero_pv_strongly_lowers_stale_sunset_forecast(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    start = datetime(2026, 7, 19, 21, 0, tzinfo=timezone.utc)
+    slots = [{"start": start + timedelta(minutes=15 * i)} for i in range(4)]
+    base = {slot["start"]: 0.8 for slot in slots}
+    weather_context = {
+        "available": True,
+        "slots": {
+            slot["start"].isoformat(): {"gti_forecast_wm2": 0.0}
+            for slot in slots
+        },
+        "summary": {},
+    }
+    monkeypatch.setattr(
+        energy_broker,
+        "_pv_nowcast_anchor_kwh",
+        lambda slot_h, now=None: {
+            "slot_kwh": 0.0,
+            "source": "live_drop",
+            "drop_ratio": 0.0,
+        },
+    )
+
+    adjusted = energy_broker._apply_pv_nowcast(
+        base, slots, weather_context, 0.25, now=start)
+
+    assert adjusted[slots[0]["start"]] <= 0.1
+    assert adjusted[slots[-1]["start"]] < base[slots[-1]["start"]]
 
 
 def test_pv_intraday_correction_scales_up_on_outperformance(monkeypatch):
@@ -451,11 +855,36 @@ def test_publish_plan_json_serializes_weather_datetime_maps(monkeypatch, tmp_pat
             "pv_shadow_forecast": {slot_start: 0.2},
             "slots": {slot_start: {"time": slot_start, "temp_forecast_c": 24.0}},
         },
+        "onecta_hvac": {
+            "enabled": True,
+            "available": True,
+            "fresh": True,
+            "fetched_at": slot_start,
+            "summary": {
+                "today_total_kwh": 1.2,
+                "today_cooling_kwh": 1.2,
+                "today_heating_kwh": 0.0,
+                "powered_units": 2,
+            },
+        },
         "planning_policy": {
             "selected": "today_first",
             "reason_code": "DAILY_SETTLEMENT_PROTECTED",
             "today_sacrifice_eur": 10.0,
             "future_gain_eur": 3.0,
+        },
+        "optimizer_mode": "winter",
+        "winter_policy": {
+            "mode": "winter",
+            "selected_candidate": "self_sufficiency",
+            "protected_soc_percent": 46.0,
+            "reason_code": "WINTER_EXCEPTIONAL_SPREAD_REJECTED",
+        },
+        "appliance_reservations": {
+            "enabled": True,
+            "devices": ["Dishwasher", "Dryer"],
+            "reserved_kwh": 2.35,
+            "active_reservations": 2,
         },
     }
 
@@ -473,6 +902,8 @@ def test_publish_plan_json_serializes_weather_datetime_maps(monkeypatch, tmp_pat
     assert payload["weather"]["summary"]["fetched_at"] == slot_start.isoformat()
     assert payload["weather"]["load_adjustments"][slot_start.isoformat()] == 0.1
     assert payload["weather"]["slots"][slot_start.isoformat()]["time"] == slot_start.isoformat()
+    assert payload["hvac"]["fetched_at"] == slot_start.isoformat()
+    assert payload["hvac"]["summary"]["today_total_kwh"] == 1.2
     assert payload["pv_remaining_wh"] == 1234.0
     assert payload["pv_remaining_raw_wh"] == 1234.0
     assert payload["pv_remaining_raw_source"] == "VRM forecast"
@@ -487,6 +918,19 @@ def test_publish_plan_json_serializes_weather_datetime_maps(monkeypatch, tmp_pat
     }
     assert payload["planning_policy"]["selected"] == "today_first"
     assert payload["planning_policy"]["reason_code"] == "DAILY_SETTLEMENT_PROTECTED"
+    assert payload["optimizer_mode"] == "winter"
+    assert payload["winter_policy"] == {
+        "mode": "winter",
+        "selected_candidate": "self_sufficiency",
+        "protected_soc_percent": 46.0,
+        "reason_code": "WINTER_EXCEPTIONAL_SPREAD_REJECTED",
+    }
+    assert payload["appliance_reservations"] == {
+        "enabled": True,
+        "devices": ["Dishwasher", "Dryer"],
+        "reserved_kwh": 2.35,
+        "active_reservations": 2,
+    }
 
 
 def test_weather_context_log_message_explains_applied_adjustments():
@@ -582,17 +1026,21 @@ def test_manual_grid_assist_reports_retain_even_with_zero_setpoint():
     assert energy_broker._grid_assist_control_action(applied_setpoint=0, manual_grid_assist=False) == "IDLE"
 
 
-def test_current_min_soc_reserve_is_seasonal(monkeypatch):
+def test_current_min_soc_reserve_follows_explicit_winter_mode(monkeypatch):
     import sys
+    import lib.ess_mode as ess_mode
     import lib.helpers as helpers
     cr = sys.modules.get("lib.config_retrieval")
-    monkeypatch.setattr(cr, "retrieve_setting",
-                        lambda n: {"MIN_SOC_RESERVE_WINTER": "40", "MIN_SOC_RESERVE_SUMMER": "0"}.get(n))
+    settings = {
+        "MIN_SOC_RESERVE_WINTER": "40",
+        "MIN_SOC_RESERVE_SUMMER": "0",
+    }
+    monkeypatch.setattr(cr, "retrieve_setting", settings.get)
+    monkeypatch.setattr(ess_mode, "WINTER_MODE", True)
 
-    monkeypatch.setattr(helpers, "is_winter_month", lambda: True)
     assert helpers.current_min_soc_reserve() == 40.0
 
-    monkeypatch.setattr(helpers, "is_winter_month", lambda: False)
+    monkeypatch.setattr(ess_mode, "WINTER_MODE", False)
     assert helpers.current_min_soc_reserve() == 0.0
 
 
@@ -614,6 +1062,20 @@ def test_settlement_writes_predicted_vs_actual(monkeypatch, tmp_path):
 
     t1 = datetime(2026, 7, 10, 10, 0, tzinfo=timezone.utc)
     t2 = t1 + timedelta(minutes=15)   # next slot -> the prior slot settles
+    res["schedule"][0].update({"time": t1, "pv": 0.7, "load": 0.8})
+    res["weather_context"] = {
+        "summary": {"hvac_apply": False, "pv_apply": False},
+        "slots": {
+            t1.isoformat(): {
+                "baseline_load_kwh": 0.6,
+                "weather_load_shadow_kwh": 0.65,
+                "final_load_forecast_kwh": 0.8,
+                "baseline_pv_kwh": 0.9,
+                "weather_pv_shadow_kwh": 0.75,
+                "final_pv_forecast_kwh": 0.7,
+            },
+        },
+    }
 
     # Cycle 1: counters at import 1.0 kWh (€0.20), no export; SoC 80%.
     energy_broker._settle_prior_slot(
@@ -625,7 +1087,9 @@ def test_settlement_writes_predicted_vs_actual(monkeypatch, tmp_path):
     # Cycle 2 (next slot): +2.0 kWh exported (+€0.60), SoC fell to 72%.
     energy_broker._settle_prior_slot(
         res, batt_soc=72.0,
-        today_actuals={"imp_kwh": 1.0, "imp_cost": 0.20, "exp_kwh": 2.0, "exp_rev": 0.60}, now=t2)
+        today_actuals={"imp_kwh": 1.0, "imp_cost": 0.20, "exp_kwh": 2.0, "exp_rev": 0.60},
+        now=t2,
+        realized_power={"grid_w": -3000.0, "batt_w": -3500.0})
 
     files = list(tmp_path.glob("ess-*.ndjson"))
     assert files
@@ -634,6 +1098,7 @@ def test_settlement_writes_predicted_vs_actual(monkeypatch, tmp_path):
     assert len(settlements) == 1
     s = settlements[0]
     assert s["predicted_control_action"] == "SELL"
+    assert s["actual_control_action"] == "SELL"
     assert not s["incomplete"]
     assert abs(s["actual_export_kwh"] - 2.0) < 1e-6
     assert abs(s["actual_net_eur"] - 0.60) < 1e-6   # +0.60 reward − 0 added import
@@ -641,6 +1106,14 @@ def test_settlement_writes_predicted_vs_actual(monkeypatch, tmp_path):
     assert abs(s["soc_delta"] - (-8.0)) < 1e-6
     # Cost-basis field is recorded (discharge slot -> basis present, may be 0).
     assert "cost_basis_eur_per_kwh" in s
+    assert s["baseline_load_forecast_kwh"] == 0.6
+    assert s["weather_load_shadow_kwh"] == 0.65
+    assert s["final_load_forecast_kwh"] == 0.8
+    assert s["baseline_pv_forecast_kwh"] == 0.9
+    assert s["weather_pv_shadow_kwh"] == 0.75
+    assert s["final_pv_forecast_kwh"] == 0.7
+    assert s["weather_hvac_apply"] is False
+    assert s["weather_pv_apply"] is False
 
 
 def test_settlement_ignores_extra_cycle_within_same_slot(monkeypatch, tmp_path):
@@ -848,6 +1321,24 @@ def test_run_ai_optimizer_skips_when_optimizer_lock_is_held(monkeypatch, caplog)
     assert "Optimization already running" in caplog.text
 
 
+def test_run_ai_optimizer_runs_ui_mutation_inside_single_writer_lock(monkeypatch):
+    calls = []
+
+    def before_run():
+        assert energy_broker._AI_OPTIMIZER_LOCK.locked()
+        calls.append("activate")
+
+    def runner():
+        assert energy_broker._AI_OPTIMIZER_LOCK.locked()
+        calls.append("plan")
+
+    monkeypatch.setattr(energy_broker, "_run_ai_optimizer_once", runner)
+
+    assert energy_broker.run_ai_optimizer(
+        wait_timeout_s=0.1, before_run=before_run) is True
+    assert calls == ["activate", "plan"]
+
+
 def test_ai_optimizer_skips_when_soc_key_missing_but_voltage_exists(monkeypatch, caplog):
     monkeypatch.setattr(energy_broker, "retrieve_setting",
                         lambda name: "1" if name == "AI_POWERED_ESS_ALGORITHM" else None)
@@ -951,6 +1442,179 @@ def test_ai_optimizer_applies_pv_nowcast_when_weather_unavailable(monkeypatch):
 
     nowcast.assert_called_once()
     assert nowcast.call_args.args[2]["available"] is False
+
+
+def test_ai_optimizer_overlays_ev_and_blocks_stationary_battery_discharge(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    import lib.weather as weather
+
+    start = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    prices = [
+        {"start": (start + timedelta(minutes=15 * i)).isoformat(), "total": 0.20}
+        for i in range(2)
+    ]
+    settings = {
+        "AI_POWERED_ESS_ALGORITHM": "1",
+        "EV_SMART_CHARGE_ENABLED": "1",
+        "EV_SMART_CHARGE_APPLY": "1",
+        "EV_ALLOW_ESS_DISCHARGE": "0",
+    }
+    monkeypatch.setattr(energy_broker, "retrieve_setting", lambda name: settings.get(name))
+    monkeypatch.setattr(energy_broker, "STATE", DummyState({
+        "batt_soc": 60,
+        "tesla_soc": 25,
+        "ac_in_power": 0,
+        "pv_power": 0,
+        "ac_out_power": 1000,
+        "batt_power": 0,
+    }))
+    monkeypatch.setattr(energy_broker, "get_all_price_points", lambda: prices)
+    monkeypatch.setattr(
+        energy_broker, "_build_pv_forecast_by_slot",
+        lambda slots, slot_h: {slot["start"]: 0.0 for slot in slots})
+    monkeypatch.setattr(
+        energy_broker, "_build_load_forecast_by_slot",
+        lambda slots, slot_h: {slot["start"]: 0.2 for slot in slots})
+    monkeypatch.setattr(
+        weather, "weather_context_for_slots",
+        lambda *args, **kwargs: {"available": False, "summary": {}, "slots": {}})
+    monkeypatch.setattr(
+        energy_broker, "_apply_appliance_reservations_to_forecast",
+        lambda load, **kwargs: (load, {"enabled": False}))
+    monkeypatch.setattr(energy_broker, "_apply_pv_nowcast", lambda pv, *args: pv)
+    selected_start = prices[0]["start"]
+    ev_plan = {
+        "active": True,
+        "status": "planned",
+        "job": {"id": "job-1", "status": "active"},
+        "slots": [{
+            "start": selected_start,
+            "end": prices[1]["start"],
+            "energy_kwh": 3.5,
+            "requested_power_kw": 14.0,
+            "supply": "grid",
+        }],
+        "timeline_slots": [{
+            "start": selected_start,
+            "end": prices[1]["start"],
+            "energy_kwh": 3.5,
+            "requested_power_kw": 14.0,
+            "supply": "grid",
+            "soc_start": 25.0,
+            "soc_end": 28.15,
+            "selected": True,
+        }],
+    }
+    monkeypatch.setattr(
+        energy_broker, "_apply_ev_smart_charge_to_forecast",
+        lambda load, *args, **kwargs: (
+            {key: value + (3.5 if index == 0 else 0.0)
+             for index, (key, value) in enumerate(load.items())},
+            {"enabled": True, "apply": True, "active": True,
+             "ess_overlay_applied": True, "status": "planned",
+             "job_id": "job-1", "plan": ev_plan},
+        ),
+    )
+    optimizer_calls = []
+
+    def optimizer(*args, **kwargs):
+        optimizer_calls.append((args, kwargs))
+        return {
+            "schedule": [{
+                "time": selected_start, "action": "hold", "control_action": "IDLE",
+                "soc_start": 60.0, "soc_end": 60.0, "grid_energy": 3.7,
+                "price": 0.20, "sell": 0.20, "load": args[2][next(iter(args[2]))],
+            }],
+            "victron_slots": [], "slot_duration_h": 0.25, "setpoint": 0.0,
+            "control_action": "IDLE", "grid_assist": False, "mode": "hold",
+            "current_price": 0.20, "limit_feed_in": False,
+        }
+
+    monkeypatch.setattr(energy_broker, "optimize_schedule", optimizer)
+    monkeypatch.setattr(energy_broker, "_set_grid_assist", lambda enabled: None)
+    monkeypatch.setattr(energy_broker, "ac_power_setpoint", lambda **kwargs: None)
+    monkeypatch.setattr(energy_broker, "limit_grid_feed_in", lambda **kwargs: None)
+    monkeypatch.setattr(energy_broker, "set_minimum_ess_soc", lambda: None)
+    monkeypatch.setattr(energy_broker, "clear_victron_schedules", lambda: None)
+    monkeypatch.setattr(energy_broker, "get_today_energy_actuals", lambda: {})
+    monkeypatch.setattr(energy_broker, "_append_history", lambda *args, **kwargs: None)
+    monkeypatch.setattr(energy_broker, "_settle_prior_slot", lambda *args, **kwargs: None)
+    published = []
+    monkeypatch.setattr(
+        energy_broker, "_publish_plan_json",
+        lambda result, **kwargs: published.append(result),
+    )
+
+    assert energy_broker.run_ai_optimizer() is True
+    assert optimizer_calls[0][0][2][next(iter(optimizer_calls[0][0][2]))] == pytest.approx(3.7)
+    assert optimizer_calls[0][1]["discharge_blocked_slots"] == {selected_start}
+    assert published[0]["schedule"][0]["planned_ev_kwh"] == pytest.approx(3.5)
+    assert published[0]["schedule"][0]["non_ev_load_kwh"] == pytest.approx(0.2)
+    assert published[0]["schedule"][0]["ev_soc_start"] == pytest.approx(25.0)
+    assert published[0]["schedule"][0]["ev_soc_end"] == pytest.approx(28.15)
+
+
+def test_winter_optimizer_failure_clears_stale_control_and_retains(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    import lib.weather as weather
+
+    start = datetime.now(timezone.utc)
+    prices = [
+        {"start": (start + timedelta(minutes=15 * i)).isoformat(), "total": 0.20}
+        for i in range(2)
+    ]
+    monkeypatch.setattr(energy_broker, "OPTIMIZER_MODE", "winter")
+    monkeypatch.setattr(
+        energy_broker,
+        "retrieve_setting",
+        lambda name: "1" if name == "AI_POWERED_ESS_ALGORITHM" else None,
+    )
+    monkeypatch.setattr(
+        energy_broker,
+        "STATE",
+        DummyState({"batt_soc": 42, "ac_in_power": 0, "pv_power": 0,
+                    "ac_out_power": 1000, "batt_power": -1000}),
+    )
+    monkeypatch.setattr(energy_broker, "get_all_price_points", lambda: prices)
+    monkeypatch.setattr(energy_broker, "_build_pv_forecast_by_slot", lambda *args: {})
+    monkeypatch.setattr(energy_broker, "_build_load_forecast_by_slot", lambda *args: {})
+    monkeypatch.setattr(energy_broker, "_apply_pv_nowcast", lambda pv, *args: pv)
+    monkeypatch.setattr(
+        weather, "weather_context_for_slots",
+        lambda *args, **kwargs: {"available": False, "summary": {}, "slots": {}},
+    )
+    monkeypatch.setattr(energy_broker, "optimize_schedule", lambda *args: None)
+    monkeypatch.setattr(energy_broker, "current_min_soc_reserve", lambda: 40.0)
+    minimum_soc = MagicMock()
+    clear_slots = MagicMock()
+    grid_assist = MagicMock()
+    monkeypatch.setattr(energy_broker, "set_minimum_ess_soc", minimum_soc)
+    monkeypatch.setattr(energy_broker, "clear_victron_schedules", clear_slots)
+    monkeypatch.setattr(energy_broker, "_set_grid_assist", grid_assist)
+    monkeypatch.setattr(energy_broker, "_apply_grid_assist_setpoint", lambda **kwargs: None)
+    monkeypatch.setattr(energy_broker, "_grid_assist_setpoint_watts", lambda **kwargs: 1000)
+    monkeypatch.setattr(energy_broker, "limit_grid_feed_in", lambda **kwargs: None)
+    monkeypatch.setattr(energy_broker, "get_today_energy_actuals", lambda: {})
+    monkeypatch.setattr(energy_broker, "_append_history", lambda *args, **kwargs: None)
+    monkeypatch.setattr(energy_broker, "_settle_prior_slot", lambda *args, **kwargs: None)
+    published = []
+    monkeypatch.setattr(
+        energy_broker, "_publish_plan_json",
+        lambda result, **kwargs: published.append(result.copy()),
+    )
+
+    assert energy_broker.run_ai_optimizer() is True
+
+    minimum_soc.assert_called_once()
+    clear_slots.assert_called_once()
+    grid_assist.assert_called_with(True)
+    assert published[0]["optimizer_mode"] == "winter"
+    assert published[0]["control_action"] == "RETAIN"
+    assert published[0]["winter_policy"]["warning"] == "optimizer_failed_safe_retain"
+    assert energy_broker.STATE.get("ai_optimizer_mode") == "winter"
+    assert energy_broker.STATE.get("ai_winter_candidate") == "self_sufficiency"
+    assert energy_broker.STATE.get("ai_winter_protected_soc") == 40.0
+    assert energy_broker.STATE.get("ai_winter_warning") == "optimizer_failed_safe_retain"
 
 
 def test_low_soc_idle_retain_defers_to_cheaper_planned_buy(monkeypatch):

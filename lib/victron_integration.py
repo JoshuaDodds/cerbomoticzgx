@@ -1,3 +1,5 @@
+import math
+
 from paho.mqtt import publish
 from lib.global_state import GlobalStateClient
 from lib.helpers import publish_message
@@ -64,26 +66,99 @@ def limit_grid_feed_in(enabled: bool, watts: int = 0):
         logging.error(f"Victron Integration: Failed to set grid feed-in limit ({desired_state}): {e}")
 
 
-def set_minimum_ess_soc(percent=None):
-    """Set the Victron ESS MinimumSocLimit (the hard discharge floor).
+def configured_victron_min_soc_limit():
+    """Return the independent Victron hard minimum SoC, or ``None`` if invalid.
 
-    Defaults to the single source of truth (helpers.current_min_soc_reserve)
-    so the hardware floor always matches the optimizer's seasonal reserve.
-    Idempotent: only publishes when the value actually changes.
+    This is deliberately separate from the optimizer's seasonal reserve. Victron
+    enters Recharge when actual SoC is below ``MinimumSocLimit``; mirroring a 40%
+    winter planning reserve here would therefore cause an immediate unscheduled
+    grid charge instead of letting the optimizer choose the cheapest window.
+
+    Missing settings default to zero so existing installations clear any stale
+    seasonal value after upgrade. Explicit malformed/out-of-range settings are
+    rejected rather than silently issuing a surprising safety-critical command.
+    """
+    raw = retrieve_setting('VICTRON_HARDWARE_MIN_SOC')
+    if raw in (None, '', 'None'):
+        return 0
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logging.error(
+            "Victron Integration: Invalid VICTRON_HARDWARE_MIN_SOC %r; "
+            "leaving MinimumSocLimit unchanged.",
+            raw,
+        )
+        return None
+    if not math.isfinite(value) or not 0.0 <= value <= 100.0:
+        logging.error(
+            "Victron Integration: VICTRON_HARDWARE_MIN_SOC must be finite and "
+            "between 0 and 100 (received %r); leaving MinimumSocLimit unchanged.",
+            raw,
+        )
+        return None
+    return int(round(value))
+
+
+def set_minimum_ess_soc(percent=None, *, force=False) -> bool:
+    """Apply Victron's independent hard ``MinimumSocLimit``.
+
+    Idempotence is based on the actual subscribed Victron topic
+    (``minimum_ess_soc``), never only on our last-command shadow. GlobalState
+    returns numeric zero for a missing key, so an explicit ``has`` check is
+    essential when the desired value is zero after a restart.
+
+    Returns ``True`` when a write was published and ``False`` when the observed
+    Victron value already matched or the requested value was invalid.
     """
     if percent is None:
-        from lib.helpers import current_min_soc_reserve
-        percent = current_min_soc_reserve()
+        percent = configured_victron_min_soc_limit()
+        if percent is None:
+            return False
 
-    percent = int(round(float(percent)))
+    try:
+        numeric = float(percent)
+    except (TypeError, ValueError):
+        logging.error(
+            "Victron Integration: Refusing invalid minimum SoC value %r.", percent)
+        return False
+    if not math.isfinite(numeric) or not 0.0 <= numeric <= 100.0:
+        logging.error(
+            "Victron Integration: Refusing out-of-range minimum SoC value %r.",
+            percent,
+        )
+        return False
+    percent = int(round(numeric))
 
-    if STATE.get('min_ess_soc_applied') == percent:
-        return
+    observed_available = False
+    try:
+        observed_available = bool(STATE.has('minimum_ess_soc'))
+    except (AttributeError, TypeError):
+        # Without presence semantics, zero cannot be distinguished from missing;
+        # publishing the idempotent setting is safer than leaving a stale floor.
+        observed_available = False
+    if not force and observed_available:
+        try:
+            observed_numeric = float(STATE.get('minimum_ess_soc'))
+            observed = (
+                int(round(observed_numeric))
+                if math.isfinite(observed_numeric)
+                else None
+            )
+        except (TypeError, ValueError, OverflowError):
+            observed = None
+        if observed == percent:
+            STATE.set('min_ess_soc_applied', percent)
+            return False
 
     _msg = f"{{\"value\": {percent}}}"
-    logging.info(f"Victron Integration: Setting ESS minimum SoC limit to: {percent}%")
+    logging.info(
+        "Victron Integration: Setting independent hardware minimum SoC limit to: %s%%",
+        percent,
+    )
     publish.single(TopicsWritable['system0']['minimum_ess_soc'], payload=_msg, qos=1, retain=True, hostname=cerboGxEndpoint, port=1883)
     STATE.set('min_ess_soc_applied', percent)
+    return True
 
 def restore_default_battery_max_voltage():
     logging.info(f"Victron Integration: Restoring max charge voltage to {float_voltage}V before shutdown...")
@@ -112,8 +187,8 @@ def regulate_battery_max_voltage(ess_soc):
             publish.single(TopicsWritable["system0"]["max_charge_voltage"], payload=f"{{\"value\": \"{battery_full_voltage}\"}}", qos=1, retain=False, hostname=cerboGxEndpoint, port=1883)
             logging.info(f"Victron Integration: Adjusting max charge voltage to {battery_full_voltage} due to battery SOC reaching {retrieve_setting('MAXIMUM_ESS_SOC')}% or higher")
             publish.single("Tesla/vehicle0/solar/ess_max_charge_voltage", payload=f"{{\"value\": \"{battery_full_voltage}\"}}", qos=1, retain=True, hostname=cerboGxEndpoint, port=1883)
-            # On full charge, re-assert the ESS minimum-SoC floor from the single
-            # source of truth (seasonal reserve), not a hardcoded value.
+            # On full charge, re-assert the independently configured Victron
+            # safety floor. Seasonal planning reserves remain optimizer-only.
             set_minimum_ess_soc()
 
         else:

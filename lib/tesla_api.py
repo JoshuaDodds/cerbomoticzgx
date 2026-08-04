@@ -1,9 +1,17 @@
+import base64
+import json
 import math
+import os
 import re
+import stat
+import tempfile
 import threading
 import time
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
 
 import requests
+from dotenv import dotenv_values
 
 import lib.helpers
 
@@ -18,8 +26,12 @@ from lib.tesla_budget import default_budget
 STATE = GlobalStateClient()
 
 TIMEOUT = 25
-TESLA_AUTH_TOKEN_URL = "https://auth.tesla.com/oauth2/v3/token"
+TESLA_AUTH_TOKEN_URL = "https://fleet-auth.prd.vn.cloud.tesla.com/oauth2/v3/token"
 VEHICLE_DATA_ENDPOINTS = "charge_state;drive_state;vehicle_state;location_data"
+TOKEN_REFRESH_SKEW_S = 60
+AUTH_FAILURE_BACKOFF_S = 15 * 60
+AUTH_TRANSIENT_BACKOFF_S = 60
+TESLA_WEEKDAY_NAMES = ("SUN", "MON", "TUES", "WED", "THURS", "FRI", "SAT")
 
 # Poll cadence (minutes). We NEVER wake the car to read status, so these are just the
 # minimum spacing between reads. When the car is asleep we back off hard: a sleeping car
@@ -27,11 +39,33 @@ VEHICLE_DATA_ENDPOINTS = "charge_state;drive_state;vehicle_state;location_data"
 DEFAULT_POLL_INTERVAL_MIN = 15
 DEFAULT_POLL_INTERVAL_CHARGING_MIN = 10
 DEFAULT_POLL_INTERVAL_ASLEEP_MIN = 30
-# In telemetry mode, a refresh within this window is treated as proof the car is online (it's
-# actively streaming), so the pre-command billable state read can be skipped entirely (audit M3).
-TELEMETRY_ONLINE_MAX_AGE_S = 300
+COMMAND_IMPLICIT_WAKE_GRACE_S = 10
+WAKE_MIN_SETTLE_S = 10
+WAKE_CONNECT_TIMEOUT_S = 60
+WAKE_TELEMETRY_POLL_S = 5
+# Connectivity events, not unchanged field ages, determine whether Fleet Telemetry
+# is online. This short grace applies only before the first connectivity event (or
+# during its delivery race): a just-received signal proves the socket was online.
+# It is not a general vehicle-data staleness threshold. Tesla documents 30-second
+# maximum reconnect backoff and 10–60 seconds for a wake to bring a vehicle online.
+TELEMETRY_CONNECTION_EVENT_GRACE_S = 60
 
 logging.getLogger('urllib3').setLevel(logging.WARNING)
+
+
+class TeslaAuthenticationError(requests.exceptions.RequestException):
+    """Sanitized OAuth failure which never includes credentials or response bodies."""
+
+    def __init__(self, status_code=0, error_code="authentication_failed",
+                 fleet_response_received=False):
+        self.status_code = int(status_code or 0)
+        self.fleet_response_received = bool(fleet_response_received)
+        normalized = re.sub(r"[^a-zA-Z0-9_-]", "_", str(error_code or ""))
+        self.error_code = normalized[:80] or "authentication_failed"
+        super().__init__(
+            f"Tesla Fleet authentication failed (HTTP {self.status_code or 'unknown'}, "
+            f"{self.error_code})"
+        )
 
 
 def _setting_int(name, default):
@@ -52,9 +86,14 @@ class TeslaApi:
         self._base_url = retrieve_setting("TESLA_FLEET_API_BASE_URL")
         self._vehicle_id = retrieve_setting("TESLA_FLEET_VEHICLE_ID")
 
-        self._access_token = None
-        self._token_expires_at = 0
+        self._access_token = retrieve_setting("TESLA_FLEET_ACCESS_TOKEN") or None
+        self._token_expires_at = self._access_token_expiry(self._access_token)
         self._token_lock = threading.Lock()
+        self._auth_retry_after = 0
+        self._auth_failure_code = None
+        self._auth_failure_status = 0
+        self._last_auth_log_signature = None
+        self._last_auth_log_ts = 0
 
         # Hard spend guard: every billable Fleet API call gates on this, so the account
         # can never exceed Tesla's $10/month credit no matter how the loop behaves.
@@ -68,14 +107,20 @@ class TeslaApi:
         self.charging_amp_limit = 0
         self.is_charging = False
         self.is_supercharging = False
-        self.is_plugged = False
-        self.is_home = False
+        # These are unknown until retained MQTT/Fleet Telemetry state is hydrated.
+        # Defaulting either to False produces a misleading "away/unplugged" state
+        # during the first controller tick after process startup.
+        self.is_plugged = None
+        self.is_home = None
         self.is_full = False
         self.time_until_full = "N/A"
         self.charging_status = "Unknown"
         self.plugged_status = "Unknown"
         self.last_update_ts = 0
         self.last_update_ts_hr = 0
+        self.charge_limit_update_ts = 0
+        self.charge_current_request_update_ts = 0
+        self.charge_state_update_ts = 0
         self._last_read_attempt_ts = 0   # throttle on the attempt, so asleep reads back off too
         self._asleep = False
 
@@ -106,9 +151,26 @@ class TeslaApi:
         """Telemetry mode: the fleet-telemetry bridge pushes fresh state onto the tesla_* STATE
         keys, so we read those instead of making a billable vehicle_data call. NO REST, NO wake,
         zero cost. Commands (start/stop/set amps) still go via the Fleet API."""
+        def _state_value(key):
+            """Return None for an absent GlobalState key.
+
+            GlobalStateClient.get() historically returns integer 0 for both a
+            missing row and a real zero value. During startup that ambiguity
+            incorrectly turned unknown home/plug state into explicit False
+            before retained MQTT hydration completed.
+            """
+            has = getattr(STATE, "has", None)
+            try:
+                if callable(has) and not has(key):
+                    return None
+                return STATE.get(key)
+            except Exception:
+                return None
+
         def _f(key):
             try:
-                return float(STATE.get(key))
+                value = _state_value(key)
+                return None if value is None else float(value)
             except (TypeError, ValueError):
                 return None
 
@@ -122,24 +184,100 @@ class TeslaApi:
         amp_req = _f("tesla_charge_current_request")
         if amp_req is not None:
             self.charging_amp_limit = amp_req
+        limit_updated = _f("tesla_soc_setpoint_updated_at")
+        current_updated = _f("tesla_charge_current_request_updated_at")
+        state_updated = _f("tesla_charge_state_updated_at")
+        if limit_updated is not None:
+            self.charge_limit_update_ts = limit_updated
+        if current_updated is not None:
+            self.charge_current_request_update_ts = current_updated
+        if state_updated is not None:
+            self.charge_state_update_ts = state_updated
 
-        self.is_charging = lib.helpers.is_truthy(STATE.get("tesla_is_charging"), False)
-        self.is_plugged = lib.helpers.is_truthy(STATE.get("tesla_is_plugged"), False)
-        self.is_supercharging = lib.helpers.is_truthy(STATE.get("tesla_is_supercharging"), False)
+        self.is_charging = lib.helpers.is_truthy(
+            _state_value("tesla_is_charging"), False)
+        plugged = _state_value("tesla_is_plugged")
+        self.is_plugged = (
+            None
+            if plugged in (None, "", "None")
+            else lib.helpers.is_truthy(plugged, False)
+        )
+        self.is_supercharging = lib.helpers.is_truthy(
+            _state_value("tesla_is_supercharging"), False)
         # is_home may be genuinely unknown until the car streams a Location; keep None so the
         # controller stays conservative rather than assuming home.
-        home = STATE.get("tesla_is_home")
+        home = _state_value("tesla_is_home")
         self.is_home = None if home in (None, "", "None") else lib.helpers.is_truthy(home, False)
-        ttf = STATE.get("tesla_time_to_full")
-        if ttf:
+        ttf = _state_value("tesla_time_to_full")
+        if self.is_charging and ttf:
             self.time_until_full = ttf
+        else:
+            self.time_until_full = "N/A"
+            if ttf not in (None, 0, "", "N/A"):
+                # Reconcile a retained ETA left by an older process/version even
+                # when the change-driven vehicle stream is currently quiet.
+                STATE.set("tesla_time_to_full", "N/A")
+                publish_message(
+                    "Tesla/vehicle0/time_until_full",
+                    payload='{"value": "N/A"}', qos=0, retain=True)
 
-        self.plugged_status = "Plugged" if self.is_plugged else "Unplugged"
+        self.plugged_status = (
+            "Unknown"
+            if self.is_plugged is None
+            else ("Plugged" if self.is_plugged else "Unplugged")
+        )
         self.charging_status = "Charging" if self.is_charging else "Idle"
-        self.is_online = True                      # an actively-streaming car is by definition online
-        self._asleep = False
-        self.last_update_ts = time.time()
+        connection_status = str(
+            _state_value("tesla_telemetry_connection_status") or "").strip().upper()
+        bridge_status = str(
+            _state_value("tesla_telemetry_bridge_status") or "").strip().upper()
+        bridge_synchronized = (
+            not bridge_status or bridge_status == "SYNCHRONIZED"
+        )
+        telemetry_updated = _f("tesla_telemetry_last_update_ts")
+        self.is_online = (
+            bridge_synchronized
+            and (
+            connection_status == "CONNECTED"
+            or (
+                connection_status != "DISCONNECTED"
+                and telemetry_updated is not None
+                and (time.time() - telemetry_updated)
+                <= TELEMETRY_CONNECTION_EVENT_GRACE_S
+            )
+            )
+        )
+        self._asleep = not self.is_online
+        vehicle_updated = _f("tesla_vehicle_last_update_ts")
+        if vehicle_updated is not None:
+            self.last_update_ts = vehicle_updated
+        elif telemetry_updated is not None:
+            self.last_update_ts = telemetry_updated
+        elif not hasattr(self, "last_update_ts"):
+            self.last_update_ts = 0
         self.last_update_ts_hr = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self.last_update_ts))
+
+    def _telemetry_stream_healthy(self) -> bool:
+        """Whether pushed vehicle state is fresh enough to satisfy an explicit refresh."""
+        bridge_status = str(
+            STATE.get("tesla_telemetry_bridge_status") or ""
+        ).strip().upper()
+        if bridge_status and bridge_status != "SYNCHRONIZED":
+            return False
+        status = str(
+            STATE.get("tesla_telemetry_connection_status") or "").strip().upper()
+        if status == "CONNECTED":
+            return True
+        if status == "DISCONNECTED":
+            return False
+        try:
+            updated = float(STATE.get("tesla_telemetry_last_update_ts") or 0)
+        except (TypeError, ValueError):
+            updated = 0
+        return bool(
+            updated
+            and (time.time() - updated) <= TELEMETRY_CONNECTION_EVENT_GRACE_S
+        )
 
     def update_vehicle_status(self, force=False, allow_wake=False):
         """Refresh cached vehicle state from ONE cheap data read.
@@ -151,9 +289,17 @@ class TeslaApi:
         of re-polling every loop. By default we never wake the car to read; ``allow_wake`` is set
         only when there is explicit intent to charge, and even then the wake is budget-capped.
         """
-        if self._telemetry_on():
+        telemetry_mode = self._telemetry_on()
+        if telemetry_mode:
             self._refresh_from_telemetry()
-            return
+            # Push telemetry remains the normal, zero-cost path. A deliberate refresh or
+            # post-command confirmation may use one REST read only when the stream is known
+            # disconnected/unavailable; background ticks never turn an outage into polling.
+            if not force or self._telemetry_stream_healthy():
+                return
+            logging.warning(
+                "TeslaApi: Fleet Telemetry is disconnected/unavailable; using one "
+                "budget-guarded vehicle_data fallback for the requested refresh.")
 
         last = self._last_read_attempt_ts
         due = (not last) or (time.time() - last >= self._poll_interval_seconds())
@@ -167,7 +313,16 @@ class TeslaApi:
             logging.debug(f"TeslaApi: no fresh data (asleep or budget-limited); keeping last state from {self.last_update_ts_hr}.")
             return
         self._asleep = False
+        self._apply_vehicle_data(vehicle_data)
+        if telemetry_mode:
+            # The bridge normally owns these retained topics. During a confirmed stream outage,
+            # publish the explicit REST result once so the UI/controller does not keep showing
+            # an hour-old SoC while still leaving telemetry_status=DISCONNECTED.
+            self._store_rest_fallback_state()
+            self._publish_vehicle_topics()
 
+    def _apply_vehicle_data(self, vehicle_data):
+        """Apply a successful Fleet API vehicle_data response to the in-memory model."""
         self.get_vehicle_name(vehicle_data)
         self.battery_soc(vehicle_data)
         self.battery_soc_setpoint(vehicle_data)
@@ -180,8 +335,32 @@ class TeslaApi:
         self.minutes_to_full_charge(vehicle_data)
         self.is_max_soc_reached(vehicle_data)
         self.last_update_ts = time.time()
+        self.charge_limit_update_ts = self.last_update_ts
+        self.charge_current_request_update_ts = self.last_update_ts
+        self.charge_state_update_ts = self.last_update_ts
         self.last_update_ts_hr = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self.last_update_ts))
         self.update_mqtt_and_domoticz()
+
+    def _store_rest_fallback_state(self):
+        """Mirror a one-shot REST fallback into the state normally maintained by the bridge."""
+        values = {
+            "tesla_vehicle_name": self.vehicle_name,
+            "tesla_soc": self.vehicle_soc,
+            "tesla_soc_setpoint": self.vehicle_soc_setpoint,
+            "tesla_charge_current_request": self.charging_amp_limit,
+            "tesla_is_charging": str(bool(self.is_charging)),
+            "tesla_is_plugged": str(bool(self.is_plugged)),
+            "tesla_is_supercharging": str(bool(self.is_supercharging)),
+            "tesla_time_to_full": self.time_until_full,
+            "tesla_vehicle_last_update_ts": self.last_update_ts,
+            "tesla_soc_setpoint_updated_at": self.charge_limit_update_ts,
+            "tesla_charge_current_request_updated_at": self.charge_current_request_update_ts,
+            "tesla_charge_state_updated_at": self.charge_state_update_ts,
+        }
+        if self.is_home is not None:
+            values["tesla_is_home"] = str(bool(self.is_home))
+        for key, value in values.items():
+            STATE.set(key, value)
 
     def update_mqtt_and_domoticz(self):
         # In telemetry (push) mode the fleet-telemetry bridge OWNS the Tesla/vehicle0/* topics
@@ -212,133 +391,475 @@ class TeslaApi:
         domoticz_update('vehicle_status', _msg, "received vehicle metrics update from EvCharger and sent to domoticz")
 
     # Fleet API auth / transport
+    @staticmethod
+    def _access_token_expiry(token) -> float:
+        """Read a JWT expiry without trusting or logging any token content."""
+        try:
+            encoded_payload = str(token).split(".")[1]
+            encoded_payload += "=" * (-len(encoded_payload) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(encoded_payload))
+            expiry = float(payload.get("exp", 0))
+            return expiry if math.isfinite(expiry) and expiry > 0 else 0
+        except (IndexError, TypeError, ValueError, json.JSONDecodeError):
+            return 0
+
+    @staticmethod
+    def _oauth_error_code(response) -> str:
+        try:
+            payload = response.json()
+        except (TypeError, ValueError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        raw = payload.get("error") or "authentication_failed"
+        normalized = re.sub(r"[^a-zA-Z0-9_-]", "_", str(raw))
+        return normalized[:80] or "authentication_failed"
+
     def _refresh_access_token(self):
-        response = requests.post(
-            TESLA_AUTH_TOKEN_URL,
-            data={
-                "grant_type": "refresh_token",
-                "client_id": self._client_id,
-                "client_secret": self._client_secret,
-                "refresh_token": self._refresh_token,
-            },
-            timeout=TIMEOUT,
-        )
-        response.raise_for_status()
-        token_data = response.json()
-        self._access_token = token_data["access_token"]
-        self._token_expires_at = time.time() + token_data.get("expires_in", 28800) - 60
-        # Tesla rotates the refresh token on each use - the old one is invalidated,
-        # so it must be persisted or the next restart will fail to authenticate.
-        new_refresh_token = token_data.get("refresh_token", self._refresh_token)
-        if new_refresh_token != self._refresh_token:
-            self._refresh_token = new_refresh_token
-            self._persist_tokens()
+        # A one-off setup process may have rotated and persisted the refresh token since this
+        # controller was constructed. Re-read only this credential immediately before use so
+        # separate processes cannot strand each other with a stale in-memory token.
+        try:
+            latest = dotenv_values(secrets_path()).get("TESLA_FLEET_REFRESH_TOKEN")
+        except OSError:
+            latest = None
+        if latest:
+            self._refresh_token = latest
+        if not self._client_id or not self._refresh_token:
+            raise TeslaAuthenticationError(0, "missing_refresh_credentials")
+
+        try:
+            response = requests.post(
+                TESLA_AUTH_TOKEN_URL,
+                data={
+                    "grant_type": "refresh_token",
+                    "client_id": self._client_id,
+                    "refresh_token": self._refresh_token,
+                },
+                timeout=TIMEOUT,
+            )
+        except requests.exceptions.RequestException as error:
+            raise TeslaAuthenticationError(
+                0, "auth_service_unavailable") from error
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        if 400 <= status_code < 500:
+            raise TeslaAuthenticationError(status_code, self._oauth_error_code(response))
+        if status_code >= 500:
+            raise TeslaAuthenticationError(status_code, "auth_service_unavailable")
+        try:
+            token_data = response.json()
+        except (TypeError, ValueError) as error:
+            raise TeslaAuthenticationError(status_code, "invalid_token_response") from error
+        if not isinstance(token_data, dict) or not token_data.get("access_token"):
+            raise TeslaAuthenticationError(status_code, "missing_access_token")
+
+        try:
+            expires_in = float(token_data.get("expires_in", 28800))
+        except (TypeError, ValueError):
+            expires_in = 28800
+        if not math.isfinite(expires_in) or expires_in <= 0:
+            expires_in = 28800
+
+        self._access_token = str(token_data["access_token"])
+        self._token_expires_at = time.time() + expires_in
+        # Refresh tokens are rotated. Persist both values after every successful exchange so
+        # a restart uses the newest pair even if Tesla omitted or reused refresh_token.
+        self._refresh_token = str(token_data.get("refresh_token") or self._refresh_token)
+        self._persist_tokens()
 
     def _persist_tokens(self):
+        """Atomically replace only Tesla token values while preserving every other secret."""
+        temporary_path = None
         try:
-            path = secrets_path()
-            with open(path) as f:
-                content = f.read()
-            content = re.sub(r'TESLA_FLEET_ACCESS_TOKEN="[^"]*"', f'TESLA_FLEET_ACCESS_TOKEN="{self._access_token}"', content)
-            content = re.sub(r'TESLA_FLEET_REFRESH_TOKEN="[^"]*"', f'TESLA_FLEET_REFRESH_TOKEN="{self._refresh_token}"', content)
-            with open(path, "w") as f:
-                f.write(content)
-        except OSError as e:
-            logging.info(f"tesla_api: could not persist refreshed Fleet API tokens to {secrets_path()}: {e}")
+            path = Path(secrets_path())
+            content = path.read_text(encoding="utf-8")
+            original_mode = stat.S_IMODE(path.stat().st_mode)
+
+            def replace_or_append(source, key, value):
+                escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
+                pattern = re.compile(
+                    rf"^(?P<prefix>\s*{re.escape(key)}\s*=\s*).*$",
+                    re.MULTILINE,
+                )
+                replacement = lambda match: f'{match.group("prefix")}"{escaped}"'
+                updated, count = pattern.subn(replacement, source)
+                if count:
+                    return updated
+                separator = "" if not updated or updated.endswith("\n") else "\n"
+                return f'{updated}{separator}{key}="{escaped}"\n'
+
+            content = replace_or_append(
+                content, "TESLA_FLEET_ACCESS_TOKEN", self._access_token)
+            content = replace_or_append(
+                content, "TESLA_FLEET_REFRESH_TOKEN", self._refresh_token)
+
+            with tempfile.NamedTemporaryFile(
+                    "w", encoding="utf-8", dir=path.parent,
+                    prefix=f".{path.name}.", delete=False) as temporary:
+                temporary_path = Path(temporary.name)
+                temporary.write(content)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            os.chmod(temporary_path, original_mode)
+            os.replace(temporary_path, path)
+            temporary_path = None
+            try:
+                directory_fd = os.open(path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            except OSError:
+                # The file itself is already flushed and replaced; some mounted filesystems
+                # simply do not support syncing a directory descriptor.
+                pass
+
+            # retrieve_setting caches .secrets by path. Keep that cache coherent so another
+            # TeslaApi constructed in this process cannot reuse the rotated refresh token.
+            cached = getattr(retrieve_setting, "_secrets", None)
+            cached_path = getattr(retrieve_setting, "_secrets_path", None)
+            if isinstance(cached, dict) and cached_path == str(path):
+                cached["TESLA_FLEET_ACCESS_TOKEN"] = self._access_token
+                cached["TESLA_FLEET_REFRESH_TOKEN"] = self._refresh_token
+            return True
+        except OSError as error:
+            logging.error(
+                "tesla_api: could not atomically persist refreshed Fleet API tokens "
+                "to %s: %s", secrets_path(), error)
+            return False
+        finally:
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def _log_auth_failure(self, context: str, error: TeslaAuthenticationError) -> None:
+        now = time.time()
+        signature = (context, error.error_code)
+        if (signature == getattr(self, "_last_auth_log_signature", None)
+                and now - getattr(self, "_last_auth_log_ts", 0) < AUTH_FAILURE_BACKOFF_S):
+            return
+        self._last_auth_log_signature = signature
+        self._last_auth_log_ts = now
+        if error.error_code == "login_required":
+            logging.error(
+                "EvCharger [Tesla API]: %s authentication failed (login_required); Tesla account "
+                "reauthorization is required if this persists on the Fleet Auth endpoint.",
+                context)
+        else:
+            logging.error(
+                "EvCharger [Tesla API]: %s authentication failed (%s, HTTP %s).",
+                context, error.error_code, error.status_code or "unknown")
 
     def _get_access_token(self):
         with self._token_lock:
-            if not self._access_token or time.time() >= self._token_expires_at:
+            now = time.time()
+            if (self._access_token
+                    and now + TOKEN_REFRESH_SKEW_S < self._token_expires_at):
+                return self._access_token
+            if now < getattr(self, "_auth_retry_after", 0):
+                raise TeslaAuthenticationError(
+                    getattr(self, "_auth_failure_status", 0),
+                    getattr(self, "_auth_failure_code", None) or "auth_backoff")
+            try:
                 self._refresh_access_token()
+            except TeslaAuthenticationError as error:
+                self._auth_failure_code = error.error_code
+                self._auth_failure_status = error.status_code
+                backoff = (AUTH_TRANSIENT_BACKOFF_S
+                           if error.error_code == "auth_service_unavailable"
+                           else AUTH_FAILURE_BACKOFF_S)
+                self._auth_retry_after = now + backoff
+                raise
+            self._auth_failure_code = None
+            self._auth_failure_status = 0
+            self._auth_retry_after = 0
             return self._access_token
 
-    def _request(self, method, path, retry_on_auth_failure=True, **kwargs):
+    def _request(self, method, path, retry_on_auth_failure=True,
+                 auth_retry_budget=None, auth_retry_critical=None, **kwargs):
+        if auth_retry_budget is None:
+            if path.endswith("/wake_up"):
+                auth_retry_budget = "wake"
+            elif "/command/" in path or path.endswith("/fleet_telemetry_config"):
+                auth_retry_budget = "command"
+            else:
+                auth_retry_budget = "data"
+        if auth_retry_critical is None:
+            auth_retry_critical = path.endswith("/command/charge_stop")
         token = self._get_access_token()
-        headers = kwargs.pop("headers", {})
-        headers["Authorization"] = f"Bearer {token}"
+        headers = dict(kwargs.pop("headers", {}))
+        headers.pop("Authorization", None)
+        request_headers = {**headers, "Authorization": f"Bearer {token}"}
         response = requests.request(
-            method, f"{self._base_url}{path}", headers=headers, timeout=TIMEOUT, **kwargs
+            method, f"{self._base_url}{path}", headers=request_headers,
+            timeout=TIMEOUT, **kwargs
         )
 
         if response.status_code == 401 and retry_on_auth_failure:
             with self._token_lock:
-                self._access_token = None
-            return self._request(method, path, retry_on_auth_failure=False, **kwargs)
+                # Another request may already have refreshed while this one was in flight.
+                if self._access_token == token:
+                    self._access_token = None
+                    self._token_expires_at = 0
+            try:
+                self._get_access_token()
+            except TeslaAuthenticationError as error:
+                error.fleet_response_received = True
+                raise
+            # The original 401 and retry are both billable Fleet calls. Reserve the retry
+            # separately so an auth recovery cannot silently bypass the monthly guard.
+            if (auth_retry_budget
+                    and not self._budget.spend(
+                        auth_retry_budget, critical=auth_retry_critical)):
+                logging.info(
+                    "tesla_api: authenticated %s retry blocked by budget guard.",
+                    auth_retry_budget)
+                return response
+            if "/command/" in path:
+                logging.info(
+                    "EvCharger [Tesla API]: sent %s - authenticated retry after "
+                    "HTTP 401.",
+                    path.rsplit("/", 1)[-1],
+                )
+            return self._request(
+                method, path, retry_on_auth_failure=False,
+                auth_retry_budget=auth_retry_budget,
+                auth_retry_critical=auth_retry_critical,
+                headers=headers, **kwargs)
 
         return response
 
     def _get_vehicle_state(self):
-        # Billable "data" request (vehicle list/state). Gate it; return None if capped.
-        if not self._budget.spend("data"):
-            return None
+        """Return Tesla's lightweight online/asleep state without charging Data usage.
+
+        Tesla's published endpoint schema assigns no pricing category to
+        ``GET /vehicles/{vin}``; only ``vehicle_data`` is Device Data. Passing
+        ``auth_retry_budget=False`` also prevents a 401 token-refresh retry for
+        this free endpoint from being misclassified as a paid Data request.
+        """
         try:
-            response = self._request("GET", f"/api/1/vehicles/{self._vehicle_id}")
+            response = self._request(
+                "GET",
+                f"/api/1/vehicles/{self._vehicle_id}",
+                auth_retry_budget=False,
+            )
+        except TeslaAuthenticationError as error:
+            self._log_auth_failure("vehicle-state", error)
+            return None
         except requests.exceptions.RequestException:
-            self._budget.refund("data")        # no HTTP response -> not billed
             return None
         if response.status_code >= 500:
-            self._budget.refund("data")        # Tesla does not bill responses >= 500
             return None
         return (response.json().get("response") or {}).get("state")
 
     def _command(self, name, error_msg, json_body=None):
-        ok, _cat = self._command_ex(name, json_body=json_body, error_msg=error_msg)
+        ok, _cat = self._command_with_wake_escalation(
+            name, json_body=json_body, error_msg=error_msg)
         return ok
 
-    def _command_ex(self, name, json_body=None, error_msg="", critical=False):
+    @staticmethod
+    def _command_audit_detail(name, json_body=None, error_msg=""):
+        """Return a concise, non-secret description for one Tesla write command."""
+        body = json_body if isinstance(json_body, dict) else {}
+        if name == "set_charge_limit":
+            detail = f"target SoC {body.get('percent')}%"
+        elif name == "set_charging_amps":
+            detail = f"requested current {body.get('charging_amps')} A/phase"
+        elif name == "add_charge_schedule":
+            def clock(minutes):
+                try:
+                    hour, minute = divmod(int(minutes), 60)
+                    return f"{hour:02d}:{minute:02d}"
+                except (TypeError, ValueError):
+                    return "invalid"
+            detail = (
+                f"owned schedule {body.get('id')}, days={body.get('days_of_week')}, "
+                f"start={body.get('start_time')} min ({clock(body.get('start_time'))}), "
+                f"end={body.get('end_time')} min ({clock(body.get('end_time'))})"
+            )
+        elif name == "remove_charge_schedule":
+            detail = f"owned schedule {body.get('id')}"
+        else:
+            detail = str(error_msg or name.replace("_", " ")).strip()
+        context = str(error_msg).lower()
+        detail_lower = detail.lower()
+        if (
+            "implicit wake" in context
+            and "retry after implicit wake grace" not in detail_lower
+        ):
+            detail = f"{detail}; retry after implicit wake grace"
+        elif (
+            "explicit vehicle wake" in context
+            or "after wake" in context
+            or "after vehicle wake" in context
+        ) and "retry after vehicle wake" not in detail_lower:
+            detail = f"{detail}; retry after vehicle wake"
+        return detail
+
+    def _command_ex(self, name, json_body=None, error_msg="", critical=False,
+                    accepted_reasons=(), preserve_accepted_reason=False):
         """Send a command and classify the outcome so callers can react appropriately.
 
         ``critical=True`` (e.g. charge_stop) bypasses the spend guard — a safety-essential
         command must never be blocked by the budget.
 
+        ``accepted_reasons`` lets an idempotent wrapper treat a documented response such as
+        ``already_set`` as success without weakening command handling globally. A caller which
+        must distinguish an applied mutation from an already-absent object may request the
+        normalized accepted reason as the successful category.
+
         Returns (success, category) where category is one of:
           'ok'       — command accepted;
           'budget'   — blocked by the spend guard;
           'asleep'   — car / command bus is asleep (a wake + retry can fix it);
+          'auth'     — OAuth refresh failed or account reauthorization is required;
           'network'  — transport failure or 5xx (waking won't help; may need manual action);
+          'unsupported' — this vehicle/firmware does not support the command;
           'error'    — some other rejection.
         """
+        audit_detail = self._command_audit_detail(name, json_body, error_msg)
         if not self._budget.spend("command", critical=critical):
-            logging.info(f"tesla_api: command '{name}' blocked by budget guard (monthly ceiling reached). {error_msg}")
+            # The authoritative budget layer logs the first block and periodic
+            # reminders with the actual daily/monthly reason. This attempted
+            # command never left the process, so keep its duplicate detail at
+            # debug level rather than emitting a second warning every retry.
+            logging.debug(
+                "EvCharger [Tesla API]: locally blocked %s - %s; Tesla API "
+                "spend guard reached.",
+                name, audit_detail,
+            )
             return False, 'budget'
+        started_at = time.monotonic()
+        logging.info(
+            "EvCharger [Tesla API]: sent %s - %s.", name, audit_detail)
         try:
             response = self._request(
-                "POST", f"/api/1/vehicles/{self._vehicle_id}/command/{name}", json=json_body or {}
+                "POST", f"/api/1/vehicles/{self._vehicle_id}/command/{name}",
+                json=json_body or {}
             )
+        except TeslaAuthenticationError as error:
+            self._log_auth_failure(f"command '{name}'", error)
+            if not error.fleet_response_received:
+                self._budget.refund("command")
+            logging.warning(
+                "EvCharger [Tesla API]: %s not delivered - authentication failed "
+                "after %.0f ms.",
+                name, (time.monotonic() - started_at) * 1000.0,
+            )
+            return False, 'auth'
         except requests.exceptions.RequestException as e:
-            logging.info(f"tesla_api: command '{name}' network error: {e}. {error_msg}")
             self._budget.refund("command")     # no HTTP response -> Tesla did not bill it
+            logging.warning(
+                "EvCharger [Tesla API]: network failure for %s after %.0f ms - "
+                "%s; %s.",
+                name, (time.monotonic() - started_at) * 1000.0, audit_detail, e,
+            )
             return False, 'network'
+        elapsed_ms = (time.monotonic() - started_at) * 1000.0
         try:
             data = response.json()
         except ValueError:
             data = {}
         result = data.get("response") or {}
         if response.status_code == 200 and result.get("result"):
+            logging.info(
+                "EvCharger [Tesla API]: accepted %s in %.0f ms - %s.",
+                name, elapsed_ms, audit_detail,
+            )
             return True, 'ok'
         reason = str(result.get('reason') or data.get('error') or '').lower()
+        normalized_reason = reason.replace('-', '_').replace(' ', '_')
+        normalized_accepted = {
+            str(value).lower().replace('-', '_').replace(' ', '_')
+            for value in accepted_reasons
+        }
+        if response.status_code == 200 and normalized_reason in normalized_accepted:
+            logging.info(
+                "EvCharger [Tesla API]: accepted %s in %.0f ms - %s; %s.",
+                name, elapsed_ms, audit_detail, normalized_reason,
+            )
+            return True, (normalized_reason if preserve_accepted_reason else 'ok')
         # Not "failed" per se — the command wasn't delivered. Whether that matters depends on the
         # caller (e.g. an asleep bus on charge_stop just means the car isn't charging).
-        logging.info(f"tesla_api: command '{name}' not delivered ({reason or response.status_code}). {error_msg}")
-        if response.status_code == 408 or any(k in reason for k in
-                ('could_not_wake', 'asleep', 'unavailable', 'offline', 'timed out')):
-            return False, 'asleep'
+        logging.warning(
+            "EvCharger [Tesla API]: rejected %s in %.0f ms - %s; %s.",
+            name, elapsed_ms, audit_detail,
+            reason or f"HTTP {response.status_code}",
+        )
         if response.status_code >= 500:
             self._budget.refund("command")     # Tesla does not bill responses >= 500
             return False, 'network'
+        if response.status_code == 408 or any(k in reason for k in
+                ('could_not_wake', 'asleep', 'unavailable', 'offline', 'timed out')):
+            return False, 'asleep'
+        if normalized_reason in ('not_supported', 'unsupported', 'unsupported_vehicle'):
+            return False, 'unsupported'
         return False, 'error'
+
+    def _command_with_wake_escalation(
+            self, name, json_body=None, error_msg="", critical=False,
+            accepted_reasons=(), preserve_accepted_reason=False):
+        """Deliver one stateful command with the cheapest wake strategy first.
+
+        A command is attempted without a paid wake. If Tesla reports an asleep
+        command bus, allow that first request ten seconds to bring the vehicle
+        online, then retry the inexpensive command once. Only a second asleep
+        rejection spends an explicit wake. After waking, wait for the documented
+        10–60 second connection window before the final command attempt.
+        """
+        if not accepted_reasons:
+            # Tesla documents these as idempotent desired-state outcomes, not
+            # delivery failures. Normalizing them here prevents every wrapper
+            # from independently retrying an already-satisfied command.
+            accepted_reasons = {
+                "charge_start": ("is_charging", "requested"),
+                "charge_stop": ("not_charging",),
+            }.get(name, ())
+        kwargs = {
+            "json_body": json_body,
+            "critical": critical,
+            "accepted_reasons": accepted_reasons,
+            "preserve_accepted_reason": preserve_accepted_reason,
+        }
+        result = self._command_ex(name, error_msg=error_msg, **kwargs)
+        if result[1] != "asleep":
+            return result
+
+        logging.info(
+            "EvCharger [Tesla API]: %s reached sleeping command buses; "
+            "waiting %ds for the command's implicit wake before retrying.",
+            name, COMMAND_IMPLICIT_WAKE_GRACE_S,
+        )
+        time.sleep(COMMAND_IMPLICIT_WAKE_GRACE_S)
+        result = self._command_ex(
+            name,
+            error_msg=f"{error_msg}; retry after implicit wake grace",
+            **kwargs,
+        )
+        if result[1] != "asleep":
+            return result
+
+        if not self.wake_vehicle(
+                skip_online_check=True, critical=critical):
+            return result
+        return self._command_ex(
+            name,
+            error_msg=f"{error_msg}; retry after explicit vehicle wake",
+            **kwargs,
+        )
 
     # Command Wrappers
     def set_charge(self, amps, error_msg):
-        self.wake_vehicle()
-        success = self._command("set_charging_amps", error_msg, {"charging_amps": amps})
+        success = self._command(
+            "set_charging_amps", error_msg, {"charging_amps": amps})
         if success:
             self.charging_amp_limit = amps
             self.update_mqtt_and_domoticz()
         return success
 
     def send_command(self, cmd, error_msg):
-        self.wake_vehicle()
         fleet_command = {"START_CHARGE": "charge_start", "STOP_CHARGE": "charge_stop"}.get(cmd, cmd)
         success = self._command(fleet_command, error_msg)
 
@@ -356,17 +877,41 @@ class TeslaApi:
         return success
 
     def _telemetry_considers_online(self) -> bool:
-        """In telemetry mode an actively-streaming car is online by definition — a recent
-        telemetry refresh is proof enough, so the billable pre-command state read is skipped
-        entirely (audit M3). Falls through to the real check if telemetry hasn't refreshed
-        recently (e.g. the bridge/MQTT connection dropped), so this never masks a genuinely
-        stale/disconnected stream."""
+        """Use Fleet connectivity—not unchanged field age—as the online signal.
+
+        Fields are emitted only on change, so a connected vehicle may legitimately
+        be quiet for hours. A recent field is used only as a short startup race
+        fallback before the first connectivity event is available.
+        """
         if not self._telemetry_on():
             return False
-        return (time.time() - (self.last_update_ts or 0)) <= TELEMETRY_ONLINE_MAX_AGE_S
+        bridge_status = str(
+            STATE.get("tesla_telemetry_bridge_status") or ""
+        ).strip().upper()
+        if bridge_status and bridge_status != "SYNCHRONIZED":
+            return False
+        status = str(
+            STATE.get("tesla_telemetry_connection_status") or ""
+        ).strip().upper()
+        if status == "CONNECTED":
+            return True
+        if status == "DISCONNECTED":
+            return False
+        return (
+            time.time() - (self.last_update_ts or 0)
+        ) <= TELEMETRY_CONNECTION_EVENT_GRACE_S
+
+    @staticmethod
+    def _telemetry_connected_at() -> float:
+        try:
+            value = float(
+                STATE.get("tesla_telemetry_connected_at") or 0)
+            return value if math.isfinite(value) and value > 0 else 0.0
+        except (TypeError, ValueError):
+            return 0.0
 
     def wake_vehicle(self, skip_online_check=False, critical=False):
-        """Wake the car — used before a command, never just to read status.
+        """Explicitly wake the car after passive command delivery was exhausted.
 
         A wake is the most expensive call ($0.02), so it is budget-gated and the confirm
         polls are bounded. ``skip_online_check`` forces a wake_up even when the car reports
@@ -382,20 +927,87 @@ class TeslaApi:
                     return True
 
             if not self._budget.spend("wake", critical=critical):
-                logging.info("tesla_api: wake blocked by budget guard (monthly ceiling reached).")
+                logging.debug(
+                    "EvCharger [Tesla API]: locally blocked wake_up - Tesla API "
+                    "spend guard reached.")
                 return False
 
+            logging.info(
+                "EvCharger [Tesla API]: sent wake_up - wake vehicle command buses.")
             resp = self._request("POST", f"/api/1/vehicles/{self._vehicle_id}/wake_up")
             if getattr(resp, "status_code", 0) >= 500:
                 self._budget.refund("wake")        # Tesla does not bill responses >= 500
 
-            for _ in range(3):   # bounded confirm-polls (each a gated data call)
-                time.sleep(3)
-                if self._get_vehicle_state() == "online":
-                    return True
+            # Tesla documents a 10–60 second wake interval. Never retry the
+            # original command immediately after the wake endpoint merely says
+            # it accepted the request: connectivity and the command buses need
+            # time to become usable. A fresh Fleet CONNECTED event starts its
+            # own full bus-settle interval.
+            wake_sent_at = time.time()
+            time.sleep(WAKE_MIN_SETTLE_S)
+            if self._telemetry_on():
+                connection_deadline = wake_sent_at + WAKE_CONNECT_TIMEOUT_S
+                final_deadline = connection_deadline + WAKE_MIN_SETTLE_S
+                while time.time() <= final_deadline:
+                    if self._telemetry_considers_online():
+                        connected_at = self._telemetry_connected_at()
+                        # An old retained CONNECTED lifecycle predates this
+                        # explicit wake and cannot acknowledge it.
+                        if connected_at < wake_sent_at:
+                            now_ts = time.time()
+                            if now_ts >= connection_deadline:
+                                break
+                            time.sleep(min(
+                                WAKE_TELEMETRY_POLL_S,
+                                connection_deadline - now_ts,
+                            ))
+                            continue
+                        settle_origin = connected_at
+                        settle_until = settle_origin + WAKE_MIN_SETTLE_S
+                        now_ts = time.time()
+                        if now_ts >= settle_until:
+                            logging.info(
+                                "EvCharger [Tesla API]: confirmed wake_up - "
+                                "Fleet Telemetry connected and command buses "
+                                "received a %ds settle period.",
+                                WAKE_MIN_SETTLE_S,
+                            )
+                            return True
+                        time.sleep(min(
+                            WAKE_TELEMETRY_POLL_S,
+                            max(0.1, settle_until - now_ts),
+                        ))
+                        continue
+                    now_ts = time.time()
+                    if now_ts >= connection_deadline:
+                        break
+                    time.sleep(min(
+                        WAKE_TELEMETRY_POLL_S,
+                        connection_deadline - now_ts,
+                    ))
+            else:
+                # Polling-only installations retain a bounded fallback without
+                # turning the wake into rapid repeated vehicle-state reads.
+                for delay in (0, 20, 30):
+                    if delay:
+                        time.sleep(delay)
+                    if self._get_vehicle_state() == "online":
+                        logging.info(
+                            "EvCharger [Tesla API]: confirmed wake_up - vehicle online.")
+                        return True
 
+            logging.warning(
+                "EvCharger [Tesla API]: wake_up not confirmed within %ds - "
+                "vehicle did not report online.",
+                WAKE_CONNECT_TIMEOUT_S,
+            )
             return False
 
+        except TeslaAuthenticationError as error:
+            self._log_auth_failure("wake", error)
+            if not error.fleet_response_received:
+                self._budget.refund("wake")
+            return False
         except requests.exceptions.RequestException as e:
             logging.info(f"tesla_api: HTTPError: {e}")
             self._budget.refund("wake")        # wake_up POST failed -> not billed
@@ -407,6 +1019,22 @@ class TeslaApi:
         self.time_until_full = "N/A"
         self.charging_status = "Idle"
         self.charging_amp_limit = 0
+        if self._telemetry_on():
+            # Fleet Telemetry normally owns spontaneous vehicle-state updates, but it is
+            # change-driven and may omit the post-command DetailedChargeState edge. A successful
+            # charge_stop response is authoritative enough to replace the stale retained UI
+            # state. The bridge can still overwrite this if the car later reports otherwise.
+            STATE.set("tesla_is_charging", "False")
+            STATE.set("tesla_time_to_full", "N/A")
+            publish_message(
+                "Tesla/vehicle0/is_charging",
+                payload='{"value": "False"}', qos=0, retain=True)
+            publish_message(
+                "Tesla/vehicle0/charging_status",
+                payload='{"value": "Idle"}', qos=0, retain=True)
+            publish_message(
+                "Tesla/vehicle0/time_until_full",
+                payload='{"value": "N/A"}', qos=0, retain=True)
         self.update_mqtt_and_domoticz()
 
     def stop_charge_robust(self):
@@ -419,17 +1047,11 @@ class TeslaApi:
         """
         # A stop is safety-essential: bypass the spend guard for the command AND the wake needed
         # to deliver it, so the budget can never leave the car charging.
-        ok, cat = self._command_ex('charge_stop', error_msg="stop charge", critical=True)
+        ok, cat = self._command_with_wake_escalation(
+            'charge_stop', error_msg="stop charge", critical=True)
         if ok:
             self._on_charge_stopped()
             return 'ok'
-        if cat == 'asleep':
-            if self.wake_vehicle(skip_online_check=True, critical=True):
-                ok, cat = self._command_ex('charge_stop', error_msg="stop charge (after wake)", critical=True)
-                if ok:
-                    self._on_charge_stopped()
-                    return 'ok'
-            return 'network' if cat == 'network' else 'failed'
         return 'network' if cat == 'network' else 'failed'
 
     def _on_charge_started(self):
@@ -439,17 +1061,11 @@ class TeslaApi:
 
     def start_charge_robust(self):
         """Start charging with the same asleep-bus escalation as stop. Returns 'ok'|'network'|'failed'."""
-        ok, cat = self._command_ex('charge_start', error_msg="start charge")
+        ok, cat = self._command_with_wake_escalation(
+            'charge_start', error_msg="start charge")
         if ok:
             self._on_charge_started()
             return 'ok'
-        if cat == 'asleep':
-            if self.wake_vehicle(skip_online_check=True):
-                ok, cat = self._command_ex('charge_start', error_msg="start charge (after wake)")
-                if ok:
-                    self._on_charge_started()
-                    return 'ok'
-            return 'network' if cat == 'network' else 'failed'
         return 'network' if cat == 'network' else 'failed'
 
     # Commands
@@ -466,26 +1082,177 @@ class TeslaApi:
         """Push a Fleet Telemetry config to the vehicle(s) so they stream to our receiver.
         One-off setup call (billable as a command); returns the parsed response or None."""
         if not self._budget.spend("command"):
-            logging.info("tesla_api: fleet_telemetry_config blocked by budget guard (daily cap reached).")
+            logging.warning(
+                "EvCharger [Tesla API]: blocked fleet_telemetry_config - command "
+                "budget ceiling reached.")
             return None
         try:
-            resp = self._request("POST", "/api/1/vehicles/fleet_telemetry_config", json=config)
-            return resp.json()
+            logging.info(
+                "EvCharger [Tesla API]: sent fleet_telemetry_config - update "
+                "vehicle streaming configuration.")
+            resp = self._request(
+                "POST", "/api/1/vehicles/fleet_telemetry_config", json=config)
+            payload = resp.json()
+            logging.info(
+                "EvCharger [Tesla API]: received fleet_telemetry_config response "
+                "- HTTP %s.", getattr(resp, "status_code", "unknown"))
+            return payload
+        except TeslaAuthenticationError as error:
+            self._log_auth_failure("Fleet Telemetry configuration", error)
+            if not error.fleet_response_received:
+                self._budget.refund("command")
+            return None
         except Exception as e:
             logging.error(f"tesla_api: fleet_telemetry_config error: {e}")
             return None
 
-    def set_tesla_charge_amps(self, amps):
+    @staticmethod
+    def _bounded_integer(value, minimum, maximum):
+        """Return a validated integral value, or ``None`` without coercing fractions."""
+        if isinstance(value, bool):
+            return None
+        try:
+            # Do not route identifiers through binary float: Tesla schedule IDs are uint64,
+            # and float conversion silently rounded the application-owned ID before sending.
+            decimal_value = Decimal(str(value))
+        except (InvalidOperation, TypeError, ValueError):
+            return None
+        if not decimal_value.is_finite() or decimal_value != decimal_value.to_integral_value():
+            return None
+        number = int(decimal_value)
+        return number if minimum <= number <= maximum else None
+
+    def _smart_charge_command(self, name, json_body, error_msg,
+                              accepted_reasons=(), preserve_accepted_reason=False):
+        """Issue one planned-charge command through centralized wake escalation.
+
+        Fleet Telemetry is the state source, so these adapters never add a vehicle-data read.
+        A first-attempt command avoids a paid wake when the command bus is already available.
+        Two asleep-bus rejections, separated by a passive grace interval, are required before
+        one explicit wake and one final post-settle command attempt.
+        """
+        return self._command_with_wake_escalation(
+            name,
+            json_body=json_body,
+            error_msg=error_msg,
+            accepted_reasons=accepted_reasons,
+            preserve_accepted_reason=preserve_accepted_reason,
+        )
+
+    def set_tesla_charge_limit(self, percent):
+        """Set the vehicle charge limit without a state read.
+
+        Tesla vehicles expose a 50–100% user charge-limit range. Invalid values are rejected
+        locally so they cannot consume a billable command. Returns the normalized
+        ``(success, category)`` command result.
+        """
+        percent = self._bounded_integer(percent, 50, 100)
+        if percent is None:
+            logging.info("tesla_api: refusing invalid charge limit; expected 50-100 percent.")
+            return False, 'invalid'
+        result = self._smart_charge_command(
+            'set_charge_limit',
+            {'percent': percent},
+            f"set Tesla charge limit to {percent}%",
+            accepted_reasons=('already_set',),
+            preserve_accepted_reason=True,
+        )
+        return result
+
+    def upsert_owned_charge_schedule(self, schedule_id, *, start_time, end_time,
+                                     days_of_week, latitude, longitude, one_time=True,
+                                     enabled=True):
+        """Add or update this application's deterministic Tesla charge schedule.
+
+        Reusing the same non-zero ID updates that one schedule and avoids accumulating entries.
+        Times are vehicle-local minutes after midnight. ``days_of_week`` is Tesla's seven-bit
+        weekday mask. Location is mandatory because Tesla schedules are location-scoped.
+        This direct Fleet command is compatible with the existing pre-2021 Model S/X path and
+        performs no schedule-list read.
+        """
+        schedule_id = self._bounded_integer(schedule_id, 1, (2 ** 64) - 1)
+        start_time = self._bounded_integer(start_time, 0, 1439)
+        days_mask = self._bounded_integer(days_of_week, 1, 127)
+        normalized_end = (None if end_time is None
+                          else self._bounded_integer(end_time, 0, 1439))
+        try:
+            latitude = float(latitude)
+            longitude = float(longitude)
+        except (TypeError, ValueError):
+            latitude = longitude = math.nan
+        valid_location = (
+            math.isfinite(latitude) and -90 <= latitude <= 90
+            and math.isfinite(longitude) and -180 <= longitude <= 180
+        )
+        if (schedule_id is None or start_time is None or days_mask is None
+                or (end_time is not None and normalized_end is None)
+                or not valid_location
+                or not isinstance(one_time, bool) or not isinstance(enabled, bool)):
+            logging.info("tesla_api: refusing invalid owned charge schedule payload.")
+            return False, 'invalid'
+
+        # The planner/controller uses Tesla's compact Sunday=1 ... Saturday=64 bitmap.
+        # Tesla's public REST-compatible command handler expects that bitmap rendered as
+        # comma-separated weekday names and converts it back internally.
+        days_of_week = ",".join(
+            name for bit, name in enumerate(TESLA_WEEKDAY_NAMES)
+            if days_mask & (1 << bit)
+        )
+
+        payload = {
+            'id': schedule_id,
+            'days_of_week': days_of_week,
+            'start_enabled': True,
+            'start_time': start_time,
+            'end_enabled': normalized_end is not None,
+            'end_time': normalized_end or 0,
+            'one_time': one_time,
+            'enabled': enabled,
+            # The Fleet command/proxy schema calls these fields lat/lon (not latitude/longitude).
+            'lat': latitude,
+            'lon': longitude,
+        }
+        return self._smart_charge_command(
+            'add_charge_schedule',
+            payload,
+            f"add/update owned Tesla charge schedule {schedule_id}",
+        )
+
+    def remove_owned_charge_schedule(self, schedule_id):
+        """Remove exactly the caller-provided application-owned schedule ID.
+
+        There is intentionally no list-and-clear or batch-delete behavior: foreign schedules
+        configured by the user or another application are never queried or touched.
+        """
+        schedule_id = self._bounded_integer(schedule_id, 1, (2 ** 64) - 1)
+        if schedule_id is None:
+            logging.info("tesla_api: refusing invalid owned charge schedule ID.")
+            return False, 'invalid'
+        return self._smart_charge_command(
+            'remove_charge_schedule',
+            {'id': schedule_id},
+            f"remove owned Tesla charge schedule {schedule_id}",
+            accepted_reasons=('schedule_not_found', 'not_found'),
+            preserve_accepted_reason=True,
+        )
+
+    def set_tesla_charge_amps(self, amps, installation_ceiling=None):
         amps = 0 if amps < 0 else amps
-        amps = 18 if amps > 18 else amps
+        try:
+            configured_max = int(float(
+                25 if installation_ceiling is None else installation_ceiling))
+        except (TypeError, ValueError):
+            configured_max = 25
+        configured_max = min(25, max(1, configured_max))
+        amps = configured_max if amps > configured_max else amps
         amps = math.floor(amps)
 
         if amps >= 5:
             return self.set_charge(amps, f"Error setting Tesla charge current to: {amps} Amp(s)")
-        if amps < 5:  # when amps are < 5, you need to send the command twice for it to take effect
-            self.set_charge(amps, f"Error setting Tesla charge current to: {amps} Amp(s)")
-            self.set_charge(amps, f"Error setting Tesla charge current to: {amps} Amp(s)")
-            return True
+        if amps < 5:  # Tesla quirk: a sub-5A request takes effect only when deliberately sent twice
+            first = self.set_charge(amps, f"Error setting Tesla charge current to: {amps} Amp(s)")
+            second = self.set_charge(amps, f"Error setting Tesla charge current to: {amps} Amp(s)")
+            return bool(first or second)
         else:
             return False
 
@@ -510,6 +1277,11 @@ class TeslaApi:
                     "GET", f"/api/1/vehicles/{self._vehicle_id}/vehicle_data",
                     params={"endpoints": VEHICLE_DATA_ENDPOINTS},
                 )
+            except TeslaAuthenticationError as error:
+                self._log_auth_failure("vehicle-data", error)
+                if not error.fleet_response_received:
+                    self._budget.refund("data")
+                return None
             except requests.exceptions.RequestException as e:
                 logging.error(f"tesla_api: get_vehicle_data() network error: {e}")
                 self._budget.refund("data")        # no HTTP response -> not billed
@@ -545,6 +1317,8 @@ class TeslaApi:
     def is_vehicle_charging(self, vehicle_data):
         self.is_charging = vehicle_data['charge_state']['charging_state'] == 'Charging'
         self.charging_status = "Charging" if self.is_charging else "Idle"
+        if not self.is_charging:
+            self.time_until_full = "N/A"
         self.update_mqtt_and_domoticz()
         return self.is_charging
 

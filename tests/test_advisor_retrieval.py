@@ -73,6 +73,35 @@ def test_day_summary_normalises_pv_load_units():
     assert s["load_actual_kwh"] == 30.0
 
 
+def test_day_summary_includes_measured_ev_energy_and_attributed_grid_cost():
+    recs = [
+        {
+            "kind": "cycle",
+            "control_action": "IDLE",
+            "ev_actual_today_kwh": 4.2,
+        },
+        {
+            "kind": "settlement",
+            "slot_start": "2026-07-25T12:00:00+02:00",
+            "slot_end": "2026-07-25T12:15:00+02:00",
+            "ev_charge_kwh": 2.0,
+            "ev_meter_quality": "measured",
+            "ev_grid_import_kwh": 1.0,
+            "ev_non_grid_kwh": 1.0,
+            "ev_grid_cost_eur": 0.15,
+            "ev_cost_quality": "proportional_site_load",
+        },
+    ]
+
+    summary = _day_summary(recs)
+
+    assert summary["ev_charge_kwh"] == 4.2
+    assert summary["ev_grid_import_kwh_attributed"] == 1.0
+    assert summary["ev_non_grid_kwh_attributed"] == 1.0
+    assert summary["ev_grid_cost_eur_attributed"] == 0.15
+    assert summary["ev_sessions"] == 1
+
+
 def test_load_days_preserves_every_requested_summary_when_detail_budget_is_exhausted(monkeypatch):
     def fake_read_day(day):
         return [{
@@ -178,4 +207,50 @@ def test_answer_with_retrieval_reasks_from_inline_summary_without_loading_files(
     ))
 
     assert any(ev.get("text") == "2026-06-23: 34.75 kWh" for ev in events)
+    assert len(calls) == 2
+
+
+def test_answer_with_retrieval_attaches_only_requested_config_metadata(monkeypatch):
+    user_prompt = """TASK
+
+=== DATA (JSON) ===
+{"tunables":{"KNOWN_SETTING":"7"},"performance":{"daily_summaries":{}}}
+=== END DATA ==="""
+    calls = []
+    tunables = [{
+        "key": "KNOWN_SETTING",
+        "value": "7",
+        "type": "int",
+        "group": "Test",
+        "desc": "A safe setting description.",
+    }]
+
+    monkeypatch.setattr(advisor, "_history_manifest", lambda: {"available_days": []})
+    monkeypatch.setattr(advisor, "_tunables", lambda conf: tunables)
+    monkeypatch.setattr(
+        advisor,
+        "_build_messages",
+        lambda question, conf, conversation_context=None: ("system", user_prompt),
+    )
+
+    def fake_stream_for(mode, system, user, model, conf):
+        calls.append(user)
+        if len(calls) == 1:
+            yield {"type": "delta", "text": "NEED_CONFIG: KNOWN_SETTING, SECRET_TOKEN"}
+        else:
+            assert '"KNOWN_SETTING"' in user
+            assert "A safe setting description." in user
+            assert "SECRET_TOKEN" not in user
+            yield {"type": "delta", "text": "The setting currently equals 7."}
+
+    monkeypatch.setattr(advisor, "_stream_for", fake_stream_for)
+
+    events = list(advisor._answer_with_retrieval(
+        "What exactly does KNOWN_SETTING do?",
+        {},
+        "cli",
+        "sonnet",
+    ))
+
+    assert any(ev.get("text") == "The setting currently equals 7." for ev in events)
     assert len(calls) == 2

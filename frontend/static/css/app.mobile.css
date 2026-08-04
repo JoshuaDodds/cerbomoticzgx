@@ -13,6 +13,12 @@
     font-size: 15px;
   }
 
+  /* The live frame is cross-origin, so Safari may try to chain a gesture from
+     its Qt canvas into this document.  Keep that chain inside the frame. */
+  body[data-app-view="live"] {
+    overscroll-behavior-y: none;
+  }
+
   .topbar {
     display: flex;
     flex-wrap: wrap;
@@ -22,6 +28,14 @@
     min-height: 58px;
     z-index: 20;
   }
+
+  .server-offline-banner {
+    top: calc(5px + env(safe-area-inset-top));
+    max-width: calc(100% - 20px); padding: 7px 10px; gap: 7px;
+  }
+
+  .server-offline-banner span { display: none; }
+  body.server-offline .mobile-key-stat { visibility: hidden; }
 
   .brand {
     flex: 0 0 auto;
@@ -147,12 +161,41 @@
   .overview,
   main,
   .battery-view,
+  .hvac-view,
   .live-view {
     width: 100%;
     max-width: none;
     padding-left: 10px;
     padding-right: 10px;
   }
+
+  .hvac-view { padding-left: 10px; padding-right: 10px; }
+  .hvac-page-head { align-items: flex-start; margin-top: 2px; }
+  .hvac-page-head h1 { font-size: 22px; }
+  .hvac-page-head p { font-size: 12px; }
+  .hvac-energy-rail { gap: 12px; padding: 13px; }
+  .hvac-rail-total { min-width: 100px; }
+  .hvac-rail-total b { font-size: 23px; }
+  .hvac-rail-split { min-width: 190px; }
+  .hvac-split-legend { gap: 10px 14px; }
+  .hvac-unit { padding: 14px 12px; }
+  .hvac-unit-head {
+    display: grid;
+    grid-template-columns: 80px minmax(0, 1fr) 50px;
+    align-items: flex-start;
+    gap: 11px;
+  }
+  .hvac-ring { flex-basis: 80px; }
+  .hvac-ring svg { width: 80px; height: 80px; }
+  .hvac-unit-identity { min-width: 0; }
+  .hvac-unit-title > span:first-child { font-size: 16px; }
+  .hvac-master-switch { width: 50px; height: 29px; }
+  .hvac-master-switch span { width: 23px; height: 23px; }
+  .hvac-master-switch[aria-pressed="true"] span { transform: translateX(21px); }
+  .hvac-mode-row { min-width: 0; }
+  .hvac-segments { gap: 4px; }
+  .hvac-segments button { min-height: 36px; font-size: 11.5px; }
+  .hvac-control-grid { grid-template-columns: 1fr; gap: 13px; }
 
   .overview {
     padding-top: 10px;
@@ -201,6 +244,24 @@
     min-height: 60px;
     padding: 7px 6px;
   }
+
+  .ev-smart-form {
+    grid-template-columns: 1fr 1.6fr;
+    gap: 8px;
+  }
+
+  .ev-smart-form .btn { grid-column: 1 / -1; width: 100%; }
+
+  .ev-smart-actions { display: grid; grid-template-columns: 1fr 1fr; }
+
+  .ev-smart-actions button { min-height: 40px; }
+
+  .ev-charge-day { grid-template-columns: 1fr; gap: 8px; padding: 11px; }
+  .ev-tesla-schedule { grid-template-columns: 1fr; }
+
+  .ev-charge-day-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+
+  .ev-charge-window { justify-content: space-between; }
 
   .overview-row {
     grid-template-columns: 1fr;
@@ -393,6 +454,8 @@
     font-size: 15px;
   }
 
+  .pl-strategy { margin: 0 0 12px; font-size: 13px; }
+
   .day-row,
   .day-sub {
     grid-template-columns: 1fr;
@@ -439,7 +502,7 @@
     /* Portrait VRM-style flow (2×2 corners + centre MP-II hub, driven by
        powerflow.js when the container is narrow). Content-fit cards + generous gaps
        for the radiating connectors; sized to sit comfortably in the viewport. */
-    height: clamp(500px, 74vh, 590px);
+    height: clamp(560px, 80vh, 650px);
   }
 
   .powerflow svg {
@@ -535,28 +598,72 @@
     min-height: 44px;
   }
 
-  .battery-frame,
-  .live-frame {
+  .advisor-sources {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .battery-frame {
     height: calc(100vh - 150px);
     min-height: 560px;
   }
 
-  .battery-frame-card,
-  .live-frame-card {
-    --mobile-frame-scale: 0.9;
-    --mobile-frame-fit: 111.111%;
+  .battery-frame-card {
+    --battery-frame-scale: 0.9;
+    --battery-frame-fit: 111.111%;
     --frame-scrollbar-mask: 48px;
     overflow: hidden;
     overscroll-behavior: none;
   }
 
-  .battery-frame,
-  .live-frame {
-    width: calc(var(--mobile-frame-fit) + var(--frame-scrollbar-mask));
+  .battery-frame {
+    width: calc(var(--battery-frame-fit) + var(--frame-scrollbar-mask));
     height: calc((100vh - 150px) * 1.11111);
     min-height: 622px;
-    transform: scale(var(--mobile-frame-scale));
+    transform: scale(var(--battery-frame-scale));
     transform-origin: top left;
+  }
+
+  /*
+   * Victron GUIv2 uses a wide Qt canvas rather than a responsive document.  A
+   * 10% reduction left its right-hand cards outside an iPhone viewport.  Give
+   * it a stable tablet-sized viewport, then scale that complete canvas into
+   * the card.  The explicit card aspect ratio is important: CSS transforms do
+   * not take part in layout, so without it the old raw iframe height produced
+   * a large empty black area below the scaled GUI.
+   */
+  .live-frame-card {
+    --victron-frame-width: 768px;
+    --victron-frame-height: 960px;
+    --victron-frame-scale: 0.48;
+    --frame-scrollbar-mask: 0px;
+    width: 100%;
+    aspect-ratio: 4 / 5;
+    padding: 0;
+    overflow: hidden;
+    overscroll-behavior: contain;
+    touch-action: manipulation;
+  }
+
+  .live-frame {
+    display: block;
+    width: var(--victron-frame-width);
+    height: var(--victron-frame-height);
+    min-height: 0;
+    margin: 0;
+    transform: scale(var(--victron-frame-scale));
+    transform-origin: top left;
+    overscroll-behavior: contain;
+  }
+
+  /* Wider phones in landscape get a larger, still complete Victron canvas. */
+  @media (min-width: 481px) {
+    .live-frame-card { --victron-frame-scale: 0.6; }
+  }
+
+  @media (min-width: 600px) {
+    .live-frame-card { --victron-frame-scale: 0.75; }
   }
 
   .foot {

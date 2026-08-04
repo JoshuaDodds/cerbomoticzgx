@@ -1,0 +1,745 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HVAC card redesign — POC</title>
+
+<!--
+  ============================================================================
+  HVAC UNIT CARD REDESIGN — self-contained proof of concept
+  ============================================================================
+
+  PURPOSE
+  A drop-in visual replacement for the per-unit cards in the Daikin ONECTA
+  dashboard. Everything (markup, CSS, JS, mock data) lives in this one file so
+  it can be opened directly in a browser with no build step.
+
+  WHAT CHANGED vs THE ORIGINAL
+  1. No expand/collapse. Every card renders its full control set at all times.
+     Off units are dimmed via `.unit.is-off` (opacity + desaturated ring) but
+     remain fully interactive.
+  2. A temperature ring replaces the 4-up stat boxes. Room temp is the primary
+     number; the arc sweeps from the low end of the range to the setpoint.
+  3. <select> elements become segmented pill groups (mode, fan speed). One tap
+     instead of open-scan-pick.
+  4. Target temperature becomes a -/+ stepper. No "type a number then press
+     Set" round trip; changes debounce before hitting the API.
+  5. Horizontal/vertical swing collapse from two 3-option selects into two
+     toggle chips, because in practice they are booleans.
+  6. The 4 summary tiles collapse into one rail: total kWh, a cooling/heating
+     split bar, and outdoor temp.
+
+  INTEGRATION NOTES FOR WHOEVER FOLDS THIS IN
+  - `MOCK_UNITS` at the bottom documents the expected shape of a unit object.
+    Swap it for the real ONECTA payload and delete the mock block.
+  - Every control calls a function in the `api` object. Those are the only
+    places that need real network calls; each one is stubbed and logged.
+  - Optimistic UI: controls update local state immediately, then call the API.
+    `applyPatch()` is the single funnel for that so rollback-on-error can be
+    added in one place.
+  - No dependencies, no framework. If the host app is React/Vue, the CSS block
+    and the `renderUnit()` markup translate directly; the state handling is
+    deliberately trivial so it can be thrown away.
+  - Colors are all CSS custom properties in `:root`. Retune there, not inline.
+  ============================================================================
+-->
+
+<style>
+:root {
+  --bg:            #0b0f14;
+  --surface:       #131a23;
+  --surface-inset: #1d2734;
+  --line:          #232c38;
+
+  --text:          #e6edf3;
+  --text-dim:      #8b98a8;
+  --text-faint:    #5c6b7d;
+
+  --cool:          #38bdf8;
+  --cool-bg:       #0e3c52;
+  --cool-text:     #7fd6f7;
+  --cool-border:   #2b6f8c;
+
+  --heat:          #f0a04b;
+  --heat-bg:       #4a2f10;
+  --heat-text:     #f5c187;
+  --heat-border:   #8a5b22;
+
+  --on:            #4ade80;
+  --on-bg:         #0f2f22;
+
+  --radius:        12px;
+  --radius-sm:     8px;
+  --dur:           140ms;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  padding: 24px 16px 64px;
+  background: var(--bg);
+  color: var(--text);
+  font: 400 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.page { max-width: 900px; margin: 0 auto; }
+
+/* ---------- page header ---------- */
+
+.page-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+.page-head h1 { margin: 0; font-size: 24px; font-weight: 600; letter-spacing: -0.01em; }
+.page-head .sub { margin-top: 3px; font-size: 13px; color: var(--text-dim); }
+.page-head .stamp { font-size: 13px; color: var(--text-dim); white-space: nowrap; }
+
+/* ---------- summary rail ---------- */
+
+.rail {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  flex-wrap: wrap;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  margin-bottom: 16px;
+}
+.rail-total { min-width: 120px; }
+.rail-total .label { font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.05em; }
+.rail-total .value { font-size: 26px; font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 2px; }
+.rail-total .value small { font-size: 13px; font-weight: 400; color: var(--text-dim); }
+
+.rail-split { flex: 1 1 260px; min-width: 220px; }
+.split-bar {
+  display: flex;
+  height: 8px;
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--surface-inset);
+}
+.split-bar span { display: block; height: 100%; }
+.split-bar .cool { background: var(--cool); }
+.split-bar .heat { background: var(--heat); }
+
+.split-legend {
+  display: flex;
+  gap: 18px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+.split-legend .dot {
+  display: inline-block;
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  margin-right: 6px;
+  vertical-align: 1px;
+}
+.split-legend .dot.cool { background: var(--cool); }
+.split-legend .dot.heat { background: var(--heat); }
+
+/* ---------- unit card ---------- */
+
+.unit {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 16px;
+  margin-bottom: 14px;
+  transition: border-color var(--dur) ease, opacity var(--dur) ease;
+}
+.unit.is-running.mode-cooling { border-color: var(--cool-border); }
+.unit.is-running.mode-heating { border-color: var(--heat-border); }
+.unit.is-off { opacity: 0.62; }
+.unit.is-off:hover,
+.unit.is-off:focus-within { opacity: 1; }
+
+.unit-head {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+}
+
+/* temperature ring */
+.ring { flex: 0 0 auto; }
+.ring svg { display: block; }
+.ring .track { stroke: var(--surface-inset); }
+.ring .arc {
+  stroke: var(--cool);
+  transition: stroke-dasharray var(--dur) ease;
+}
+.mode-heating .ring .arc { stroke: var(--heat); }
+.is-off .ring .arc { stroke: var(--text-faint); }
+.ring .room { font: 600 21px/1 ui-monospace, SFMono-Regular, Menlo, monospace; fill: var(--text); }
+.ring .goal { font: 400 10px/1 system-ui, sans-serif; fill: var(--text-dim); }
+.is-off .ring .room { fill: var(--text-dim); }
+
+.unit-id { flex: 1 1 auto; min-width: 0; }
+.unit-name-row { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.unit-name { font-size: 17px; font-weight: 600; }
+.unit-meta { font-size: 12.5px; color: var(--text-dim); margin-top: 3px; }
+
+.pill-status {
+  font-size: 11px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  background: var(--surface-inset);
+  color: var(--text-dim);
+}
+.is-running .pill-status { background: var(--on-bg); color: var(--on); }
+
+/* master power switch */
+.power {
+  flex: 0 0 auto;
+  width: 54px; height: 31px;
+  border: 0;
+  padding: 0;
+  border-radius: 999px;
+  background: var(--surface-inset);
+  cursor: pointer;
+  position: relative;
+  transition: background var(--dur) ease;
+}
+.power .knob {
+  position: absolute;
+  top: 3px; left: 3px;
+  width: 25px; height: 25px;
+  border-radius: 50%;
+  background: var(--text-faint);
+  transition: transform var(--dur) ease, background var(--dur) ease;
+}
+.is-running .power { background: var(--cool-border); }
+.is-running.mode-heating .power { background: var(--heat-border); }
+.is-running .power .knob { transform: translateX(23px); background: var(--text); }
+
+/* ---------- segmented groups ---------- */
+
+.seg { display: flex; gap: 5px; }
+.seg.tight { gap: 4px; }
+.seg button {
+  flex: 1 1 0;
+  min-width: 0;
+  border: 0;
+  padding: 7px 4px;
+  border-radius: 7px;
+  background: var(--surface-inset);
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: background var(--dur) ease, color var(--dur) ease;
+}
+.seg button:hover { background: #26333f; color: var(--text); }
+.seg button[aria-pressed="true"] { background: var(--cool-bg); color: var(--cool-text); }
+.mode-heating .seg button[aria-pressed="true"] { background: var(--heat-bg); color: var(--heat-text); }
+
+.mode-row { margin-top: 11px; }
+
+/* ---------- control grid ---------- */
+
+.divider { height: 1px; background: var(--line); margin: 15px 0; }
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 14px;
+}
+.field > .label {
+  font-size: 11px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 7px;
+}
+
+/* target temperature stepper */
+.stepper {
+  display: flex;
+  align-items: stretch;
+  background: var(--surface-inset);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+.stepper button {
+  width: 38px;
+  border: 0;
+  background: transparent;
+  color: var(--text-dim);
+  font: 400 18px/1 system-ui, sans-serif;
+  cursor: pointer;
+  transition: background var(--dur) ease, color var(--dur) ease;
+}
+.stepper button:hover { background: #26333f; color: var(--text); }
+.stepper button:disabled { opacity: 0.3; cursor: not-allowed; }
+.stepper .readout {
+  flex: 1;
+  text-align: center;
+  align-self: center;
+  padding: 8px 0;
+  font: 500 15px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+/* swing toggles */
+.chip-row { display: flex; gap: 7px; }
+.chip {
+  flex: 1;
+  border: 0;
+  padding: 8px 4px;
+  border-radius: 7px;
+  background: var(--surface-inset);
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: background var(--dur) ease, color var(--dur) ease;
+}
+.chip:hover { background: #26333f; color: var(--text); }
+.chip[aria-pressed="true"] { background: var(--cool-bg); color: var(--cool-text); }
+.mode-heating .chip[aria-pressed="true"] { background: var(--heat-bg); color: var(--heat-text); }
+.chip .glyph { margin-right: 5px; opacity: 0.85; }
+
+/* powerful mode switch */
+.switch-row { display: flex; align-items: center; gap: 10px; padding: 4px 0; }
+.switch {
+  width: 42px; height: 23px;
+  border: 0; padding: 0;
+  border-radius: 999px;
+  background: var(--surface-inset);
+  position: relative;
+  cursor: pointer;
+  flex: 0 0 auto;
+  transition: background var(--dur) ease;
+}
+.switch .knob {
+  position: absolute;
+  top: 3px; left: 3px;
+  width: 17px; height: 17px;
+  border-radius: 50%;
+  background: var(--text-faint);
+  transition: transform var(--dur) ease, background var(--dur) ease;
+}
+.switch[aria-pressed="true"] { background: var(--cool-border); }
+.mode-heating .switch[aria-pressed="true"] { background: var(--heat-border); }
+.switch[aria-pressed="true"] .knob { transform: translateX(19px); background: var(--text); }
+.switch-label { font-size: 12.5px; color: var(--text-dim); }
+
+/* ---------- accessibility floor ---------- */
+
+button:focus-visible {
+  outline: 2px solid var(--cool);
+  outline-offset: 2px;
+}
+.sr-only {
+  position: absolute; width: 1px; height: 1px;
+  padding: 0; margin: -1px; overflow: hidden;
+  clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; }
+}
+@media (max-width: 560px) {
+  .unit-head { flex-wrap: wrap; }
+  .unit-id { flex-basis: calc(100% - 160px); }
+  .grid { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+
+<div class="page">
+  <header class="page-head">
+    <div>
+      <h1>HVAC</h1>
+      <div class="sub" id="sub">Daikin ONECTA</div>
+    </div>
+    <div class="stamp" id="stamp">Updated —</div>
+  </header>
+
+  <section class="rail" aria-label="Energy summary">
+    <div class="rail-total">
+      <div class="label">Used today</div>
+      <div class="value" id="totalKwh">0.0 <small>kWh</small></div>
+    </div>
+    <div class="rail-split">
+      <div class="split-bar" role="img" id="splitBar" aria-label="Cooling and heating share of today's usage">
+        <span class="cool" id="splitCool"></span>
+        <span class="heat" id="splitHeat"></span>
+      </div>
+      <div class="split-legend">
+        <span><i class="dot cool"></i><span id="legendCool">Cooling 0.0</span></span>
+        <span><i class="dot heat"></i><span id="legendHeat">Heating 0.0</span></span>
+        <span id="legendOutdoor">Outdoor —</span>
+      </div>
+    </div>
+  </section>
+
+  <main id="units"></main>
+</div>
+
+<script>
+"use strict";
+
+/* ==========================================================================
+   1. DATA CONTRACT
+   Replace MOCK_UNITS with the live ONECTA payload mapped to this shape.
+   ========================================================================== */
+
+const MOCK_UNITS = [
+  {
+    id: "woonkamer",
+    name: "Woonkamer",
+    on: false,
+    mode: "cooling",            // cooling | heating | dry | fan | auto
+    roomTemp: 24.0,
+    targetTemp: 23.0,
+    outdoorTemp: 22.5,
+    fan: "auto",                // auto | 1 | 2 | 3 | 4 | 5
+    swingHorizontal: false,
+    swingVertical: false,
+    powerful: false,
+    kwhToday: 0.0,
+    lastRan: "09:40"
+  },
+  {
+    id: "bedroom",
+    name: "Bedroom",
+    on: true,
+    mode: "cooling",
+    roomTemp: 24.0,
+    targetTemp: 26.0,
+    outdoorTemp: 22.5,
+    fan: "auto",
+    swingHorizontal: false,
+    swingVertical: false,
+    powerful: false,
+    kwhToday: 0.2,
+    lastRan: null
+  },
+  {
+    id: "zolder",
+    name: "Zolder",
+    on: false,
+    mode: "cooling",
+    roomTemp: 24.0,
+    targetTemp: 24.0,
+    outdoorTemp: 22.5,
+    fan: "3",
+    swingHorizontal: true,
+    swingVertical: false,
+    powerful: false,
+    kwhToday: 0.3,
+    lastRan: "11:05"
+  },
+  {
+    id: "study",
+    name: "Study",
+    on: false,
+    mode: "heating",
+    roomTemp: 25.0,
+    targetTemp: 21.0,
+    outdoorTemp: 22.5,
+    fan: "1",
+    swingHorizontal: false,
+    swingVertical: true,
+    powerful: false,
+    kwhToday: 0.0,
+    lastRan: null
+  }
+];
+
+/* ==========================================================================
+   2. CONSTANTS
+   ========================================================================== */
+
+const MODES = [
+  { key: "cooling", label: "Cool" },
+  { key: "heating", label: "Heat" },
+  { key: "dry",     label: "Dry"  },
+  { key: "fan",     label: "Fan"  },
+  { key: "auto",    label: "Auto" }
+];
+
+const FAN_STEPS = ["auto", "1", "2", "3", "4", "5"];
+
+// Ring sweep range. Adjust if the units report a wider setpoint range.
+const TEMP_MIN = 16;
+const TEMP_MAX = 32;
+const TEMP_STEP = 0.5;
+
+const MODE_LABEL = {
+  cooling: "Cooling", heating: "Heating", dry: "Dry", fan: "Fan only", auto: "Auto"
+};
+
+/* ==========================================================================
+   3. API STUBS — the only places that need real network calls
+   ========================================================================== */
+
+const api = {
+  setPower(id, on)        { return this._send(id, { on }); },
+  setMode(id, mode)       { return this._send(id, { mode }); },
+  setTarget(id, temp)     { return this._send(id, { targetTemp: temp }); },
+  setFan(id, fan)         { return this._send(id, { fan }); },
+  setSwing(id, axis, val) { return this._send(id, { ["swing" + axis]: val }); },
+  setPowerful(id, val)    { return this._send(id, { powerful: val }); },
+
+  _send(id, patch) {
+    console.log("[api] PATCH /units/" + id, patch);
+    // return fetch(`/api/units/${id}`, {
+    //   method: "PATCH",
+    //   headers: { "Content-Type": "application/json" },
+    //   body: JSON.stringify(patch)
+    // });
+    return Promise.resolve();
+  }
+};
+
+// Target-temp changes are debounced so holding +/- sends one request.
+const debounceTimers = new Map();
+function debounced(key, fn, ms = 600) {
+  clearTimeout(debounceTimers.get(key));
+  debounceTimers.set(key, setTimeout(fn, ms));
+}
+
+/* ==========================================================================
+   4. STATE + RENDER
+   ========================================================================== */
+
+let units = MOCK_UNITS.map(u => ({ ...u }));
+
+function applyPatch(id, patch) {
+  units = units.map(u => (u.id === id ? { ...u, ...patch } : u));
+  render();
+}
+
+const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n));
+const round1 = n => Math.round(n * 10) / 10;
+
+/* Ring geometry: a 270-degree arc starting bottom-left. */
+const R = 36;
+const CIRC = 2 * Math.PI * R;          // ~226.19
+const SWEEP = CIRC * 0.75;             // 270 degrees of usable track
+
+function ringArc(unit) {
+  if (!unit.on) return 0;
+  const frac = clamp((unit.targetTemp - TEMP_MIN) / (TEMP_MAX - TEMP_MIN), 0, 1);
+  return SWEEP * frac;
+}
+
+function renderRing(u) {
+  const filled = ringArc(u);
+  return `
+    <div class="ring">
+      <svg viewBox="0 0 90 90" width="88" height="88" role="img"
+           aria-label="${u.name} room temperature ${round1(u.roomTemp)} degrees, target ${round1(u.targetTemp)} degrees">
+        <circle class="track" cx="45" cy="45" r="${R}" fill="none" stroke-width="7"
+                stroke-dasharray="${SWEEP} ${CIRC}" stroke-linecap="round"
+                transform="rotate(135 45 45)"></circle>
+        <circle class="arc" cx="45" cy="45" r="${R}" fill="none" stroke-width="7"
+                stroke-dasharray="${filled} ${CIRC}" stroke-linecap="round"
+                transform="rotate(135 45 45)"></circle>
+        <text class="room" x="45" y="43" text-anchor="middle">${round1(u.roomTemp)}&deg;</text>
+        <text class="goal" x="45" y="57" text-anchor="middle">${u.on ? "&rarr; " + round1(u.targetTemp) + "&deg;" : "idle"}</text>
+      </svg>
+    </div>`;
+}
+
+function renderMeta(u) {
+  const bits = [MODE_LABEL[u.mode]];
+  if (u.on) {
+    bits.push("fan " + (u.fan === "auto" ? "auto" : "level " + u.fan));
+  } else if (u.lastRan) {
+    bits.push("last ran " + u.lastRan);
+  }
+  bits.push(round1(u.kwhToday).toFixed(1) + " kWh today");
+  return bits.join(" &middot; ");
+}
+
+function renderUnit(u) {
+  const cls = ["unit", "mode-" + u.mode, u.on ? "is-running" : "is-off"].join(" ");
+
+  const modeBtns = MODES.map(m =>
+    `<button type="button" data-act="mode" data-id="${u.id}" data-val="${m.key}"
+             aria-pressed="${u.mode === m.key}">${m.label}</button>`
+  ).join("");
+
+  const fanBtns = FAN_STEPS.map(f =>
+    `<button type="button" data-act="fan" data-id="${u.id}" data-val="${f}"
+             aria-pressed="${u.fan === f}">${f === "auto" ? "Auto" : f}</button>`
+  ).join("");
+
+  return `
+  <article class="${cls}" data-unit="${u.id}">
+    <div class="unit-head">
+      ${renderRing(u)}
+      <div class="unit-id">
+        <div class="unit-name-row">
+          <span class="unit-name">${u.name}</span>
+          <span class="pill-status">${u.on ? "Running" : "Off"}</span>
+        </div>
+        <div class="unit-meta">${renderMeta(u)}</div>
+        <div class="seg mode-row" role="group" aria-label="${u.name} mode">${modeBtns}</div>
+      </div>
+      <button type="button" class="power" data-act="power" data-id="${u.id}"
+              aria-pressed="${u.on}" aria-label="${u.on ? "Turn off" : "Turn on"} ${u.name}">
+        <span class="knob"></span>
+      </button>
+    </div>
+
+    <div class="divider"></div>
+
+    <div class="grid">
+      <div class="field">
+        <div class="label" id="lbl-target-${u.id}">Target</div>
+        <div class="stepper">
+          <button type="button" data-act="step" data-id="${u.id}" data-val="-1"
+                  aria-label="Lower target for ${u.name}"
+                  ${u.targetTemp <= TEMP_MIN ? "disabled" : ""}>&minus;</button>
+          <span class="readout" aria-live="polite">${round1(u.targetTemp).toFixed(1)}&deg;C</span>
+          <button type="button" data-act="step" data-id="${u.id}" data-val="1"
+                  aria-label="Raise target for ${u.name}"
+                  ${u.targetTemp >= TEMP_MAX ? "disabled" : ""}>+</button>
+        </div>
+      </div>
+
+      <div class="field">
+        <div class="label">Fan speed</div>
+        <div class="seg tight" role="group" aria-label="${u.name} fan speed">${fanBtns}</div>
+      </div>
+
+      <div class="field">
+        <div class="label">Airflow swing</div>
+        <div class="chip-row">
+          <button type="button" class="chip" data-act="swing" data-id="${u.id}" data-val="Horizontal"
+                  aria-pressed="${u.swingHorizontal}">
+            <span class="glyph" aria-hidden="true">&#8596;</span>${u.swingHorizontal ? "On" : "Off"}
+          </button>
+          <button type="button" class="chip" data-act="swing" data-id="${u.id}" data-val="Vertical"
+                  aria-pressed="${u.swingVertical}">
+            <span class="glyph" aria-hidden="true">&#8597;</span>${u.swingVertical ? "On" : "Off"}
+          </button>
+        </div>
+      </div>
+
+      <div class="field">
+        <div class="label">Powerful</div>
+        <div class="switch-row">
+          <button type="button" class="switch" data-act="powerful" data-id="${u.id}"
+                  aria-pressed="${u.powerful}" aria-label="Powerful mode for ${u.name}">
+            <span class="knob"></span>
+          </button>
+          <span class="switch-label">${u.powerful ? "Boost on" : "Boost off"}</span>
+        </div>
+      </div>
+    </div>
+  </article>`;
+}
+
+function renderSummary() {
+  const running = units.filter(u => u.on).length;
+  const cool = units.filter(u => u.mode === "cooling").reduce((s, u) => s + u.kwhToday, 0);
+  const heat = units.filter(u => u.mode === "heating").reduce((s, u) => s + u.kwhToday, 0);
+  const total = cool + heat;
+  const outdoor = units.length ? units[0].outdoorTemp : null;
+
+  document.getElementById("sub").innerHTML =
+    `Daikin ONECTA &middot; ${units.length} units &middot; ${running} running`;
+  document.getElementById("stamp").textContent =
+    "Updated " + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+
+  document.getElementById("totalKwh").innerHTML =
+    `${round1(total).toFixed(1)} <small>kWh</small>`;
+
+  const coolPct = total > 0 ? (cool / total) * 100 : 0;
+  document.getElementById("splitCool").style.width = coolPct + "%";
+  document.getElementById("splitHeat").style.width = (total > 0 ? 100 - coolPct : 0) + "%";
+
+  document.getElementById("legendCool").textContent = "Cooling " + round1(cool).toFixed(1);
+  document.getElementById("legendHeat").textContent = "Heating " + round1(heat).toFixed(1);
+  document.getElementById("legendOutdoor").textContent =
+    outdoor == null ? "Outdoor —" : "Outdoor " + round1(outdoor).toFixed(1) + "\u00B0";
+}
+
+function render() {
+  document.getElementById("units").innerHTML = units.map(renderUnit).join("");
+  renderSummary();
+}
+
+/* ==========================================================================
+   5. EVENTS — one delegated listener for the whole board
+   ========================================================================== */
+
+document.getElementById("units").addEventListener("click", function (e) {
+  const btn = e.target.closest("button[data-act]");
+  if (!btn) return;
+
+  const id = btn.dataset.id;
+  const val = btn.dataset.val;
+  const unit = units.find(u => u.id === id);
+  if (!unit) return;
+
+  switch (btn.dataset.act) {
+    case "power": {
+      const on = !unit.on;
+      applyPatch(id, { on });
+      api.setPower(id, on);
+      break;
+    }
+    case "mode": {
+      applyPatch(id, { mode: val });
+      api.setMode(id, val);
+      break;
+    }
+    case "fan": {
+      applyPatch(id, { fan: val });
+      api.setFan(id, val);
+      break;
+    }
+    case "step": {
+      const next = clamp(
+        round1(unit.targetTemp + Number(val) * TEMP_STEP),
+        TEMP_MIN,
+        TEMP_MAX
+      );
+      applyPatch(id, { targetTemp: next });
+      debounced("target:" + id, () => api.setTarget(id, next));
+      break;
+    }
+    case "swing": {
+      const key = "swing" + val;
+      const next = !unit[key];
+      applyPatch(id, { [key]: next });
+      api.setSwing(id, val, next);
+      break;
+    }
+    case "powerful": {
+      const next = !unit.powerful;
+      applyPatch(id, { powerful: next });
+      api.setPowerful(id, next);
+      break;
+    }
+  }
+
+  // Keep focus on the control that was just used, since render() rebuilds DOM.
+  const restored = document.querySelector(
+    `[data-act="${btn.dataset.act}"][data-id="${id}"]` +
+    (val != null ? `[data-val="${CSS.escape(val)}"]` : "")
+  );
+  if (restored) restored.focus();
+});
+
+render();
+</script>
+</body>
+</html>

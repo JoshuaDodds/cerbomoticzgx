@@ -1,10 +1,20 @@
 import json
+import sys
+import types
 import pytest
 from pathlib import Path
 from datetime import datetime, timedelta
 
 from frontend import data
 from frontend.config_schema import CONFIG_SCHEMA
+
+
+class _MidMonthDateTime(datetime):
+    """Keep completed-day monthly-history assertions valid on the first day."""
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls(2026, 7, 15, 12, 0, 0, tzinfo=tz)
 
 
 def _schema_keys():
@@ -41,12 +51,37 @@ def test_config_schema_exposes_grid_charge_cap_and_advisor_safe_knobs():
     assert "ADVISOR_RETRIEVAL_MAX_CHARS" in keys
 
 
+def test_advisor_model_schema_offers_curated_models_without_restricting_custom_cli():
+    advisor_group = next(group for group in CONFIG_SCHEMA if group["group"] == "AI Advisor")
+    model = next(setting for setting in advisor_group["settings"] if setting["key"] == "ADVISOR_MODEL")
+
+    assert "options" not in model  # custom provider model names must remain writable
+    assert model["ui_options"] == [
+        {"value": "", "label": "Auto / latest Sonnet (recommended)"},
+        {"value": "claude-sonnet-5", "label": "Claude Sonnet 5"},
+        {"value": "claude-sonnet-4-6", "label": "Claude Sonnet 4.6 (fallback)"},
+        {"value": "claude-opus-4-8", "label": "Claude Opus 4.8"},
+        {"value": "claude-haiku-4-5", "label": "Claude Haiku 4.5"},
+    ]
+    assert model["custom_cli_editor"] == "text"
+
+
 def test_numeric_config_schema_entries_have_bounds():
     for group in CONFIG_SCHEMA:
         for setting in group["settings"]:
             if setting.get("type") in ("int", "float"):
                 assert "min" in setting, setting["key"]
                 assert "max" in setting, setting["key"]
+
+
+def test_advisor_retrieval_ui_cap_matches_backend_hard_limit():
+    advisor_group = next(group for group in CONFIG_SCHEMA if group["group"] == "AI Advisor")
+    setting = next(
+        item for item in advisor_group["settings"]
+        if item["key"] == "ADVISOR_RETRIEVAL_MAX_CHARS"
+    )
+    assert setting["min"] == 1000
+    assert setting["max"] == 120000
 
 
 def test_numeric_config_writes_reject_values_outside_schema_bounds(tmp_path):
@@ -64,12 +99,31 @@ def test_numeric_config_writes_reject_values_outside_schema_bounds(tmp_path):
 
 
 def test_weather_behavior_toggles_are_first_in_weather_config_group():
-    weather = next(group for group in CONFIG_SCHEMA if group["group"] == "Weather Forecast")
+    weather = next(
+        group
+        for group in CONFIG_SCHEMA
+        if group["group"] == "Weather & HVAC Forecasting"
+    )
     keys = [setting["key"] for setting in weather["settings"]]
 
-    assert keys[:3] == ["WEATHER_ENABLED", "HVAC_LOAD_APPLY", "PV_WEATHER_APPLY"]
+    assert keys[:7] == [
+        "ONECTA_ENABLED",
+        "ONECTA_CONTROL_ENABLED",
+        "ONECTA_POLL_INTERVAL_MIN",
+        "ONECTA_EXPECTED_UNITS",
+        "WEATHER_ENABLED",
+        "HVAC_LOAD_APPLY",
+        "PV_WEATHER_APPLY",
+    ]
     assert "ADVISOR_CLI_CMD" not in keys
     assert "CLAUDE_CONFIG_DIR" not in keys
+    poll = next(
+        setting for setting in weather["settings"]
+        if setting["key"] == "ONECTA_POLL_INTERVAL_MIN"
+    )
+    assert "20" in poll["desc"]
+    assert "72" in poll["desc"]
+    assert "96" not in poll["desc"]
 
 
 def test_removed_grid_charge_price_caps_are_not_user_tunable():
@@ -104,21 +158,140 @@ def test_settled_slots_for_today_are_schedule_shaped(monkeypatch, tmp_path):
         "actual_reward": 0.09,
         "actual_net_eur": 0.07,
         "actual_pv_kwh": 0.4,
+        "actual_load_kwh": 1.0,
+        "ev_charge_kwh": 0.6,
+        "ev_average_kw": 2.4,
+        "ev_grid_import_kwh": 0.06,
+        "ev_non_grid_kwh": 0.54,
+        "ev_grid_cost_eur": 0.012,
+        "ev_cost_quality": "proportional_site_load",
+        "ev_meter_quality": "measured",
+        "ev_soc_start": 40.0,
+        "ev_soc_end": 41.0,
         "soc_start": 10.0,
         "soc_end": 11.0,
         "price_buy": 0.2,
         "price_sell": 0.3,
     }
-    path.write_text(json.dumps(rec) + "\n")
+    cycle = {
+        "kind": "cycle",
+        "ts": (now + timedelta(minutes=15) - timedelta(milliseconds=50)).isoformat(),
+        "control_action": "SELL",
+        "realized_action": "IDLE",
+    }
+    path.write_text(json.dumps(cycle) + "\n" + json.dumps(rec) + "\n")
 
     slots = data.settled_slots_for_today((now + timedelta(hours=1)).isoformat())
 
     assert len(slots) == 1
     slot = slots[0]
     assert slot["settled"] is True
+    assert slot["control_action"] == "IDLE"
+    assert slot["planned_control_action"] == "IDLE"
+    assert slot["actual_action_quality"] == "cycle_observation"
     assert slot["grid_energy"] == -0.19999999999999998
     assert slot["pv"] == 0.4
     assert slot["actual_net_eur"] == 0.07
+    assert slot["actual_ev_kwh"] == 0.6
+    assert slot["actual_ev_avg_kw"] == 2.4
+    assert slot["actual_ev_grid_kwh"] == 0.06
+    assert slot["actual_ev_non_grid_kwh"] == 0.54
+    assert slot["actual_ev_grid_cost_eur"] == 0.012
+    assert slot["ev_soc_start"] == 40.0
+    assert slot["ev_soc_end"] == 41.0
+    assert slot["actual_ev_timing_quality"] == "settlement_interval"
+    assert slot["actual_ev_observed_from"] == now.isoformat()
+    assert slot["actual_ev_observed_until"] == (
+        now + timedelta(minutes=15)
+    ).isoformat()
+
+
+def test_settled_ev_history_uses_meter_session_boundaries_not_plan(
+        monkeypatch, tmp_path):
+    monkeypatch.setattr(data, "_env", lambda: {"HISTORY_DIR": str(tmp_path)})
+    now = datetime.now().astimezone().replace(
+        hour=11, minute=45, second=0, microsecond=0
+    )
+    records = [
+        {
+            "kind": "ev_charge_transition",
+            "ts": (now + timedelta(minutes=8)).isoformat(),
+            "event": "started",
+            "source": "abb_meter",
+            "timing_quality": "meter_transition",
+            "ev_w": 3540.0,
+        },
+        {
+            "kind": "cycle",
+            "ts": (now + timedelta(minutes=15, milliseconds=-50)).isoformat(),
+            "control_action": "BUY",
+            "realized_action": "IDLE",
+        },
+        {
+            "kind": "settlement",
+            "slot_start": now.isoformat(),
+            "slot_end": (now + timedelta(minutes=15)).isoformat(),
+            "predicted_control_action": "BUY",
+            "predicted_ev_charge_kwh": 4.0,
+            "ev_charge_kwh": 0.41,
+            "ev_meter_quality": "measured",
+            "actual_load_kwh": 0.5,
+        },
+        {
+            "kind": "ev_charge_transition",
+            "ts": (now + timedelta(minutes=49)).isoformat(),
+            "event": "stopped",
+            "source": "abb_meter",
+            "timing_quality": "meter_transition",
+            "ev_w": 4.0,
+        },
+    ]
+    path = tmp_path / f"ess-{now.date().isoformat()}.ndjson"
+    path.write_text("".join(json.dumps(record) + "\n" for record in records))
+
+    slot = data.settled_slots_for_today(
+        (now + timedelta(hours=1)).isoformat()
+    )[0]
+
+    assert slot["actual_ev_kwh"] == 0.41
+    assert "planned_ev_kwh" not in slot
+    assert slot["control_action"] == "IDLE"
+    assert slot["planned_control_action"] == "BUY"
+    assert slot["actual_ev_observed_from"] == (
+        now + timedelta(minutes=8)
+    ).isoformat()
+    assert slot["actual_ev_observed_until"] == (
+        now + timedelta(minutes=49)
+    ).isoformat()
+    assert slot["actual_ev_timing_quality"] == "meter_transition"
+
+
+def test_settled_slots_derive_ev_rate_and_cost_for_existing_history(monkeypatch, tmp_path):
+    monkeypatch.setattr(data, "_env", lambda: {"HISTORY_DIR": str(tmp_path)})
+    now = datetime.now().astimezone().replace(hour=1, minute=0, second=0, microsecond=0)
+    path = tmp_path / f"ess-{now.date().isoformat()}.ndjson"
+    path.write_text(json.dumps({
+        "kind": "settlement",
+        "slot_start": now.isoformat(),
+        "slot_end": (now + timedelta(minutes=15)).isoformat(),
+        "actual_import_kwh": 2.0,
+        "actual_cost": 0.4,
+        "actual_load_kwh": 2.0,
+        "ev_charge_kwh": 1.0,
+        "ev_meter_quality": "measured",
+        "price_buy": 0.2,
+    }) + "\n")
+
+    slot = data.settled_slots_for_today(
+        (now + timedelta(hours=1)).isoformat()
+    )[0]
+
+    assert slot["actual_ev_kwh"] == 1.0
+    assert slot["actual_ev_avg_kw"] == 4.0
+    assert slot["actual_ev_grid_kwh"] == 1.0
+    assert slot["actual_ev_non_grid_kwh"] == 0.0
+    assert slot["actual_ev_grid_cost_eur"] == 0.2
+    assert slot["ev_cost_quality"] == "proportional_site_load"
 
 
 def test_group_by_hour_aggregates_settled_actuals(monkeypatch, tmp_path):
@@ -151,6 +324,127 @@ def test_group_by_hour_aggregates_settled_actuals(monkeypatch, tmp_path):
     assert hour["net_cost"] == -0.07
     assert hour["is_current"] is False
     assert hour["hour_start"] == now.isoformat()
+
+
+def test_group_by_hour_exposes_compact_ev_schedule_annotations():
+    now = datetime.now().astimezone().replace(hour=8, minute=0, second=0, microsecond=0)
+    slots = [
+        {
+            "time": (now + timedelta(minutes=offset)).isoformat(),
+            "control_action": "BUY",
+            "grid_energy": 4.0,
+            "price": 0.12,
+            "pv": 0.0,
+            "load": 4.3,
+            "planned_ev_kwh": ev_kwh,
+            "ev_target_kw": target_kw,
+            "ev_soc_start": 40.0 + offset / 15,
+            "ev_soc_end": 41.0 + offset / 15,
+        }
+        for offset, ev_kwh, target_kw in ((0, 4.0, 16.0), (15, 2.0, 8.0))
+    ]
+    slots[0]["ev_supply"] = "solar"
+    slots[0]["ev_tentative"] = True
+    slots[1]["ev_supply"] = "solar"
+
+    hour = data.group_by_hour(slots)[0]
+
+    assert hour["planned_ev_kwh"] == 6.0
+    assert hour["ev_target_kw"] == 16.0
+    assert hour["ev_supply"] == "solar"
+    assert hour["ev_tentative"] is True
+    assert hour["ev_soc_start"] == 40.0
+    assert hour["ev_soc_end"] == 42.0
+
+
+def test_plan_exposes_ev_smart_charge_snapshot(monkeypatch, tmp_path):
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps({
+        "generated_at": datetime.now().astimezone().isoformat(),
+        "schedule": [],
+        "ev_smart_charge": {"status": "planned", "blocks": []},
+    }))
+    monkeypatch.setattr(data, "_env", lambda: {"AI_PLAN_EXPORT_PATH": str(plan_path)})
+
+    plan = data.get_plan()
+
+    assert plan["ev_smart_charge"]["status"] == "planned"
+
+
+def test_ev_smart_charge_dashboard_uses_configured_job_and_plan_paths(monkeypatch, tmp_path):
+    calls = []
+    fake = types.SimpleNamespace(
+        load_job=lambda path=None: calls.append(("job", path)) or {"id": "j1", "status": "active"},
+        load_plan_snapshot=lambda path=None: calls.append(("plan", path)) or {
+            "job": {"id": "j1", "status": "active"}, "status": "planned",
+        },
+    )
+    monkeypatch.setitem(sys.modules, "lib.ev_smart_charge", fake)
+    monkeypatch.setattr(data, "load_raw_plan", lambda: {})
+    monkeypatch.setattr(data, "_env", lambda: {
+        "EV_SMART_CHARGE_ENABLED": "True",
+        "EV_SMART_CHARGE_APPLY": "False",
+        "EV_SMART_CHARGE_JOB_PATH": str(tmp_path / "job.json"),
+        "EV_SMART_CHARGE_PLAN_PATH": str(tmp_path / "plan.json"),
+    })
+
+    result = data.ev_smart_charge_dashboard()
+
+    assert result["enabled"] is True
+    assert result["apply"] is False
+    assert result["plan"]["status"] == "planned"
+    assert calls == [
+        ("job", str(tmp_path / "job.json")),
+        ("plan", str(tmp_path / "plan.json")),
+    ]
+
+
+def test_ev_smart_charge_dashboard_hides_orphaned_terminal_plan(monkeypatch):
+    fake = types.SimpleNamespace(load_job=lambda path=None: None)
+    monkeypatch.setitem(sys.modules, "lib.ev_smart_charge", fake)
+    monkeypatch.setattr(data, "load_raw_plan", lambda: {
+        "ev_smart_charge": {
+            "job": {"id": "completed-job"},
+            "status": "completed",
+        },
+    })
+    monkeypatch.setattr(data, "_env", lambda: {
+        "EV_SMART_CHARGE_ENABLED": "True",
+        "EV_SMART_CHARGE_APPLY": "True",
+    })
+
+    result = data.ev_smart_charge_dashboard()
+
+    assert result["job"] is None
+    assert result["plan"] is None
+
+
+def test_ev_smart_charge_dashboard_advertises_run_now_only_for_eligible_applied_plan(
+        monkeypatch):
+    fake = types.SimpleNamespace(
+        load_job=lambda path=None: {"id": "j1", "status": "active"},
+        run_now_eligibility=lambda job, plan: (
+            bool(plan.get("eligible")), "eligible" if plan.get("eligible")
+            else "plan_requires_multiple_windows"
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "lib.ev_smart_charge", fake)
+    monkeypatch.setattr(data, "_env", lambda: {
+        "EV_SMART_CHARGE_ENABLED": "True",
+        "EV_SMART_CHARGE_APPLY": "True",
+    })
+
+    monkeypatch.setattr(data, "load_raw_plan", lambda: {
+        "ev_smart_charge": {"job": {"id": "j1"}, "eligible": True},
+    })
+    assert data.ev_smart_charge_dashboard()["actions"] == ["run_now"]
+
+    monkeypatch.setattr(data, "load_raw_plan", lambda: {
+        "ev_smart_charge": {"job": {"id": "j1"}, "eligible": False},
+    })
+    result = data.ev_smart_charge_dashboard()
+    assert result["actions"] == []
+    assert result["run_now_reason"] == "plan_requires_multiple_windows"
 
 
 def test_forecast_accuracy_uses_settlement_predicted_and_actuals(monkeypatch, tmp_path):
@@ -238,6 +532,128 @@ def test_monthly_history_adds_projected_today_profit_from_current_plan(monkeypat
     today_row = next(d for d in days if d["is_today"])
     assert today_row["net_eur"] == -2.8
     assert today_row["projected_net_eur"] == 6.2
+
+
+def test_monthly_history_hides_box_plot_for_too_few_forecast_samples(monkeypatch, tmp_path):
+    monkeypatch.setattr(data, "datetime", _MidMonthDateTime)
+    today = _MidMonthDateTime.now().date()
+    day = today - timedelta(days=1)
+    records = [
+        {"kind": "cycle", "ts": f"{day.isoformat()}T08:00:00+02:00",
+         "forecast_day_net_eur": -1.5, "day_import_cost": 1.0, "day_export_reward": 0.0},
+        {"kind": "cycle", "ts": f"{day.isoformat()}T12:00:00+02:00",
+         "forecast_day_net_eur": 2.0, "day_import_cost": 2.0, "day_export_reward": 1.0},
+        {"kind": "cycle", "ts": f"{day.isoformat()}T20:00:00+02:00",
+         "forecast_day_net_eur": 0.5, "day_import_cost": 3.0, "day_export_reward": 4.25},
+    ]
+    (tmp_path / f"ess-{day.isoformat()}.ndjson").write_text(
+        "".join(json.dumps(r) + "\n" for r in records)
+    )
+    monkeypatch.setattr(data, "_env", lambda: {"HISTORY_DIR": str(tmp_path)})
+
+    rows = data.monthly_history()
+
+    row = next(r for r in rows if r["date"] == day.isoformat())
+    assert "forecast_q1_eur" not in row
+    assert "forecast_median_eur" not in row
+    assert "forecast_range_low_eur" not in row
+    assert row["forecast_open_eur"] == -1.5
+    assert row["forecast_low_eur"] == -1.5
+    assert row["forecast_high_eur"] == 2.0
+    assert row["forecast_close_eur"] == 0.5
+    assert row["forecast_samples"] == 3
+    assert row["forecast_raw_samples"] == 3
+    assert row["forecast_complete"] is False
+    assert row["net_eur"] == 1.25
+    assert row["settled"] is True
+
+
+def test_forecast_box_stats_keeps_every_observation_in_the_visible_range():
+    stats = data._forecast_box_stats([0, 1, 2, 3, 4, 5, 6, 7, 8, 100])
+
+    assert stats == {
+        "forecast_q1_eur": 2.25,
+        "forecast_median_eur": 4.5,
+        "forecast_q3_eur": 6.75,
+        "forecast_range_low_eur": 0.0,
+        "forecast_range_high_eur": 100.0,
+    }
+
+
+def test_forecast_box_stats_requires_two_samples_per_quartile():
+    assert data._forecast_box_stats([0, 1, 2, 100, 101, 102, 103]) == {}
+
+
+def test_monthly_history_deduplicates_replans_into_latest_quarter_snapshot(
+        monkeypatch, tmp_path):
+    monkeypatch.setattr(data, "datetime", _MidMonthDateTime)
+    today = _MidMonthDateTime.now().date()
+    day = today - timedelta(days=1)
+    records = []
+    for index in range(96):
+        hour, quarter = divmod(index, 4)
+        minute = quarter * 15
+        records.append({
+            "kind": "cycle",
+            "ts": f"{day.isoformat()}T{hour:02d}:{minute:02d}:00+02:00",
+            "forecast_day_net_eur": float(index),
+            "day_import_cost": 1.0,
+            "day_export_reward": 2.0,
+        })
+        if index == 40:
+            # A request-triggered replan in the same quarter must replace, not
+            # statistically outweigh, the scheduled cycle.
+            records.append({
+                "kind": "cycle",
+                "ts": f"{day.isoformat()}T{hour:02d}:{minute + 5:02d}:00+02:00",
+                "forecast_day_net_eur": -50.0,
+                "day_import_cost": 1.0,
+                "day_export_reward": 2.0,
+            })
+    (tmp_path / f"ess-{day.isoformat()}.ndjson").write_text(
+        "".join(json.dumps(record) + "\n" for record in records)
+    )
+    monkeypatch.setattr(data, "_env", lambda: {"HISTORY_DIR": str(tmp_path)})
+
+    row = next(
+        item for item in data.monthly_history()
+        if item["date"] == day.isoformat()
+    )
+
+    assert row["forecast_raw_samples"] == 97
+    assert row["forecast_samples"] == 96
+    assert row["forecast_coverage_pct"] == 100.0
+    assert row["forecast_complete"] is True
+    assert row["forecast_range_low_eur"] == -50.0
+    assert row["forecast_range_high_eur"] == 95.0
+
+
+def test_monthly_history_does_not_claim_full_day_stats_from_midday_cluster(
+        monkeypatch, tmp_path):
+    monkeypatch.setattr(data, "datetime", _MidMonthDateTime)
+    today = _MidMonthDateTime.now().date()
+    day = today - timedelta(days=1)
+    records = [{
+        "kind": "cycle",
+        "ts": f"{day.isoformat()}T12:{index * 5:02d}:00+02:00",
+        "forecast_day_net_eur": float(index),
+        "day_import_cost": 1.0,
+        "day_export_reward": 2.0,
+    } for index in range(8)]
+    (tmp_path / f"ess-{day.isoformat()}.ndjson").write_text(
+        "".join(json.dumps(record) + "\n" for record in records)
+    )
+    monkeypatch.setattr(data, "_env", lambda: {"HISTORY_DIR": str(tmp_path)})
+
+    row = next(
+        item for item in data.monthly_history()
+        if item["date"] == day.isoformat()
+    )
+
+    assert row["forecast_raw_samples"] == 8
+    assert row["forecast_samples"] == 3
+    assert row["forecast_complete"] is False
+    assert "forecast_q1_eur" not in row
 
 
 def test_day_summary_idle_surplus_charges_battery_not_grid():

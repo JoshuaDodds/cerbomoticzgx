@@ -11,7 +11,11 @@ import os
 import json
 import time
 import logging
+import inspect
+import math
+from dataclasses import asdict, is_dataclass
 from datetime import datetime, timedelta
+from importlib import import_module
 
 from dotenv import dotenv_values
 
@@ -19,8 +23,14 @@ from frontend.config_schema import CONFIG_SCHEMA
 from lib.config_paths import env_path as runtime_env_path
 from lib import history_store as _hist
 from lib import tesla_budget as _tesla_budget
+from lib.ev_history import attribute_ev_grid_cost, measured_ev_sessions
 
 DEFAULT_PLAN_PATH = "/dev/shm/cerbo_ai_plan.json"
+MIN_FORECAST_BOX_SAMPLES = 8
+FORECAST_BUCKETS_PER_DAY = 96
+MIN_COMPLETE_FORECAST_COVERAGE = 0.75
+LATEST_COMPLETE_START_BUCKET = 2   # a first observation no later than 00:30
+EARLIEST_COMPLETE_END_BUCKET = 94  # a final observation no earlier than 23:30
 
 
 def _env():
@@ -101,16 +111,119 @@ def _day_totals(path: str):
     return _day_totals_from_records(_records_from_path(path))
 
 
+def _forecast_box_stats(values) -> dict:
+    """Return the middle spread and full observed range of daily forecasts.
+
+    These are successive revisions, not independent random observations. Every
+    valid snapshot therefore remains visible in the low/high range; labelling a
+    late, accurate revision as a statistical outlier would be misleading.
+    """
+    ordered = sorted(
+        value for raw in values
+        if (value := _f(raw)) is not None and math.isfinite(value)
+    )
+    # Eight observations provide at least two samples per quartile. Below this,
+    # quartile interpolation and Tukey outlier labels look authoritative without
+    # representing a useful intraday forecast distribution.
+    if len(ordered) < MIN_FORECAST_BOX_SAMPLES:
+        return {}
+
+    def percentile(fraction: float) -> float:
+        position = (len(ordered) - 1) * fraction
+        lower = math.floor(position)
+        upper = math.ceil(position)
+        if lower == upper:
+            return ordered[lower]
+        weight = position - lower
+        return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+    q1 = percentile(0.25)
+    median = percentile(0.50)
+    q3 = percentile(0.75)
+    return {
+        "forecast_q1_eur": round(q1, 2),
+        "forecast_median_eur": round(median, 2),
+        "forecast_q3_eur": round(q3, 2),
+        "forecast_range_low_eur": round(ordered[0], 2),
+        "forecast_range_high_eur": round(ordered[-1], 2),
+    }
+
+
+def _canonical_forecast_snapshots(records, *, day, extra=None) -> dict:
+    """Keep the latest forecast in each local 15-minute period.
+
+    Optimizer replans can also be event-triggered, so raw history may contain
+    several revisions in one quarter and no revision in another. Treating each
+    write as an equally weighted sample lets restarts/button presses distort the
+    chart. Canonical buckets give elapsed time—not replan frequency—the weight.
+    """
+    raw_values = []
+    buckets = {}
+
+    def add(value, timestamp):
+        numeric = _f(value)
+        if numeric is None or not math.isfinite(numeric):
+            return
+        try:
+            parsed = (
+                timestamp if isinstance(timestamp, datetime)
+                else datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+            )
+        except (TypeError, ValueError):
+            raw_values.append(numeric)
+            return
+        if parsed.date() != day:
+            return
+        raw_values.append(numeric)
+        bucket = parsed.hour * 4 + parsed.minute // 15
+        previous = buckets.get(bucket)
+        if previous is None or parsed >= previous[0]:
+            buckets[bucket] = (parsed, numeric)
+
+    for record in records:
+        if record.get("kind") not in (None, "cycle"):
+            continue
+        add(record.get("forecast_day_net_eur"), record.get("ts"))
+    if extra is not None:
+        add(extra[0], extra[1])
+
+    ordered = [buckets[key][1] for key in sorted(buckets)]
+    if not ordered:
+        # Preserve compatibility fields for old timestamp-less history, but do
+        # not claim coverage or distribution statistics from it.
+        ordered = raw_values
+    bucket_count = len(buckets)
+    coverage = bucket_count / FORECAST_BUCKETS_PER_DAY
+    complete = bool(
+        bucket_count >= MIN_FORECAST_BOX_SAMPLES
+        and coverage >= MIN_COMPLETE_FORECAST_COVERAGE
+        and min(buckets, default=FORECAST_BUCKETS_PER_DAY) <= LATEST_COMPLETE_START_BUCKET
+        and max(buckets, default=-1) >= EARLIEST_COMPLETE_END_BUCKET
+    )
+    return {
+        "values": ordered,
+        "raw_samples": len(raw_values),
+        "samples": bucket_count if buckets else len(ordered),
+        "coverage_pct": round(coverage * 100.0, 1),
+        "complete": complete,
+    }
+
+
 def monthly_history() -> list:
-    """Per-day net totals for the current calendar month (Trends monthly chart).
-    net_eur = export_reward - import_cost (profit positive). Days with no data are
-    skipped."""
+    """Per-day settled net and prospective intraday forecast distributions.
+
+    ``net_eur`` is export reward minus import cost (profit positive). Forecast
+    Box-plot and compatibility range fields are emitted only when newer cycle
+    records contain a same-day final-net forecast; legacy history remains an
+    honest actual-only point instead of receiving an invented distribution.
+    """
     today = datetime.now().date()
     d = today.replace(day=1)
     out = []
     today_projection = projected_today_net_eur()
     while d <= today:
-        t = _day_totals_from_records(_hist.read_day(d, history_dir()))
+        records = _hist.read_day(d, history_dir())
+        t = _day_totals_from_records(records)
         if t is not None:
             imp_cost = t["import_cost"] or 0.0
             exp_rev = t["export_reward"] or 0.0
@@ -123,9 +236,29 @@ def monthly_history() -> list:
                 "import_kwh": t["import_kwh"],
                 "export_kwh": t["export_kwh"],
                 "is_today": d == today,
+                "settled": d < today,
             }
+            extra = None
             if d == today and today_projection is not None:
                 row["projected_net_eur"] = today_projection
+                extra = (today_projection, datetime.now().astimezone())
+            snapshot_data = _canonical_forecast_snapshots(
+                records, day=d, extra=extra)
+            forecasts = snapshot_data["values"]
+            if forecasts:
+                row.update({
+                    "forecast_open_eur": round(forecasts[0], 2),
+                    "forecast_low_eur": round(min(forecasts), 2),
+                    "forecast_high_eur": round(max(forecasts), 2),
+                    "forecast_close_eur": round(forecasts[-1], 2),
+                    "forecast_samples": snapshot_data["samples"],
+                    "forecast_raw_samples": snapshot_data["raw_samples"],
+                    "forecast_coverage_pct": snapshot_data["coverage_pct"],
+                    "forecast_complete": snapshot_data["complete"],
+                    "forecast_box_min_samples": MIN_FORECAST_BOX_SAMPLES,
+                })
+                if d == today or snapshot_data["complete"]:
+                    row.update(_forecast_box_stats(forecasts))
             out.append(row)
         d += timedelta(days=1)
     return out
@@ -344,6 +477,22 @@ def _settled_slots_for_day(day, cutoff=None) -> list:
     """
     slots = []
     load_map = _actual_load_by_slot(day)   # per-slot consumption (works for old days too)
+    records = _hist.read_day(day, history_dir())
+    # Include the preceding day so a charge that crosses midnight retains its
+    # measured start boundary in today's settled rows.
+    session_records = (
+        _hist.read_day(day - timedelta(days=1), history_dir()) + records
+    )
+    ev_sessions = measured_ev_sessions(session_records)
+    cycle_actions = []
+    for record in records:
+        if record.get("kind") not in (None, "cycle"):
+            continue
+        timestamp = _parse_time(record.get("ts"))
+        action = record.get("realized_action")
+        if timestamp is not None and action:
+            cycle_actions.append((timestamp, str(action).upper()))
+    cycle_actions.sort(key=lambda item: item[0])
 
     def _num(v):
         try:
@@ -351,7 +500,7 @@ def _settled_slots_for_day(day, cutoff=None) -> list:
         except (TypeError, ValueError):
             return None
 
-    for rec in _hist.read_day(day, history_dir()):
+    for rec in records:
         if rec.get("kind") != "settlement":
             continue
         start = _parse_time(rec.get("slot_start"))
@@ -359,6 +508,22 @@ def _settled_slots_for_day(day, cutoff=None) -> list:
             continue
         if cutoff is not None and start >= cutoff:
             continue
+        end = _parse_time(rec.get("slot_end"))
+
+        actual_action = rec.get("actual_control_action")
+        actual_action_quality = (
+            "endpoint_observation" if actual_action else "unavailable"
+        )
+        if not actual_action and end is not None:
+            observed = [
+                (timestamp, action)
+                for timestamp, action in cycle_actions
+                if start <= timestamp <= end
+            ]
+            if observed:
+                actual_action = observed[-1][1]
+                actual_action_quality = "cycle_observation"
+        actual_action = str(actual_action or "UNKNOWN").upper()
 
         imp_f = _num(rec.get("actual_import_kwh"))
         exp_f = _num(rec.get("actual_export_kwh"))
@@ -369,13 +534,77 @@ def _settled_slots_for_day(day, cutoff=None) -> list:
         load_val = _num(rec.get("actual_load_kwh"))     # stored from today on
         if load_val is None:
             load_val = load_map.get(_slot_key(start))   # derived for older days
+        ev_kwh = _num(rec.get("ev_charge_kwh"))
+        ev_avg_kw = _num(rec.get("ev_average_kw"))
+        if ev_avg_kw is None and ev_kwh is not None:
+            duration_h = (
+                (end - start).total_seconds() / 3600.0
+                if end is not None and end > start else None
+            )
+            if duration_h:
+                ev_avg_kw = ev_kwh / duration_h
+        ev_attribution = {
+            "ev_grid_import_kwh": _num(rec.get("ev_grid_import_kwh")),
+            "ev_non_grid_kwh": _num(rec.get("ev_non_grid_kwh")),
+            "ev_grid_cost_eur": _num(rec.get("ev_grid_cost_eur")),
+            "ev_cost_quality": rec.get("ev_cost_quality"),
+        }
+        # Existing settlement rows already contain measured EV energy. Derive
+        # the newly introduced attribution on read so the historical timeline
+        # improves immediately without rewriting source data.
+        if all(ev_attribution[key] is None for key in (
+            "ev_grid_import_kwh", "ev_non_grid_kwh", "ev_grid_cost_eur"
+        )):
+            ev_attribution = attribute_ev_grid_cost(
+                ev_charge_kwh=ev_kwh,
+                site_load_kwh=(
+                    load_val if rec.get("load_meter_quality") in (None, "measured")
+                    else None
+                ),
+                site_import_kwh=imp_f,
+                site_import_cost_eur=_num(rec.get("actual_cost")),
+            )
+
+        observed_from = observed_until = None
+        timing_quality = None
+        if ev_kwh is not None and ev_kwh > 0.02 and end is not None:
+            overlapping = []
+            for session in ev_sessions:
+                session_start = _parse_time(session.get("start"))
+                session_end = _parse_time(session.get("end"))
+                if session_start is None:
+                    continue
+                if session_start < end and (session_end is None or session_end > start):
+                    overlapping.append((session_start, session_end, session))
+            if overlapping:
+                observed_from = min(item[0] for item in overlapping).isoformat()
+                completed = [item[1] for item in overlapping if item[1] is not None]
+                observed_until = max(completed).isoformat() if completed else None
+                qualities = {
+                    item[2].get("timing_quality") for item in overlapping
+                }
+                if "first_idle_observation" in qualities:
+                    timing_quality = "first_idle_observation"
+                elif "first_active_observation" in qualities:
+                    timing_quality = "first_active_observation"
+                else:
+                    timing_quality = "meter_transition"
+            else:
+                # Older records contain authoritative interval energy but no
+                # transition events. Preserve that truth without pretending the
+                # bucket boundary is an exact charging start or stop.
+                observed_from = start.isoformat()
+                observed_until = end.isoformat()
+                timing_quality = "settlement_interval"
 
         slots.append({
             "time": start.isoformat(),
             "settled": True,
             "closed_at": rec.get("slot_end"),
-            "control_action": rec.get("predicted_control_action") or "IDLE",
-            "reason": "Settled actuals from history",
+            "control_action": actual_action,
+            "planned_control_action": rec.get("predicted_control_action"),
+            "actual_action_quality": actual_action_quality,
+            "reason": "Measured outcome from history",
             "reason_code": "SETTLED_ACTUAL",
             "grid_energy": grid,
             "price": _num(rec.get("price_buy")) or 0.0,
@@ -389,6 +618,18 @@ def _settled_slots_for_day(day, cutoff=None) -> list:
             "actual_cost": _num(rec.get("actual_cost")),
             "actual_reward": _num(rec.get("actual_reward")),
             "actual_net_eur": _num(rec.get("actual_net_eur")),
+            "actual_ev_kwh": ev_kwh,
+            "actual_ev_avg_kw": round(ev_avg_kw, 3) if ev_avg_kw is not None else None,
+            "actual_ev_grid_kwh": ev_attribution.get("ev_grid_import_kwh"),
+            "actual_ev_non_grid_kwh": ev_attribution.get("ev_non_grid_kwh"),
+            "actual_ev_grid_cost_eur": ev_attribution.get("ev_grid_cost_eur"),
+            "actual_ev_observed_from": observed_from,
+            "actual_ev_observed_until": observed_until,
+            "actual_ev_timing_quality": timing_quality,
+            "ev_cost_quality": ev_attribution.get("ev_cost_quality"),
+            "ev_meter_quality": rec.get("ev_meter_quality"),
+            "ev_soc_start": _num(rec.get("ev_soc_start")),
+            "ev_soc_end": _num(rec.get("ev_soc_end")),
             "incomplete": bool(rec.get("incomplete")),
         })
 
@@ -464,6 +705,16 @@ def group_by_hour(schedule: list) -> list:
                 "grid_kwh": 0.0, "production_kwh": 0.0, "consumption_kwh": 0.0,
                 "prices": [],
                 "mode_counts": {},
+                "planned_ev_kwh": 0.0,
+                "ev_target_kw": 0.0,
+                "ev_supply_counts": {},
+                "ev_tentative": False,
+                "ev_soc_start": None,
+                "ev_soc_end": None,
+                "actual_ev_kwh": 0.0,
+                "actual_ev_grid_kwh": 0.0,
+                "actual_ev_non_grid_kwh": 0.0,
+                "actual_ev_grid_cost_eur": 0.0,
             }
             order.append(key)
         h = hours[key]
@@ -474,7 +725,23 @@ def group_by_hour(schedule: list) -> list:
         h["grid_kwh"] += g
         h["production_kwh"] += slot.get("pv", 0.0) or 0.0
         h["consumption_kwh"] += slot.get("load", 0.0) or 0.0
+        h["planned_ev_kwh"] += _f(slot.get("planned_ev_kwh")) or 0.0
+        h["ev_target_kw"] = max(h["ev_target_kw"], _f(slot.get("ev_target_kw")) or 0.0)
+        if (_f(slot.get("planned_ev_kwh")) or 0.0) > 0:
+            supply = str(slot.get("ev_supply") or "grid").lower()
+            h["ev_supply_counts"][supply] = h["ev_supply_counts"].get(supply, 0) + 1
+            h["ev_tentative"] = h["ev_tentative"] or bool(slot.get("ev_tentative"))
+        if h["ev_soc_start"] is None and slot.get("ev_soc_start") is not None:
+            h["ev_soc_start"] = slot.get("ev_soc_start")
+        if slot.get("ev_soc_end") is not None:
+            h["ev_soc_end"] = slot.get("ev_soc_end")
         if slot.get("settled"):
+            h["actual_ev_kwh"] += _f(slot.get("actual_ev_kwh")) or 0.0
+            h["actual_ev_grid_kwh"] += _f(slot.get("actual_ev_grid_kwh")) or 0.0
+            h["actual_ev_non_grid_kwh"] += _f(slot.get("actual_ev_non_grid_kwh")) or 0.0
+            h["actual_ev_grid_cost_eur"] += (
+                _f(slot.get("actual_ev_grid_cost_eur")) or 0.0
+            )
             imp = slot.get("actual_import_kwh")
             exp = slot.get("actual_export_kwh")
             imp_cost = slot.get("actual_cost")
@@ -508,6 +775,8 @@ def group_by_hour(schedule: list) -> list:
         n = len(h["prices"]) or 1
         modes = h["mode_counts"]
         dominant = max(modes, key=modes.get) if modes else ""
+        ev_supplies = h["ev_supply_counts"]
+        ev_supply = max(ev_supplies, key=ev_supplies.get) if ev_supplies else None
         result.append({
             "key": h["key"],
             "label": h["label"],
@@ -522,6 +791,16 @@ def group_by_hour(schedule: list) -> list:
             "grid_kwh": round(h["grid_kwh"], 2),
             "production_kwh": round(h["production_kwh"], 2),
             "consumption_kwh": round(h["consumption_kwh"], 2),
+            "planned_ev_kwh": round(h["planned_ev_kwh"], 2),
+            "ev_target_kw": round(h["ev_target_kw"], 2),
+            "ev_supply": ev_supply,
+            "ev_tentative": h["ev_tentative"],
+            "ev_soc_start": h["ev_soc_start"],
+            "ev_soc_end": h["ev_soc_end"],
+            "actual_ev_kwh": round(h["actual_ev_kwh"], 3),
+            "actual_ev_grid_kwh": round(h["actual_ev_grid_kwh"], 3),
+            "actual_ev_non_grid_kwh": round(h["actual_ev_non_grid_kwh"], 3),
+            "actual_ev_grid_cost_eur": round(h["actual_ev_grid_cost_eur"], 4),
             "net_kwh": round(h["import_kwh"] - h["export_kwh"], 2),
             "net_cost": round(h["import_cost"] - h["export_rev"], 3),
             "soc_start": h["slots"][0].get("soc_start"),
@@ -609,6 +888,7 @@ def get_plan() -> dict:
     return {
         "available": True,
         "generated_at": raw.get("generated_at"),
+        "optimizer_mode": raw.get("optimizer_mode") or "summer",
         "age_seconds": age_s,
         "stale": (age_s is not None and age_s > 1800),  # >30 min old
         "battery_soc": raw.get("battery_soc"),
@@ -623,12 +903,94 @@ def get_plan() -> dict:
         "price_points": raw.get("price_points"),
         "slot_duration_h": raw.get("slot_duration_h"),
         "current": raw.get("current", {}),
+        "winter_policy": raw.get("winter_policy"),
         "today": raw.get("today", {}),
         "victron_slots": raw.get("victron_slots", []),
+        "ev_smart_charge": raw.get("ev_smart_charge") or raw.get("ev_charge_plan"),
         "hours": group_by_hour(timeline_schedule),
         "day_summary": day_summary(schedule, raw.get("today_actuals")),
         "mtd_net": mtd_net_eur(),
     }
+
+
+def _json_value(value):
+    if value is None or isinstance(value, (str, int, float, bool, list, dict)):
+        return value
+    if is_dataclass(value):
+        return asdict(value)
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        return to_dict()
+    return vars(value) if hasattr(value, "__dict__") else str(value)
+
+
+def _optional_path_call(fn, path):
+    parameters = inspect.signature(fn).parameters
+    accepts_path = "path" in parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    return fn(path=path) if path and accepts_path else fn()
+
+
+def ev_smart_charge_dashboard() -> dict:
+    """Read the optional job lazily and combine it with the published shadow/live plan."""
+    raw = load_raw_plan() or {}
+    plan = raw.get("ev_smart_charge") or raw.get("ev_charge_plan")
+    try:
+        module = import_module("lib.ev_smart_charge")
+        snapshot = getattr(module, "dashboard_snapshot", None)
+        if callable(snapshot):
+            value = _json_value(snapshot()) or {}
+            if isinstance(value, dict):
+                value.setdefault("available", True)
+                if plan is not None:
+                    value.setdefault("plan", plan)
+                return value
+        loader = next((getattr(module, name, None) for name in
+                       ("load_job", "get_job", "current_job")
+                       if callable(getattr(module, name, None))), None)
+        env = _env()
+        job = _json_value(_optional_path_call(
+            loader, env.get("EV_SMART_CHARGE_JOB_PATH"))) if loader else None
+        # The exported ESS plan can lag one optimizer cycle behind terminal
+        # cleanup. No durable job means there is nothing current to display.
+        if loader and job is None:
+            plan = None
+        plan_loader = getattr(module, "load_plan_snapshot", None)
+        if job is not None and plan is None and callable(plan_loader):
+            plan = _json_value(_optional_path_call(
+                plan_loader, env.get("EV_SMART_CHARGE_PLAN_PATH")))
+        enabled = getattr(module, "enabled", None)
+        configured = str(env.get("EV_SMART_CHARGE_ENABLED", "False")).strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        apply_enabled = str(env.get("EV_SMART_CHARGE_APPLY", "False")).strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        actions = []
+        run_now_reason = "apply_disabled"
+        eligibility = getattr(module, "run_now_eligibility", None)
+        if apply_enabled and job is not None and callable(eligibility):
+            allowed, run_now_reason = eligibility(job, plan)
+            if allowed:
+                actions.append("run_now")
+        return {
+            "available": True,
+            "enabled": bool(enabled()) if callable(enabled) else configured,
+            "apply": apply_enabled,
+            "job": job,
+            "plan": plan,
+            "actions": actions,
+            "run_now_reason": run_now_reason,
+        }
+    except (ImportError, OSError, RuntimeError, ValueError) as e:
+        return {
+            "available": False,
+            "job": None,
+            "plan": plan,
+            "message": f"Smart charging is unavailable: {e}",
+        }
 
 
 def tesla_usage() -> dict:

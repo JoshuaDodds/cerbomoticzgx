@@ -10,12 +10,17 @@
 </head>
 <body>
   <header class="topbar">
+    <div id="server-offline-banner" class="server-offline-banner" role="status" aria-live="assertive" hidden>
+      <strong>Server Offline</strong>
+      <span>Showing the last data received</span>
+    </div>
     <div class="brand" data-home data-mobile-home>
       <img src="{{ url_for('static', filename='img/logo_final.png') }}" alt="CerbomoticzGX" class="brand-logo"/>
       <nav class="app-nav" aria-label="Application sections">
         <a href="#overview" class="app-nav-link active" data-app-view="overview">Overview</a>
         <a href="#ess" class="app-nav-link" data-app-view="ess">ESS</a>
         <a href="#battery" class="app-nav-link" data-app-view="battery">Battery</a>
+        <a href="#hvac" id="hvac-nav-link" class="app-nav-link" data-app-view="hvac" hidden>HVAC</a>
         <a href="#live" class="app-nav-link" data-app-view="live">Victron</a>
       </nav>
     </div>
@@ -67,7 +72,7 @@
           <div id="forecast-accuracy-chart" class="chart"><span class="muted">loading…</span></div>
         </div>
         <div class="card">
-          <h3 style="margin:2px 0 10px">Daily net — month so far</h3>
+          <h3 style="margin:2px 0 10px">Daily forecast spread vs actual</h3>
           <div id="monthly-chart" class="chart"><span class="muted">loading…</span></div>
         </div>
 
@@ -134,15 +139,15 @@
         <div class="card">
           <div class="vehicle-card-head">
             <h3 style="margin:2px 0 10px">Vehicle</h3>
-            <button id="vehicle-refresh" type="button" class="btn-secondary" data-vehicle-refresh
-                    title="Force an on-demand status check now (wakes the car and costs API budget in REST polling mode; free in Fleet Telemetry mode)">Refresh data</button>
+            <button id="vehicle-refresh" type="button" class="btn" data-vehicle-refresh
+                    title="Force an on-demand status check now (healthy Fleet Telemetry is free; a disconnected or stale stream uses one budget-capped Fleet API read and may wake the car)">Refresh data</button>
           </div>
           <div id="vehicle"><span class="muted">waiting for vehicle status…</span></div>
-          <p class="cfg-note">Live status mirrored from the MQTT bus — read-only, no Tesla API cost.
+          <!-- <p class="cfg-note">Live status mirrored from the MQTT bus — read-only, no Tesla API cost.
             The controller only contacts the car when it needs to act (see the Tesla cost controls).
-            <strong>Refresh data</strong> forces an on-demand status check now — in REST polling
-            mode this wakes the car (billable, budget-capped); in Fleet Telemetry mode it just
-            re-reads the already-streamed state (free).</p>
+            <strong>Refresh data</strong> forces an on-demand status check now. Healthy Fleet
+            Telemetry remains free; if its stream is disconnected or stale, one budget-capped
+            Fleet API read is used instead and may wake the car.</p> -->
         </div>
         <div class="card">
           <h3 style="margin:2px 0 10px">Charge control</h3>
@@ -150,32 +155,80 @@
             <button id="ev-start" type="button" class="btn" data-ev-charge="start">Start charge</button>
             <button id="ev-stop" type="button" class="btn" data-ev-charge="stop">Stop charge</button>
           </div>
-          <p class="cfg-note">Manually request or stop an EV charge. This sets the dedicated
-            EV-charge intent (independent of grid assist); the controller then starts/stops the car
-            with its safety checks (only acts when the car is home and plugged in).</p>
+          <!-- <p class="cfg-note"><strong>Start charge</strong> plus <strong>Grid assist</strong>
+            authorizes an immediate grid-backed charge. A smart block or protected solar surplus
+            can charge independently. <strong>Stop charge</strong> always stops the car and
+            suppresses the current smart block (only acts when the car is home and plugged in,
+            except a safety stop may use confirmed local charger draw).</p> -->
+        </div>
+        <div class="card ev-smart-card">
+          <div class="vehicle-card-head">
+            <div>
+              <h3 style="margin:2px 0 3px">Smart charging</h3>
+              <p class="cfg-note">Choose the charge target and when the car must be ready.</p>
+            </div>
+            <span id="ev-smart-status" class="ev-smart-status muted" role="status">Loading…</span>
+          </div>
+          <form id="ev-smart-charge-form" class="ev-smart-form">
+            <label>
+              <span>Target SoC</span>
+              <span class="ev-smart-input-with-unit">
+                <input id="ev-smart-target-soc" name="target_soc" type="number"
+                       min="50" max="100" step="1" value="80" inputmode="numeric" required>
+                <span>%</span>
+              </span>
+            </label>
+            <fieldset class="ev-smart-ready-fields">
+              <legend>Ready by</legend>
+              <div>
+                <input id="ev-smart-ready-date" name="ready_date" type="date"
+                       aria-label="Ready date" required>
+                <select id="ev-smart-ready-time" name="ready_time"
+                        aria-label="Ready time, 24-hour format" required></select>
+              </div>
+            </fieldset>
+            <button id="ev-smart-save" type="submit" class="btn">Plan charge</button>
+          </form>
+          <div id="ev-smart-message" class="ev-smart-message muted" aria-live="polite"></div>
+          <div id="ev-smart-summary"></div>
+          <div id="ev-smart-plan" class="ev-smart-plan" aria-label="Daily EV charge plan"></div>
+          <div id="ev-smart-actions" class="ev-smart-actions" hidden>
+            <button type="button" class="btn-secondary" data-ev-smart-action="pause">Pause plan</button>
+            <button type="button" class="btn-secondary" data-ev-smart-action="resume">Resume plan</button>
+            <button type="button" class="btn-primary" data-ev-smart-action="run_now">Run Now</button>
+            <button type="button" class="btn-secondary" data-ev-smart-edit>Edit</button>
+            <button type="button" class="btn-secondary btn-danger" data-ev-smart-cancel>Cancel job</button>
+          </div>
+          <!-- <p class="cfg-note ev-smart-footnote">Smart-charge control uses the Tesla Fleet API only
+            when its control toggle is enabled. Preview mode does not act on planned times; the
+            existing excess-solar charging remains independent. Maxem always controls the actual
+            current available to the car.</p> -->
         </div>
         <div class="card">
           <h3 style="margin:2px 0 10px">Tesla API usage — this billing cycle (local estimate)</h3>
           <div id="vehicle-usage"><span class="muted">loading…</span></div>
-          <p class="cfg-note">Counted locally to <em>enforce</em> a hard spend cap (Tesla has no
-            usage API — the portal's Billing &amp; Usage page is authoritative). This is a
-            forward-only estimate since the counter started, so it can read lower than the portal;
-            regardless, the cap makes exceeding the $10 credit impossible.</p>
+          <!-- <p class="cfg-note">Counted locally to <em>enforce</em> a hard spend cap (Tesla has no
+            usage API — its Billing &amp; Usage page is authoritative). The estimate starts at
+            the most recent portal reconciliation and then adds paid requests plus approximate
+            live streaming signals. Its unrounded all-in estimate limits normal requests to
+            preserve a €0.25 margin below the monthly credit.</p> -->
         </div>
       </section>
 
       <section id="tab-advisor" class="tab-panel">
         <div class="card advisor">
-          <p class="cfg-note">A read-only AI review of recent optimizer behaviour. Run the daily
-            review, or ask a specific question — it analyses history + tunables and never changes
-            config or control.</p>
+          <p class="cfg-note">A read-only AI review of optimizer behaviour. Daily review uses the
+            current plan and performance; open questions can retrieve bounded history, logs,
+            runtime state, and approved code excerpts. It never changes config or control.</p>
           <div class="advisor-controls">
             <button id="advisor-clear" class="btn-secondary btn-danger">Clear chat</button>
             <button id="advisor-review" class="btn-secondary">Run daily review</button>
             <form id="advisor-ask" class="advisor-ask">
               <input id="advisor-q" type="text" autocomplete="off"
+                     aria-label="Ask the AI Advisor a question"
                      placeholder="Ask a question, e.g. Why did we sell at 15:00 yesterday?"/>
-              <button type="submit" class="btn-secondary">Ask</button>
+              <button id="advisor-submit" type="submit" class="btn-secondary">Ask</button>
+              <span id="advisor-submit-status" class="sr-only" role="status" aria-live="polite"></span>
             </form>
           </div>
           <div id="advisor-meta" class="advisor-meta muted"></div>
@@ -219,6 +272,12 @@
     </div>
   </section>
 
+  <section id="hvac-view" class="app-view hvac-view" aria-label="Daikin HVAC">
+    <div id="hvac-dashboard" class="hvac-dashboard">
+      <div class="card"><span class="muted">Loading HVAC state…</span></div>
+    </div>
+  </section>
+
   <section id="live-view" class="app-view live-view" aria-label="CerboGx">
     <div class="card live-frame-card">
       <iframe class="live-frame" src="https://venus.hs.mfis.net/gui-v2/" title="CerboGX system view"></iframe>
@@ -256,6 +315,7 @@
       </div>
       <div class="mobile-menu-group" aria-label="Application sections">
         <button type="button" data-mobile-app-view="battery">Battery</button>
+        <button type="button" id="hvac-mobile-link" data-mobile-app-view="hvac" hidden>HVAC</button>
         <button type="button" data-mobile-app-view="live">Victron</button>
       </div>
       <div class="mobile-menu-group" aria-label="Dashboard tabs">
@@ -275,6 +335,7 @@
        calls them defensively (try/catch) so a failure here can't break the rest. -->
   <script src="{{ url_for('static', filename='js/powerflow.js') }}"></script>
   <script src="{{ url_for('static', filename='js/charts.js') }}"></script>
+  <script src="{{ url_for('static', filename='js/hvac.js') }}"></script>
   <script src="{{ url_for('static', filename='js/app.js') }}"></script>
 </body>
 </html>

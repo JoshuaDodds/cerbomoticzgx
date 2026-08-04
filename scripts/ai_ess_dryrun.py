@@ -23,7 +23,13 @@ sys.path.append(os.getcwd())
 
 from lib.global_state import GlobalStateClient
 from lib.tibber_api import get_all_price_points
-from lib.ai_powered_ess import OptimizationEngine, format_plan_summary
+from lib.ess_optimizer_selector import (
+    OPTIMIZER_MODE,
+    OptimizationEngine,
+    _coerce_datetime,
+    format_plan_summary,
+    optimize_schedule,
+)
 from lib.energy_broker import (
     _build_pv_forecast_by_slot,
     _build_load_forecast_by_slot,
@@ -46,7 +52,10 @@ def main():
     args = parser.parse_args()
 
     print(BANNER)
-    print("AI ESS OPTIMIZER — DRY RUN (read-only, no changes written to Victron)")
+    print(
+        f"AI ESS OPTIMIZER — {OPTIMIZER_MODE.upper()} MODE DRY RUN "
+        "(read-only, no changes written to Victron)"
+    )
     print(BANNER)
 
     # --- Inputs -------------------------------------------------------------
@@ -71,7 +80,6 @@ def main():
         return 1
 
     # Mirror run_ai_optimizer()'s PV forecast construction.
-    from lib.ai_powered_ess import _coerce_datetime
     normalised_slots = []
     for p in prices:
         try:
@@ -110,7 +118,7 @@ def main():
     print(f"  export_price_factor  : {engine.export_price_factor:.3f}")
     print(f"  export_fee           : {getattr(engine, 'export_fee', 0.0):.4f} €/kWh")
     print(f"  min_sell_price       : {engine.min_sell_price:.3f} €/kWh")
-    print(f"  expected_peak_price  : {engine.expected_peak_price:.3f} €/kWh")
+    print(f"  expected_peak_price  : {getattr(engine, 'expected_peak_price', 0.0):.3f} €/kWh")
     print(f"  terminal_value_factor: {getattr(engine, 'terminal_value_factor', 1.0):.3f}")
     print(f"  min_soc_reserve      : {engine.min_soc:.1f} %   soc_step: {engine.soc_step:.1f} %")
     print(f"  max charge/discharge : {engine.max_charge_power:.1f} / {engine.max_discharge_power:.1f} kW")
@@ -119,7 +127,7 @@ def main():
 
     # --- Optimize -----------------------------------------------------------
     t0 = datetime.now()
-    result = engine.optimize_with_daily_policy(batt_soc, prices, load_forecast, pv_forecast)
+    result = optimize_schedule(batt_soc, prices, load_forecast, pv_forecast)
     elapsed = (datetime.now() - t0).total_seconds()
 
     if not result:
@@ -142,6 +150,7 @@ def main():
 
     if args.json:
         serialisable = {
+            "optimizer_mode": result.get("optimizer_mode") or OPTIMIZER_MODE,
             "mode": result["mode"],
             "reason": result.get("reason"),
             "reason_code": result.get("reason_code"),
@@ -151,6 +160,7 @@ def main():
             "grid_assist": result.get("grid_assist"),
             "limit_feed_in": result["limit_feed_in"],
             "planning_policy": result.get("planning_policy"),
+            "winter_policy": result.get("winter_policy"),
             "victron_slots": [
                 {"start": s["start"].isoformat(), "duration": s["duration"], "target_soc": s["target_soc"]}
                 for s in result["victron_slots"]

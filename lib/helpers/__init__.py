@@ -2,6 +2,7 @@ import json
 import math
 import logging
 import time
+import uuid
 import paho.mqtt.client as mqtt
 
 from datetime import datetime
@@ -99,7 +100,10 @@ def get_current_value_from_mqtt(topic: str, timeout: float = 1.0, raw: bool = Fa
         completed = True
 
     # Initialize a new temporary MQTT client
-    temp_client = mqtt.Client(client_id="helper-message-retrieval-client")
+    # Multiple service instances may perform a retained-value read at the same
+    # time. A static ID makes Mosquitto evict one temporary reader.
+    temp_client = mqtt.Client(
+        client_id=f"cerbo-read-{uuid.uuid4().hex[:12]}")
     temp_client.on_connect = on_connect
     temp_client.on_message = on_message
 
@@ -183,12 +187,15 @@ def is_winter_month():
 def current_min_soc_reserve() -> float:
     """Single source of truth for the battery minimum-SoC reserve (%).
 
-    Resolves the seasonal reserve from .env (MIN_SOC_RESERVE_WINTER / SUMMER)
-    using the one season rule (is_winter_month). Both the optimizer's planning
-    floor AND the Victron hardware MinimumSocLimit derive from this, so they can
-    never diverge. The cells' own BMS remains the ultimate low-SoC cutoff.
+    Resolves the reserve from .env (MIN_SOC_RESERVE_WINTER / SUMMER) using the
+    explicit WINTER_MODE control-policy toggle. This is an optimizer planning
+    floor, not Victron's ``MinimumSocLimit``: the latter can trigger autonomous
+    Recharge and is configured independently by ``VICTRON_HARDWARE_MIN_SOC``.
+    ``is_winter_month`` remains only as a compatibility helper for legacy callers;
+    it no longer selects ESS or Home Connect appliance behavior.
     """
     from lib.config_retrieval import retrieve_setting
+    from lib.ess_mode import WINTER_MODE
 
     def _f(name, default):
         try:
@@ -196,7 +203,7 @@ def current_min_soc_reserve() -> float:
         except (TypeError, ValueError):
             return default
 
-    if is_winter_month():
+    if WINTER_MODE:
         return _f('MIN_SOC_RESERVE_WINTER', 20.0)
     return _f('MIN_SOC_RESERVE_SUMMER', 5.0)
 

@@ -5,11 +5,14 @@ can be started as a daemon thread from the main service via ``run_in_thread()``.
 """
 import os
 import json
+import inspect
 import logging
 import threading
 import time
+from datetime import datetime
+from importlib import import_module
 
-from flask import Flask, jsonify, render_template, request, Response, redirect, url_for
+from flask import Flask, cli as flask_cli, jsonify, render_template, request, Response, redirect, url_for
 
 from frontend import data
 from frontend.live import live
@@ -48,7 +51,39 @@ def api_plan():
 
 @app.route("/api/config")
 def api_config():
-    return jsonify({"groups": data.get_config()})
+    groups = data.get_config()
+    # Model IDs are provider-specific. Give the built-in Claude runner a curated
+    # selector while preserving a free-text field for an explicitly allow-listed,
+    # audited text-only wrapper. Raw agentic CLIs are intentionally rejected by the
+    # Advisor backend. Do not expose the command or wrapper path itself.
+    advisor_env = data._env()
+    custom_advisor_cli = (
+        str(advisor_env.get("ADVISOR_AUTH") or "auto").strip().lower() != "api"
+        and bool((advisor_env.get("ADVISOR_CLI_CMD") or "").strip())
+    )
+    for group in groups:
+        for setting in group.get("settings", []):
+            if setting.get("key") != "ADVISOR_MODEL":
+                continue
+            current = str(setting.get("value") or "").strip()
+            setting["editor"] = (
+                setting.get("custom_cli_editor", "text")
+                if custom_advisor_cli
+                else "select"
+            )
+            setting["effective_label"] = current or (
+                "Provider default" if custom_advisor_cli else "Auto / latest Sonnet"
+            )
+            if custom_advisor_cli:
+                setting["editor_help"] = (
+                    "An audited text-only custom CLI wrapper is configured and must be "
+                    "allow-listed through ADVISOR_CLI_SAFE_EXECUTABLES. An explicit "
+                    "model is applied only when ADVISOR_CLI_CMD contains {model}; "
+                    "otherwise leave this blank for the provider default."
+                )
+            else:
+                setting["editor_help"] = setting.get("desc", "")
+    return jsonify({"groups": groups})
 
 
 @app.route("/api/history/month")
@@ -73,10 +108,246 @@ def api_weather():
     return jsonify(data.weather_dashboard())
 
 
+def _hvac_dashboard():
+    return import_module("lib.onecta_control").hvac_dashboard()
+
+
+def _hvac_control_command(unit_key, command, value):
+    module = import_module("lib.onecta_control")
+    return module.get_control_service().command(unit_key, command, value)
+
+
+@app.route("/api/hvac")
+def api_hvac():
+    """Return cached ONECTA state only; rendering the page never calls Daikin."""
+    return jsonify(_hvac_dashboard())
+
+
+@app.route("/api/hvac/units/<unit_key>/control", methods=["POST"])
+def api_hvac_control(unit_key):
+    """Apply one capability-validated command behind the separate control gate."""
+    payload = request.get_json(silent=True) or {}
+    command = str(payload.get("command") or "").strip()
+    if not command or "value" not in payload:
+        return jsonify({"ok": False, "error": "command and value are required"}), 400
+    try:
+        result = _hvac_control_command(unit_key, command, payload["value"])
+        return jsonify({"ok": True, "result": result}), (
+            202 if result.get("status") == "accepted" else 200
+        )
+    except ValueError as error:
+        return jsonify({"ok": False, "error": str(error)}), 400
+    except Exception as error:
+        module = import_module("lib.onecta_control")
+        if isinstance(error, module.OnectaControlDisabled):
+            return jsonify({"ok": False, "error": str(error)}), 403
+        if isinstance(error, module.OnectaControlBusy):
+            return jsonify({"ok": False, "error": str(error)}), 409
+        logging.warning("ONECTA dashboard control failed: %s", error)
+        return jsonify({"ok": False, "error": str(error)}), 503
+
+
 @app.route("/api/tesla/usage")
 def api_tesla_usage():
     """Today's Tesla Fleet API spend (counts + cost per category + total)."""
     return jsonify(data.tesla_usage())
+
+
+@app.route("/api/ev/smart-charge", methods=["GET"])
+def api_ev_smart_charge_get():
+    """Return the single durable smart-charge job and its latest published plan.
+
+    The import stays below the request boundary so the observational dashboard can
+    still start while the optional controller feature is disabled or unavailable.
+    """
+    return jsonify(data.ev_smart_charge_dashboard())
+
+
+def _ev_smart_charge_module():
+    return import_module("lib.ev_smart_charge")
+
+
+def _ev_callable(*names):
+    module = _ev_smart_charge_module()
+    for name in names:
+        fn = getattr(module, name, None)
+        if callable(fn):
+            return fn
+    raise RuntimeError("Smart-charge control is unavailable in this service version.")
+
+
+def _ev_call_with_configured_path(fn, *args, setting):
+    path = data._env().get(setting)
+    parameters = inspect.signature(fn).parameters
+    accepts_path = "path" in parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    return fn(*args, path=path) if path and accepts_path else fn(*args)
+
+
+def _save_ev_smart_charge_job(payload):
+    module = _ev_smart_charge_module()
+    saver = _ev_callable("save_job", "upsert_job", "create_or_update_job")
+    creator = getattr(module, "create_job", None)
+    if callable(creator):
+        current_soc = live.snapshot().get("veh_soc")
+        if current_soc is None:
+            raise ValueError("Current vehicle SoC is unavailable; refresh the vehicle before planning.")
+        job = creator(
+            current_soc=float(current_soc),
+            target_soc=payload["target_soc"],
+            ready_by=datetime.fromisoformat(payload["ready_by"]),
+        )
+        result = _ev_call_with_configured_path(
+            saver, job, setting="EV_SMART_CHARGE_JOB_PATH")
+    else:
+        result = _ev_call_with_configured_path(
+            saver, payload, setting="EV_SMART_CHARGE_JOB_PATH")
+    return result
+
+
+def _delete_ev_smart_charge_job():
+    module = _ev_smart_charge_module()
+    loader = getattr(module, "load_job", None)
+    current = (
+        _ev_call_with_configured_path(
+            loader, setting="EV_SMART_CHARGE_JOB_PATH")
+        if callable(loader) else None
+    )
+    fn = _ev_callable("delete_job", "cancel_job", "clear_job")
+    _ev_call_with_configured_path(
+        fn, setting="EV_SMART_CHARGE_JOB_PATH")
+    return current
+
+
+def _act_on_ev_smart_charge_job(action):
+    module = _ev_smart_charge_module()
+    if action == "run_now":
+        fn = getattr(module, "activate_run_now", None)
+        if not callable(fn):
+            raise RuntimeError(
+                "Run Now is unavailable in this service version.")
+        env = data._env()
+        from lib.global_state import GlobalStateClient
+        grid_assist_was_on = _boolish(
+            GlobalStateClient().get("grid_charging_enabled"), False)
+        return fn(
+            job_path=env.get("EV_SMART_CHARGE_JOB_PATH") or None,
+            plan_path=env.get("EV_SMART_CHARGE_PLAN_PATH") or None,
+            grid_assist_owned=not grid_assist_was_on,
+        )
+    generic = getattr(module, "set_job_action", None)
+    if callable(generic):
+        result = generic(action)
+    elif action in {"pause", "resume"} and callable(getattr(module, "update_job_status", None)):
+        result = _ev_call_with_configured_path(
+            module.update_job_status, action, setting="EV_SMART_CHARGE_JOB_PATH")
+    else:
+        names = {
+            "pause": ("pause_job",),
+            "resume": ("resume_job",),
+        }
+        result = _ev_call_with_configured_path(
+            _ev_callable(*names[action]), setting="EV_SMART_CHARGE_JOB_PATH")
+    return result
+
+
+def _validated_ev_job_payload(body):
+    raw_target = body.get("target_soc")
+    if isinstance(raw_target, bool):
+        raise ValueError("target_soc must be a whole percentage")
+    try:
+        numeric_target = float(raw_target)
+    except (TypeError, ValueError):
+        raise ValueError("target_soc must be a whole percentage")
+    if not numeric_target.is_integer():
+        raise ValueError("target_soc must be a whole percentage")
+    target_soc = int(numeric_target)
+    if not 50 <= target_soc <= 100:
+        raise ValueError("target_soc must be between Tesla's 50 and 100 percent limits")
+
+    ready_by = str(body.get("ready_by") or "").strip()
+    try:
+        parsed = datetime.fromisoformat(ready_by.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError("ready_by must be an ISO-8601 date and time")
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("ready_by must include the local UTC offset")
+    if parsed <= datetime.now().astimezone():
+        raise ValueError("ready_by must be in the future")
+    return {"target_soc": target_soc, "ready_by": parsed.isoformat()}
+
+
+@app.route("/api/ev/smart-charge", methods=["PUT"])
+def api_ev_smart_charge_put():
+    try:
+        payload = _validated_ev_job_payload(request.get_json(silent=True) or {})
+        job = _save_ev_smart_charge_job(payload)
+        return jsonify({"ok": True, "job": job})
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except (ImportError, RuntimeError, OSError) as e:
+        logging.warning("EV smart-charge job save failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 503
+
+
+@app.route("/api/ev/smart-charge", methods=["DELETE"])
+def api_ev_smart_charge_delete():
+    try:
+        deleted_job = _delete_ev_smart_charge_job()
+        if (
+            isinstance(deleted_job, dict)
+            and str(deleted_job.get("execution_mode") or "").lower()
+            == "run_now"
+            and _boolish(
+                deleted_job.get("run_now_grid_assist_owned"), True)
+        ):
+            # Run Now enabled this retained toggle, so cancellation must
+            # release it immediately rather than waiting for the EV worker or
+            # the next quarter-hour optimizer cycle.
+            _set_grid_assist_toggle(False)
+        return jsonify({"ok": True})
+    except (ImportError, RuntimeError, OSError) as e:
+        logging.warning("EV smart-charge job delete failed: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 503
+
+
+@app.route("/api/ev/smart-charge/action", methods=["POST"])
+def api_ev_smart_charge_action():
+    action = str((request.get_json(silent=True) or {}).get("action") or "").strip().lower()
+    if action not in {"pause", "resume", "run_now"}:
+        return jsonify({
+            "ok": False,
+            "error": "action must be pause, resume, or run_now",
+        }), 400
+    try:
+        job = None
+        replanned = False
+        if action == "run_now":
+            from lib.energy_broker import run_ai_optimizer
+
+            def activate():
+                nonlocal job
+                job = _act_on_ev_smart_charge_job(action)
+                _set_grid_assist_toggle(True)
+
+            # Acquire the optimizer's single-writer lock before changing the
+            # durable job or grid state. This avoids a half-activated Run Now
+            # when a scheduled cycle happens to overlap the button press.
+            replanned = run_ai_optimizer(
+                wait_timeout_s=30, before_run=activate)
+            if replanned is False:
+                raise RuntimeError(
+                    "The optimizer is already running; Run Now was not started.")
+        else:
+            job = _act_on_ev_smart_charge_job(action)
+        return jsonify({
+            "ok": True, "job": job, "replanned": bool(replanned)})
+    except (ImportError, RuntimeError, OSError, ValueError) as e:
+        logging.warning("EV smart-charge action failed: %s", e)
+        status = 400 if isinstance(e, ValueError) else 503
+        return jsonify({"ok": False, "error": str(e)}), status
 
 
 @app.route("/api/history/day")
@@ -261,13 +532,19 @@ def api_control_grid_assist():
 
 def _set_ev_charge_requested(enabled: bool):
     """Manual EV Start/Stop. Sets the DEDICATED ev_charge_requested intent flag the EV controller
-    reads (fully decoupled from grid-assist). The controller then starts/stops the car with its
-    full safety logic — home+plugged+non-supercharging checks, wake escalation, and local-meter
-    stop verification. A direct one-shot command would just be undone by the controller's next
-    tick, so we drive its intent flag instead. Publishing the retained control topic keeps it in
-    sync + survives a restart via the state restore."""
+    reads. Immediate grid-backed Start requires grid-assist too; schedule and protected-PV
+    authority remain independent. Stop is latched through bounded wake escalation, suppresses
+    the current smart block, and uses local-meter verification even if pushed fields are stale.
+    Publishing the retained control topic keeps persistent intent in sync and survives a restart
+    via the state restore."""
     from lib.global_state import GlobalStateClient
-    GlobalStateClient().set("ev_charge_requested", bool(enabled))
+    state = GlobalStateClient()
+    state.set("ev_charge_requested", bool(enabled))
+    # Stop is an imperative safety action, not merely the false state of a persistent
+    # start-intent latch. Preserve a latched request even when intent was already false (for
+    # example, a Tesla onboard schedule started the car); the controller clears it only after
+    # confirmation or bounded escalation.
+    state.set("vehicle_stop_requested", not enabled)
     publish_message("Tesla/vehicle0/control/charge_requested",
                     message="True" if enabled else "False", retain=True)
     logging.info("Manual EV charge %s.", "START requested" if enabled else "STOP requested")
@@ -304,9 +581,11 @@ def api_control_refresh_vehicle():
 @app.route("/api/advisor", methods=["POST"])
 def api_advisor():
     """Run the read-only AI advisor — a default daily review, or answer an open
-    question (e.g. "Why did we sell at 15:00 yesterday?"). Never writes config or
-    control; only allow-listed tunables + performance data are sent to the API.
-    Blocking (the model call takes a few seconds); threaded=True keeps the UI free."""
+    question (e.g. "Why did we sell at 15:00 yesterday?"). Open questions may use
+    the bounded backend retrieval allow-list for history, recent in-process logs,
+    approved source excerpts, live/plan state, named runtime artifacts, and safe
+    config metadata. It never receives raw environment/secrets and cannot write
+    config or control. Blocking; threaded=True keeps the UI free."""
     body = request.get_json(silent=True) or {}
     question = (body.get("question") or "").strip() or None
     try:
@@ -351,7 +630,10 @@ def api_advisor_latest():
 def api_advisor_clear():
     """Clear the persisted advisor chat session."""
     from frontend import advisor
-    return jsonify(advisor.clear_chat())
+    try:
+        return jsonify(advisor.clear_chat())
+    except advisor.AdvisorBusyError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 409
 
 
 @app.route("/api/advisor/delete-exchange", methods=["POST"])
@@ -365,6 +647,8 @@ def api_advisor_delete_exchange():
         return jsonify({"ok": False, "error": "message index is required"}), 400
     try:
         return jsonify(advisor.delete_exchange(index))
+    except advisor.AdvisorBusyError as e:
+        return jsonify({"ok": False, "error": str(e)}), 409
     except IndexError as e:
         return jsonify({"ok": False, "error": str(e)}), 400
     except OSError as e:
@@ -442,6 +726,12 @@ def _debug_enabled() -> bool:
     return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _project_server_banner(debug: bool, app_name: str) -> None:
+    """Route Flask's otherwise unformatted Click banner through project logging."""
+    logging.info("Serving Flask app '%s'.", app_name)
+    logging.info("Flask debug mode: %s.", "on" if debug else "off")
+
+
 def run():
     """Run the server in the foreground (blocking)."""
     # Per-request HTTP logging (werkzeug) is noisy and, when the dashboard runs
@@ -453,7 +743,12 @@ def run():
     host, port = _host_port()
     # threaded=True so concurrent requests don't block each other; the process
     # itself is independent of the main service threads.
-    app.run(host=host, port=port, threaded=True, use_reloader=False)
+    original_banner = flask_cli.show_server_banner
+    flask_cli.show_server_banner = _project_server_banner
+    try:
+        app.run(host=host, port=port, threaded=True, use_reloader=False)
+    finally:
+        flask_cli.show_server_banner = original_banner
 
 
 def run_in_thread() -> threading.Thread:

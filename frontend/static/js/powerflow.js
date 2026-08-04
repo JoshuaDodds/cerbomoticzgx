@@ -31,6 +31,17 @@
   };
 
   const NODE_LABEL = { grid: "Grid", inv: "MultiPlus-II", house: "AC Loads", solar: "Solar", batt: "Battery", ev: "EV", gas: "Gas" };
+  // Power Flow knows which physical cards are navigable, but deliberately does not
+  // know anything about dashboard routes. The app shell owns that mapping and listens
+  // for the route-neutral `powerflow:navigate` event emitted below.
+  const CARD_NAVIGATION = {
+    batt: { target: "battery", label: "Open Battery details" },
+    inv: { target: "victron", label: "Open Victron details" },
+    ev: { target: "vehicle", label: "Open Vehicle details" },
+  };
+  const CARD_NAVIGATION_TARGETS = new Set(
+    Object.values(CARD_NAVIGATION).map((item) => item.target),
+  );
 
   // Origin-centred glyphs (the group's translate sets the visual centre).
   const ICON = {
@@ -59,9 +70,17 @@
   const GAS_EDGE = { key: "gas", a: "house", ap: ["bottom", 0.26], b: "gas", bp: ["top", 0], color: PALETTE.gas };
 
   const A = (w) => isFinite(w) && Math.abs(w) > 15;
+  // The ABB meter reports a few watts of idle electronics draw. Below this
+  // threshold the charger is not delivering energy, so stale phase-current
+  // notifications must render as 0 A rather than a phantom charging current.
+  const EV_IDLE_POWER_W = 100;
   const f = (v) => (isFinite(v) ? v.toFixed(1) : "0");
   const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
-  const num = (v) => { const n = Number(v); return isFinite(n) ? n : null; };
+  const num = (v) => {
+    if (v == null || v === "") return null;
+    const n = Number(v);
+    return isFinite(n) ? n : null;
+  };
 
   const fmtW = (w) => {
     if (w == null || !isFinite(w)) return "—";
@@ -75,7 +94,7 @@
   const fmtHM = (s) => { s = Math.max(0, Math.round(Number(s))); return Math.floor(s / 3600) + "h " + String(Math.floor((s % 3600) / 60)).padStart(2, "0") + "m"; };
   const gridBig = (w) => {
     if (w == null || !isFinite(w)) return "—";
-    const ar = w > 15 ? "► " : (w < -15 ? "◄ " : "");
+    const ar = w > 15 ? "►" : (w < -15 ? "◄" : "");
     return ar + fmtW(Math.abs(w));
   };
   function durFor(mag) {
@@ -87,6 +106,11 @@
   }
 
   const MOBILE_MAX = 600;   // container width (px) below which the 2-column layout kicks in
+  // Firefox's SVG implementation paints the actual glyph box higher above its
+  // baseline than Chromium/WebKit for the system UI font.  The desktop cards use
+  // closely packed, baseline-positioned text, so reserve a little more header
+  // space there only.  Keep the established Chrome/Safari coordinates untouched.
+  const IS_FIREFOX = typeof navigator !== "undefined" && /firefox/i.test(navigator.userAgent || "");
 
   function layout(W, H, hasEV, hasGas) {
     return W < MOBILE_MAX ? layoutMobile(W, H, hasEV, hasGas) : layoutDesktop(W, H, hasEV, hasGas);
@@ -95,8 +119,12 @@
   // Desktop / wide: Victron-style proportions — wider central column, EV+Gas small.
   function layoutDesktop(W, H, hasEV, hasGas) {
     const xL = 0.145 * W, xC = 0.485 * W, xR = 0.825 * W;
-    const wSide = 0.215 * W, wCtr = 0.30 * W;
-    const yT = 0.25 * H, yB = 0.72 * H, rowH = 0.36 * H;
+    const wSide = 0.235 * W, wCtr = 0.30 * W;
+    // Firefox needs slightly taller SVG cards to preserve the same readable
+    // detail-row rhythm as Chromium/WebKit.  There is vertical room in the
+    // existing desktop topology, so grow the card rather than compressing text.
+    const yT = 0.25 * H, yB = 0.72 * H;
+    const rowH = (IS_FIREFOX ? 0.45 : 0.36) * H;
     const N = {
       grid:  { x: xL, y: yT, w: wSide, h: rowH },
       inv:   { x: xC, y: yT, w: wCtr,  h: rowH },
@@ -129,10 +157,14 @@
     const xL = 0.225 * W, xR = 0.775 * W, colW = 0.41 * W;   // small side margins, wider cards
     // Battery + Solar carry extra BMS/string detail rows, so they're taller than the
     // Grid/AC-Loads cards; the whole stack is scaled to fill H below.
-    // evh sized for the EV card's 5 detail rows (SoC/Limit/Amps/ETA/Total) + header + hero,
-    // at the same per-row density as Solar (196/7 rows) / Battery (190/6) so fonts stay
-    // consistent and the rows don't overflow into the Solar card below.
-    const ch = 104, batth = 190, mph = 100, evh = 162, solh = 196, gash = 54;
+    // evh sized for the EV card's 6 detail rows (SoC/Limit/Amps/ETA/Total/Today) + header + hero,
+    // at the same per-row density as Solar (196/7 rows) / Battery (220/6 natural,
+    // content-capped below) so fonts stay consistent and rows remain inside their cards.
+    const ch = 104, batth = 220, mph = 100, evh = 162, solh = 196, gash = 54;
+    // AC Loads needs one more hierarchy level than Grid on mobile: live power,
+    // house-only day energy, then three phases. Give only that card a small
+    // content allowance; the overall diagram height remains unchanged.
+    const houseCardH = 128;
     // Left column: Grid, Battery. Right column: AC Loads, then EV stacked above a
     // dropped-down-and-right Solar (so its line to Battery can curve). MP-II hub
     // centred; Gas centred at the bottom overflow. Heights are content-fit; the whole
@@ -146,11 +178,16 @@
     // stack now ends at Battery (left) / Solar (right); the taller of those scales it.
     const Tnat = Math.max(nR2 + batth / 2, nSol + solh / 2) + 12;
     const sc = H / Tnat;
+    // Preserve the hub-to-Battery gap, but do not stretch a content-fit Battery card merely
+    // because a tall phone gives the overall diagram more room. The row-budget calculation
+    // below remains responsible for shrinking safely in shorter embedded viewports.
+    const battTop = (nHub + mph / 2 + 26) * sc;
+    const battCardH = Math.min(batth * sc, 190);
     const N = {
       grid:  { x: xL, y: ny1 * sc, w: colW, h: ch * sc },
-      house: { x: xR, y: ny1 * sc, w: colW, h: ch * sc },
+      house: { x: xR, y: (ny1 + 6) * sc, w: colW, h: houseCardH * sc },
       inv:   { x: 0.5 * W, y: nHub * sc, w: 0.36 * W, h: mph * sc },
-      batt:  { x: xL, y: nR2 * sc, w: colW, h: batth * sc },
+      batt:  { x: xL, y: battTop + battCardH / 2, w: colW, h: battCardH },
       solar: { x: xR + 0.015 * W, y: nSol * sc, w: 0.40 * W, h: solh * sc },   // dropped down + right
     };
     if (hasEV)  N.ev  = { x: xR, y: nEv * sc, w: colW, h: evh * sc };          // stacked above Solar
@@ -281,20 +318,85 @@
   }
   const gasSvg = (N) => `<path id="pf-base-gas" d="${edgePath(GAS_EDGE, N)}" fill="none" stroke="${PALETTE.gas}" stroke-width="5.5" stroke-linecap="round" opacity="0.12"/>`;
 
+  function wrapNavigableCard(key, markup) {
+    const nav = CARD_NAVIGATION[key];
+    if (!nav) return markup;
+    return `<g class="pf-navigable-card" data-pf-navigation="${nav.target}" role="button" tabindex="0" focusable="true" aria-label="${nav.label}">${markup}</g>`;
+  }
+
+  function bindPowerFlowNavigation(box) {
+    if (box.dataset.pfNavigationBound === "true") return;
+    box.dataset.pfNavigationBound = "true";
+
+    const navigationTarget = (event) => {
+      const card = event.target && event.target.closest
+        ? event.target.closest("[data-pf-navigation]")
+        : null;
+      const target = card && card.dataset ? card.dataset.pfNavigation : null;
+      return CARD_NAVIGATION_TARGETS.has(target) ? target : null;
+    };
+    const emitNavigation = (target) => {
+      box.dispatchEvent(new CustomEvent("powerflow:navigate", {
+        bubbles: true,
+        detail: { target },
+      }));
+    };
+
+    box.addEventListener("click", (event) => {
+      const target = navigationTarget(event);
+      if (target) emitNavigation(target);
+    });
+    box.addEventListener("keydown", (event) => {
+      if (event.repeat || (event.key !== "Enter" && event.key !== " ")) return;
+      const target = navigationTarget(event);
+      if (!target) return;
+      event.preventDefault();
+      emitNavigation(target);
+    });
+  }
+
   function buildCard(key, N, mobile) {
     const r = N[key]; if (!r) return "";
     const F = boxFonts(r, mobile ? 0.8 : 1), x0 = r.x - r.w / 2, y0 = r.y - r.h / 2;
     const pad = clamp(r.w * (mobile ? 0.05 : 0.06), mobile ? 5 : 8, mobile ? 12 : 20), L = x0 + pad, R = x0 + r.w - pad;
+    // See IS_FIREFOX above.  These offsets intentionally affect only the
+    // desktop SVG text bands, not the separately content-budgeted mobile cards.
+    const firefoxDesktop = !mobile && IS_FIREFOX;
     let s = `<rect id="pf-card-${key}" x="${f(x0)}" y="${f(y0)}" width="${f(r.w)}" height="${f(r.h)}" rx="14" fill="var(--panel-2)" stroke="var(--line)" stroke-width="2.5"/>`;
     s += `<g id="pf-icon-${key}" transform="translate(${f(x0 + pad + 9)},${f(y0 + pad + 9)}) scale(${F.iscale.toFixed(2)})" color="var(--muted)">${ICON[key]}</g>`;
     s += txt(null, x0 + pad + 22, y0 + pad + F.title + 1, { size: F.title, fill: "var(--muted)" }, NODE_LABEL[key]);
     const bigY = y0 + r.h * 0.45;
-    if (key === "grid" || key === "house") {
-      s += txt(`pf-${key}-big`, L, bigY, { size: F.big, weight: 700 }, "—");
+    // Match the compact Solar detail-row rhythm for desktop phase readings.
+    // Mobile cards are rendered by buildCardMobile() and remain unchanged.
+    const desktopPhaseStep = r.h * 0.062;
+    if (key === "grid") {
+      const heroY = y0 + r.h * (firefoxDesktop ? 0.37 : 0.31);
+      const dividerY = y0 + r.h * (firefoxDesktop ? 0.43 : 0.37);
+      s += txt("pf-grid-big", L, heroY, { size: F.big, weight: 700 }, "—");
+      s += `<line x1="${f(L)}" y1="${f(dividerY)}" x2="${f(R)}" y2="${f(dividerY)}" stroke="var(--line)"/>`;
+      [["Import today", "pf-grid-import"], ["Export today", "pf-grid-export"]].forEach(([lab, id], i) => {
+        const y = y0 + r.h * (firefoxDesktop ? 0.51 : 0.47) + i * desktopPhaseStep;
+        s += txt(null, L, y, { size: F.row * 0.88, fill: "var(--muted)" }, lab);
+        s += txt(id, R, y, { size: F.row * 0.88, anchor: "end" }, "—");
+      });
       ["L1", "L2", "L3"].forEach((lab, i) => {
-        const y = y0 + r.h * 0.62 + i * (r.h * 0.135);
+        const y = y0 + r.h * 0.68 + i * desktopPhaseStep;
         s += txt(null, L, y, { size: F.row, fill: "var(--muted)" }, lab);
-        s += txt(`pf-${key}-l${i + 1}`, R, y, { size: F.row, anchor: "end" }, "—");
+        s += txt(`pf-grid-l${i + 1}`, R, y, { size: F.row, anchor: "end" }, "—");
+      });
+      s += txt("pf-grid-updated", L, y0 + r.h * 0.96, {
+        size: F.row * 0.78, fill: "var(--muted)",
+      }, "");
+    } else if (key === "house") {
+      s += txt("pf-house-big", L, y0 + r.h * (firefoxDesktop ? 0.40 : 0.34), { size: F.big, weight: 700 }, "—");
+      s += txt("pf-house-today", L, y0 + r.h * (firefoxDesktop ? 0.55 : 0.47), {
+        size: F.big * 0.50, weight: 700,
+      }, "—");
+      s += `<line x1="${f(L)}" y1="${f(y0 + r.h * (firefoxDesktop ? 0.61 : 0.53))}" x2="${f(R)}" y2="${f(y0 + r.h * (firefoxDesktop ? 0.61 : 0.53))}" stroke="var(--line)"/>`;
+      ["L1", "L2", "L3"].forEach((lab, i) => {
+        const y = y0 + r.h * (firefoxDesktop ? 0.70 : 0.66) + i * desktopPhaseStep;
+        s += txt(null, L, y, { size: F.row, fill: "var(--muted)" }, lab);
+        s += txt(`pf-house-l${i + 1}`, R, y, { size: F.row, anchor: "end" }, "—");
       });
     } else if (key === "solar") {
       s += txt(`pf-solar-big`, L, y0 + r.h * 0.40, { size: F.big, weight: 700 }, "—");
@@ -309,9 +411,9 @@
       s += txt(`pf-batt-temp`, R, y0 + pad + F.title + 1, { size: F.row, fill: "var(--muted)", anchor: "end" }, "");
       // Hero: SoC% (reduced) with the live charge/discharge power tight underneath —
       // the two headline metrics — then the state word.
-      s += txt(`pf-batt-big`, L, y0 + r.h * 0.33, { size: F.big * 0.82, weight: 700 }, "—");
-      s += txt(`pf-batt-power`, L, y0 + r.h * 0.46, { size: F.big * 0.44, weight: 700, fill: "var(--text)" }, "");
-      s += txt(`pf-batt-state`, L, y0 + r.h * 0.565, { size: F.row, fill: "var(--muted)" }, "");
+      s += txt(`pf-batt-big`, L, y0 + r.h * (firefoxDesktop ? 0.37 : 0.33), { size: F.big * 0.82, weight: 700 }, "—");
+      s += txt(`pf-batt-power`, L, y0 + r.h * (firefoxDesktop ? 0.50 : 0.46), { size: F.big * 0.44, weight: 700, fill: "var(--text)" }, "");
+      s += txt(`pf-batt-state`, L, y0 + r.h * (firefoxDesktop ? 0.605 : 0.565), { size: F.row, fill: "var(--muted)" }, "");
       // BMS detail rows (label left / value right); min/max cell temps sit top-right.
       [["Voltage", "pf-batt-volt"], ["Current", "pf-batt-curr"], ["Min / Max (V)", "pf-batt-cells"],
        ["Capacity", "pf-batt-cap"], ["Modules Online", "pf-batt-mods"]].forEach(([lab, id], i) => {
@@ -322,11 +424,17 @@
     } else if (key === "inv") {
       s += txt(`pf-inv-big`, L, bigY + 4, { size: F.state, weight: 700 }, "—");
     } else if (key === "ev") {
-      s += txt(`pf-ev-big`, L, y0 + r.h * 0.26, { size: F.big, weight: 700 }, "—");
-      s += txt(`pf-ev-energy`, L, y0 + r.h * 0.40, { size: F.row, fill: "var(--muted)" }, "");
+      s += txt(`pf-ev-big`, L, y0 + r.h * (firefoxDesktop ? 0.36 : 0.26), { size: F.big, weight: 700 }, "—");
+      s += txt(`pf-ev-energy`, L, y0 + r.h * (firefoxDesktop ? 0.48 : 0.40), { size: F.row, fill: "var(--muted)" }, "");
+      s += txt(null, L, y0 + r.h * (firefoxDesktop ? 0.57 : 0.49), {
+        size: F.row, fill: "var(--muted)",
+      }, "Today");
+      s += txt("pf-ev-today", R, y0 + r.h * (firefoxDesktop ? 0.57 : 0.49), {
+        size: F.row, anchor: "end",
+      }, "—");
       // Tesla detail: SoC / charge limit / measured amps / ETA-to-limit (label left, value right).
       [["SoC", "pf-ev-soc"], ["Limit", "pf-ev-limit"], ["Amps", "pf-ev-amps"], ["ETA", "pf-ev-eta"]].forEach(([lab, id], i) => {
-        const y = y0 + r.h * 0.55 + i * (r.h * 0.10);
+        const y = y0 + r.h * (firefoxDesktop ? 0.66 : 0.60) + i * (r.h * 0.095);
         s += txt(null, L, y, { size: F.row, fill: "var(--muted)" }, lab);
         s += txt(id, R, y, { size: F.row, anchor: "end" }, "—");
       });
@@ -340,24 +448,53 @@
   // unit via tspans) → divider → compact labelled detail rows. Uses data we already
   // have. (Desktop keeps buildCard above, untouched.)
   const MOBILE_ROWS = {
-    grid:  [["L1", "pf-grid-l1"], ["L2", "pf-grid-l2"], ["L3", "pf-grid-l3"]],
+    // Mobile preserves the existing card/diagram height by prioritising the new
+    // daily accounting over per-phase Grid detail. Desktop retains all phases.
+    grid:  [["Import", "pf-grid-import-m"], ["Export", "pf-grid-export-m"],
+            ["Updated", "pf-grid-updated-m"]],
     house: [["L1", "pf-house-l1"], ["L2", "pf-house-l2"], ["L3", "pf-house-l3"]],
     batt:  [["Voltage", "pf-batt-volt"], ["Current", "pf-batt-curr"], ["Cells", "pf-batt-cells"],
             ["Temps", "pf-batt-temps"], ["Capacity", "pf-batt-cap"], ["Modules", "pf-batt-mods"]],
     solar: [["Today", "pf-solar-kwh"], ["Forecast", "pf-solar-forecast"], ["A", "pf-solar-a"],
             ["B", "pf-solar-b"], ["C", "pf-solar-c"], ["Amps", "pf-solar-amps"], ["Surplus", "pf-solar-surplus"]],
     ev:    [["SoC", "pf-ev-soc"], ["Limit", "pf-ev-limit"], ["Amps", "pf-ev-amps"],
-            ["ETA", "pf-ev-eta"], ["Total", "pf-ev-energy"]],
+            ["ETA", "pf-ev-eta"], ["Total", "pf-ev-energy"], ["Today", "pf-ev-today"]],
   };
   function buildCardMobile(key, N) {
     const r = N[key]; if (!r) return "";
     const x0 = r.x - r.w / 2, y0 = r.y - r.h / 2;
     const pad = clamp(r.w * 0.07, 6, 12), L = x0 + pad, R = x0 + r.w - pad;
+    const rows = MOBILE_ROWS[key];
     // Fonts scale with the card's (content-fit) height so the rows fill it tightly.
     const nameF = clamp(Math.min(r.h * 0.115, r.w * 0.12), 9, 13.5);
     const bigF = clamp(Math.min(r.h * 0.24, r.w * 0.18), 14, 27);
     const unitF = Math.max(9, bigF * 0.52);
-    const rowF = clamp(Math.min(r.h * 0.105, r.w * 0.105), 9, 12.5);
+    let rowF = clamp(Math.min(r.h * 0.105, r.w * 0.105), 9, 12.5);
+    const bottomInset = 3 + Math.max(3, pad * 0.4);
+    if (key === "batt" && rows && rows.length) {
+      // Battery has an extra power/state hero above six BMS rows. The diagram itself
+      // scales with viewport height, while width-based font clamps can otherwise stop
+      // shrinking and push Capacity/Modules below the card. Budget the row font from the
+      // actual remaining height, including text descent and a visible bottom inset.
+      const bBig = bigF * 0.86;
+      const fixedHeight = pad + nameF + bBig + 15 + 3 * (rows.length - 1);
+      const batteryRowBudget = (
+        r.h - fixedHeight - bottomInset
+      ) / (rows.length + 2.25);
+      rowF = Math.max(9, Math.min(rowF, batteryRowBudget));
+    } else if (rows && rows.length) {
+      // All other detailed cards have one headline above their rows. Keep the final
+      // Grid/Loads/EV/Solar row inside the border when an embedded viewport is shorter
+      // than the normal mobile height, without taking the text below a readable 9 px.
+      const houseDayF = key === "house" ? clamp(bigF * 0.54, 10, 14) : 0;
+      const fixedHeight = (
+        pad + nameF + bigF + houseDayF + 11 + 3 * (rows.length - 1)
+      );
+      const detailRowBudget = (
+        r.h - fixedHeight - bottomInset
+      ) / (rows.length + 0.25);
+      rowF = Math.max(9, Math.min(rowF, detailRowBudget));
+    }
     const iscale = clamp(nameF / 15, 0.42, 0.6);
     let s = `<rect id="pf-card-${key}" x="${f(x0)}" y="${f(y0)}" width="${f(r.w)}" height="${f(r.h)}" rx="12" fill="var(--panel-2)" stroke="var(--line)" stroke-width="2"/>`;
 
@@ -393,11 +530,19 @@
       s += `<text x="${f(L)}" y="${f(bigY)}" font-size="${bigF.toFixed(1)}" font-weight="700" fill="var(--text)">`
          + `<tspan id="pf-${key}-bignum">—</tspan> `
          + `<tspan id="pf-${key}-bigunit" font-size="${unitF.toFixed(1)}" font-weight="600" fill="var(--muted)"></tspan></text>`;
-      heroBottom = bigY;
+      if (key === "house") {
+        const houseDayF = clamp(bigF * 0.54, 10, 14);
+        const houseDayY = bigY + houseDayF + 1;
+        s += txt("pf-house-today-m", L, houseDayY, {
+          size: houseDayF, weight: 700,
+        }, "—");
+        heroBottom = houseDayY;
+      } else {
+        heroBottom = bigY;
+      }
     }
 
     // Compact labelled detail rows.
-    const rows = MOBILE_ROWS[key];
     if (rows && rows.length) {
       const divY = heroBottom + 5;
       s += `<line x1="${f(L)}" y1="${f(divY)}" x2="${f(R)}" y2="${f(divY)}" stroke="var(--line)"/>`;
@@ -457,20 +602,37 @@
     const ev = (live.ev_w != null && isFinite(Number(live.ev_w))) ? Number(live.ev_w) : null;
     const gasM3 = today.gas_m3 != null && isFinite(Number(today.gas_m3)) ? Number(today.gas_m3) : null;
     const soc = num(live.soc);
+    const evW = ev != null ? Math.max(0, ev) : 0;
+    const houseLoad = load != null ? Math.max(0, load - evW) : null;
+    const rawEvMeterPhaseAmps = [live.ev_l1_a, live.ev_l2_a, live.ev_l3_a]
+      .map(num).map((amps) => Number.isFinite(amps) ? Math.max(0, amps) : null);
+    const measuredEvAmpTotal = rawEvMeterPhaseAmps.reduce(
+      (total, amps) => total + (Number.isFinite(amps) ? amps : 0), 0,
+    );
+    const rawHousePhaseWatts = [live.load_l1, live.load_l2, live.load_l3].map(num);
+    const validHousePhaseCount = rawHousePhaseWatts.filter(Number.isFinite).length;
+    const housePhaseWatts = rawHousePhaseWatts.map((phaseWatts, index) => {
+      if (!Number.isFinite(phaseWatts)) return null;
+      const measuredPhaseAmps = rawEvMeterPhaseAmps[index];
+      const evShare = measuredEvAmpTotal > 0 && Number.isFinite(measuredPhaseAmps)
+        ? measuredPhaseAmps / measuredEvAmpTotal
+        : (validHousePhaseCount > 0 ? 1 / validHousePhaseCount : 0);
+      return Math.max(0, phaseWatts - evW * evShare);
+    });
 
     // Source-flow decomposition → provenance-coloured particles, and a flow-consistent
     // Inverter↔Battery direction: the link follows the net DC-bus flow (pv − batt_w),
     // NOT raw batt_w — so a solar surplus that's exporting correctly shows the DC bus
     // feeding the inverter *upward*, even while the battery itself trickle-charges.
     const D = decompose(pv || 0, grid || 0, batt || 0, load || 0);
-    const evW = ev != null ? Math.max(0, ev) : 0;
+    const houseShare = load > 0 ? houseLoad / load : 0;
     const invDc = (pv || 0) - (batt || 0);   // + = DC→inverter (up); − = inverter→DC (down, grid-charging)
     const flows = {
       grid: (grid || 0) >= 0
         ? { mag: Math.abs(grid || 0), fwd: true,  sources: [{ c: SRC.grid, m: D.g_house + D.g_batt }] }
         : { mag: Math.abs(grid || 0), fwd: false, sources: [{ c: SRC.solar, m: D.s_grid }, { c: SRC.batt, m: D.b_grid }] },
-      load: { mag: Math.max(0, load || 0), fwd: true,
-              sources: [{ c: SRC.solar, m: D.s_house }, { c: SRC.batt, m: D.b_house }, { c: SRC.grid, m: D.g_house }] },
+      load: { mag: Math.max(0, houseLoad || 0), fwd: true,
+              sources: [{ c: SRC.solar, m: D.s_house * houseShare }, { c: SRC.batt, m: D.b_house * houseShare }, { c: SRC.grid, m: D.g_house * houseShare }] },
       batt: invDc >= 0
         ? { mag: invDc,  fwd: false, sources: [{ c: SRC.solar, m: D.s_house + D.s_grid }, { c: SRC.batt, m: D.b_house + D.b_grid }] }
         : { mag: -invDc, fwd: true,  sources: [{ c: SRC.grid, m: D.g_batt }] },
@@ -478,7 +640,7 @@
       ev:    { mag: evW, fwd: true, sources: [{ c: PALETTE.ev, m: evW }] },
     };
     const active = {
-      grid: A(grid), house: A(load), solar: A(pv) && pv > 0, batt: A(batt),
+      grid: A(grid), house: A(houseLoad), solar: A(pv) && pv > 0, batt: A(batt),
       ev: ev != null && A(ev),
     };
 
@@ -498,6 +660,19 @@
     const invCol = (batt || 0) > 15 ? PALETTE.batt : ((batt || 0) < -15 ? "#eab308" : "var(--line)");
 
     const V = {};
+    const fmtDayPair = (energy, money, energyDp) => {
+      const e = num(energy), m = num(money);
+      if (!Number.isFinite(e) && !Number.isFinite(m)) return "—";
+      const parts = [];
+      if (Number.isFinite(e)) parts.push(e.toFixed(energyDp) + " kWh");
+      if (Number.isFinite(m)) parts.push("€" + m.toFixed(2));
+      return parts.join(" · ");
+    };
+    const tibberUpdateTime = (() => {
+      const raw = String(live.day_energy_last_update || "");
+      const match = /(?:^|[ T])(\d{2}:\d{2}:\d{2})(?:$|Z|[+-])/.exec(raw);
+      return match ? match[1] : "";
+    })();
     // Combined value (desktop pf-X-big) + split number/unit (mobile VRM tspans).
     const big = (key, str) => {
       V["pf-" + key + "-big"] = str;
@@ -506,9 +681,29 @@
       V["pf-" + key + "-bigunit"] = m ? m[2] : "";
     };
     big("grid", gridBig(grid));
+    V["pf-grid-import"] = fmtDayPair(
+      live.day_import_kwh, live.day_import_cost, 1,
+    );
+    V["pf-grid-export"] = fmtDayPair(
+      live.day_export_kwh, live.day_export_reward, 2,
+    );
+    V["pf-grid-updated"] = tibberUpdateTime
+      ? "Tibber updated " + tibberUpdateTime : "Tibber update unavailable";
+    V["pf-grid-import-m"] = fmtDayPair(
+      live.day_import_kwh, live.day_import_cost, 1,
+    );
+    V["pf-grid-export-m"] = fmtDayPair(
+      live.day_export_kwh, live.day_export_reward, 2,
+    );
+    V["pf-grid-updated-m"] = tibberUpdateTime || "—";
     V["pf-grid-l1"] = fmtWs(num(live.grid_l1)); V["pf-grid-l2"] = fmtWs(num(live.grid_l2)); V["pf-grid-l3"] = fmtWs(num(live.grid_l3));
-    big("house", fmtW(load));
-    V["pf-house-l1"] = fmtWs(num(live.load_l1)); V["pf-house-l2"] = fmtWs(num(live.load_l2)); V["pf-house-l3"] = fmtWs(num(live.load_l3));
+    big("house", fmtW(houseLoad));
+    const houseDayKwh = num(live.house_day_kwh);
+    V["pf-house-today"] = Number.isFinite(houseDayKwh)
+      ? houseDayKwh.toFixed(2) + " kWh today" : "—";
+    V["pf-house-today-m"] = Number.isFinite(houseDayKwh)
+      ? houseDayKwh.toFixed(1) + " kWh today" : "—";
+    V["pf-house-l1"] = fmtWs(housePhaseWatts[0]); V["pf-house-l2"] = fmtWs(housePhaseWatts[1]); V["pf-house-l3"] = fmtWs(housePhaseWatts[2]);
     big("solar", fmtW(pv));
     V["pf-solar-sub"] = today.solar_kwh != null ? kwh(today.solar_kwh) + " today" : "";
     V["pf-solar-kwh"] = today.solar_kwh != null ? kwh(today.solar_kwh) : "—";
@@ -548,13 +743,26 @@
     if (ev != null) {
       big("ev", fmtW(ev));
       V["pf-ev-energy"] = fmtEnergy(num(live.ev_energy_kwh));
+      const evTodayKwh = num(live.ev_actual_today_kwh);
+      V["pf-ev-today"] = Number.isFinite(evTodayKwh)
+        ? evTodayKwh.toFixed(2) + " kWh" : "—";
       // Tesla vehicle detail (from MQTT; no API cost). "—" when a field hasn't published.
       const _pct = (v) => (v != null && isFinite(Number(v))) ? Number(v).toFixed(0) + "%" : "—";
       const _amps = (v) => (v != null && isFinite(Number(v))) ? Number(v).toFixed(0) + " A" : "—";
       const _charging = live.veh_is_charging === true || String(live.veh_is_charging) === "True";
       V["pf-ev-soc"] = _pct(live.veh_soc);
       V["pf-ev-limit"] = _pct(live.veh_soc_limit);
-      V["pf-ev-amps"] = _amps(live.veh_amps);
+      // Use the same per-phase convention as the Vehicle tab and Tesla current
+      // commands. The canonical topic is the ABB phase average; retaining an
+      // average-of-available-phases fallback keeps the card useful during startup.
+      const vehicleAmps = num(live.veh_amps);
+      const evMeterPhaseAmps = rawEvMeterPhaseAmps.filter(Number.isFinite);
+      const fallbackPhaseAmps = evMeterPhaseAmps.length
+        ? evMeterPhaseAmps.reduce((total, amps) => total + amps, 0) / evMeterPhaseAmps.length
+        : null;
+      const evCurrent = ev <= EV_IDLE_POWER_W ? 0
+        : (Number.isFinite(vehicleAmps) ? vehicleAmps : fallbackPhaseAmps);
+      V["pf-ev-amps"] = Number.isFinite(evCurrent) ? _amps(evCurrent) : "—";
       V["pf-ev-eta"] = (_charging && live.veh_eta && live.veh_eta !== "N/A") ? String(live.veh_eta) : "—";
     }
     if (gasM3 != null) big("gas", gasM3.toFixed(2) + " m³");
@@ -577,6 +785,7 @@
     if (!box) return;
     _boxId = containerId; _lastLive = live; _lastPlan = plan;
     ensureObserver(box);
+    bindPowerFlowNavigation(box);
 
     if (!live || !live.connected) {
       box.innerHTML = '<span class="muted">live feed offline — connect to see real-time power flow.</span>';
@@ -612,10 +821,13 @@
     if (fr.hasGas) cardKeys.push("gas");
 
     box.innerHTML = `
-      <svg viewBox="0 0 ${f(W)} ${f(H)}" width="100%" height="100%" preserveAspectRatio="xMidYMid meet" style="display:block" role="img" aria-label="live power flow">
+      <svg viewBox="0 0 ${f(W)} ${f(H)}" width="100%" height="100%" preserveAspectRatio="xMidYMid meet" style="display:block" role="group" aria-label="Live power flow">
         ${edges.map((e) => edgeSvg(e, N, _edgeDur[e.key], fr.flows[e.key].fwd, mobile)).join("")}
         ${!mobile && fr.hasGas ? gasSvg(N) : ""}
-        ${cardKeys.map((k) => mobile ? buildCardMobile(k, N) : buildCard(k, N, false)).join("")}
+        ${cardKeys.map((k) => wrapNavigableCard(
+          k,
+          mobile ? buildCardMobile(k, N) : buildCard(k, N, false),
+        )).join("")}
       </svg>`;
 
     applyEdges(box, fr.flows);

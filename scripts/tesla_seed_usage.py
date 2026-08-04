@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Reconcile the locally-counted Tesla API usage with the developer portal.
+"""Reconcile locally-counted Tesla usage with the authoritative developer portal.
 
 Tesla exposes usage only in the developer portal (there is no usage API), and our local
-counter is a forward-only estimate whose real job is to ENFORCE the hard spend cap. Run this
-with the portal's current Billing & Usage numbers (e.g. at the start of a billing cycle) so
-the dashboard total matches; the guard then accumulates new calls from that baseline.
+counter's primary job is to enforce the spend guard. Run this with one portal Billing & Usage
+snapshot so the dashboard matches its category counts; the guard then accumulates new paid
+calls and approximate live streaming signals from that dated baseline.
 
 Only the categories you pass are touched — e.g. `--signals 1334` alone leaves command/data/wake
 exactly as they were (and vice versa), so you can reconcile one category at a time.
@@ -49,20 +49,17 @@ def main():
         counts["data"] = args.data
     if args.wakes is not None:
         counts["wake"] = args.wakes
-    if counts:
-        tb.seed_month_usage(counts, path)
-    if args.signals is not None:
-        tb.seed_signal_count(args.signals, path)
     if not counts and args.signals is None:
         ap.error("nothing to seed — pass at least one of --commands/--data/--wakes/--signals")
 
-    snap = tb.usage_snapshot(path)
-    print(f"Seeded {path} for {snap['month']}:")
+    snap = tb.reconcile_usage(counts, signals=args.signals, state_path=path)
+    print(f"Reconciled {path} for {snap['month']}:")
     for cat, v in snap["categories"].items():
         print(f"  {cat:<8} {v['count']:>5}   €{v['cost']:.3f}")
     sig = snap["streaming"]
-    print(f"  {'signals':<8} {sig['count']:>5}   €{sig['cost']:.3f}  (~, not billed against the cap)")
+    print(f"  {'signals':<8} {sig['count']:>5}   €{sig['cost']:.3f}  (~ after baseline)")
     print(f"  total this cycle: €{snap['total']:.2f} of €{snap['monthly_credit']:.0f}")
+    print(f"  reconciled at: {snap['reconciled_at']}")
     return 0
 
 

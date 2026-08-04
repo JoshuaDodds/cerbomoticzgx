@@ -1,6 +1,7 @@
 import os
 import math
 import signal
+import time
 
 from lib.helpers import get_topic_key, publish_message, is_truthy
 from lib.constants import logging
@@ -8,6 +9,7 @@ from lib.config_retrieval import retrieve_setting
 from lib.victron_integration import regulate_battery_max_voltage, ac_power_setpoint
 from lib.global_state import GlobalStateClient
 from lib.notifications import pushover_notification_critical
+from lib.ev_history import record_ev_power_observation
 from lib.event_handler_appliances import handle_dryer_event, handle_dishwasher_event
 from lib.energy_broker import (
     manage_sale_of_stored_energy_to_the_grid,
@@ -74,12 +76,16 @@ class Event:
             logging.debug("AC Input: Grid is online.")
 
     def dryer_state(self):
-        if HOME_CONNECT_APPLIANCE_SCHEDULING:
-            handle_dryer_event(self.value)
+        handle_dryer_event(
+            self.value,
+            automation_enabled=HOME_CONNECT_APPLIANCE_SCHEDULING,
+        )
 
     def dishwasher_state(self):
-        if HOME_CONNECT_APPLIANCE_SCHEDULING:
-            handle_dishwasher_event(self.value)
+        handle_dishwasher_event(
+            self.value,
+            automation_enabled=HOME_CONNECT_APPLIANCE_SCHEDULING,
+        )
 
     def ac_power_setpoint(self):
         if float(self.value) > 0 or float(self.value) < 0:
@@ -143,6 +149,7 @@ class Event:
 
     def pv_power(self):
         _value = round(self.value)
+        self.gs_client.set("pv_power_updated_at", time.time())
         publish_message("Tesla/vehicle0/solar/pv_watts", message=f"{_value}", retain=True)
         self.calculate_surplus_watts()
 
@@ -152,6 +159,18 @@ class Event:
 
     def tesla_power(self):
         _value = round(self.value)
+        self.gs_client.set("tesla_power_updated_at", time.time())
+        try:
+            record_ev_power_observation(
+                self.value,
+                history_dir=retrieve_setting("HISTORY_DIR") or "data/history",
+            )
+        except (OSError, ValueError, TypeError) as e:
+            # History is observational only: a storage failure must never
+            # interrupt live EV/load control.
+            logging.warning(
+                f"EvCharger: unable to record ABB power transition: {e}"
+            )
         self.adjust_ac_out_power()
         publish_message("Tesla/vehicle0/charging_watts", message=f"{_value}", retain=True)
         publish_message("Tesla/vehicle0/Ac/tesla_load", message=f"{_value}", retain=True)
@@ -202,6 +221,20 @@ class Event:
 
     def tesla_l3_current(self):
         self.update_charging_amp_totals()
+
+    def tesla_plug_status(self):
+        """Hydrate the controller-facing plug flag from the retained UI topic.
+
+        Fleet Telemetry's raw charge fields can legitimately be null while the
+        car sleeps. The normalized retained Plugged/Unplugged topic is therefore
+        the restart-safe last-known state and must rebuild ``tesla_is_plugged``
+        after GlobalState's tmpfs database is recreated.
+        """
+        normalised = str(self.value).strip().lower()
+        if normalised == "plugged":
+            self.gs_client.set("tesla_is_plugged", "True")
+        elif normalised == "unplugged":
+            self.gs_client.set("tesla_is_plugged", "False")
 
     #
     # calculation and helper methods
@@ -255,19 +288,16 @@ class Event:
         return round(surplus_watts, 0)
 
     def update_charging_amp_totals(self, charging_amp_totals=None):
-        if not charging_amp_totals:
+        if charging_amp_totals is None:
             l1, l2, l3 = self.gs_client.get("tesla_l1_current"), self.gs_client.get("tesla_l2_current"), self.gs_client.get("tesla_l3_current")
             charging_amp_totals = (l1 + l2 + l3) / 3
 
-        charging_amps = round(charging_amp_totals, 2)
+        per_phase = round(charging_amp_totals, 2)
 
-        # STATE stays per-phase for the surplus control math. But in telemetry mode the
-        # fleet-telemetry bridge OWNS Tesla/vehicle0/charging_amps with the car's own accurate
-        # per-phase current (the local Victron meter under-reads ~3x) — publishing here too would
-        # fight it and flap the value. So only publish in legacy polling mode.
-        self.gs_client.set("tesla_charging_amps_total", charging_amps)
-        if not is_truthy(retrieve_setting("TESLA_TELEMETRY_ENABLED"), False):
-            publish_message("Tesla/vehicle0/charging_amps", message=f"{charging_amps}", retain=True)
+        # Single MQTT owner: measured ABB per-phase average for legacy UI and the
+        # controller. Fleet ChargeAmps is retained separately as diagnostic data.
+        self.gs_client.set("tesla_charging_amps_total", per_phase)
+        publish_message("Tesla/vehicle0/charging_amps", message=f"{per_phase}", retain=True)
 
     def set_surplus_amps(self, surplus_amps):
         self.gs_client.set("surplus_amps", surplus_amps)

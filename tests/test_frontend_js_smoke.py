@@ -38,6 +38,9 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SMOKE_SCRIPT = ROOT / "tests" / "js" / "cold_load_smoke.js"
+POWERFLOW_ROUTING_SCRIPT = ROOT / "tests" / "js" / "app_powerflow_routing.js"
+TIMELINE_EV_HISTORY_SCRIPT = ROOT / "tests" / "js" / "timeline_ev_history.js"
+POWERFLOW_HOUSE_LOAD_SCRIPT = ROOT / "tests" / "js" / "powerflow_house_load.js"
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
@@ -53,4 +56,50 @@ def test_dashboard_scripts_execute_cleanly_on_cold_load():
         "frontend/static/js/{powerflow,charts,app}.js threw during a simulated cold page "
         "load (see tests/js/cold_load_smoke.js and this file's module docstring for why this "
         f"test exists).\n\nstdout:\n{result.stdout}\n\nstderr:\n{result.stderr}"
+    )
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_powerflow_navigation_events_reach_the_app_router():
+    result = subprocess.run(
+        ["node", str(POWERFLOW_ROUTING_SCRIPT)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        cwd=str(ROOT),
+    )
+    assert result.returncode == 0, (
+        "Power Flow emitted a navigation event that the application shell did not "
+        "route correctly.\n\n"
+        f"stdout:\n{result.stdout}\n\nstderr:\n{result.stderr}"
+    )
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_powerflow_ac_loads_card_excludes_ev_charging_power():
+    result = subprocess.run(
+        ["node", str(POWERFLOW_HOUSE_LOAD_SCRIPT)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        cwd=str(ROOT),
+    )
+    assert result.returncode == 0, (
+        "Power Flow AC Loads decomposition regression:\n\n"
+        f"stdout:\n{result.stdout}\n\nstderr:\n{result.stderr}"
+    )
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_timeline_renders_settled_ev_history_without_standby_noise():
+    result = subprocess.run(
+        ["node", str(TIMELINE_EV_HISTORY_SCRIPT)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        cwd=str(ROOT),
+    )
+    assert result.returncode == 0, (
+        "Settled EV timeline rendering regression:\n\n"
+        f"stdout:\n{result.stdout}\n\nstderr:\n{result.stderr}"
     )

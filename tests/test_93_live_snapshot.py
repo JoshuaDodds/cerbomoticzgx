@@ -6,6 +6,12 @@ time-to-go, inverter system-state code, EV lifetime energy + session time).
 No broker is needed: snapshot() only reads the in-memory value cache, so we
 inject values directly and assert the parsing/None-fallback behaviour.
 """
+import time
+from datetime import datetime, timedelta
+
+import pytest
+
+from frontend import live
 from frontend.live import MqttLive
 
 # Every key the v2 cards depend on, beyond the pre-existing power/SoC fields.
@@ -14,8 +20,17 @@ V2_FIELDS = (
     "load_l1", "load_l2", "load_l3",
     "batt_temp", "batt_voltage", "batt_current", "batt_ttg",
     "system_state",
-    "ev_energy_kwh", "ev_charge_time",
+    "ev_energy_kwh", "ev_charge_time", "ev_l1_a", "ev_l2_a", "ev_l3_a",
 )
+
+
+def test_dashboard_mqtt_client_id_is_unique_per_runtime_instance(monkeypatch):
+    monkeypatch.setattr(live.socket, "gethostname", lambda: "ESS Dev")
+    monkeypatch.setattr(live.os, "getpid", lambda: 101)
+    assert live.mqtt_client_id() == "cerbo-live-ess-dev-101"
+
+    monkeypatch.setattr(live.os, "getpid", lambda: 102)
+    assert live.mqtt_client_id() == "cerbo-live-ess-dev-102"
 
 
 def _snapshot_with(values):
@@ -32,6 +47,7 @@ def test_snapshot_exposes_v2_fields_when_present():
         "batt_temp": 36, "batt_voltage": 52.85, "batt_current": -122,
         "batt_ttg": 24840, "system_state": 256,
         "ev_energy_kwh": 18420.5, "ev_charge_time": 0,
+        "ev_l1_a": 13.1, "ev_l2_a": 13.0, "ev_l3_a": 13.2,
     })
     # Grid + AC-loads per-phase (signs preserved as the meter reports them).
     assert snap["grid_l1"] == -2056 and snap["grid_l3"] == -1445
@@ -46,6 +62,9 @@ def test_snapshot_exposes_v2_fields_when_present():
     # EV session detail.
     assert snap["ev_energy_kwh"] == 18420.5
     assert snap["ev_charge_time"] == 0
+    assert snap["ev_l1_a"] == 13.1
+    assert snap["ev_l2_a"] == 13.0
+    assert snap["ev_l3_a"] == 13.2
 
 
 def test_snapshot_v2_fields_default_to_none_when_absent():
@@ -69,3 +88,245 @@ def test_snapshot_bad_values_become_none_not_exceptions():
     snap = _snapshot_with({"batt_current": "n/a", "system_state": None})
     assert snap["batt_current"] is None
     assert snap["system_state"] is None
+
+
+def test_local_ev_meter_overrides_stale_charging_status_at_idle_power():
+    snap = _snapshot_with({
+        "ev_w": "4",
+        "veh_is_charging": "True",
+        "veh_charging_status": "Charging",
+        "veh_eta": "15 hr 48 min",
+    })
+
+    assert snap["veh_is_charging"] is False
+    assert snap["veh_charging_status"] == "Idle"
+    assert snap["veh_eta"] == "N/A"
+
+
+def test_vehicle_status_is_not_overridden_without_local_meter_evidence():
+    snap = _snapshot_with({
+        "veh_is_charging": "True",
+        "veh_charging_status": "Charging",
+        "veh_eta": "1 hr 5 min",
+    })
+
+    assert snap["veh_is_charging"] == "True"
+    assert snap["veh_charging_status"] == "Charging"
+    assert snap["veh_eta"] == "1 hr 5 min"
+
+
+def test_explicit_idle_vehicle_never_exposes_stale_eta_without_meter_sample():
+    snap = _snapshot_with({
+        "veh_is_charging": "False",
+        "veh_charging_status": "Idle",
+        "veh_eta": "4 hr 12 min",
+    })
+
+    assert snap["veh_is_charging"] == "False"
+    assert snap["veh_charging_status"] == "Idle"
+    assert snap["veh_eta"] == "N/A"
+
+
+def test_vehicle_charging_status_remains_when_ev_meter_shows_real_draw():
+    snap = _snapshot_with({
+        "ev_w": "2380",
+        "veh_is_charging": "True",
+        "veh_charging_status": "Charging",
+    })
+
+    assert snap["veh_is_charging"] == "True"
+    assert snap["veh_charging_status"] == "Charging"
+
+
+def test_snapshot_exposes_vehicle_telemetry_connection_status():
+    snap = _snapshot_with({"veh_telemetry_status": "DISCONNECTED"})
+
+    assert snap["veh_telemetry_status"] == "DISCONNECTED"
+
+
+def test_snapshot_exposes_vehicle_update_age_for_local_timestamp():
+    updated_at = time.strftime(
+        "%Y-%m-%d %H:%M:%S",
+        time.localtime(time.time() - 60),
+    )
+
+    snap = _snapshot_with({"veh_last_update": updated_at})
+
+    assert 59 <= snap["veh_last_update_age_s"] <= 62
+
+
+def test_snapshot_vehicle_update_age_is_none_when_timestamp_is_unavailable():
+    assert _snapshot_with({})["veh_last_update_age_s"] is None
+    assert _snapshot_with({"veh_last_update": "not-a-date"})[
+        "veh_last_update_age_s"
+    ] is None
+
+
+def test_snapshot_exposes_tibber_day_totals_and_house_only_consumption():
+    snap = _snapshot_with({
+        "day_import_kwh": "61.676",
+        "day_import_cost": "9.732679",
+        "day_export_kwh": "0.097",
+        "day_export_reward": "0.019341",
+        "day_energy_last_update": "2026-07-26 18:30:38",
+        "load_actual_today_wh": "30659.79",
+        "ev_actual_today_kwh": "12.27",
+    })
+
+    assert snap["day_import_kwh"] == pytest.approx(61.676)
+    assert snap["day_import_cost"] == pytest.approx(9.732679)
+    assert snap["day_export_kwh"] == pytest.approx(0.097)
+    assert snap["day_export_reward"] == pytest.approx(0.019341)
+    assert snap["day_energy_last_update"] == "2026-07-26 18:30:38"
+    assert snap["house_day_kwh"] == pytest.approx(18.38979)
+    assert snap["house_day_energy_quality"] == "authoritative_anchor"
+
+
+def test_snapshot_does_not_claim_house_only_total_without_ev_day_meter():
+    snap = _snapshot_with({"load_actual_today_wh": "30659.79"})
+
+    assert snap["house_day_kwh"] is None
+    assert snap["house_day_energy_quality"] == "unavailable"
+
+
+def test_house_day_total_integrates_live_non_ev_power_between_vrm_anchors():
+    tracker = MqttLive()
+    now = datetime(2026, 7, 26, 18, 30)
+
+    tracker._record_value(
+        "ev_actual_today_kwh", 2.0, now=now, monotonic_now=0.0
+    )
+    tracker._record_value(
+        "load_actual_today_wh", 10000.0, now=now, monotonic_now=0.0
+    )
+    tracker._record_value("load_w", 2000.0, now=now, monotonic_now=1.0)
+    tracker._record_value("ev_w", 500.0, now=now, monotonic_now=1.0)
+    tracker._record_value(
+        "load_w",
+        2000.0,
+        now=now + timedelta(seconds=60),
+        monotonic_now=61.0,
+    )
+    tracker._connected = True
+
+    snap = tracker.snapshot()
+    assert snap["house_day_kwh"] == pytest.approx(8.025)
+    assert snap["house_day_energy_quality"] == "live_integrated"
+
+
+def test_house_day_total_skips_long_mqtt_gaps_and_reanchors_to_vrm():
+    tracker = MqttLive()
+    now = datetime(2026, 7, 26, 18, 30)
+
+    tracker._record_value(
+        "ev_actual_today_kwh", 2.0, now=now, monotonic_now=0.0
+    )
+    tracker._record_value(
+        "load_actual_today_wh", 10000.0, now=now, monotonic_now=0.0
+    )
+    tracker._record_value("load_w", 4000.0, now=now, monotonic_now=1.0)
+    tracker._record_value("ev_w", 1000.0, now=now, monotonic_now=1.0)
+    tracker._record_value(
+        "load_w",
+        4000.0,
+        now=now + timedelta(minutes=10),
+        monotonic_now=601.0,
+    )
+    tracker._connected = True
+
+    # A disconnected ten-minute interval must not be invented from one old power
+    # sample. The authoritative 8 kWh anchor therefore remains unchanged.
+    assert tracker.snapshot()["house_day_kwh"] == pytest.approx(8.0)
+
+    tracker._record_value(
+        "ev_actual_today_kwh",
+        2.25,
+        now=now + timedelta(minutes=15),
+        monotonic_now=901.0,
+    )
+    tracker._record_value(
+        "load_actual_today_wh",
+        11250.0,
+        now=now + timedelta(minutes=15),
+        monotonic_now=901.0,
+    )
+    snap = tracker.snapshot()
+    assert snap["house_day_kwh"] == pytest.approx(9.0)
+    assert snap["house_day_energy_quality"] == "authoritative_anchor"
+
+
+def test_house_day_total_resets_instead_of_integrating_across_midnight():
+    tracker = MqttLive()
+    before_midnight = datetime(2026, 7, 26, 23, 59, 30)
+    after_midnight = datetime(2026, 7, 27, 0, 0, 15)
+
+    tracker._record_value(
+        "ev_actual_today_kwh", 5.0, now=before_midnight, monotonic_now=0.0
+    )
+    tracker._record_value(
+        "load_actual_today_wh",
+        25000.0,
+        now=before_midnight,
+        monotonic_now=0.0,
+    )
+    tracker._record_value(
+        "load_w", 2000.0, now=before_midnight, monotonic_now=1.0
+    )
+    tracker._record_value(
+        "ev_w", 0.0, now=before_midnight, monotonic_now=1.0
+    )
+    tracker._record_value(
+        "load_actual_today_wh",
+        100.0,
+        now=after_midnight,
+        monotonic_now=46.0,
+    )
+    tracker._record_value(
+        "ev_actual_today_kwh",
+        0.0,
+        now=after_midnight,
+        monotonic_now=46.0,
+    )
+    tracker._connected = True
+
+    assert tracker.snapshot()["house_day_kwh"] == pytest.approx(0.1)
+
+
+def test_house_day_total_stays_unknown_after_rollover_until_new_anchors_arrive():
+    tracker = MqttLive()
+    before_midnight = datetime(2026, 7, 26, 23, 59, 30)
+    after_midnight = datetime(2026, 7, 27, 0, 0, 1)
+
+    tracker._record_value(
+        "ev_actual_today_kwh", 5.0, now=before_midnight, monotonic_now=0.0
+    )
+    tracker._record_value(
+        "load_actual_today_wh",
+        25000.0,
+        now=before_midnight,
+        monotonic_now=0.0,
+    )
+    # An unrelated live update crosses midnight before either daily counter has
+    # reset. The stale values remain in the generic cache but must not be used as
+    # a fallback for the new day.
+    tracker._record_value(
+        "soc", 80.0, now=after_midnight, monotonic_now=31.0
+    )
+    tracker._connected = True
+
+    snap = tracker.snapshot()
+    assert snap["house_day_kwh"] is None
+    assert snap["house_day_energy_quality"] == "unavailable"
+
+
+def test_rollover_guard_does_not_hide_a_valid_zero_import_day_after_midnight():
+    assert live._midnight_counter_mismatch(
+        25000.0,
+        0.0,
+        now=datetime(2026, 7, 27, 0, 10),
+    )
+    assert not live._midnight_counter_mismatch(
+        25000.0,
+        0.0,
+        now=datetime(2026, 7, 27, 12, 0),
+    )

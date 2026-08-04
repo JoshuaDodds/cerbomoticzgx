@@ -1,5 +1,6 @@
 import importlib.util
 import sys
+import threading
 import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -49,12 +50,27 @@ def _load_tibber_api(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "websockets", websockets_stub)
     monkeypatch.setitem(sys.modules, "websockets.exceptions", websockets_exceptions_stub)
 
+    deferred_workers = []
+    real_thread = threading.Thread
+
+    class _DeferredThread:
+        def __init__(self, *, target, **_kwargs):
+            self.target = target
+
+        def start(self):
+            deferred_workers.append(self.target)
+
+    # The module starts account discovery at import time. Defer that worker until its
+    # settings and sleep dependencies have been replaced, eliminating a teardown race with
+    # pytest's temporary environment variables.
+    monkeypatch.setattr(threading, "Thread", _DeferredThread)
     spec = importlib.util.spec_from_file_location(
         "tibber_api_under_test",
         Path(__file__).resolve().parents[1] / "lib" / "tibber_api.py",
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    monkeypatch.setattr(threading, "Thread", real_thread)
 
     cache_path = tmp_path / "prices.json"
 
@@ -68,6 +84,8 @@ def _load_tibber_api(monkeypatch, tmp_path):
 
     monkeypatch.setattr(module, "retrieve_setting", _setting)
     monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
+    for worker in deferred_workers:
+        worker()
     module._PRICE_CACHE.clear()
     return module, cache_path
 

@@ -10,7 +10,7 @@ from lib.config_change_handler import ConfigWatcher, handle_env_change
 from lib.victron_mqtt_client import mqtt_start, mqtt_stop
 from lib.ev_charge_controller import EvCharger
 from lib.task_scheduler import TaskScheduler
-from lib.victron_integration import restore_default_battery_max_voltage
+from lib.victron_integration import restore_default_battery_max_voltage, set_minimum_ess_soc
 from lib.tibber_api import live_measurements, publish_pricing_data
 from lib.helpers import publish_message, retrieve_message, is_truthy
 from lib.global_state import GlobalStateDatabase, GlobalStateClient
@@ -26,8 +26,77 @@ STATE = GlobalStateClient()
 
 ACTIVE_MODULES = json.loads(retrieve_setting('ACTIVE_MODULES'))
 HOME_CONNECT_APPLIANCE_SCHEDULING = is_truthy(retrieve_setting("HOME_CONNECT_APPLIANCE_SCHEDULING"))
+_EV_CHARGER = None
+_TESLA_TELEMETRY_BRIDGE = None
+_TESLA_TELEMETRY_BRIDGE_STARTING = False
+_ONECTA_MONITOR_THREAD = None
 
-def ev_charge_controller(): EvCharger().main()
+
+def _run_ev_charge_controller():
+    """Own the EV controller lifecycle without delaying unrelated services."""
+    global _EV_CHARGER
+    try:
+        _EV_CHARGER = EvCharger()
+        _EV_CHARGER.main()
+    except Exception as error:
+        logging.error("EV charge controller failed to start: %s", error)
+
+
+def ev_charge_controller():
+    """Start the self-rescheduling EV controller on a daemon worker."""
+    thread = threading.Thread(
+        target=_run_ev_charge_controller,
+        name="ev-charge-controller",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
+def _run_tesla_telemetry_bridge():
+    global _TESLA_TELEMETRY_BRIDGE, _TESLA_TELEMETRY_BRIDGE_STARTING
+    try:
+        from lib.tesla_telemetry_bridge import start_bridge_if_enabled
+        bridge = start_bridge_if_enabled(retrieve_setting)
+        if bridge is not None:
+            _TESLA_TELEMETRY_BRIDGE = bridge
+            logging.info(
+                "Tesla Fleet Telemetry bridge started "
+                "(TESLA_TELEMETRY_ENABLED)."
+            )
+    except Exception as error:
+        STATE.set("tesla_telemetry_bridge_status", "DISCONNECTED")
+        logging.warning(
+            "Tesla telemetry bridge failed to start; EV control will wait "
+            "for authoritative state: %s",
+            error,
+        )
+    finally:
+        _TESLA_TELEMETRY_BRIDGE_STARTING = False
+
+
+def _start_tesla_telemetry_bridge():
+    """Dispatch pushed-state hydration without blocking application startup."""
+    global _TESLA_TELEMETRY_BRIDGE_STARTING
+    if not is_truthy(
+        retrieve_setting("TESLA_TELEMETRY_ENABLED"), default=False
+    ):
+        return None
+    if _TESLA_TELEMETRY_BRIDGE is not None or _TESLA_TELEMETRY_BRIDGE_STARTING:
+        return _TESLA_TELEMETRY_BRIDGE
+
+    # This local write is deliberately synchronous and network-free. It closes
+    # the race before the independent EV worker can inspect startup state.
+    STATE.set("tesla_telemetry_bridge_status", "CONNECTING")
+    STATE.set("tesla_telemetry_bridge_updated_at", time.time())
+    _TESLA_TELEMETRY_BRIDGE_STARTING = True
+    thread = threading.Thread(
+        target=_run_tesla_telemetry_bridge,
+        name="tesla-telemetry-bridge",
+        daemon=True,
+    )
+    thread.start()
+    return thread
 
 def energy_broker(): energybroker()
 
@@ -55,6 +124,15 @@ def shutdown():
     if retrieve_setting('VICTRON_OPTIMIZED_CHARGING') == '1':
         restore_default_battery_max_voltage()
 
+    if _TESLA_TELEMETRY_BRIDGE is not None:
+        _TESLA_TELEMETRY_BRIDGE.stop()
+
+    try:
+        from lib.onecta_monitor import stop_onecta_monitor
+        stop_onecta_monitor()
+    except Exception as error:
+        logging.warning("ONECTA: monitor shutdown was incomplete: %s", error)
+
     mqtt_stop()
 
     # publish message to broker that we are shutting down
@@ -73,8 +151,22 @@ def init():
     publish_message(topic='Tibber/home/price_info/now/total', message="0.35", retain=True)
     STATE.set('tibber_price_now', "0.35")
 
+    # Re-assert the real Victron setting in the unconditional startup path and
+    # before the one-second post-startup delay. GlobalState is recreated at
+    # startup, and a missing key reads as numeric zero; without a forced write a
+    # stale 40% winter limit could masquerade as the desired 0%.
+    try:
+        set_minimum_ess_soc(force=True)
+    except Exception as e:
+        logging.error(
+            "init(): unable to apply Victron hardware minimum SoC; "
+            "the next optimizer cycle will retry: %s",
+            e,
+        )
+
 
 def post_startup():
+    global _ONECTA_MONITOR_THREAD
     time.sleep(1)
 
     if HOME_CONNECT_APPLIANCE_SCHEDULING:
@@ -130,16 +222,17 @@ def post_startup():
 
     threading.Thread(target=_startup_warm_up, name="startup-warmup", daemon=True).start()
 
-    # Start the Tesla Fleet Telemetry bridge if enabled. It subscribes to the in-cluster
-    # fleet-telemetry MQTT firehose and republishes normalized Tesla/vehicle0/* state +
-    # tesla_* GlobalState keys, so the EV controller/GUI read PUSHED data instead of polling
-    # vehicle_data. Fully inert (returns None) when TESLA_TELEMETRY_ENABLED is off.
+    # ONECTA cloud I/O owns a separate daemon thread. It reuses a recent durable
+    # snapshot at startup and otherwise follows the rate-conscious 20-minute
+    # cadence, so Daikin latency cannot hold up startup or the shared scheduler.
     try:
-        from lib.tesla_telemetry_bridge import start_bridge_if_enabled
-        if start_bridge_if_enabled(retrieve_setting):
-            logging.info("Tesla Fleet Telemetry bridge started (TESLA_TELEMETRY_ENABLED).")
-    except Exception as e:
-        logging.warning("Tesla telemetry bridge failed to start; continuing without it: %s", e)
+        from lib.onecta_monitor import start_onecta_monitor_if_enabled
+        _ONECTA_MONITOR_THREAD = start_onecta_monitor_if_enabled()
+    except Exception as error:
+        logging.warning(
+            "ONECTA: read-only monitor failed to start; ESS control continues: %s",
+            error,
+        )
 
     # Start service scheduled tasks + the .env config watcher (independent of the
     # warm-up above, so they come up immediately).
@@ -153,6 +246,10 @@ def post_startup():
 def main():
     try:
         init()
+
+        # Begin the non-blocking pushed-state subscription before any controller
+        # can infer vehicle state or issue a Tesla command.
+        _start_tesla_telemetry_bridge()
 
         # start sync tasks
         sync_tasks_start()

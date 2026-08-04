@@ -25,6 +25,7 @@ import glob
 import json
 import logging
 import tempfile
+import threading
 from datetime import date, datetime
 
 try:
@@ -38,6 +39,7 @@ DEFAULT_HISTORY_DIR = "data/history"
 
 _DAY_RE = re.compile(r"ess-(\d{4})-(\d{2})-(\d{2})\.ndjson$")
 _MONTH_RE = re.compile(r"ess-(\d{4})-(\d{2})\.parquet$")
+_APPEND_LOCK = threading.Lock()
 
 
 def duckdb_available() -> bool:
@@ -76,11 +78,13 @@ def _month_parquet_for_day(iso, hist_dir) -> str:
 # --- writes ----------------------------------------------------------------
 
 def append(day, record: dict, hist_dir=None) -> None:
-    """Append one record to the day's NDJSON file (the hot path). Single writer."""
+    """Append one record to the day's NDJSON file without interleaved writers."""
     path = day_ndjson_path(day, hist_dir)
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(record) + "\n")
+    line = json.dumps(record) + "\n"
+    with _APPEND_LOCK:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line)
 
 
 # --- reads -----------------------------------------------------------------

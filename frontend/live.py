@@ -7,7 +7,11 @@ UI via /api/live so the dashboard can show truly live values instead of only the
 plan snapshot (which updates every optimization cycle).
 """
 import json
+import os
+import socket
 import threading
+import time
+from datetime import datetime
 
 from dotenv import dotenv_values
 from lib.config_paths import env_path, secrets_path
@@ -16,6 +20,59 @@ try:
     import paho.mqtt.client as mqtt
 except Exception:  # paho optional at import time
     mqtt = None
+
+
+# The dedicated ABB/Victron EV meter idles at a few watts even when no energy is being
+# transferred. Keep this aligned with the Power Flow card's existing standby threshold.
+EV_IDLE_POWER_W = 100.0
+# Live power samples can bridge the 15-minute VRM daily-consumption refresh, but
+# never extrapolate through a dashboard/MQTT outage. The next authoritative VRM
+# sample re-anchors any small integration drift.
+HOUSE_ENERGY_MAX_GAP_SECONDS = 120.0
+
+
+def mqtt_client_id() -> str:
+    """Keep concurrently running dashboard subscribers from evicting each other."""
+    host = "".join(
+        character if character.isalnum() else "-"
+        for character in socket.gethostname().lower()
+    )[:18] or "host"
+    return f"cerbo-live-{host}-{os.getpid()}"
+
+
+def _timestamp_age_seconds(value):
+    """Return the age of a retained vehicle timestamp, or None when it is unusable."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        timestamp = float(value)
+    except (TypeError, ValueError):
+        try:
+            # The bridge's retained timestamp is local wall time. fromisoformat()
+            # also keeps this compatible with a future timezone-aware ISO value.
+            parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+            timestamp = parsed.timestamp()
+        except (TypeError, ValueError):
+            return None
+    if timestamp <= 0:
+        return None
+    return max(0.0, time.time() - timestamp)
+
+
+def _midnight_counter_mismatch(load_wh, grid_import_kwh, now=None) -> bool:
+    """Detect the brief rollover window where VRM can still expose yesterday."""
+    now = now or datetime.now().astimezone()
+    try:
+        load_wh = float(load_wh)
+        grid_import_kwh = float(grid_import_kwh)
+    except (TypeError, ValueError):
+        return False
+    return (
+        now.hour == 0
+        and now.minute < 30
+        and grid_import_kwh < 0.1
+        and load_wh > 2000.0
+    )
 
 
 def _config():
@@ -35,6 +92,12 @@ class MqttLive:
         self._started = False
         self._key_by_topic = {}
         self._cond = threading.Condition()   # notified on every new MQTT value (for SSE push)
+        self._house_day_kwh = None
+        self._house_day_energy_quality = "unavailable"
+        self._house_day_date = None
+        self._house_last_tick_mono = None
+        self._house_load_total_received_day = None
+        self._house_ev_total_received_day = None
 
     def _build_topics(self, sid):
         return {
@@ -93,6 +156,12 @@ class MqttLive:
             # from the Victron evcharger service (instance 42; matches lib/constants.py).
             "ev_energy_kwh": f"N/{sid}/evcharger/42/Ac/Energy/Forward",
             "ev_charge_time": f"N/{sid}/evcharger/42/ChargingTime",
+            # ABB meter phase currents. The power-flow EV card intentionally sums
+            # these three physical measurements to match the Tesla total-current
+            # convention; it must not multiply the car's retained ChargeAmps value.
+            "ev_l1_a": f"N/{sid}/evcharger/42/Ac/L1/Current",
+            "ev_l2_a": f"N/{sid}/evcharger/42/Ac/L2/Current",
+            "ev_l3_a": f"N/{sid}/evcharger/42/Ac/L3/Current",
             # Tesla vehicle status (published by tesla_api / ev_charge_controller as
             # {"value": ...}). Read-only in the UI — no Fleet API cost. Absent topics
             # simply leave the field None and the Vehicle tab hides that row.
@@ -108,6 +177,7 @@ class MqttLive:
             "veh_amps": "Tesla/vehicle0/charging_amps",
             "veh_surplus_amps": "Tesla/vehicle0/solar/surplus_amps",
             "veh_last_update": "Tesla/vehicle0/last_update_at",
+            "veh_telemetry_status": "Tesla/vehicle0/telemetry_status",
             "setpoint_w": f"N/{sid}/settings/0/Settings/CGwacs/AcPowerSetPoint",
             "mode": "Cerbomoticzgx/GlobalState/ai_mode",
             "control_action": "Cerbomoticzgx/GlobalState/ai_control_action",
@@ -119,6 +189,13 @@ class MqttLive:
             "day_import_cost": "Tibber/home/energy/day/cost",
             "day_export_kwh": "Tibber/home/energy/day/exported",
             "day_export_reward": "Tibber/home/energy/day/reward",
+            "day_energy_last_update": "Tibber/home/energy/day/last_update",
+            # The VRM total is the authoritative whole-site AC consumption counter
+            # (Wh). Domoticz's CounterToday for the dedicated ABB EV meter is
+            # mirrored into GlobalState in kWh. Their difference is the home's
+            # own daily consumption, excluding EV charging.
+            "load_actual_today_wh": "Cerbomoticzgx/GlobalState/consumption_total_cumulative",
+            "ev_actual_today_kwh": "Cerbomoticzgx/GlobalState/ev_today_kwh",
             # Today / tomorrow lowest & highest buy price (cost €/kWh + the hour it
             # occurs) — already published retained by the Tibber module. Tomorrow's
             # values read "not_yet_published" until Tibber releases them (~13:00).
@@ -146,7 +223,8 @@ class MqttLive:
         topics = self._build_topics(sid)
         self._key_by_topic = {t: k for k, t in topics.items()}
 
-        client = mqtt.Client(client_id="cerbo-dashboard-live", reconnect_on_failure=True)
+        client = mqtt.Client(
+            client_id=mqtt_client_id(), reconnect_on_failure=True)
         client.on_connect = self._on_connect
         client.on_message = self._on_message
         client.on_disconnect = self._on_disconnect
@@ -174,10 +252,91 @@ class MqttLive:
             value = payload.get("value", payload) if isinstance(payload, dict) else payload
         except Exception:
             value = msg.payload.decode("utf-8", "ignore")
-        with self._lock:
-            self._values[key] = value
+        self._record_value(key, value)
         with self._cond:                      # wake any SSE streams waiting for a change
             self._cond.notify_all()
+
+    @staticmethod
+    def _number(value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _reset_house_day_locked(self, day, monotonic_now):
+        self._house_day_kwh = None
+        self._house_day_energy_quality = "unavailable"
+        self._house_day_date = day
+        self._house_last_tick_mono = monotonic_now
+        self._house_load_total_received_day = None
+        self._house_ev_total_received_day = None
+
+    def _integrate_house_energy_locked(self, monotonic_now):
+        previous = self._house_last_tick_mono
+        self._house_last_tick_mono = monotonic_now
+        if self._house_day_kwh is None or previous is None:
+            return
+        elapsed = monotonic_now - previous
+        if elapsed <= 0.0 or elapsed > HOUSE_ENERGY_MAX_GAP_SECONDS:
+            return
+        load_w = self._number(self._values.get("load_w"))
+        ev_w = self._number(self._values.get("ev_w"))
+        if load_w is None:
+            return
+        house_w = max(0.0, load_w - max(0.0, ev_w or 0.0))
+        self._house_day_kwh += house_w * elapsed / 3_600_000.0
+        self._house_day_energy_quality = "live_integrated"
+
+    def _anchor_house_energy_locked(self, day):
+        if (
+            self._house_load_total_received_day != day
+            or self._house_ev_total_received_day != day
+        ):
+            return
+        load_wh = self._number(self._values.get("load_actual_today_wh"))
+        ev_kwh = self._number(self._values.get("ev_actual_today_kwh"))
+        if load_wh is None or ev_kwh is None:
+            self._house_day_kwh = None
+            self._house_day_energy_quality = "unavailable"
+            return
+        self._house_day_kwh = max(0.0, load_wh / 1000.0 - max(0.0, ev_kwh))
+        self._house_day_energy_quality = "authoritative_anchor"
+
+    def _record_value(self, key, value, *, now=None, monotonic_now=None):
+        """Record one MQTT value and maintain the live house-only day counter.
+
+        VRM's cumulative site-consumption value is the correction anchor. Between
+        those refreshes, frequent AC-out and ABB EV power updates integrate only
+        the home's non-EV draw. Long gaps are skipped rather than invented.
+        """
+        now = now or datetime.now().astimezone()
+        monotonic_now = (
+            time.monotonic() if monotonic_now is None else float(monotonic_now)
+        )
+        day = now.date()
+        energy_keys = {
+            "load_w",
+            "ev_w",
+            "load_actual_today_wh",
+            "ev_actual_today_kwh",
+        }
+        with self._lock:
+            if self._house_day_date != day:
+                self._reset_house_day_locked(day, monotonic_now)
+            if key in energy_keys:
+                self._integrate_house_energy_locked(monotonic_now)
+            self._values[key] = value
+            if key == "load_actual_today_wh":
+                self._house_load_total_received_day = day
+                self._anchor_house_energy_locked(day)
+            elif key == "ev_actual_today_kwh":
+                self._house_ev_total_received_day = day
+                # At startup retained values may arrive EV-first or VRM-first.
+                # Establish the first anchor once both have arrived, but do not
+                # re-anchor on subsequent minute-level EV updates against a
+                # potentially older 15-minute VRM total.
+                if self._house_day_kwh is None:
+                    self._anchor_house_energy_locked(day)
 
     def wait_for_change(self, timeout: float = 15.0) -> None:
         """Block until the next MQTT value arrives (or ``timeout`` for keepalive)."""
@@ -199,13 +358,13 @@ class MqttLive:
     def snapshot(self) -> dict:
         with self._lock:
             vals = dict(self._values)
+            tracked_house_day_kwh = self._house_day_kwh
+            tracked_house_quality = self._house_day_energy_quality
+            tracked_house_day_date = self._house_day_date
         out = {"connected": self._connected}
 
         def _num(k):
-            try:
-                return float(vals.get(k))
-            except (TypeError, ValueError):
-                return None
+            return self._number(vals.get(k))
 
         out["soc"] = _num("soc")
         out["price"] = _num("price")
@@ -243,6 +402,9 @@ class MqttLive:
         out["ev_w"] = _num("ev_w")
         out["ev_energy_kwh"] = _num("ev_energy_kwh")  # lifetime forward energy (kWh)
         out["ev_charge_time"] = _num("ev_charge_time")  # present session time (s)
+        out["ev_l1_a"] = _num("ev_l1_a")
+        out["ev_l2_a"] = _num("ev_l2_a")
+        out["ev_l3_a"] = _num("ev_l3_a")
         # Tesla vehicle status (read-only mirror of the MQTT bus; no Fleet API cost).
         out["veh_soc"] = _num("veh_soc")
         out["veh_soc_limit"] = _num("veh_soc_limit")
@@ -256,6 +418,35 @@ class MqttLive:
         out["veh_is_supercharging"] = vals.get("veh_is_supercharging")
         out["veh_eta"] = vals.get("veh_eta")               # time-to-limit while charging
         out["veh_last_update"] = vals.get("veh_last_update")
+        out["veh_last_update_age_s"] = _timestamp_age_seconds(
+            out["veh_last_update"]
+        )
+        out["veh_telemetry_status"] = vals.get("veh_telemetry_status")
+        # Fleet Telemetry is change-driven and an old retained DetailedChargeState can survive
+        # a confirmed stop if the vehicle never emits the matching edge. The dedicated local EV
+        # meter is faster and authoritative for whether energy is actually flowing. Reconcile
+        # only the unambiguous idle case; with no meter sample (or real draw), preserve Tesla's
+        # own status rather than inventing one.
+        raw_charging = out["veh_is_charging"]
+        says_charging = (
+            raw_charging is True
+            or str(raw_charging).strip().lower() in {"true", "1", "yes", "on"}
+            or str(out["veh_charging_status"] or "").strip().lower() == "charging"
+        )
+        explicitly_idle = (
+            raw_charging is False
+            or str(raw_charging).strip().lower() in {"false", "0", "no", "off"}
+            or str(out["veh_charging_status"] or "").strip().lower()
+            in {"idle", "stopped", "complete", "disconnected", "no power"}
+        )
+        if explicitly_idle and not says_charging:
+            out["veh_eta"] = "N/A"
+        if (out["ev_w"] is not None
+                and abs(out["ev_w"]) <= EV_IDLE_POWER_W
+                and says_charging):
+            out["veh_is_charging"] = False
+            out["veh_charging_status"] = "Idle"
+            out["veh_eta"] = "N/A"
         out["setpoint_w"] = _num("setpoint_w")
         out["mode"] = vals.get("mode")
         out["control_action"] = vals.get("control_action")
@@ -267,6 +458,30 @@ class MqttLive:
         out["day_import_cost"] = _num("day_import_cost")
         out["day_export_kwh"] = _num("day_export_kwh")
         out["day_export_reward"] = _num("day_export_reward")
+        out["day_energy_last_update"] = vals.get("day_energy_last_update")
+        out["load_actual_today_wh"] = _num("load_actual_today_wh")
+        out["ev_actual_today_kwh"] = _num("ev_actual_today_kwh")
+        house_day_kwh = tracked_house_day_kwh
+        house_day_quality = tracked_house_quality
+        if house_day_kwh is None and tracked_house_day_date is None:
+            load_wh = out["load_actual_today_wh"]
+            ev_day_kwh = out["ev_actual_today_kwh"]
+            if load_wh is not None and ev_day_kwh is not None:
+                house_day_kwh = max(
+                    0.0, load_wh / 1000.0 - max(0.0, ev_day_kwh)
+                )
+                house_day_quality = "authoritative_anchor"
+        # The VRM day counter can briefly retain yesterday's full value after
+        # Tibber has reset its import counter at midnight. Hide that impossible
+        # combination until the next VRM refresh instead of flashing a false day
+        # total. This mirrors the history recorder's existing rollover guard.
+        if _midnight_counter_mismatch(
+            out["load_actual_today_wh"], out["day_import_kwh"]
+        ):
+            house_day_kwh = None
+            house_day_quality = "unavailable"
+        out["house_day_kwh"] = house_day_kwh
+        out["house_day_energy_quality"] = house_day_quality
         # Today / tomorrow price extremes (cost is None when not yet published).
         out["price_today_low"] = _num("price_today_low")
         out["price_today_high"] = _num("price_today_high")
