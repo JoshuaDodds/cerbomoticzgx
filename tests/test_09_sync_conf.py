@@ -1,6 +1,7 @@
 """Behavioural coverage for the cluster configuration sync helper."""
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -25,7 +26,26 @@ def _fake_rsync(tmp_path: Path, itemized_changes: str) -> Path:
     return bin_dir
 
 
+def _sync_project(tmp_path: Path) -> tuple[Path, Path]:
+    """Build a self-contained sync source tree, matching GitHub Actions.
+
+    CI deliberately has no real ``.env`` or ``.secrets`` checkout.  Push mode
+    correctly refuses to run without those files, so this behavioural test must
+    provide harmless stand-ins rather than accidentally relying on a developer's
+    local credentials.
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+    script = project / "sync_conf.sh"
+    shutil.copy2(SYNC_SCRIPT, script)
+    (project / ".env").write_text("TEST_ONLY=true\n", encoding="utf-8")
+    (project / ".secrets").write_text("TEST_ONLY_SECRET=true\n", encoding="utf-8")
+    (project / "data").mkdir()
+    return script, project
+
+
 def test_push_summary_groups_added_updated_and_metadata_only_paths(tmp_path):
+    sync_script, project = _sync_project(tmp_path)
     fake_bin = _fake_rsync(
         tmp_path,
         "\n".join(
@@ -40,8 +60,8 @@ def test_push_summary_groups_added_updated_and_metadata_only_paths(tmp_path):
     env = os.environ | {"PATH": f"{fake_bin}:{os.environ['PATH']}"}
 
     result = subprocess.run(
-        ["bash", str(SYNC_SCRIPT), "--push", "--dry-run"],
-        cwd=ROOT,
+        ["bash", str(sync_script), "--push", "--dry-run"],
+        cwd=project,
         env=env,
         text=True,
         capture_output=True,
@@ -59,12 +79,13 @@ def test_push_summary_groups_added_updated_and_metadata_only_paths(tmp_path):
 
 
 def test_pull_summary_identifies_local_destination_and_no_change_case(tmp_path):
+    sync_script, project = _sync_project(tmp_path)
     fake_bin = _fake_rsync(tmp_path, "")
     env = os.environ | {"PATH": f"{fake_bin}:{os.environ['PATH']}"}
 
     result = subprocess.run(
-        ["bash", str(SYNC_SCRIPT), "--pull", "--dry-run"],
-        cwd=ROOT,
+        ["bash", str(sync_script), "--pull", "--dry-run"],
+        cwd=project,
         env=env,
         text=True,
         capture_output=True,

@@ -45,3 +45,6 @@ a certain order of how pytest iterates the files in the directory.
 ## Appendix: Suggested developer mindset
 - Be conservative: prefer clarity over cleverness when working on concurrency or IO code.
 - When in doubt, pause work and consult with the human who set you to task.
+
+## GHA compatiblity
+If i ask for a commit msg to be written that indicates that i am about to commit and push something upstream which will trigger a build.  Any tests should be wrriten and checked in such a way that we are certain they will run in GHA as well and not result in an error and waste build minutes and my time.  
