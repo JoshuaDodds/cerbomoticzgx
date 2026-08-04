@@ -33,11 +33,74 @@ EOF
 
 DIRECTION="push"
 direction_explicitly_set=""
+DRY_RUN="false"
 RSYNC_OPTIONS=(
     --archive
     --human-readable
     --itemize-changes
+    --out-format='%i|%n%L'
 )
+
+CHANGE_LOG=""
+cleanup() {
+    if [[ -n "${CHANGE_LOG}" ]]; then
+        rm -f -- "${CHANGE_LOG}"
+    fi
+}
+trap cleanup EXIT
+
+print_changes() {
+    local destination
+    if [[ "${DIRECTION}" == "push" ]]; then
+        destination="the cluster (remote n1)"
+    else
+        destination="this checkout (local)"
+    fi
+
+    awk -F'|' -v destination="${destination}" '
+        function print_heading(kind, count) {
+            if (count) printf "\n%s %s (%d):\n", kind, destination, count
+        }
+        function print_paths(kind, marker, list, count,    i) {
+            print_heading(kind, count)
+            for (i = 1; i <= count; i++) printf "  %s %s\n", marker, list[i]
+        }
+        {
+            item = $1
+            path = substr($0, length(item) + 2)
+            if (!path || item == "*deleting") next
+
+            # The itemized format is YXcstpoguax. A + marks a new path;
+            # s/c means file content changed; everything else is metadata.
+            if (item ~ /\+\+\+\+\+\+\+\+\+/) {
+                added[++added_count] = path
+            } else if (substr(item, 2, 1) == "f" &&
+                       (substr(item, 3, 1) != "." || substr(item, 4, 1) != ".")) {
+                updated[++updated_count] = path
+            } else {
+                metadata[++metadata_count] = path
+            }
+        }
+        END {
+            if (!added_count && !updated_count && !metadata_count) {
+                printf "No files need copying; both locations are already in sync.\n"
+                exit
+            }
+            print_paths("Added to", "+", added, added_count)
+            print_paths("Updated in", "~", updated, updated_count)
+            print_paths("Metadata updated in", "·", metadata, metadata_count)
+        }
+    ' "${CHANGE_LOG}"
+}
+
+run_rsync() {
+    CHANGE_LOG="$(mktemp "${TMPDIR:-/tmp}/sync-conf.XXXXXX")"
+    if ! rsync "$@" >"${CHANGE_LOG}"; then
+        printf 'Synchronization failed; no summary was produced.\n' >&2
+        exit 1
+    fi
+    print_changes
+}
 
 while (($#)); do
     case "$1" in
@@ -53,6 +116,7 @@ while (($#)); do
             ;;
         --dry-run)
             RSYNC_OPTIONS+=(--dry-run)
+            DRY_RUN="true"
             ;;
         -h|--help)
             usage
@@ -82,8 +146,11 @@ if [[ "${DIRECTION}" == "push" ]]; then
 
     printf 'Pushing .env, .secrets, and data/ to %s:%s/\n' \
         "${REMOTE_HOST}" "${REMOTE_DIR}"
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        printf 'Dry run — no files will be copied.\n'
+    fi
 
-    rsync "${RSYNC_OPTIONS[@]}" \
+    run_rsync "${RSYNC_OPTIONS[@]}" \
         "${PROJECT_DIR}/.env" \
         "${PROJECT_DIR}/.secrets" \
         "${PROJECT_DIR}/data" \
@@ -91,8 +158,11 @@ if [[ "${DIRECTION}" == "push" ]]; then
 else
     printf 'Pulling .env, .secrets, and data/ from %s:%s/ into %s/\n' \
         "${REMOTE_HOST}" "${REMOTE_DIR}" "${PROJECT_DIR}"
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        printf 'Dry run — no files will be copied.\n'
+    fi
 
-    rsync "${RSYNC_OPTIONS[@]}" \
+    run_rsync "${RSYNC_OPTIONS[@]}" \
         --include='/.env' \
         --include='/.secrets' \
         --include='/data/***' \
