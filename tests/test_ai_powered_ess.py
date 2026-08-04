@@ -67,6 +67,62 @@ class TestAIPoweredESS(unittest.TestCase):
         # IDLE: self-supply (battery powers loads, no export).
         self.assertEqual(control_action_for('self_supply', 50.0, 45.0, 0.0), 'IDLE')
 
+    def test_below_reserve_waits_for_a_cheaper_buy_instead_of_forcing_peak_charge(self):
+        """The reserve prevents further discharge, not an uneconomic emergency buy.
+
+        A live SoC can fall slightly below the configured reserve through meter
+        drift/BMS behaviour.  At a high-price current slot the controller must
+        retain and cover the house from the grid rather than forcing an
+        immediate precharge solely to step back over the discretized reserve
+        boundary. A later buy remains an economic decision, not a reserve
+        bookkeeping requirement.
+        """
+        now = datetime.now(tz.UTC).replace(second=0, microsecond=0)
+        self.engine.soc_step = 1.0
+        self.engine.soc_states = [float(i) for i in range(101)]
+        self.engine.max_power_import = 10.0
+        self.engine.max_charge_power = 10.0
+        self.engine.max_power_export = 10.0
+        self.engine.max_discharge_power = 10.0
+        prices = [
+            {'start': now, 'total': 0.35},
+            {'start': now + timedelta(hours=1), 'total': 0.10},
+            {'start': now + timedelta(hours=2), 'total': 0.15},
+        ]
+        loads = {point['start']: 0.25 for point in prices}
+        pv = {point['start']: 0.0 for point in prices}
+
+        result = self.engine.optimize(4.0, prices, loads, pv)
+
+        self.assertIsNotNone(result)
+        first = result['schedule'][0]
+        self.assertEqual(first['action'], 'hold')
+        self.assertEqual(first['control_action'], 'RETAIN')
+        self.assertEqual(first['soc_start'], 4.0)
+        self.assertEqual(first['soc_end'], 4.0)
+
+    def test_below_reserve_recovers_when_no_cheaper_buy_is_known(self):
+        """Reserve recovery remains compulsory when waiting cannot save money."""
+        now = datetime.now(tz.UTC).replace(second=0, microsecond=0)
+        self.engine.soc_step = 1.0
+        self.engine.soc_states = [float(i) for i in range(101)]
+        self.engine.max_power_import = 10.0
+        self.engine.max_charge_power = 10.0
+        prices = [
+            {'start': now, 'total': 0.35},
+            {'start': now + timedelta(hours=1), 'total': 0.36},
+            {'start': now + timedelta(hours=2), 'total': 0.37},
+        ]
+        loads = {point['start']: 0.25 for point in prices}
+        pv = {point['start']: 0.0 for point in prices}
+
+        result = self.engine.optimize(4.0, prices, loads, pv)
+
+        self.assertIsNotNone(result)
+        first = result['schedule'][0]
+        self.assertEqual(first['action'], 'buy')
+        self.assertGreaterEqual(first['soc_end'], self.engine.min_soc)
+
     def test_pv_surplus_sell_is_idle_neutral_setpoint(self):
         # Exporting while SoC is flat = PV surplus -> IDLE, neutral setpoint (no
         # forced/capping export); Victron routes surplus in real time.

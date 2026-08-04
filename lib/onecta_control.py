@@ -533,6 +533,11 @@ class OnectaControlService:
             lock.release()
             raise
 
+        # Preserve the synchronous command acknowledgement for the caller.  The
+        # confirmation worker can complete before ``Thread.start`` returns in
+        # fast/mock environments; returning a copy afterwards would then make
+        # this API race between ``accepted`` and ``confirmed``.
+        response = dict(status)
         worker = threading.Thread(
             target=self._confirm,
             args=(key, command, desired, confirmed, lock),
@@ -540,7 +545,7 @@ class OnectaControlService:
             daemon=True,
         )
         worker.start()
-        return dict(status)
+        return response
 
     def _confirm(
         self,
