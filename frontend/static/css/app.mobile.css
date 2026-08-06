@@ -591,6 +591,18 @@
     min-width: 0;
   }
 
+  .advisor-tools {
+    grid-template-columns: 1fr;
+  }
+
+  .advisor-tool-card {
+    grid-template-columns: 1fr;
+  }
+
+  .advisor-tool-card .btn-secondary {
+    width: 100%;
+  }
+
   .advisor-ask input,
   .btn-secondary,
   .btn,

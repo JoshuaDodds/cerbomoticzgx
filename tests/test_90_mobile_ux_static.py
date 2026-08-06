@@ -21,6 +21,19 @@ def test_mobile_stylesheet_loads_after_desktop_stylesheet():
     assert html.index("css/app.css") < html.index("css/app.mobile.css")
 
 
+def test_desktop_overview_gives_solar_forecast_more_room_without_changing_mobile():
+    css = APP_CSS.read_text(encoding="utf-8")
+
+    assert "@media (min-width: 901px)" in css
+    assert (
+        "grid-template-columns: minmax(320px, .95fr) minmax(0, 2.05fr);"
+        in css
+    )
+    # The existing phone override remains present and is not replaced by the
+    # desktop-only adjustment.
+    assert "@media (max-width: 720px) { .overview-row { grid-template-columns: 1fr; } }" in css
+
+
 def test_powerflow_ev_card_uses_per_phase_current_like_vehicle_tab():
     powerflow = POWERFLOW_JS.read_text(encoding="utf-8")
     live = LIVE_PY.read_text(encoding="utf-8")
@@ -94,7 +107,7 @@ def test_desktop_grid_and_house_phase_rows_match_solar_spacing():
 
     assert "const desktopPhaseStep = r.h * 0.062" in powerflow
     assert (
-        "const y = y0 + r.h * (firefoxDesktop ? 0.51 : 0.47) + i * desktopPhaseStep"
+        "const y = y0 + r.h * (desktopDetailLayout ? 0.51 : 0.47) + i * desktopPhaseStep"
         in powerflow
     )
     assert (
@@ -102,21 +115,21 @@ def test_desktop_grid_and_house_phase_rows_match_solar_spacing():
         in powerflow
     )
     assert (
-        "const y = y0 + r.h * (firefoxDesktop ? 0.70 : 0.66) + i * desktopPhaseStep"
+        "const y = y0 + r.h * (desktopDetailLayout ? 0.70 : 0.66) + i * desktopPhaseStep"
         in powerflow
     )
 
 
-def test_firefox_desktop_powerflow_reserves_extra_svg_header_space_only_there():
+def test_desktop_powerflow_reserves_extra_svg_header_space_in_every_browser():
     powerflow = POWERFLOW_JS.read_text(encoding="utf-8")
 
-    assert "const IS_FIREFOX" in powerflow
-    assert "const firefoxDesktop = !mobile && IS_FIREFOX" in powerflow
-    assert "const rowH = (IS_FIREFOX ? 0.45 : 0.36) * H" in powerflow
-    assert "firefoxDesktop ? 0.37 : 0.31" in powerflow
-    assert "firefoxDesktop ? 0.40 : 0.34" in powerflow
-    assert "firefoxDesktop ? 0.37 : 0.33" in powerflow
-    assert "firefoxDesktop ? 0.36 : 0.26" in powerflow
+    assert "const desktopDetailLayout = !mobile;" in powerflow
+    assert "const rowH = 0.45 * H;" in powerflow
+    assert "desktopDetailLayout ? 0.37 : 0.31" in powerflow
+    assert "desktopDetailLayout ? 0.40 : 0.34" in powerflow
+    assert "desktopDetailLayout ? 0.37 : 0.33" in powerflow
+    assert "desktopDetailLayout ? 0.36 : 0.26" in powerflow
+    assert "IS_FIREFOX" not in powerflow
 
 
 def test_hvac_dashboard_uses_capability_driven_compact_controls():
@@ -542,6 +555,17 @@ def test_advisor_latest_report_loads_on_browser_startup():
     assert 'fetch("/api/advisor/latest")' in js
     assert "loadAdvisorLatest();" in js
     assert "function clearAdvisorChat(" in js
+
+
+def test_advisor_exposes_read_only_forecast_and_strategy_tools():
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    js = APP_JS.read_text(encoding="utf-8")
+    css = APP_CSS.read_text(encoding="utf-8")
+
+    assert 'id="advisor-forecast-validation"' in html
+    assert 'id="advisor-ess-strategies"' in html
+    assert 'fetch(`/api/advisor/tools/${tool}`' in js
+    assert "CURRENT LIVE PLAN" in js
     assert 'fetch("/api/advisor/clear", { method: "POST" })' in js
     assert "function copyAdvisorMessage(" in js
     assert "function deleteAdvisorExchange(" in js

@@ -701,6 +701,42 @@ def test_day_summary_idle_surplus_exports_when_battery_full():
     assert today["net"] == -0.25      # −cost == €0.25 real projected profit
 
 
+def test_day_summary_only_counts_unelapsed_part_of_current_buy_and_sell_slot():
+    """Live counters own elapsed time; the forecast owns only what remains."""
+    start = datetime.now().astimezone().replace(
+        hour=14, minute=0, second=0, microsecond=0
+    )
+    as_of = start + timedelta(minutes=5)
+    schedule = [
+        {
+            "time": start.isoformat(), "grid_energy": 3.75,
+            "price": 0.20, "sell": 0.20, "soc_end": 50.0,
+        },
+        {
+            "time": start.isoformat(), "grid_energy": -3.75,
+            "price": 0.30, "sell": 0.30, "control_action": "SELL",
+            "soc_end": 50.0,
+        },
+    ]
+
+    summary = data.day_summary(
+        schedule,
+        {"imp_kwh": 1.0, "imp_cost": 0.20, "exp_kwh": 1.0, "exp_rev": 0.30},
+        as_of=as_of,
+    )
+
+    today = next(day for day in summary["days"] if day["is_today"])
+    # Ten of the fifteen minutes remain: 2.5 kWh of each planned grid flow.
+    assert today["forecast"] == {
+        "import_kwh": 2.5, "import_cost": 0.5,
+        "export_kwh": 2.5, "export_rev": 0.75,
+    }
+    assert today["combined"] == {
+        "import_kwh": 3.5, "import_cost": 0.7,
+        "export_kwh": 3.5, "export_rev": 1.05,
+    }
+
+
 def test_group_by_hour_idle_surplus_charges_battery_not_grid(monkeypatch, tmp_path):
     monkeypatch.setattr(data, "_env", lambda: {"HISTORY_DIR": str(tmp_path)})
     now = datetime.now().astimezone().replace(hour=14, minute=0, second=0, microsecond=0)

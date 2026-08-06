@@ -2451,6 +2451,94 @@ function runAdvisor(question, callbacks) {
 }
 const _advReview = $("#advisor-review");
 if (_advReview) _advReview.addEventListener("click", () => runAdvisor(null));
+
+function advisorToolEur(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? `${number >= 0 ? "+" : "−"}€${Math.abs(number).toFixed(2)}` : "—";
+}
+
+function renderForecastValidationTool(report) {
+  const load = report && report.load ? report.load : {};
+  const current = load.baseline && load.baseline.mae_kwh;
+  const trial = load.shadow && load.shadow.mae_kwh;
+  const recommendation = (report && report.overall && report.overall.recommendation) || "KEEP_APPLY_OFF";
+  const decision = recommendation === "KEEP_APPLY_OFF"
+    ? "Keep forecast adjustments OFF" : recommendation;
+  const reasons = (load.gate && Array.isArray(load.gate.reasons)) ? load.gate.reasons : [];
+  return `<div class="advisor-tool-summary"><strong>${_esc(decision)}</strong>
+    <span>Current forecast error ${_esc(current == null ? "—" : `${Number(current).toFixed(4)} kWh/slot`)}</span>
+    <span>Weather/HVAC trial error ${_esc(trial == null ? "—" : `${Number(trial).toFixed(4)} kWh/slot`)}</span>
+    ${reasons.length ? `<ul>${reasons.map((reason) => `<li>${_esc(reason)}</li>`).join("")}</ul>` : ""}
+  </div>`;
+}
+
+function advisorCandidateLabel(candidateId) {
+  return ({
+    market_arbitrage: "Market arbitrage",
+    pv_first_self_sufficiency: "PV-first self-sufficiency",
+    protected_hybrid: "Protected hybrid",
+  })[candidateId] || candidateId;
+}
+
+function renderEssStrategyTool(report) {
+  const plan = lastPlan || {};
+  const current = plan.current || {};
+  const today = ((plan.day_summary && plan.day_summary.days) || []).find((day) => day.is_today) || {};
+  const liveAction = current.control_action || current.action || "—";
+  const liveReason = current.reason_code || "";
+  // Dashboard day-summary net is cost minus reward; the strategy report's
+  // Grid result is reward minus cost, so invert it for the shared wording.
+  const liveNet = today.net != null ? advisorToolEur(-Number(today.net)) : "—";
+  const candidates = Object.entries((report && report.candidates) || {});
+  const rows = candidates.map(([candidateId, candidate]) => {
+    if (!candidate || !candidate.feasible) {
+      return `<li><strong>${_esc(advisorCandidateLabel(candidateId))}</strong> — unavailable: ${_esc((candidate && candidate.rejection_reason) || "unknown reason")}</li>`;
+    }
+    return `<li><strong>${_esc(advisorCandidateLabel(candidateId))}</strong>
+      <span>Grid result ${_esc(advisorToolEur(candidate.cash_net_eur))}; after battery wear ${_esc(advisorToolEur(candidate.economic_net_eur))}; battery use ${_esc(Number(candidate.full_equivalent_cycles || 0).toFixed(3))} full cycles.</span></li>`;
+  }).join("");
+  return `<div class="advisor-tool-summary">
+    <div class="advisor-live-plan"><strong>CURRENT LIVE PLAN</strong>
+      <span>AI Optimizer — ${_esc(liveAction)}${liveReason ? ` · ${_esc(liveReason)}` : ""}; today’s projected result ${_esc(liveNet)}.</span>
+      <small>This is the plan currently used for forecast and dispatch. None of the alternatives below is active.</small>
+    </div>
+    <p class="muted">Grid result = export reward − import cost. After battery wear subtracts estimated battery cycle cost.</p>
+    <ul>${rows || "<li>No candidate data was returned.</li>"}</ul>
+  </div>`;
+}
+
+async function runAdvisorTool(tool, button, result) {
+  if (!button || button.disabled) return;
+  const label = button.textContent;
+  button.disabled = true;
+  button.textContent = "Running…";
+  if (result) result.innerHTML = '<span class="muted">Reading the saved plan and history…</span>';
+  try {
+    const response = await fetch(`/api/advisor/tools/${tool}`, { method: "POST" });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || !payload.ok) throw new Error(payload.error || "tool failed");
+    if (result) {
+      result.innerHTML = tool === "forecast-validation"
+        ? renderForecastValidationTool(payload.report)
+        : renderEssStrategyTool(payload.report);
+    }
+  } catch (error) {
+    if (result) result.innerHTML = `<span class="banner">${_esc(error.message || "Could not run the read-only report.")}</span>`;
+  } finally {
+    button.disabled = false;
+    button.textContent = label;
+  }
+}
+
+const _advForecastValidation = $("#advisor-forecast-validation");
+if (_advForecastValidation) _advForecastValidation.addEventListener("click", () => {
+  runAdvisorTool("forecast-validation", _advForecastValidation, $("#advisor-forecast-validation-result"));
+});
+const _advEssStrategies = $("#advisor-ess-strategies");
+if (_advEssStrategies) _advEssStrategies.addEventListener("click", () => {
+  runAdvisorTool("ess-strategies", _advEssStrategies, $("#advisor-ess-strategies-result"));
+});
+
 async function clearAdvisorChat() {
   if (_advisorBusy) return;
   const confirmed = await advisorConfirm({

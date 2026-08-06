@@ -630,6 +630,38 @@ def test_advisor_latest_route_returns_saved_report(monkeypatch):
     assert response.get_json()["messages"][0]["text"] == "Because."
 
 
+def test_advisor_forecast_validation_route_returns_read_only_report(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_run_forecast_validation",
+        lambda: {"overall": {"recommendation": "KEEP_APPLY_OFF"}},
+    )
+
+    response = server.app.test_client().post("/api/advisor/tools/forecast-validation")
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "ok": True,
+        "report": {"overall": {"recommendation": "KEEP_APPLY_OFF"}},
+    }
+
+
+def test_advisor_strategy_evaluation_route_returns_read_only_report(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_run_ess_strategy_evaluation",
+        lambda: {"read_only": True, "candidates": {}},
+    )
+
+    response = server.app.test_client().post("/api/advisor/tools/ess-strategies")
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "ok": True,
+        "report": {"read_only": True, "candidates": {}},
+    }
+
+
 def test_advisor_clear_route_empties_saved_chat(monkeypatch):
     calls = []
 

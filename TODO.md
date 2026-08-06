@@ -1,117 +1,104 @@
 # TODO / roadmap
 
-- **Daikin ONECTA HVAC shadow validation** — Phase 1 now reads all four units in
-  one request every 20 minutes, publishes retained `hvac/#` state, and stores
-  correctly separated today/yesterday cumulative heating and cooling energy.
-  It is observational and off by default; do not use the data to alter the load
-  forecast until these future-data checks pass:
+- **Daikin ONECTA HVAC shadow validation** — Four real Daikin units are now
+  collected in one request every 20 minutes, published as retained `hvac/#`
+  state, and persist correctly separated daily cooling/heating energy. The
+  combined daily figures match the ONECTA app in attended checks, but the
+  source remains a delayed, 0.1 kWh-resolution cumulative measure rather than
+  instantaneous power. It remains observational: no ONECTA measurement changes
+  the load forecast or ESS dispatch yet.
 
-  - Compare combined `today_total_kwh` with the ONECTA mobile app several times
-    over at least 7 complete cooling days and later 7 complete heating days.
-  - Verify midnight rollover moves the prior day's final total into
-    `yesterday_total_kwh` without combining the two 12-bucket halves.
-  - Confirm OAuth refresh remains unattended, the collector stays below the
-    200-call daily limit, and restarts do not duplicate fresh API reads.
-  - Correlate cumulative HVAC increments, powered modes, outdoor temperature and
-    AC base-load settlements; quantify reporting delay and shared-outdoor-unit
-    effects before fitting forecast features.
-  - Measure whether ONECTA's 0.1 kWh reporting resolution, two-hour source
-    buckets, and cloud delay are reliable enough for intraday correction or
-    only for next-day/model calibration. Never reinterpret cumulative energy
-    deltas as instantaneous HVAC power.
-  - Compare weather-only versus weather-plus-ONECTA holdout error. Apply no HVAC
-    forecast correction until multiple complete days show a material improvement
-    in both aggregate daily load and 15-minute settlement forecasts.
+  - Accumulate at least 7 continuous complete cooling days and, separately, 7
+    complete heating days. Account explicitly for cloud reporting delay,
+    two-hour source buckets, shared-outdoor-unit behaviour and midnight rollover;
+    never treat a cumulative delta as instantaneous HVAC power.
+  - Compare weather-only versus weather-plus-ONECTA forecasts on a held-out
+    period for both daily load and measured 15-minute base-load settlements.
+    Require a material improvement before proposing any HVAC apply gate.
+  - Keep the independently implemented manual control surface gated by
+    `ONECTA_CONTROL_ENABLED=False` until an attended real-unit matrix confirms
+    power, mode, setpoint, fan, airflow and Powerful commands converge in the
+    cached UI within the API reserve. Streamer remains out of scope until Daikin
+    advertises an official readable/settable capability for an installed unit.
 
-- **Daily-net forecast calibration** — The Trends chart correctly preserves one latest
-  forecast revision per 15-minute period, so it must not hide the Aug 2–3 divergence as a
-  chart-only artefact. Investigation found 38 (Aug 2) and 36 (Aug 3)
-  `BUY`/`PRECHARGE_FOR_PEAK` cycles whose measured action was `RETAIN`: the optimizer
-  hardware's RETAIN was the correct response to an uneconomic plan. When live SoC was slightly
-  below the seasonal reserve, the DP prohibited the neutral below-reserve state and so
-  forced an immediate BUY merely to cross its discretized reserve boundary—even at
-  €0.30–€0.36/kWh while a €0.13/kWh daytime window was known. The reserve now prevents
-  further discharge below the floor but permits RETAIN there only while a strictly cheaper
-  known buy remains; otherwise it still recovers immediately. This is an optimizer control
-  fix, not PV/load tuning. Historical box plots should retain the pre-fix misses as useful
-  evidence. The closing forecast was already close in earlier validation (about €0.23 MAE),
-  but earlier forecasts require fresh validation after this repair.
+- **Daily-net forecast calibration** — The Aug 2–3 low-SoC divergence was not a
+  PV/load forecasting miss: the plan improperly proposed expensive
+  `BUY`/`PRECHARGE_FOR_PEAK` blocks merely to cross a discretised reserve, while
+  the realised Victron action correctly remained `RETAIN` ahead of known cheaper
+  prices. The reserve-policy repair is live: it prevents further discharge below
+  reserve but allows `RETAIN` only while a strictly cheaper known buy remains.
+  Preserve historical misses in Trends; they are useful evidence rather than
+  chart artefacts.
 
-  - Observe at least 3 low-SoC mornings after deployment. Before the genuinely cheap
-    window, expected control is `RETAIN`/`RESERVE_POLICY` (grid covers house load but no
-    forced battery charge); only an economically justified scheduled window may become
-    `BUY`.
-  - Compare forecast error by time-to-settlement before and after the repair. Treat a
-    planned BUY that actually executes as RETAIN as an execution incident only after
-    verifying the planned BUY itself is economical; inspect the reserve state and planned
-    buy price before changing PV/load assumptions.
+  - Validate at least 3 low-SoC mornings: before a genuinely cheap window the
+    expected action is `RETAIN`/`RESERVE_POLICY`, not forced `BUY`; an immediate
+    `BUY` remains valid only when its known economics justify it.
+  - The PV nowcast now uses `pv-nowcast-confidence-v3`: a single daylight low/0 W
+    source observation is `live_drop_pending` and preserves the baseline; two
+    distinct fresh source updates spanning at least 45 seconds become the bounded
+    `live_drop_confirmed` correction. A fresh near-sunset low/0 W reading is the
+    immediate `live_drop_sunset` case. Both uplift and drop overlays are limited to
+    the current hour: a point live reading must not revise the remaining day’s
+    export forecast. Collect 7–14 days with the explicit fair baseline/weather
+    branches before drawing conclusions about PV forecast error.
+  - **Active-slot daily-net accounting repaired (2026-08-05).** The optimiser
+    deliberately keeps the current quarter-hour in its schedule; previously the
+    dashboard and history counted that entire slot as future while Tibber's daily
+    counters already contained its elapsed portion. Both now book only the
+    unelapsed fraction, so during a planned BUY the rising realised import should
+    be offset by falling remaining-import cost; during SELL, rising realised export
+    should be offset by falling remaining-export reward. Historical snapshots remain
+    unchanged. Validate this through BUY, waiting and SELL periods, including
+    EV/appliance days. Any remaining movement must be attributable to a real replan
+    or new PV/load/EV information, not the passing time inside the active slot.
 
-  - Collect at least 7 complete days, preferably 14, with
-    `forecast_remaining_import_cost_eur` and
-    `forecast_remaining_export_reward_eur`.
-  - Recalculate error by time-to-settlement and attribute the positive bias to predicted
-    import cost, export reward, or both. Check EV/appliance days separately.
-  - Investigate the repeatable intraday shape observed by the operator: the projected
-    final net starts highly profitable, falls roughly in step with realized grid cost
-    during scheduled BUY/charging, then rises again after buying finishes while the
-    system waits to SELL. The BUY-period reduction has also been observed to jump back
-    up when the optimizer runs, suggesting a sawtooth where live settled cost is
-    subtracted from a stale remaining-cost forecast and only reconciled on the next
-    optimizer cycle. For every forecast snapshot and intervening live UI update, verify
-    whether the displayed value comes from the persisted optimizer projection or is
-    recomputed by mixing live settlement with stale forecast components. Verify the
-    accounting identity
-    `projected final net = settled net so far + remaining export reward -
-    remaining import cost` and determine whether realized import/export is replacing
-    its corresponding forecast exactly once or being omitted/double-counted.
-  - Replay BUY, waiting, and SELL periods with fixed day-ahead prices and record
-    settled import cost/reward, remaining import cost/reward, SoC, PV/load revisions,
-    and optimizer plan changes separately. Distinguish legitimate forecast changes
-    caused by new load/PV/SoC evidence from a ledger/display bug that merely follows
-    cumulative spend or reward.
-  - Tune the underlying forecast only after the component history identifies the source;
-    require lower morning/midday MAE, smoother convergence through BUY/SELL settlement,
-    and no degradation of the approximately €0.23 closing MAE.
+- **Weather forecast validation / apply tuning** — Both gates stay off:
+  `HVAC_LOAD_APPLY=False`, `PV_WEATHER_APPLY=False`. The validation command is
+  deliberately read-only and now fails closed if any compacted history cannot
+  be enumerated/read:
 
-- **Weather forecast validation / apply tuning** — The first 21-full-day validation
-  found the original apply model harmful: load MAE was 0.2163 kWh/slot with weather
-  versus 0.1155 without it, and weather improved 0/21 days. Root causes were full-day
-  HVAC demand being reallocated into every shrinking remaining-day horizon, absolute
-  HVAC demand being added to a trailing baseline which already contained HVAC, a
-  compass/Open-Meteo azimuth convention mismatch, preceding-hour GTI being assigned
-  to the following hour, and fresh 0 W sunset evidence being discarded. The
-  `hvac-pv-validation-tuning` branch repairs these and records explicit baseline,
-  shadow, and final forecasts. Summer now evaluates cooling anomalies only; Winter
-  evaluates heating anomalies only. Keep `HVAC_LOAD_APPLY=False` and
-  `PV_WEATHER_APPLY=False` while collecting repaired shadow rows. Re-enable each gate
-  independently only after multiple full holdout days show a material reduction in
-  error; summer history tentatively supports `HVAC_ALPHA_COOL=2.0`, while heating
-  still requires winter data.
+  `python scripts/validate_forecasts.py --dir data/history`
 
-  Immediate validation of the repaired implementation has passed: configuration and
-  provider azimuth, 144-hour weather coverage, cooling-mode selection, disabled apply
-  gates, bounded slot adjustments, Weather-tab presentation, and the new settlement
-  fields all checked out. Deferred operational validation that needs future slots or
-  additional seasons remains:
+  Current valid load evidence is **13** complete days / **1,223** unique
+  quarter-hour slots: baseline MAE **0.106831** kWh versus weather shadow
+  **0.103834** kWh (**2.8%** improvement; 7 improved, 3 tied, 3 worse). Its
+  day-block confidence interval still includes harm, so the correct result is
+  `KEEP_APPLY_OFF`. The old raw PV comparison is diagnostic only (3.9%
+  improvement on 13 days) because it predates matched post-nowcast branches;
+  new `final_baseline_pv_forecast_kwh` and
+  `final_weather_pv_shadow_kwh` records are required before PV can be judged.
 
-  - Over several replans and through the end of a day, confirm the HVAC adjustment
-    remains stable as the horizon shrinks, does not accumulate into late slots, and
-    stays below the temporary investigation threshold of 0.5 kWh per 15-minute slot.
-  - At sunset on multiple days, confirm a fresh live 0 W PV reading suppresses any
-    stale near-term PV forecast. `pv_nowcast_source=live_drop` is expected when a
-    correction is needed; no applied correction is correct when the baseline is
-    already zero.
-  - After at least 7 complete days, preferably 14 with varied temperature and cloud
-    cover, compare baseline versus shadow forecasts against settlement measurements.
-    Require roughly 5% lower combined MAE, improvement on a majority of complete
-    days, no materially worse bias, and no recurring oversized adjustments before
-    enabling either apply gate.
-  - Evaluate HVAC and PV separately and enable at most one apply gate at a time,
-    followed by another multi-day observation period to catch optimizer-plan
-    instability or unintended schedule changes.
-  - Do not enable or declare the heating model validated from summer cooling data.
-    Collect and evaluate at least 7–14 complete winter-mode days with meaningful
-    heating demand before selecting `HVAC_ALPHA_HEAT` or enabling winter HVAC apply.
+  - Re-run after at least 14 complete local calendar days. A branch only earns
+    human review if it has at least 80 distinct quarter-hours/day, at least 80%
+    of the expected local-day slots, evidence close to both local-day boundaries,
+    improves MAE by at least 5% on a majority of days, does not materially worsen
+    bias, has a day-block confidence interval excluding harm, and stays within
+    the 0.5 kWh/slot adjustment bound. The evaluator accounts for 92/100-slot
+    daylight-saving days and uses unrounded values for every threshold decision.
+  - Evaluate HVAC/load and PV independently. Enable at most one gate at a time,
+    then collect another multi-day holdout period; nothing changes automatically.
+  - Do not tune `HVAC_ALPHA_HEAT` or claim heating validation from summer cooling
+    data. Winter needs its own meaningful heating sample.
+
+- **ESS dispatch-efficiency counterfactuals** — The exported AI plan now contains
+  an explicit, timestamped physical/economic snapshot for an offline comparison
+  of three simplified candidates: market arbitrage, PV-first self-sufficiency,
+  and a protected hybrid. Run it explicitly, never from the live service:
+
+  `python scripts/evaluate_ess_strategies.py --plan /dev/shm/cerbo_ai_plan.json --json`
+
+  The evaluator is read-only: it does not import the broker/settings/MQTT/Victron,
+  select a winner, persist a background job, or change dispatch. It is a research
+  baseline, not a second production optimizer; it intentionally does not model
+  every live guardrail/device response. After deployment, issue one normal replan
+  before using the command so the exported plan has its explicit assumptions; a
+  pre-upgrade plan requires the visibly labelled `--use-research-defaults` mode.
+  Before proposing a seasonal-policy change,
+  collect comparable snapshots over at least 14 complete days and compare net grid result
+  (export reward minus import cost),
+  import/export, battery DC throughput/full-equivalent cycles, minimum/protected SoC,
+  terminal SoC and realised settlement. Do not use future actual PV/load to choose a
+  historical "winner", and do not change Summer/Winter behaviour from one scenario.
 
 ## EV smart-charge scheduling — operator validation / learning follow-up
 
@@ -221,20 +208,6 @@ have been completed:
 - Collect several completed sessions before tuning `EV_BATTERY_USABLE_KWH`,
   `EV_CHARGE_EFFICIENCY`, `EV_EXPECTED_DELIVERY_KW`, startup delay, or high-SoC
   taper. Do not auto-learn/apply these from one session.
-
-## Onecta module for data and control of Daikin Airco units
-- Phase 0 discovery and Phase 1 monitoring are implemented. The four real units,
-  cumulative cooling/heating energy and retained `hvac/#` state are available.
-- A top-level HVAC page and separately gated, capability-driven manual controls
-  are implemented. Keep `ONECTA_CONTROL_ENABLED=False` until the disabled/read-only
-  presentation and each desired real-unit command have been reviewed manually.
-- Complete one real-unit command matrix for power, mode, setpoint, fan,
-  horizontal/vertical airflow, and Powerful; verify accepted commands converge
-  in the cached UI without manual refresh and remain within the daily API reserve.
-- Streamer is not advertised by any installed unit's official API capabilities;
-  revisit only if Daikin adds a readable/settable purification characteristic.
-- Continue multi-day shadow validation before allowing ONECTA data to alter load
-  forecasts. Scheduling and comfort-aware optimizer orchestration remain future work.
 
 # Bugs / Testing
 - None known at this time
