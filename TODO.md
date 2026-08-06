@@ -80,7 +80,7 @@
   - Do not tune `HVAC_ALPHA_HEAT` or claim heating validation from summer cooling
     data. Winter needs its own meaningful heating sample.
 
-- **ESS dispatch-efficiency counterfactuals** — The exported AI plan now contains
+- **ESS dispatch-efficiency counterfactuals** — The exported AI plan contains
   an explicit, timestamped physical/economic snapshot for an offline comparison
   of three simplified candidates: market arbitrage, PV-first self-sufficiency,
   and a protected hybrid. Run it explicitly, never from the live service:
@@ -93,12 +93,67 @@
   every live guardrail/device response. After deployment, issue one normal replan
   before using the command so the exported plan has its explicit assumptions; a
   pre-upgrade plan requires the visibly labelled `--use-research-defaults` mode.
+
+  **Comparison basis corrected (2026-08-06); earlier candidate numbers are void.**
+  The report previously totalled each candidate over the *whole* plan horizon —
+  roughly 32 hours once tomorrow's Tibber prices publish around 13:00 — while the
+  Advisor panel scored it against the dashboard's today-only tile. Tomorrow's
+  revenue was therefore read as today's, and the alternatives looked
+  overwhelmingly better than the active plan (a representative afternoon showed
+  market arbitrage at `+€19.92` against a live `+€6.74`). Every row is now one
+  calendar day, midnight to midnight: the already-settled part of today
+  (`plan.today_actuals`, an identical constant in every row) plus that policy's
+  planned remainder. Candidates still optimize over the full known horizon;
+  only the reported window is today. `plan_baseline` re-totals the active plan's
+  own per-slot flows through the same function as the candidates, so the rows
+  differ only by policy, and it ties to the dashboard Today tile in attended
+  checks. `schema_version` is 2.
+
+  On the same afternoon's plan the corrected ranking inverted: live plan `+€7.09`
+  (after wear `+€5.90`), market arbitrage `+€5.84` (`+€4.76`), protected hybrid
+  `+€0.03` (`−€0.52`), PV-first `−€5.74` (`−€5.78`). `market_arbitrage`'s
+  constraint set is in fact already the live engine's own (same reserve floor,
+  same grid-charge cap, export permitted), which is consistent with a small
+  spread rather than a large one.
+
+  - **Open validation (started 2026-08-06):** watch the Advisor strategy panel
+    over several days and confirm the ranking is stable when the battery does
+    *not* start the window at 100% SoC, and across BUY/RETAIN/SELL afternoons.
+    The single validated sample so far began at 100%.
+  - Read `carried_energy_kwh` / `carried_energy_value_eur` alongside every
+    whole-day figure. A today-only total credits a policy for selling stored
+    energy but never debits the emptier battery it hands to tomorrow, so a
+    policy that ends the day flat can outscore one that ends it full purely by
+    borrowing from tomorrow. On the sample above the four policies sat within
+    about €0.90 of each other once carried value was added back.
+  - Do not reintroduce a comparison against `day_summary`: that tile applies
+    different per-slot rules (it suppresses IDLE PV-surplus export revenue and
+    fraction-weights the active slot). `tests/test_90_mobile_ux_static.py`
+    pins this out of the Advisor panel.
+
   Before proposing a seasonal-policy change,
   collect comparable snapshots over at least 14 complete days and compare net grid result
   (export reward minus import cost),
   import/export, battery DC throughput/full-equivalent cycles, minimum/protected SoC,
   terminal SoC and realised settlement. Do not use future actual PV/load to choose a
   historical "winner", and do not change Summer/Winter behaviour from one scenario.
+
+- **Per-day strategy override (proposed, not implemented)** — Requested: select
+  an alternative strategy in the Advisor and have it drive dispatch for the rest
+  of the day, reverting to the AI optimizer at midnight. Deliberately deferred
+  until the corrected counterfactual has collected enough days to show a
+  candidate genuinely and repeatably beating the live plan — the original
+  motivation for the feature rested on the void horizon-vs-today comparison
+  above. Design notes for when it is revisited: the three candidates are
+  *constraint sets*, not planners, so this must be a policy override applied to
+  the existing engine at the `optimize_schedule()` choke point, never a second
+  optimizer. It needs one new DP constraint (`allow_active_battery_export`,
+  defaulting to today's behaviour), read-time expiry from a durable JSON store
+  so a missed tick or restart cannot strand it, refusal in Winter Mode
+  (separate engine, separate reserve policy), a hard invariant that it can never
+  lower the planning floor below `current_min_soc_reserve()` or touch
+  `VICTRON_HARDWARE_MIN_SOC`, and `strategy_override` recorded into the plan
+  JSON and history so every slot stays attributable.
 
 ## EV smart-charge scheduling — operator validation / learning follow-up
 

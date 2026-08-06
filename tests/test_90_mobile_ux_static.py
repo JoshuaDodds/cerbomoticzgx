@@ -557,6 +557,29 @@ def test_advisor_latest_report_loads_on_browser_startup():
     assert "function clearAdvisorChat(" in js
 
 
+def test_strategy_panel_compares_every_row_on_the_reports_own_whole_day_basis():
+    """The alternatives must be read against the report's own live-plan row.
+
+    The day-summary tile is built with different per-slot rules (it suppresses
+    IDLE PV-surplus revenue and folds in fraction-weighted actuals), so scoring
+    candidates against it overstated them by several euro. The comparison row
+    now comes from plan_baseline, computed by the same code as the candidates.
+    """
+    js = APP_JS.read_text(encoding="utf-8")
+    panel = js[js.index("function advisorStrategyRow("):]
+    panel = panel[:panel.index("\nasync function runAdvisorTool(")]
+
+    assert "report.plan_baseline" in panel
+    assert "settled_today" in panel
+    assert "whole_day_cash_net_eur" in panel
+    assert "whole_day_economic_net_eur" in panel
+    assert "carried_energy_kwh" in panel
+    # The horizon-wide totals and the dashboard tile must not drive these rows.
+    assert "day_summary" not in panel
+    assert "candidate.cash_net_eur" not in panel
+    assert "candidate.economic_net_eur" not in panel
+
+
 def test_advisor_exposes_read_only_forecast_and_strategy_tools():
     html = INDEX_HTML.read_text(encoding="utf-8")
     js = APP_JS.read_text(encoding="utf-8")

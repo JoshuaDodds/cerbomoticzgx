@@ -12,6 +12,8 @@ from lib.ess_strategy_candidates import (
     CandidateConfig,
     DeterministicSlot,
     evaluate_shadow_candidates,
+    first_local_day_steps,
+    summarize_steps,
 )
 
 
@@ -208,3 +210,113 @@ def test_reports_infeasibility_without_falling_back_to_a_real_control_path():
         assert candidate.feasible is False
         assert candidate.rejection_reason == "no_physical_feasible_schedule"
         assert candidate.schedule == ()
+
+
+def _cross_midnight_slots():
+    """Two slots on 01 June and two on 02 June, in local (+02:00) time."""
+    tz = timezone(timedelta(hours=2))
+    start = datetime(2030, 6, 1, 22, 0, tzinfo=tz)
+    prices = (0.50, 0.40, 0.10, 0.10)
+    return tuple(
+        DeterministicSlot(
+            start=start + timedelta(hours=index),
+            duration_h=1.0,
+            buy_price=price,
+            load_kwh=0.0,
+            pv_kwh=0.0,
+        )
+        for index, price in enumerate(prices)
+    )
+
+
+def test_first_local_day_steps_splits_a_horizon_at_the_local_midnight():
+    candidates = evaluate_shadow_candidates(
+        _cross_midnight_slots(),
+        initial_soc_percent=100.0,
+        config=_config(protected_soc_percent=20.0),
+    )
+    schedule = candidates["market_arbitrage"].schedule
+
+    today = first_local_day_steps(schedule)
+
+    assert len(schedule) == 4
+    assert len(today) == 2
+    assert {step.start.date() for step in today} == {datetime(2030, 6, 1).date()}
+    assert today == schedule[:2]
+
+
+def test_first_local_day_steps_is_empty_for_an_empty_or_untyped_schedule():
+    assert first_local_day_steps(()) == ()
+
+
+def test_window_totals_of_the_day_slices_sum_back_to_the_full_horizon():
+    # The today window is a reporting projection, never a second optimization,
+    # so slicing must not create or destroy any euro of the evaluated plan.
+    config = _config(protected_soc_percent=20.0)
+    candidate = evaluate_shadow_candidates(
+        _cross_midnight_slots(),
+        initial_soc_percent=100.0,
+        config=config,
+    )["market_arbitrage"]
+    schedule = candidate.schedule
+    today = first_local_day_steps(schedule)
+    tomorrow = schedule[len(today):]
+
+    today_totals = summarize_steps(today, config)
+    tomorrow_totals = summarize_steps(tomorrow, config)
+
+    assert today_totals.cash_net_eur + tomorrow_totals.cash_net_eur == pytest.approx(
+        candidate.cash_net_eur
+    )
+    assert (today_totals.lifecycle_cost_eur + tomorrow_totals.lifecycle_cost_eur
+            == pytest.approx(candidate.lifecycle_cost_eur))
+    assert (today_totals.dc_throughput_kwh + tomorrow_totals.dc_throughput_kwh
+            == pytest.approx(candidate.dc_throughput_kwh))
+    assert today_totals.opening_soc_percent == pytest.approx(100.0)
+    assert today_totals.closing_soc_percent == pytest.approx(
+        tomorrow_totals.opening_soc_percent
+    )
+
+
+def test_summarize_steps_uses_the_evaluator_arithmetic_and_reports_the_window_edges():
+    config = _config(protected_soc_percent=20.0, cycle_cost_eur_per_dc_kwh=0.03)
+    candidate = evaluate_shadow_candidates(
+        _cross_midnight_slots(),
+        initial_soc_percent=100.0,
+        config=config,
+    )["market_arbitrage"]
+    today = first_local_day_steps(candidate.schedule)
+
+    totals = summarize_steps(today, config)
+
+    assert totals.slot_count == 2
+    assert totals.window_start == today[0].start
+    # The window ends on the local midnight boundary, not on the last slot start.
+    assert totals.window_end == today[-1].start + timedelta(hours=1)
+    assert totals.import_cost_eur == pytest.approx(
+        sum(step.grid_import_kwh * step.buy_price for step in today)
+    )
+    assert totals.export_reward_eur == pytest.approx(
+        sum(step.grid_export_kwh * step.sell_price for step in today)
+    )
+    assert totals.cash_net_eur == pytest.approx(
+        totals.export_reward_eur - totals.import_cost_eur
+    )
+    assert totals.economic_net_eur == pytest.approx(
+        totals.cash_net_eur - totals.lifecycle_cost_eur
+    )
+    assert totals.lifecycle_cost_eur == pytest.approx(totals.dc_discharge_kwh * 0.03)
+
+
+def test_summarize_steps_of_an_empty_window_is_zero_rather_than_undefined():
+    totals = summarize_steps((), _config())
+
+    assert totals.slot_count == 0
+    assert totals.cash_net_eur == 0.0
+    assert totals.economic_net_eur == 0.0
+    assert totals.dc_throughput_kwh == 0.0
+    assert totals.full_equivalent_cycles == 0.0
+    assert totals.window_start is None
+    assert totals.window_end is None
+    assert totals.opening_soc_percent is None
+    assert totals.closing_soc_percent is None

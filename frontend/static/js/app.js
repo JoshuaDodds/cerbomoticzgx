@@ -2480,30 +2480,49 @@ function advisorCandidateLabel(candidateId) {
   })[candidateId] || candidateId;
 }
 
+// Every row below is a whole calendar day: the already-settled part of today
+// plus that policy's planned remainder. The report supplies the live plan's own
+// figure on exactly that basis, so this must NOT fall back to the day-summary
+// tile — that number is built with different per-slot rules and mixing the two
+// is what made the alternatives look far better than they are.
+function advisorStrategyRow(label, today, extra) {
+  if (!today) return `<li><strong>${_esc(label)}</strong> — no result for today.</li>`;
+  const carried = today.carried_energy_kwh == null
+    ? ""
+    : ` Leaves ${_esc(Number(today.carried_energy_kwh).toFixed(1))} kWh in the battery at midnight (worth ${_esc(advisorToolEur(today.carried_energy_value_eur))} tomorrow).`;
+  return `<li><strong>${_esc(label)}</strong>
+    <span>Grid result ${_esc(advisorToolEur(today.whole_day_cash_net_eur))}; after battery wear ${_esc(advisorToolEur(today.whole_day_economic_net_eur))}; battery use ${_esc(Number(today.full_equivalent_cycles || 0).toFixed(3))} full cycles.${carried}</span>
+    ${extra ? `<small>${_esc(extra)}</small>` : ""}</li>`;
+}
+
 function renderEssStrategyTool(report) {
   const plan = lastPlan || {};
   const current = plan.current || {};
-  const today = ((plan.day_summary && plan.day_summary.days) || []).find((day) => day.is_today) || {};
   const liveAction = current.control_action || current.action || "—";
   const liveReason = current.reason_code || "";
-  // Dashboard day-summary net is cost minus reward; the strategy report's
-  // Grid result is reward minus cost, so invert it for the shared wording.
-  const liveNet = today.net != null ? advisorToolEur(-Number(today.net)) : "—";
+  const baseline = (report && report.plan_baseline) || {};
+  const settled = report && report.settled_today;
   const candidates = Object.entries((report && report.candidates) || {});
   const rows = candidates.map(([candidateId, candidate]) => {
     if (!candidate || !candidate.feasible) {
       return `<li><strong>${_esc(advisorCandidateLabel(candidateId))}</strong> — unavailable: ${_esc((candidate && candidate.rejection_reason) || "unknown reason")}</li>`;
     }
-    return `<li><strong>${_esc(advisorCandidateLabel(candidateId))}</strong>
-      <span>Grid result ${_esc(advisorToolEur(candidate.cash_net_eur))}; after battery wear ${_esc(advisorToolEur(candidate.economic_net_eur))}; battery use ${_esc(Number(candidate.full_equivalent_cycles || 0).toFixed(3))} full cycles.</span></li>`;
+    return advisorStrategyRow(advisorCandidateLabel(candidateId), candidate.today, "");
   }).join("");
+  const liveRow = baseline.available
+    ? advisorStrategyRow("Live plan (active)", baseline.today, "")
+    : `<li><strong>Live plan (active)</strong> — not comparable: ${_esc(baseline.unavailable_reason || "the published plan is missing per-slot grid flows")}.</li>`;
+  const settledNote = settled
+    ? `Already settled today, identical in every row: ${_esc(advisorToolEur(settled.cash_net_eur))}.`
+    : "This plan carries no settled totals for today, so the rows below cover only the planned remainder of today.";
   return `<div class="advisor-tool-summary">
     <div class="advisor-live-plan"><strong>CURRENT LIVE PLAN</strong>
-      <span>AI Optimizer — ${_esc(liveAction)}${liveReason ? ` · ${_esc(liveReason)}` : ""}; today’s projected result ${_esc(liveNet)}.</span>
+      <span>AI Optimizer — ${_esc(liveAction)}${liveReason ? ` · ${_esc(liveReason)}` : ""}.</span>
       <small>This is the plan currently used for forecast and dispatch. None of the alternatives below is active.</small>
     </div>
+    <p class="muted">Whole day, midnight to midnight — the same basis as the Today tile. ${settledNote} Alternatives still plan over the full known horizon; only their result is limited to today.</p>
     <p class="muted">Grid result = export reward − import cost. After battery wear subtracts estimated battery cycle cost.</p>
-    <ul>${rows || "<li>No candidate data was returned.</li>"}</ul>
+    <ul>${liveRow}${rows || "<li>No candidate data was returned.</li>"}</ul>
   </div>`;
 }
 

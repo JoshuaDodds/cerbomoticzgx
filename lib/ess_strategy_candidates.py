@@ -25,7 +25,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass
 from math import isfinite
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Iterable, Optional
 
 
@@ -619,6 +619,25 @@ def _terminal_value(
     return usable_dc * config.terminal_value_eur_per_dc_kwh
 
 
+def _local_date(value: Any) -> Optional[date]:
+    """Return the calendar day a slot/step timestamp falls on, or None.
+
+    Aware timestamps resolve in their own UTC offset, which is the local day the
+    price slot was published for.  ``datetime`` is checked first because it is a
+    subclass of ``date``.
+    """
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).date()
+        except ValueError:
+            return None
+    return None
+
+
 def _horizon_crosses_day(slots: tuple[DeterministicSlot, ...]) -> bool:
     """True only when supplied slot timestamps prove a multi-day horizon.
 
@@ -629,19 +648,105 @@ def _horizon_crosses_day(slots: tuple[DeterministicSlot, ...]) -> bool:
     """
     dates = set()
     for slot in slots:
-        value = slot.start
-        if isinstance(value, datetime):
-            dates.add(value.date())
-        elif isinstance(value, date):
-            dates.add(value)
-        elif isinstance(value, str):
-            try:
-                dates.add(datetime.fromisoformat(value.replace("Z", "+00:00")).date())
-            except ValueError:
-                return False
-        else:
+        parsed = _local_date(slot.start)
+        if parsed is None:
             return False
+        dates.add(parsed)
     return len(dates) > 1
+
+
+@dataclass(frozen=True)
+class WindowTotals:
+    """Metrics for one sub-window of an already-evaluated candidate schedule.
+
+    This is a *reporting* projection, never a second optimization.  The
+    candidate still plans over the whole supplied horizon, so a strategy that
+    rationally holds charge through midnight keeps that decision; only the
+    attribution of its cash flows is restricted to the window.
+    """
+
+    slot_count: int
+    window_start: Any
+    window_end: Any
+    cash_net_eur: float
+    import_cost_eur: float
+    export_reward_eur: float
+    lifecycle_cost_eur: float
+    economic_net_eur: float
+    grid_import_kwh: float
+    grid_export_kwh: float
+    dc_charge_kwh: float
+    dc_discharge_kwh: float
+    dc_throughput_kwh: float
+    full_equivalent_cycles: float
+    opening_soc_percent: Optional[float]
+    closing_soc_percent: Optional[float]
+
+
+def first_local_day_steps(
+    steps: Iterable[CandidateStep],
+) -> tuple[CandidateStep, ...]:
+    """Return the steps falling on the first calendar day of a schedule.
+
+    A published plan begins at the current slot, so this is the remainder of
+    today.  An unparseable leading timestamp yields no steps rather than a
+    silently mis-attributed window.
+    """
+    ordered = tuple(steps)
+    if not ordered:
+        return ()
+    first_day = _local_date(ordered[0].start)
+    if first_day is None:
+        return ()
+    return tuple(
+        step for step in ordered if _local_date(step.start) == first_day
+    )
+
+
+def _window_end(steps: tuple[CandidateStep, ...]) -> Any:
+    if not steps:
+        return None
+    last = steps[-1]
+    if isinstance(last.start, datetime):
+        return last.start + timedelta(hours=last.duration_h)
+    return None
+
+
+def summarize_steps(
+    steps: Iterable[CandidateStep],
+    config: CandidateConfig,
+) -> WindowTotals:
+    """Total one window of candidate steps using the evaluator's own arithmetic.
+
+    Import/export are taken exactly as the model booked them so a candidate and
+    a live-plan baseline summed by this function stay directly comparable.
+    """
+    ordered = tuple(steps)
+    import_cost = sum(step.grid_import_kwh * step.buy_price for step in ordered)
+    export_reward = sum(step.grid_export_kwh * step.sell_price for step in ordered)
+    dc_charge = sum(max(0.0, step.dc_change_kwh) for step in ordered)
+    dc_discharge = sum(max(0.0, -step.dc_change_kwh) for step in ordered)
+    lifecycle_cost = dc_discharge * config.cycle_cost_eur_per_dc_kwh
+    cash_net = export_reward - import_cost
+    throughput = dc_charge + dc_discharge
+    return WindowTotals(
+        slot_count=len(ordered),
+        window_start=ordered[0].start if ordered else None,
+        window_end=_window_end(ordered),
+        cash_net_eur=cash_net,
+        import_cost_eur=import_cost,
+        export_reward_eur=export_reward,
+        lifecycle_cost_eur=lifecycle_cost,
+        economic_net_eur=cash_net - lifecycle_cost,
+        grid_import_kwh=sum(step.grid_import_kwh for step in ordered),
+        grid_export_kwh=sum(step.grid_export_kwh for step in ordered),
+        dc_charge_kwh=dc_charge,
+        dc_discharge_kwh=dc_discharge,
+        dc_throughput_kwh=throughput,
+        full_equivalent_cycles=throughput / (2.0 * config.battery_capacity_kwh),
+        opening_soc_percent=ordered[0].soc_start_percent if ordered else None,
+        closing_soc_percent=ordered[-1].soc_end_percent if ordered else None,
+    )
 
 
 __all__ = [
@@ -649,5 +754,8 @@ __all__ = [
     "CandidateResult",
     "CandidateStep",
     "DeterministicSlot",
+    "WindowTotals",
     "evaluate_shadow_candidates",
+    "first_local_day_steps",
+    "summarize_steps",
 ]
