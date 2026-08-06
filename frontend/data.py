@@ -24,6 +24,7 @@ from lib.config_paths import env_path as runtime_env_path
 from lib import history_store as _hist
 from lib import tesla_budget as _tesla_budget
 from lib.ev_history import attribute_ev_grid_cost, measured_ev_sessions
+from lib.forecast_projection import slot_remaining_fraction
 
 DEFAULT_PLAN_PATH = "/dev/shm/cerbo_ai_plan.json"
 MIN_FORECAST_BOX_SAMPLES = 8
@@ -273,8 +274,14 @@ def projected_today_net_eur() -> float | None:
     if not schedule:
         return None
     try:
-        today = datetime.now().date().isoformat()
-        summary = day_summary(schedule, raw.get("today_actuals"))
+        now = datetime.now().astimezone()
+        today = now.date().isoformat()
+        summary = day_summary(
+            schedule,
+            raw.get("today_actuals"),
+            as_of=now,
+            slot_duration_h=_f(raw.get("slot_duration_h")) or 0.25,
+        )
         row = next((d for d in summary.get("days", []) if d.get("date") == today), None)
         if not row or row.get("net") is None:
             return None
@@ -398,7 +405,7 @@ def is_idle(slot) -> bool:
 PV_SURPLUS_FULL_SOC = 99.0
 
 
-def _forward_grid_econ(slot):
+def _forward_grid_econ(slot, *, fraction: float = 1.0):
     """Projected grid economics ``(import_kwh, import_cost, export_kwh, export_rev)``
     for an unsettled slot, matched to what will actually settle at the meter.
 
@@ -410,9 +417,15 @@ def _forward_grid_econ(slot):
     so the running projection still converges to the settled day total without
     booking phantom self-consumption "profit".
     """
-    g = slot.get("grid_energy", 0.0) or 0.0
-    buy = slot.get("price", 0.0) or 0.0
-    sell = slot.get("sell", buy) or buy
+    # The active optimiser slot begins at the preceding 15-minute boundary,
+    # whereas Tibber's cumulative daily counters already include its elapsed
+    # energy.  Only book the portion after ``as_of`` as forecast.
+    try:
+        g = float(slot.get("grid_energy", 0.0) or 0.0) * float(fraction)
+        buy = float(slot.get("price", 0.0) or 0.0)
+        sell = float(slot.get("sell", buy) or buy)
+    except (TypeError, ValueError):
+        return 0.0, 0.0, 0.0, 0.0
     if g > 0:
         return g, g * buy, 0.0, 0.0
     if g < 0:
@@ -810,13 +823,29 @@ def group_by_hour(schedule: list) -> list:
     return result
 
 
-def day_summary(schedule: list, today_actuals: dict | None) -> dict:
-    """Per-calendar-day cost forecast, folding in today's actuals."""
+def day_summary(
+    schedule: list,
+    today_actuals: dict | None,
+    *,
+    as_of: datetime | None = None,
+    slot_duration_h: float = 0.25,
+) -> dict:
+    """Per-calendar-day cost forecast, folding in today's actuals.
+
+    ``as_of`` makes the current slot's forecast strictly forward-looking.  It
+    is optional for compatibility with callers rendering a wholly historical
+    schedule, where every supplied slot remains a complete forecast slot.
+    """
     days = {}
     order = []
     for slot in schedule:
         dt = _parse_time(slot.get("time"))
         if dt is None:
+            continue
+        fraction = (slot_remaining_fraction(
+            slot, as_of=as_of, default_duration_h=slot_duration_h)
+            if as_of is not None else 1.0)
+        if fraction <= 0.0:
             continue
         d = dt.date().isoformat()
         if d not in days:
@@ -828,13 +857,14 @@ def day_summary(schedule: list, today_actuals: dict | None) -> dict:
         # non-full battery charges it (SoC up / cost basis down, no grid revenue)
         # rather than exporting — see _forward_grid_econ — so the forecast stays
         # complete and converges to the settled actuals without phantom profit.
-        f_imp_kwh, f_imp_cost, f_exp_kwh, f_exp_rev = _forward_grid_econ(slot)
+        f_imp_kwh, f_imp_cost, f_exp_kwh, f_exp_rev = _forward_grid_econ(
+            slot, fraction=fraction)
         days[d]["import_kwh"] += f_imp_kwh
         days[d]["import_cost"] += f_imp_cost
         days[d]["export_kwh"] += f_exp_kwh
         days[d]["export_rev"] += f_exp_rev
 
-    today = datetime.now().date().isoformat()
+    today = (as_of.date() if as_of is not None else datetime.now().date()).isoformat()
     rows = []
     _keys = ("import_kwh", "import_cost", "export_kwh", "export_rev")
     for d in order:
@@ -883,6 +913,7 @@ def get_plan() -> dict:
             age_s = None
 
     schedule = raw.get("schedule", [])
+    projection_as_of = datetime.now().astimezone()
     forecast_start = schedule[0].get("time") if schedule else None
     timeline_schedule = settled_slots_for_today(forecast_start) + schedule
     return {
@@ -908,7 +939,12 @@ def get_plan() -> dict:
         "victron_slots": raw.get("victron_slots", []),
         "ev_smart_charge": raw.get("ev_smart_charge") or raw.get("ev_charge_plan"),
         "hours": group_by_hour(timeline_schedule),
-        "day_summary": day_summary(schedule, raw.get("today_actuals")),
+        "day_summary": day_summary(
+            schedule,
+            raw.get("today_actuals"),
+            as_of=projection_as_of,
+            slot_duration_h=_f(raw.get("slot_duration_h")) or 0.25,
+        ),
         "mtd_net": mtd_net_eur(),
     }
 

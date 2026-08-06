@@ -2,6 +2,7 @@ import time
 import threading
 import math
 import schedule as scheduler
+from datetime import datetime as _dt
 
 from paho.mqtt import publish
 from lib.config_retrieval import retrieve_setting
@@ -21,6 +22,7 @@ from lib.ess_optimizer_selector import (
 from lib.appliance_mode import APPLIANCE_OPTIMIZATION_ENABLED
 from lib import history_store as _hist
 from lib.ev_history import attribute_ev_grid_cost
+from lib.forecast_projection import slot_remaining_fraction
 
 STATE = GlobalStateClient()
 
@@ -62,6 +64,9 @@ _WEATHER_LOAD_LOG_THRESHOLD_KWH = 0.10
 _WEATHER_PV_SHIFT_LOG_THRESHOLD_KWH = 0.25
 _WEATHER_PV_TOTAL_LOG_THRESHOLD_KWH = 0.10
 _AI_OPTIMIZER_LOCK = threading.Lock()
+# The optional strategy evaluator must never overlap itself or delay the live
+# controller.  It is deliberately separate from _AI_OPTIMIZER_LOCK because it
+# runs only on a frozen snapshot after all operational work has completed.
 
 # History classification guardrails. These do not constrain live control; they
 # only decide whether a sample is trustworthy enough to teach the optimizer.
@@ -639,6 +644,23 @@ def run_daily_price_update_and_optimize():
 
 PV_DAYLIGHT_START_H, PV_DAYLIGHT_END_H = 5, 22
 
+# Live PV is valuable near-term evidence, but one transient meter sample must not
+# overwrite several hours of a day forecast.  These are intentionally internal
+# safety bounds rather than user tunables: they protect the control forecast from
+# a common telemetry edge without increasing configuration surface.
+_PV_NOWCAST_LIVE_FRESH_SECONDS = 120.0
+_PV_NOWCAST_DROP_RATIO = 0.75
+_PV_NOWCAST_DROP_CONFIRMATION_SECONDS = 45.0
+_PV_NOWCAST_DROP_CANDIDATE_MAX_AGE_SECONDS = 20.0 * 60.0
+_PV_NOWCAST_SUNSET_EARLY_MINUTES = 15
+_PV_NOWCAST_CONFIRMED_DROP_WEIGHT_CAP = 0.45
+_PV_NOWCAST_HORIZON_H = 1.0
+_PV_NOWCAST_STAGE = "post_nowcast"
+_PV_NOWCAST_PIPELINE_VERSION = "pv-nowcast-confidence-v3"
+_PV_NOWCAST_ANCHOR_UNSET = object()
+_PV_NOWCAST_DROP_CANDIDATE = None
+_PV_NOWCAST_DROP_LOCK = threading.Lock()
+
 
 def _pv_shape_by_slot(days: int = 3) -> dict:
     """Learned PV *shape*: mean realised PV power (kW) per quarter-hour-of-day
@@ -924,74 +946,262 @@ def _latest_settled_pv_slot_kwh(slot_duration_h: float, now=None) -> float | Non
     return None
 
 
-def _pv_nowcast_anchor_kwh(slot_duration_h: float, now=None) -> dict | None:
-    """Choose a per-slot PV anchor from the latest actual slot and live PV.
+def _pv_nowcast_near_sunset(now) -> bool:
+    """Whether a fresh zero is credible immediately because daylight is ending.
 
-    The latest settled slot captures what the system just did; live PV captures
-    sudden drop-offs. When live output is materially below the previous slot, use
-    live PV and reduce confidence so the forecast follows the tree-line/sundown
-    drop instead of projecting stale high output forward.
+    Domoticz publishes the day's local sunset time.  Use it when available and
+    allow a small lead-in because the array can fall to zero shortly before the
+    astronomical sunset due to local shading.  The learned PV window is only a
+    conservative fallback for startup/error cases where that topic is absent.
     """
+    try:
+        now_minutes = int(now.hour) * 60 + int(now.minute)
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+    sunset_minutes = None
+    try:
+        text = str(STATE.get('sun_set') or '').strip()
+        hours, minutes = text.split(':', 1)
+        sunset_minutes = int(hours) * 60 + int(minutes[:2])
+        if not 0 <= sunset_minutes < 24 * 60:
+            sunset_minutes = None
+    except (AttributeError, TypeError, ValueError):
+        sunset_minutes = None
+
+    if sunset_minutes is not None:
+        return now_minutes >= max(0, sunset_minutes - _PV_NOWCAST_SUNSET_EARLY_MINUTES)
+    return now.hour >= max(PV_DAYLIGHT_START_H, PV_DAYLIGHT_END_H - 1)
+
+
+def _clear_pv_nowcast_drop_candidate() -> bool:
+    """Forget a provisional daytime PV-drop observation.
+
+    This is deliberately process-local.  A restart should require fresh evidence
+    before lowering PV, which is safer than inheriting an unverified low reading.
+    """
+    global _PV_NOWCAST_DROP_CANDIDATE
+    with _PV_NOWCAST_DROP_LOCK:
+        had_candidate = _PV_NOWCAST_DROP_CANDIDATE is not None
+        _PV_NOWCAST_DROP_CANDIDATE = None
+    return had_candidate
+
+
+def _pv_nowcast_drop_confidence(
+    *,
+    now,
+    updated_at: float,
+    live_slot_kwh: float,
+    recent_slot_kwh: float,
+    drop_ratio: float,
+) -> dict:
+    """Return the confidence state for a daylight live-PV drop.
+
+    A candidate is confirmed only after two distinct fresh telemetry updates
+    spanning a short interval.  Repeated optimizer calls looking at the same MQTT
+    measurement therefore cannot turn one bad sample into an active forecast
+    correction.  The state stays local to this process so a service restart is
+    conservatively a fresh observation.
+    """
+    global _PV_NOWCAST_DROP_CANDIDATE
+
+    try:
+        now_ts = float(now.timestamp())
+    except (AttributeError, TypeError, ValueError):
+        now_ts = time.time()
+    date_key = getattr(now, 'date', lambda: None)()
+
+    with _PV_NOWCAST_DROP_LOCK:
+        candidate = _PV_NOWCAST_DROP_CANDIDATE
+        if candidate is not None:
+            # Age the provisional evidence from the *source telemetry timestamp*,
+            # not from the most recent optimizer read.  The optimizer may inspect
+            # exactly the same retained MQTT value many times; refreshing an
+            # observation's wall-clock "seen" time would let one bad zero survive
+            # indefinitely and eventually be paired with an unrelated later drop.
+            stale = (
+                now_ts - float(candidate.get('last_update_at', now_ts))
+                > _PV_NOWCAST_DROP_CANDIDATE_MAX_AGE_SECONDS
+            )
+            if stale or candidate.get('date') != date_key:
+                candidate = None
+
+        if candidate is None:
+            candidate = {
+                'date': date_key,
+                'first_update_at': updated_at,
+                'last_update_at': updated_at,
+                'samples': 1,
+            }
+        else:
+            previous_update = float(candidate.get('last_update_at', updated_at))
+            if updated_at > previous_update + 1e-6:
+                candidate['samples'] = int(candidate.get('samples', 1)) + 1
+                candidate['last_update_at'] = updated_at
+
+        candidate['live_slot_kwh'] = live_slot_kwh
+        candidate['recent_slot_kwh'] = recent_slot_kwh
+        candidate['drop_ratio'] = drop_ratio
+        _PV_NOWCAST_DROP_CANDIDATE = candidate
+
+        samples = int(candidate.get('samples', 1))
+        elapsed = max(
+            0.0,
+            float(candidate.get('last_update_at', updated_at))
+            - float(candidate.get('first_update_at', updated_at)),
+        )
+        confirmed = samples >= 2 and elapsed >= _PV_NOWCAST_DROP_CONFIRMATION_SECONDS
+        return {
+            'state': 'confirmed' if confirmed else 'pending',
+            'confirmed': confirmed,
+            'samples': samples,
+            'first_observed_at': float(candidate.get('first_update_at', updated_at)),
+            'evidence': (
+                'two_distinct_live_drop_samples'
+                if confirmed else 'single_live_drop_sample'
+            ),
+        }
+
+
+def _pv_nowcast_anchor_kwh(slot_duration_h: float, now=None) -> dict | None:
+    """Choose a confidence-qualified per-slot PV anchor from live and settled PV.
+
+    A fresh live value normally complements the latest settled slot.  A sharp
+    daylight drop is provisional until a second, distinct telemetry update
+    confirms it; only then can it lower the near-term forecast, and the later
+    blend bounds its effect.  A fresh zero at/near sunset remains immediate valid
+    evidence so the system does not project stale solar after dark.
+    """
+    if now is None:
+        from datetime import datetime as _dt
+        now = _dt.now().astimezone()
+
     try:
         slot_h = max(0.01, float(slot_duration_h or 0.25))
     except (TypeError, ValueError):
         slot_h = 0.25
 
     recent = _latest_settled_pv_slot_kwh(slot_h, now=now)
-    live = None
+    live = updated_at = None
     try:
         updated_at = float(STATE.get('pv_power_updated_at'))
         reference_ts = (now.timestamp() if now is not None else time.time())
-        fresh = 0.0 <= reference_ts - updated_at <= 120.0
+        fresh = 0.0 <= reference_ts - updated_at <= _PV_NOWCAST_LIVE_FRESH_SECONDS
         pv_available = (
             STATE.has('pv_power') if hasattr(STATE, 'has')
             else STATE.get('pv_power') is not None
         )
         if fresh and pv_available:
-            # A fresh zero is critical evidence at sunset or after an abrupt
-            # production stop; treating it as missing preserves stale PV.
-            pv_w = max(0.0, float(STATE.get('pv_power')))
-            live = pv_w / 1000.0 * slot_h
-    except (TypeError, ValueError):
-        live = None
+            live = max(0.0, float(STATE.get('pv_power'))) / 1000.0 * slot_h
+    except (AttributeError, TypeError, ValueError):
+        live = updated_at = None
 
     if recent is None and live is None:
         return None
 
     drop_ratio = 1.0
-    source = "live" if live is not None else "recent"
+    drop_state = 'none'
+    drop_confirmed = False
+    drop_evidence = 'stable_live_recent'
+    drop_samples = 0
+    drop_observed_at = None
+    downward_weight_cap = 1.0
+    source = 'live' if live is not None else 'recent'
+
+    sunset_evidence = live is not None and live <= 0.03 and _pv_nowcast_near_sunset(now)
+    if sunset_evidence:
+        # A zero around sunset is intrinsically different from a midday zero:
+        # response must be immediate, including when the last settlement has not
+        # been written yet.
+        if recent is not None and recent > 0.05:
+            drop_ratio = max(0.0, min(1.5, live / recent))
+        _clear_pv_nowcast_drop_candidate()
+        return {
+            'slot_kwh': float(live),
+            'source': 'live_drop_sunset' if recent is not None else 'live_sunset',
+            'drop_ratio': float(drop_ratio),
+            'live_slot_kwh': live,
+            'recent_slot_kwh': recent,
+            'drop_state': 'sunset',
+            'drop_confirmed': True,
+            'drop_evidence': 'fresh_live_zero_near_sunset',
+            'drop_samples': 1,
+            'drop_observed_at': updated_at,
+            'downward_weight_cap': 1.0,
+        }
+
     if recent is not None and live is not None and recent > 0.05:
         drop_ratio = max(0.0, min(1.5, live / recent))
-        if drop_ratio < 0.75:
-            anchor = live
-            source = "live_drop"
+        if drop_ratio < _PV_NOWCAST_DROP_RATIO:
+            confidence = _pv_nowcast_drop_confidence(
+                now=now,
+                updated_at=updated_at,
+                live_slot_kwh=live,
+                recent_slot_kwh=recent,
+                drop_ratio=drop_ratio,
+            )
+            drop_state = confidence['state']
+            drop_confirmed = bool(confidence['confirmed'])
+            drop_evidence = confidence['evidence']
+            drop_samples = int(confidence['samples'])
+            drop_observed_at = confidence['first_observed_at']
+            if drop_confirmed:
+                anchor = live
+                source = 'live_drop_confirmed'
+                # A real midday loss must be allowed to inform the plan, but one
+                # short disruption should not erase the rest of the solar day.
+                downward_weight_cap = _PV_NOWCAST_CONFIRMED_DROP_WEIGHT_CAP
+            else:
+                # Keep the credible settled production as the anchor while the
+                # low live reading awaits confirmation.  This prevents a one-off
+                # 0 W MQTT sample from triggering PRECHARGE_FOR_PEAK.
+                anchor = max(live, recent)
+                source = 'live_drop_pending'
         else:
+            recovered = _clear_pv_nowcast_drop_candidate()
             anchor = max(live, recent)
-            source = "live_recent"
+            source = 'live_recent'
+            if recovered:
+                drop_state = 'recovered'
+                drop_evidence = 'healthy_live_recovery'
     else:
         anchor = live if live is not None else recent
+        if live is not None and live > 0.03:
+            recovered = _clear_pv_nowcast_drop_candidate()
+            if recovered:
+                drop_state = 'recovered'
+                drop_evidence = 'healthy_live_recovery'
 
-    confirmed_drop_to_zero = source == "live_drop" and anchor == 0.0
-    if anchor is None or (anchor <= 0.03 and not confirmed_drop_to_zero):
+    if anchor is None or (anchor <= 0.03 and not drop_confirmed):
         return None
     return {
-        "slot_kwh": float(anchor),
-        "source": source,
-        "drop_ratio": float(drop_ratio),
-        "live_slot_kwh": live,
-        "recent_slot_kwh": recent,
+        'slot_kwh': float(anchor),
+        'source': source,
+        'drop_ratio': float(drop_ratio),
+        'live_slot_kwh': live,
+        'recent_slot_kwh': recent,
+        'drop_state': drop_state,
+        'drop_confirmed': drop_confirmed,
+        'drop_evidence': drop_evidence,
+        'drop_samples': drop_samples,
+        'drop_observed_at': drop_observed_at,
+        'downward_weight_cap': downward_weight_cap,
     }
 
 
 def _apply_pv_nowcast(pv_forecast: dict, forecast_slots: list, weather_context: dict | None,
-                      slot_duration_h: float, now=None) -> dict:
+                      slot_duration_h: float, now=None, *, anchor=_PV_NOWCAST_ANCHOR_UNSET) -> dict:
     """Blend live/recent PV evidence into the near-term PV forecast.
 
     The baseline forecast still owns the full-day shape. This overlay nudges current-day
     near-term slots toward live evidence — raising them when live production and GTI imply
     the baseline is too low, and lowering them when that evidence implies it's too high —
-    then fades out over a few hours. Lowering requires real evidence (a GTI ratio derived
+    and is limited to the current hour. Lowering requires real evidence (a GTI ratio derived
     from data, or a confirmed live production drop) so a missing-GTI gap never zeroes a slot.
+
+    ``anchor`` allows the caller to apply the same already-qualified live evidence
+    to parallel baseline and weather-shadow forecast maps.  It avoids observing the
+    same MQTT sample twice and keeps forecast-validation comparisons apples-to-apples.
     """
     if not pv_forecast or not forecast_slots:
         return pv_forecast
@@ -1000,15 +1210,24 @@ def _apply_pv_nowcast(pv_forecast: dict, forecast_slots: list, weather_context: 
     if not starts:
         return pv_forecast
 
-    from datetime import datetime as _dt
+    from datetime import datetime as _dt, timedelta as _td
     now = now or _dt.now(starts[0].tzinfo)
-    anchor = _pv_nowcast_anchor_kwh(slot_duration_h, now=now)
-    if not anchor:
-        return pv_forecast
-
     weather_context = weather_context if isinstance(weather_context, dict) else {}
     slot_context = weather_context.setdefault("slots", {})
     summary = weather_context.setdefault("summary", {})
+    if anchor is _PV_NOWCAST_ANCHOR_UNSET:
+        anchor = _pv_nowcast_anchor_kwh(slot_duration_h, now=now)
+    if not anchor:
+        summary.update({
+            "pv_nowcast_applied": False,
+            "pv_nowcast_decision": "no_fresh_anchor",
+            "pv_nowcast_source": None,
+            "pv_nowcast_delta_kwh": 0.0,
+            "pv_nowcast_slots": 0,
+            "pv_forecast_stage": _PV_NOWCAST_STAGE,
+            "pv_nowcast_pipeline_version": _PV_NOWCAST_PIPELINE_VERSION,
+        })
+        return pv_forecast
 
     def _gti(start):
         try:
@@ -1026,18 +1245,48 @@ def _apply_pv_nowcast(pv_forecast: dict, forecast_slots: list, weather_context: 
         drop_ratio = float(anchor.get("drop_ratio", 1.0))
     except (TypeError, ValueError):
         drop_ratio = 1.0
+    source = str(anchor.get("source") or "")
+    drop_state = str(anchor.get("drop_state") or "none")
+    pending_drop = drop_state == "pending" or source == "live_drop_pending"
+    # ``live_drop`` remains recognised for compatibility with prior saved/test
+    # anchors, but new production anchors use the explicit states below.
+    drop_confirmed = bool(anchor.get("drop_confirmed")) or source in {
+        "live_drop", "live_drop_confirmed", "live_drop_sunset", "live_sunset",
+    }
+    try:
+        downward_weight_cap = min(
+            1.0, max(0.0, float(anchor.get("downward_weight_cap", 1.0))))
+    except (TypeError, ValueError):
+        downward_weight_cap = 1.0
+    raised_slots = lowered_slots = 0
 
     for start in starts:
+        # A provisional daylight drop is evidence about neither a downward nor
+        # an upward revision yet. Its retained settled anchor exists only for
+        # audit; using it to raise a lower baseline would make
+        # ``pending_drop_baseline_preserved`` an untrue safety claim.
+        if pending_drop:
+            continue
         if start.date() != today:
             continue
-        hours_ahead = max(0.0, (start - now).total_seconds() / 3600.0)
-        if hours_ahead > 4.0:
+        # The optimiser intentionally retains the slot that just ended so it
+        # can safely derive the current command.  It is historical at this
+        # point, however, and a live nowcast must not revise it.  Omitting it
+        # keeps the bounded current-hour overlay to four quarter-hour slots.
+        if start + _td(hours=slot_duration_h) <= now:
             continue
-        if hours_ahead <= 2.0:
-            weight = 0.90 - 0.20 * (hours_ahead / 2.0)
-        else:
-            weight = 0.70 * max(0.0, 1.0 - (hours_ahead - 2.0) / 2.0)
-        if drop_ratio < 0.75 and float(anchor.get("slot_kwh", 0.0)) > 0.0:
+        hours_ahead = max(0.0, (start - now).total_seconds() / 3600.0)
+        # A point-in-time production measurement is meaningful for immediate
+        # dispatch, not a prediction of four hours of cloud cover.  Restrict
+        # every live-nowcast adjustment — uplift and drop alike — to the
+        # current hour.  The weather/learned forecast remains responsible for
+        # the rest of the day, preventing one high sample from adding many kWh
+        # of speculative export revenue and then disappearing next cycle.
+        if hours_ahead >= _PV_NOWCAST_HORIZON_H:
+            continue
+        weight = 0.90 - 0.30 * (hours_ahead / _PV_NOWCAST_HORIZON_H)
+        if (drop_confirmed and drop_ratio < _PV_NOWCAST_DROP_RATIO
+                and float(anchor.get("slot_kwh", 0.0)) > 0.0):
             weight *= max(0.25, drop_ratio)
         if weight <= 0:
             continue
@@ -1054,23 +1303,44 @@ def _apply_pv_nowcast(pv_forecast: dict, forecast_slots: list, weather_context: 
         nowcast = float(anchor["slot_kwh"]) * gti_ratio
         base = max(0.0, float(pv_forecast.get(start, 0.0) or 0.0))
         raising = nowcast > base + 0.01
-        # Lower the baseline only on real evidence it's too high: a GTI ratio derived from
-        # data, or a confirmed live production drop. Never lower on the missing-GTI fallback
-        # (gti_ratio=0), which would zero out slots whenever GTI data is simply absent.
-        lowering = nowcast < base - 0.01 and (have_gti or drop_ratio < 0.75)
+        # A daylight live drop needs two independent fresh telemetry samples.  Until
+        # then it is deliberately unable to lower the forecast even when weather
+        # GTI happens to be present.  This avoids treating a one-off meter zero as
+        # a four-hour cloud/outage forecast.
+        lowering = (
+            not pending_drop
+            and nowcast < base - 0.01
+            and (have_gti or drop_confirmed)
+        )
         if not (raising or lowering):
             continue
+        if lowering and drop_confirmed:
+            weight = min(weight, downward_weight_cap)
         adjusted = base * (1.0 - weight) + nowcast * weight
         out[start] = adjusted
         delta += adjusted - base
         adjusted_slots += 1
+        if adjusted > base:
+            raised_slots += 1
+        elif adjusted < base:
+            lowered_slots += 1
         row = slot_context.setdefault(start.isoformat(), {})
         row["pv_nowcast_kwh"] = round(adjusted, 4)
         row["pv_nowcast_weight"] = round(weight, 3)
 
+    if pending_drop:
+        decision = "pending_drop_baseline_preserved"
+    elif drop_state == "sunset":
+        decision = "sunset_drop_applied" if adjusted_slots else "sunset_drop_no_material_change"
+    elif drop_confirmed:
+        decision = "confirmed_drop_bounded" if adjusted_slots else "confirmed_drop_no_material_change"
+    else:
+        decision = "live_anchor_applied" if adjusted_slots else "live_anchor_no_material_change"
+
     summary.update({
         "pv_nowcast_applied": adjusted_slots > 0,
-        "pv_nowcast_source": anchor.get("source"),
+        "pv_nowcast_source": source or None,
+        "pv_nowcast_decision": decision,
         "pv_nowcast_anchor_kwh": round(float(anchor["slot_kwh"]), 3),
         "pv_nowcast_live_slot_kwh": (
             round(float(anchor["live_slot_kwh"]), 3)
@@ -1081,9 +1351,20 @@ def _apply_pv_nowcast(pv_forecast: dict, forecast_slots: list, weather_context: 
             if anchor.get("recent_slot_kwh") is not None else None
         ),
         "pv_nowcast_drop_ratio": round(drop_ratio, 3),
+        "pv_nowcast_drop_state": drop_state,
+        "pv_nowcast_drop_confirmed": drop_confirmed,
+        "pv_nowcast_drop_evidence": anchor.get("drop_evidence"),
+        "pv_nowcast_drop_samples": int(anchor.get("drop_samples") or 0),
+        "pv_nowcast_drop_observed_at": anchor.get("drop_observed_at"),
+        "pv_nowcast_downward_weight_cap": round(downward_weight_cap, 3),
         "pv_nowcast_delta_kwh": round(delta, 3),
         "pv_nowcast_slots": adjusted_slots,
+        "pv_nowcast_raised_slots": raised_slots,
+        "pv_nowcast_lowered_slots": lowered_slots,
+        "pv_forecast_stage": _PV_NOWCAST_STAGE,
+        "pv_nowcast_pipeline_version": _PV_NOWCAST_PIPELINE_VERSION,
     })
+    weather_context["pv_nowcast_anchor"] = dict(anchor)
     if adjusted_slots:
         weather_context["pv_nowcast_forecast"] = out
         weather_context["pv_forecast"] = out
@@ -1092,6 +1373,117 @@ def _apply_pv_nowcast(pv_forecast: dict, forecast_slots: list, weather_context: 
         row["final_pv_forecast_kwh"] = round(
             max(0.0, float(out.get(start, 0.0) or 0.0)), 4)
     return out
+
+
+def _apply_matched_pv_nowcast(
+    baseline_pv_forecast: dict,
+    forecast_slots: list,
+    weather_context: dict | None,
+    slot_duration_h: float,
+    now=None,
+) -> dict:
+    """Apply one qualified PV-nowcast observation to both forecast variants.
+
+    Weather validation must not compare a post-nowcast live forecast with a raw
+    weather shadow.  That would confound weather skill with a volatile meter
+    adjustment.  When weather data is available, derive one anchor exactly once
+    and run both baseline and weather-shadow maps through the same post-nowcast
+    stage.  The selected live branch stays governed solely by ``PV_WEATHER_APPLY``.
+
+    This function deliberately does no optimisation and never changes an apply
+    gate.  It only annotates the existing weather context so the slot settlement
+    can later make an apples-to-apples validation comparison.
+    """
+    if not isinstance(weather_context, dict) or not weather_context.get("available"):
+        # Preserve the long-standing unavailable-weather path (including its
+        # test/mocking surface) exactly.
+        if now is None:
+            return _apply_pv_nowcast(
+                baseline_pv_forecast,
+                forecast_slots,
+                weather_context,
+                slot_duration_h,
+            )
+        return _apply_pv_nowcast(
+            baseline_pv_forecast,
+            forecast_slots,
+            weather_context,
+            slot_duration_h,
+            now=now,
+        )
+
+    import copy
+    from datetime import datetime as _dt
+
+    baseline = dict(baseline_pv_forecast or {})
+    weather_shadow = dict(weather_context.get("pv_shadow_forecast") or baseline)
+    starts = [slot.get("start") for slot in forecast_slots if slot.get("start") is not None]
+    if now is None and starts:
+        now = _dt.now(starts[0].tzinfo)
+
+    # A single live/settled observation is a shared input, not one observation
+    # per branch.  In particular, a pending-drop candidate must not gain a
+    # second sample merely because two forecast variants are evaluated.
+    shared_anchor = _pv_nowcast_anchor_kwh(slot_duration_h, now=now)
+
+    source_slots = weather_context.get("slots") or {}
+    source_summary = weather_context.get("summary") or {}
+    baseline_context = {
+        "available": True,
+        "slots": copy.deepcopy(source_slots),
+        "summary": dict(source_summary),
+    }
+    shadow_context = {
+        "available": True,
+        "slots": copy.deepcopy(source_slots),
+        "summary": dict(source_summary),
+    }
+    final_baseline = _apply_pv_nowcast(
+        baseline,
+        forecast_slots,
+        baseline_context,
+        slot_duration_h,
+        now=now,
+        anchor=shared_anchor,
+    )
+    final_shadow = _apply_pv_nowcast(
+        weather_shadow,
+        forecast_slots,
+        shadow_context,
+        slot_duration_h,
+        now=now,
+        anchor=shared_anchor,
+    )
+
+    use_weather_shadow = bool(source_summary.get("pv_apply"))
+    selected = final_shadow if use_weather_shadow else final_baseline
+    selected_context = shadow_context if use_weather_shadow else baseline_context
+
+    # Keep the weather-derived raw fields and attach the two fair final values
+    # onto the original context.  Do not replace it with a cloned context: the
+    # rest of the result payload relies on its original weather metadata.
+    weather_slots = weather_context.setdefault("slots", {})
+    for start in starts:
+        row = weather_slots.setdefault(start.isoformat(), {})
+        row["final_baseline_pv_forecast_kwh"] = round(
+            max(0.0, float(final_baseline.get(start, 0.0) or 0.0)), 4)
+        row["final_weather_pv_shadow_kwh"] = round(
+            max(0.0, float(final_shadow.get(start, 0.0) or 0.0)), 4)
+        row["final_pv_forecast_kwh"] = round(
+            max(0.0, float(selected.get(start, 0.0) or 0.0)), 4)
+
+    summary = weather_context.setdefault("summary", {})
+    summary.update(selected_context.get("summary") or {})
+    summary["pv_nowcast_selected_branch"] = (
+        "weather_shadow" if use_weather_shadow else "baseline")
+    weather_context["final_baseline_pv_forecast"] = final_baseline
+    weather_context["final_weather_pv_shadow_forecast"] = final_shadow
+    weather_context["pv_forecast"] = selected
+    weather_context["pv_nowcast_anchor"] = (
+        dict(shared_anchor) if isinstance(shared_anchor, dict) else None)
+    if selected_context.get("pv_nowcast_forecast"):
+        weather_context["pv_nowcast_forecast"] = selected
+    return selected
 
 
 def _set_grid_assist(enabled: bool) -> None:
@@ -2077,6 +2469,87 @@ def get_today_energy_actuals() -> dict:
     }
 
 
+def _strategy_candidate_config_snapshot(result: dict | None = None) -> dict:
+    """Return explicit assumptions for the *read-only* strategy evaluator.
+
+    This is intentionally a snapshot embedded in the exported plan, rather than
+    a new controller or a second live optimisation pass.  The offline evaluator
+    can therefore replay the same physical/economic assumptions without reading
+    a possibly changed ``.env`` later.  Its protected floor is the active
+    seasonal safety reserve (or the more conservative winter policy floor), not
+    ``MINIMUM_ESS_SOC``: the latter is a PV-reservation target for EV planning,
+    not a household outage reserve.
+    """
+    reserve_setting = (
+        'MIN_SOC_RESERVE_WINTER' if OPTIMIZER_MODE == 'winter'
+        else 'MIN_SOC_RESERVE_SUMMER'
+    )
+    minimum_soc = min(100.0, max(0.0, _get_float_setting(reserve_setting, 5.0)))
+    protected_soc = minimum_soc
+    winter_policy = (result or {}).get('winter_policy') or {}
+    try:
+        policy_floor = float(winter_policy.get('protected_soc_percent'))
+        if math.isfinite(policy_floor):
+            protected_soc = min(100.0, max(minimum_soc, policy_floor))
+    except (TypeError, ValueError):
+        pass
+
+    prices = []
+    for slot in (result or {}).get('schedule') or []:
+        try:
+            value = float(slot.get('price'))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if math.isfinite(value):
+            prices.append(value)
+    mean_buy = sum(prices) / len(prices) if prices else 0.0
+    terminal_price = mean_buy * max(
+        0.0, _get_float_setting('ESS_TERMINAL_VALUE_FACTOR', 1.0))
+    terminal_price = max(
+        terminal_price,
+        max(0.0, _get_float_setting('ESS_EXPECTED_PEAK_PRICE', 0.0)),
+    )
+
+    charge_efficiency = min(
+        1.0, max(0.01, _get_float_setting('AC_DC_CHARGE_EFFICIENCY', 0.96)))
+    discharge_efficiency = min(
+        1.0, max(0.01, _get_float_setting('AC_DC_DISCHARGE_EFFICIENCY', 0.96)))
+
+    max_import = max(0.0, _get_float_setting('ESS_MAX_GRID_IMPORT_KW', 10.0))
+    max_export = max(0.0, _get_float_setting('ESS_MAX_GRID_EXPORT_KW', 10.0))
+    return {
+        'battery_capacity_kwh': max(
+            0.1, _get_float_setting('BATTERY_CAPACITY_KWH', 42.0)),
+        'min_soc_percent': minimum_soc,
+        'protected_soc_percent': protected_soc,
+        'charge_efficiency': charge_efficiency,
+        'discharge_efficiency': discharge_efficiency,
+        'max_charge_kw': max(
+            0.0, _get_float_setting('ESS_MAX_CHARGE_KW', max_import)),
+        'max_discharge_kw': max(
+            0.0, _get_float_setting('ESS_MAX_DISCHARGE_KW', max_export)),
+        'max_import_kw': max_import,
+        'max_export_kw': max_export,
+        'soc_step_percent': min(
+            100.0, max(1.0, _get_float_setting('OPTIMIZER_SOC_STEP_PCT', 5.0))),
+        'grid_charge_soc_cap_percent': min(
+            100.0, max(
+                minimum_soc,
+                _get_float_setting('ESS_MAX_GRID_CHARGE_SOC', 100.0),
+            )),
+        'cycle_cost_eur_per_dc_kwh': max(
+            0.0, _get_float_setting('ESS_BATTERY_CYCLE_COST', 0.0)),
+        'arbitrage_margin_eur_per_dc_kwh': max(
+            0.0, _get_float_setting('ESS_ARBITRAGE_MARGIN', 0.0)),
+        'export_price_factor': _get_float_setting('ESS_EXPORT_PRICE_FACTOR', 1.0),
+        'export_fee_eur_per_kwh': _get_float_setting('ESS_EXPORT_FEE', 0.0),
+        # The live engine values usable AC output at its terminal price.  The
+        # replay model tracks DC-side stored energy, so preserve the same value
+        # per DC kWh by applying the configured discharge efficiency here.
+        'terminal_value_eur_per_dc_kwh': terminal_price * discharge_efficiency,
+    }
+
+
 def _publish_plan_json(result, *, batt_soc, price_points, pv_remaining,
                        applied_setpoint, today_actuals) -> None:
     """Write the current plan to a JSON file for the frontend dashboard to read.
@@ -2228,6 +2701,7 @@ def _publish_plan_json(result, *, batt_soc, price_points, pv_remaining,
             'pv_tomorrow_forecast_date': STATE.get('pv_projected_tomorrow_date'),
             'pv_forecast_updated_at': STATE.get('pv_forecast_updated_at'),
             'pv_actual_quality': STATE.get('pv_actual_quality'),
+            'pv_forecast_update_status': STATE.get('pv_forecast_update_status'),
             'slot_duration_h': result.get('slot_duration_h'),
             'current': {
                 'mode': result.get('mode'),
@@ -2252,6 +2726,22 @@ def _publish_plan_json(result, *, batt_soc, price_points, pv_remaining,
             'optimizer_guardrails': _json_safe(
                 result.get('optimizer_guardrails') or _optimizer_guardrails_snapshot()
             ),
+            # Explicit replay assumptions for scripts/evaluate_ess_strategies.py.
+            # The script remains strictly read-only: this metadata is an audit
+            # snapshot, never an instruction to select or apply a candidate.
+            'strategy_candidate_config': _strategy_candidate_config_snapshot(result),
+            'strategy_shadow': {
+                'mode': 'read_only_offline_replay',
+                'protected_soc_source': (
+                    'winter_policy' if (result.get('winter_policy') or {}).get(
+                        'protected_soc_percent') is not None
+                    else 'active_seasonal_reserve'
+                ),
+                'note': (
+                    'Candidate comparisons are observational only and are not '
+                    'used by the live ESS controller.'
+                ),
+            },
             'planning_policy': _json_safe(result.get('planning_policy')),
             'winter_policy': _json_safe(result.get('winter_policy')),
             'victron_slots': victron_slots,
@@ -2295,7 +2785,9 @@ def _realized_action(grid_w, batt_w, deadband_w: int = 200) -> str:
     return "IDLE"                # PV-driven / neutral
 
 
-def _append_history(result, *, batt_soc, applied_setpoint, today_actuals, realized_power=None) -> None:
+def _append_history(
+        result, *, batt_soc, applied_setpoint, today_actuals,
+        realized_power=None, now=None) -> None:
     """Append one analytics-ready record per optimizer cycle to a per-day NDJSON
     file (one JSON object per line) under HISTORY_DIR.
 
@@ -2313,7 +2805,7 @@ def _append_history(result, *, batt_soc, applied_setpoint, today_actuals, realiz
         history_dir = retrieve_setting('HISTORY_DIR') or 'data/history'
         os.makedirs(history_dir, exist_ok=True)
 
-        now = _dt.now().astimezone()
+        now = now or _dt.now().astimezone()
         sched0 = (result.get('schedule') or [{}])[0]
         act = today_actuals or {}
         rp = realized_power or {}
@@ -2321,6 +2813,12 @@ def _append_history(result, *, batt_soc, applied_setpoint, today_actuals, realiz
         def _num(value):
             try:
                 return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        def _int(value):
+            try:
+                return int(value)
             except (TypeError, ValueError):
                 return None
 
@@ -2338,9 +2836,14 @@ def _append_history(result, *, batt_soc, applied_setpoint, today_actuals, realiz
         # revenue) to stay comparable with grid-measured actuals.
         f_imp_cost = f_exp_rev = 0.0
         today_f_imp_cost = today_f_exp_rev = 0.0
+        slot_duration_h = _num(result.get('slot_duration_h')) or 0.25
         for s in (result.get('schedule') or []):
             try:
-                g = float(s.get('grid_energy') or 0.0)
+                fraction = slot_remaining_fraction(
+                    s, as_of=now, default_duration_h=slot_duration_h)
+                if fraction <= 0.0:
+                    continue
+                g = float(s.get('grid_energy') or 0.0) * fraction
                 b = float(s.get('price') or 0.0)
                 sl = float(s.get('sell', b) or b)
             except (TypeError, ValueError):
@@ -2436,6 +2939,7 @@ def _append_history(result, *, batt_soc, applied_setpoint, today_actuals, realiz
             "pv_forecast_today_date": STATE.get('pv_projected_today_date'),
             "pv_forecast_tomorrow_date": STATE.get('pv_projected_tomorrow_date'),
             "pv_forecast_updated_at": STATE.get('pv_forecast_updated_at'),
+            "pv_forecast_update_status": STATE.get('pv_forecast_update_status'),
             "pv_actual_quality": STATE.get('pv_actual_quality'),
             "pv_actual_raw_kwh": _num(STATE.get('pv_actual_raw_kwh')),
             "pv_actual_effective_kwh": _num(STATE.get('pv_actual_effective_kwh')),
@@ -2505,6 +3009,45 @@ def _append_history(result, *, batt_soc, applied_setpoint, today_actuals, realiz
                 "weather_load_adj_today_kwh": weather_summary.get("load_adj_today_kwh"),
                 "weather_max_temp_c": weather_summary.get("max_temp_c"),
                 "weather_pv_shadow_abs_delta_kwh": weather_summary.get("pv_shadow_abs_delta_kwh"),
+                # Live-PV nowcast audit.  These fields make a future forecast
+                # revision explainable after the volatile in-memory context has
+                # moved on, especially when a provisional low PV observation was
+                # intentionally suppressed rather than acted upon.
+                "pv_nowcast_applied": _is_truthy(
+                    weather_summary.get("pv_nowcast_applied"), False),
+                "pv_nowcast_source": weather_summary.get("pv_nowcast_source"),
+                "pv_nowcast_decision": weather_summary.get("pv_nowcast_decision"),
+                "pv_nowcast_anchor_kwh": _num(
+                    weather_summary.get("pv_nowcast_anchor_kwh")),
+                "pv_nowcast_live_slot_kwh": _num(
+                    weather_summary.get("pv_nowcast_live_slot_kwh")),
+                "pv_nowcast_recent_slot_kwh": _num(
+                    weather_summary.get("pv_nowcast_recent_slot_kwh")),
+                "pv_nowcast_drop_ratio": _num(
+                    weather_summary.get("pv_nowcast_drop_ratio")),
+                "pv_nowcast_drop_state": weather_summary.get("pv_nowcast_drop_state"),
+                "pv_nowcast_drop_confirmed": _is_truthy(
+                    weather_summary.get("pv_nowcast_drop_confirmed"), False),
+                "pv_nowcast_drop_evidence": weather_summary.get(
+                    "pv_nowcast_drop_evidence"),
+                "pv_nowcast_drop_samples": _int(
+                    weather_summary.get("pv_nowcast_drop_samples")),
+                "pv_nowcast_drop_observed_at": _num(
+                    weather_summary.get("pv_nowcast_drop_observed_at")),
+                "pv_nowcast_downward_weight_cap": _num(
+                    weather_summary.get("pv_nowcast_downward_weight_cap")),
+                "pv_nowcast_delta_kwh": _num(
+                    weather_summary.get("pv_nowcast_delta_kwh")),
+                "pv_nowcast_slots": _int(weather_summary.get("pv_nowcast_slots")),
+                "pv_nowcast_raised_slots": _int(
+                    weather_summary.get("pv_nowcast_raised_slots")),
+                "pv_nowcast_lowered_slots": _int(
+                    weather_summary.get("pv_nowcast_lowered_slots")),
+                "pv_forecast_stage": weather_summary.get("pv_forecast_stage"),
+                "pv_nowcast_pipeline_version": weather_summary.get(
+                    "pv_nowcast_pipeline_version"),
+                "pv_nowcast_selected_branch": weather_summary.get(
+                    "pv_nowcast_selected_branch"),
             })
         hvac_context = result.get("onecta_hvac") or {}
         hvac_summary = hvac_context.get("summary") or {}
@@ -2667,6 +3210,18 @@ def _settle_prior_slot(
             'final_load_forecast_kwh': _f(w0.get('final_load_forecast_kwh')),
             'baseline_pv_forecast_kwh': _f(w0.get('baseline_pv_kwh')),
             'final_pv_forecast_kwh': _f(w0.get('final_pv_forecast_kwh')),
+            # These are the only PV comparison fields suitable for validation:
+            # both forecast branches have already passed through the same
+            # confidence-qualified live-nowcast stage.
+            'final_baseline_pv_forecast_kwh': _f(
+                w0.get('final_baseline_pv_forecast_kwh')),
+            'final_weather_pv_shadow_kwh': _f(
+                w0.get('final_weather_pv_shadow_kwh')),
+            'pv_forecast_stage': weather_summary.get('pv_forecast_stage'),
+            'pv_nowcast_pipeline_version': weather_summary.get(
+                'pv_nowcast_pipeline_version'),
+            'pv_nowcast_selected_branch': weather_summary.get(
+                'pv_nowcast_selected_branch'),
             'weather_hvac_apply': bool(weather_summary.get('hvac_apply')),
             'weather_pv_apply': bool(weather_summary.get('pv_apply')),
         }
@@ -2837,6 +3392,15 @@ def _settle_prior_slot(
                 'final_load_forecast_kwh': pred.get('final_load_forecast_kwh'),
                 'baseline_pv_forecast_kwh': pred.get('baseline_pv_forecast_kwh'),
                 'final_pv_forecast_kwh': pred.get('final_pv_forecast_kwh'),
+                'final_baseline_pv_forecast_kwh': pred.get(
+                    'final_baseline_pv_forecast_kwh'),
+                'final_weather_pv_shadow_kwh': pred.get(
+                    'final_weather_pv_shadow_kwh'),
+                'pv_forecast_stage': pred.get('pv_forecast_stage'),
+                'pv_nowcast_pipeline_version': pred.get(
+                    'pv_nowcast_pipeline_version'),
+                'pv_nowcast_selected_branch': pred.get(
+                    'pv_nowcast_selected_branch'),
                 'weather_hvac_apply': pred.get('weather_hvac_apply'),
                 'weather_pv_apply': pred.get('weather_pv_apply'),
                 'soc_start': soc_start,
@@ -2886,6 +3450,49 @@ def run_ai_optimizer(*, wait_timeout_s=0.0, before_run=None):
         _AI_OPTIMIZER_LOCK.release()
 
 
+def _forecast_inputs_transiently_empty(now=None) -> bool:
+    """Detect a partially reset forecast snapshot before dispatch.
+
+    A short-lived GlobalState/VRM refresh gap can expose zero for every forecast
+    field even though the previous plan was healthy.  That state must not be
+    converted into a real optimizer plan.  A genuinely absent forecast (for
+    example before the first VRM response) is left to the existing fallback
+    behavior; this guard only fires when forecast keys are present and all of
+    their values have simultaneously collapsed to zero.
+    """
+    now = now or _dt.now().astimezone()
+    keys = (
+        'pv_projected_remaining',
+        'pv_projected_tomorrow',
+        'consumption_total_projected',
+        'pv_projected_today_date',
+        'pv_forecast_updated_at',
+    )
+    has_key = getattr(STATE, 'has', None)
+    present = [bool(has_key(key)) if callable(has_key) else STATE.get(key) is not None
+               for key in keys]
+    # Do not change the legacy fallback for installations which do not expose
+    # one of these optional forecast fields at all. This guard is only for a
+    # complete, but simultaneously zeroed, forecast snapshot.
+    if not all(present[:3]):
+        return False
+
+    def _number(key):
+        try:
+            return float(STATE.get(key) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    all_zero = all(_number(key) <= 0.0 for key in keys[:3])
+    if not all_zero:
+        return False
+
+    # A valid winter forecast can have zero PV, but a zero consumption forecast
+    # at the same time is not a usable planning snapshot. The combination is
+    # therefore rejected even when stale metadata still carries today's date.
+    return True
+
+
 def _run_ai_optimizer_once():
     """
     Runs the AI optimizer if enabled and applies the resulting plan to the
@@ -2908,6 +3515,12 @@ def _run_ai_optimizer_once():
         soc_reporting = STATE.has('batt_soc') if hasattr(STATE, 'has') else batt_soc is not None
         if not soc_reporting or batt_soc is None:
             logging.warning("AI_ESS: Battery SoC not available yet. Skipping optimization.")
+            return
+        if _forecast_inputs_transiently_empty():
+            logging.warning(
+                "AI_ESS: Forecast inputs are temporarily empty; retaining the last validated plan."
+            )
+            STATE.set('pv_forecast_update_status', 'optimizer_skipped_empty')
             return
 
         # Snapshot the realized power NOW, before we apply this cycle's setpoint,
@@ -2985,6 +3598,10 @@ def _run_ai_optimizer_once():
 
         forecast_slots = _forecast_slots_for_optimizer(normalised_slots, slot_duration_h)
         pv_forecast = _build_pv_forecast_by_slot(forecast_slots, slot_duration_h)
+        # Keep the learned/base PV branch before weather selection.  The
+        # post-nowcast validation path below needs to compare this with the
+        # weather shadow after *identical* live-nowcast treatment.
+        baseline_pv_forecast = dict(pv_forecast)
         # Self-consumption: forecast house load per slot from VRM consumption
         # data shaped by a diurnal profile, so SoC predictions reflect real usage.
         load_forecast = _build_load_forecast_by_slot(forecast_slots, slot_duration_h)
@@ -3009,8 +3626,8 @@ def _run_ai_optimizer_once():
             slot_duration_h=slot_duration_h,
         )
 
-        pv_forecast = _apply_pv_nowcast(
-            pv_forecast,
+        pv_forecast = _apply_matched_pv_nowcast(
+            baseline_pv_forecast,
             forecast_slots,
             weather_context,
             slot_duration_h,
