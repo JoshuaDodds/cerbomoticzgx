@@ -24,7 +24,7 @@ from lib.config_paths import env_path as runtime_env_path
 from lib import history_store as _hist
 from lib import tesla_budget as _tesla_budget
 from lib.ev_history import attribute_ev_grid_cost, measured_ev_sessions
-from lib.forecast_projection import slot_remaining_fraction
+from lib.forecast_projection import PV_SURPLUS_FULL_SOC, slot_remaining_fraction
 
 DEFAULT_PLAN_PATH = "/dev/shm/cerbo_ai_plan.json"
 MIN_FORECAST_BOX_SAMPLES = 8
@@ -398,11 +398,6 @@ def _parse_time(s):
 def is_idle(slot) -> bool:
     """True when a slot is IDLE (Victron-managed, neutral setpoint)."""
     return str(slot.get("control_action") or "").upper() == "IDLE"
-
-
-# At/above this SoC the battery is treated as full, so PV surplus feeds the grid.
-# Below it, an IDLE slot's surplus stores into the battery instead of exporting.
-PV_SURPLUS_FULL_SOC = 99.0
 
 
 def _forward_grid_econ(slot, *, fraction: float = 1.0):

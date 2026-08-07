@@ -48,6 +48,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from lib.ess_strategy_candidates import (  # noqa: E402
+    WINTER_APPROXIMATION_CAVEATS,
     CandidateConfig,
     CandidateStep,
     DeterministicSlot,
@@ -107,7 +108,46 @@ DISPLAY_CANDIDATE_NAMES = {
     "market_arbitrage": "Market arbitrage",
     "pv_first_self_sufficiency": "PV-first self-sufficiency",
     "protected_hybrid": "Protected hybrid",
+    "winter_self_sufficiency": "Winter-style self-sufficiency (approx.)",
 }
+
+# One line per row, in the vocabulary the rest of the dashboard already uses
+# (BUY/SELL/RETAIN/IDLE are the literal control_action values shown elsewhere;
+# "reserve"/"grid charging"/"export" match the .env and Settings wording) rather
+# than the euro-denominated columns above, which describe outcome, not policy.
+# Kept identical to ADVISOR_STRATEGY_LEGEND in frontend/static/js/app.js so the
+# CLI and the dashboard explain each strategy the same way.
+LIVE_PLAN_LEGEND = (
+    "The AI optimizer actually controlling the battery right now — chooses "
+    "BUY / SELL / RETAIN / IDLE each cycle from live prices and forecasts."
+)
+CANDIDATE_LEGEND = {
+    "market_arbitrage": (
+        "No protected reserve — BUYs and SELLs freely down to the minimum SoC "
+        "reserve, whichever the price favors."
+    ),
+    "protected_hybrid": (
+        "BUYs only enough to hold a protected reserve, then SELLs freely from "
+        "whatever is stored above it."
+    ),
+    "pv_first_self_sufficiency": (
+        "Never BUYs or SELLs — solar and the protected reserve cover household "
+        "load alone."
+    ),
+    "winter_self_sufficiency": (
+        "BUYs up to the reserve to cover household load, like Winter Mode's "
+        "routine policy, but never SELLs."
+    ),
+}
+
+
+def _live_plan_label(report: Mapping[str, Any]) -> str:
+    mode = str(report.get("optimizer_mode") or "").strip().lower()
+    if mode == "winter":
+        return "Live plan (Winter mode, active)"
+    if mode == "summer":
+        return "Live plan (Summer mode, active)"
+    return "Live plan (active)"
 
 
 class EvaluationInputError(ValueError):
@@ -141,6 +181,19 @@ def _parser() -> argparse.ArgumentParser:
         "--include-schedule",
         action="store_true",
         help="include per-slot candidate schedules in the human-readable report",
+    )
+    parser.add_argument(
+        "--winter-reserve-soc-percent",
+        type=float,
+        default=None,
+        help=("add an approximate Winter-Mode comparison row held above this "
+              "reserve; defaults to the plan's winter_reserve_soc_percent when "
+              "present. Never the winter engine itself"),
+    )
+    parser.add_argument(
+        "--no-winter-candidate",
+        action="store_true",
+        help="omit the approximate Winter-Mode comparison row",
     )
     parser.add_argument("--json", action="store_true", help="emit full report as JSON")
 
@@ -427,6 +480,37 @@ def _initial_soc(args: argparse.Namespace, plan: Mapping[str, Any]) -> float:
     return soc
 
 
+def _winter_reserve(args: argparse.Namespace, plan: Mapping[str, Any]) -> float | None:
+    """Resolve the reserve for the approximate Winter-Mode row, or None.
+
+    Read from a plan key that sits *beside* ``strategy_candidate_config`` rather
+    than inside it, because that mapping is validated against a closed field
+    list.  A plan published before this key existed simply yields no winter row.
+    """
+    if args.no_winter_candidate:
+        return None
+    explicit = args.winter_reserve_soc_percent is not None
+    value = args.winter_reserve_soc_percent
+    source = "--winter-reserve-soc-percent"
+    if value is None:
+        value = plan.get("winter_reserve_soc_percent")
+        source = "plan.winter_reserve_soc_percent"
+    if value is None:
+        return None
+    try:
+        reserve = _number(value, label=source)
+        if not 0.0 <= reserve <= 100.0:
+            raise EvaluationInputError(f"{source} must be between 0 and 100")
+    except EvaluationInputError:
+        # An operator who typed the flag deserves the error. A malformed value
+        # in the published plan must only cost the optional winter row, never
+        # the whole comparison the rest of the report exists to provide.
+        if explicit:
+            raise
+        return None
+    return reserve
+
+
 def _json_safe(value: Any) -> Any:
     if isinstance(value, datetime):
         return value.isoformat()
@@ -540,6 +624,10 @@ def _today_block(
     today_steps = first_local_day_steps(all_steps)
     window = summarize_steps(today_steps, config)
     block = _json_safe(asdict(window))
+    # Carried energy is measured above each policy's *own* floor, so a row
+    # holding a higher reserve is not carrying less by choice. Publish the floor
+    # with the figure rather than relying on a footnote to explain the offset.
+    block["floor_soc_percent"] = floor_soc_percent
     if settled is None:
         block["whole_day_cash_net_eur"] = None
         block["whole_day_economic_net_eur"] = None
@@ -571,13 +659,16 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
     parsed, inferred_duration_h = _parse_schedule_rows(plan)
     slots = _build_slots(parsed)
     initial_soc = _initial_soc(args, plan)
+    winter_reserve = _winter_reserve(args, plan)
     candidates = evaluate_shadow_candidates(
         slots,
         initial_soc_percent=initial_soc,
         config=config,
+        winter_reserve_soc_percent=winter_reserve,
     )
     settled = _settled_today(plan)
     baseline_steps = _plan_baseline_steps(parsed, config)
+    winter_result = candidates.get("winter_self_sufficiency")
     return {
         "schema_version": 2,
         "read_only": True,
@@ -598,6 +689,25 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             "the full known horizon; only their reported result is limited to today."
         ),
         "settled_today": settled,
+        # Present only when a winter row was produced, so a consumer can tell an
+        # absent row from a suppressed one and can always show the caveats next
+        # to the figure rather than in separate documentation.
+        "winter_candidate": (
+            None if winter_result is None else {
+                # The evaluator raises the requested reserve to the configured
+                # physical minimum when it sits below it, so report the floor the
+                # row was actually held above rather than the one asked for.
+                "reserve_soc_percent": winter_result.protected_soc_percent,
+                "requested_reserve_soc_percent": winter_reserve,
+                "reserve_was_raised": (
+                    winter_reserve is not None
+                    and winter_result.protected_soc_percent > winter_reserve + 1e-9
+                ),
+                "is_approximation": True,
+                "engine_module": "lib.ai_powered_ess_winter",
+                "caveats": list(WINTER_APPROXIMATION_CAVEATS),
+            }
+        ),
         "plan_baseline": {
             "available": baseline_steps is not None,
             "unavailable_reason": (
@@ -676,11 +786,12 @@ def _print_human(report: Mapping[str, Any], *, include_schedule: bool) -> None:
         print("All candidate assumptions supplied by the plan/config/CLI (no research defaults).")
 
     baseline = report.get("plan_baseline") or {}
+    live_label = _live_plan_label(report)
     print("Whole-day result per policy (observational; no candidate is selected or executed):")
     if baseline.get("available"):
-        _print_today_row("Live plan (active)", baseline.get("today"))
+        _print_today_row(live_label, baseline.get("today"))
     else:
-        print(f"  Live plan (active): unavailable — {baseline.get('unavailable_reason')}")
+        print(f"  {live_label}: unavailable — {baseline.get('unavailable_reason')}")
     for candidate_id, candidate in report["candidates"].items():
         label = DISPLAY_CANDIDATE_NAMES.get(candidate_id, candidate_id)
         if not candidate["feasible"]:
@@ -693,6 +804,29 @@ def _print_human(report: Mapping[str, Any], *, include_schedule: bool) -> None:
                     f"    {step['start']}: {step['soc_start_percent']:.1f}% → "
                     f"{step['soc_end_percent']:.1f}%, grid {step['grid_energy_kwh']:+.3f} kWh"
                 )
+
+    # Rows in the same order as the table above, so this reads as a caption for
+    # it rather than a second, separately-ordered list.
+    print("What drives each strategy:")
+    print(f"  {live_label}: {LIVE_PLAN_LEGEND}")
+    for candidate_id in report["candidates"]:
+        legend = CANDIDATE_LEGEND.get(candidate_id)
+        if legend:
+            label = DISPLAY_CANDIDATE_NAMES.get(candidate_id, candidate_id)
+            print(f"  {label}: {legend}")
+
+    winter = report.get("winter_candidate")
+    if winter:
+        raised = ""
+        if winter.get("reserve_was_raised"):
+            raised = (f" (raised from the requested "
+                      f"{winter['requested_reserve_soc_percent']:.0f}% to the "
+                      f"configured minimum)")
+        print(f"The Winter-style row is an approximation held above a "
+              f"{winter['reserve_soc_percent']:.0f}% reserve{raised}, not the "
+              f"{winter['engine_module']} engine. It differs in that it:")
+        for caveat in winter["caveats"]:
+            print(f"  - {caveat}")
 
 
 def main(argv: list[str] | None = None) -> int:

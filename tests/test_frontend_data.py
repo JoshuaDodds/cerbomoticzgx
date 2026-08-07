@@ -493,7 +493,15 @@ def test_forecast_accuracy_uses_settlement_predicted_and_actuals(monkeypatch, tm
 
 
 def test_monthly_history_adds_projected_today_profit_from_current_plan(monkeypatch, tmp_path):
-    today = datetime.now().astimezone().replace(hour=12, minute=0, second=0, microsecond=0)
+    # Freeze the clock the projection itself reads. The plan slot below sits at
+    # 18:00, and projected_today_net_eur() takes its as_of from data.datetime:
+    # against a real clock this slot is wholly future before 18:00, partly
+    # elapsed until 18:15, and wholly past after it, so the assertion only held
+    # when the suite happened to run in the morning. GitHub Actions runs in UTC,
+    # where any push after 18:00 UTC failed here.
+    monkeypatch.setattr(data, "datetime", _MidMonthDateTime)
+    today = data.datetime.now().astimezone().replace(
+        hour=12, minute=0, second=0, microsecond=0)
     history_dir = tmp_path / "history"
     history_dir.mkdir()
     plan_path = tmp_path / "plan.json"

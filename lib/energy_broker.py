@@ -2730,6 +2730,14 @@ def _publish_plan_json(result, *, batt_soc, price_points, pv_remaining,
             # The script remains strictly read-only: this metadata is an audit
             # snapshot, never an instruction to select or apply a candidate.
             'strategy_candidate_config': _strategy_candidate_config_snapshot(result),
+            # Deliberately a sibling of strategy_candidate_config rather than a
+            # member of it: that mapping is validated against a closed field
+            # list, so adding a key there would reject every plan this build
+            # writes. The evaluator uses this to offer an approximate
+            # Winter-Mode comparison row while Summer Mode is running, where
+            # the snapshot's own reserve is the summer one.
+            'winter_reserve_soc_percent': min(100.0, max(0.0, _get_float_setting(
+                'MIN_SOC_RESERVE_WINTER', 20.0))),
             'strategy_shadow': {
                 'mode': 'read_only_offline_replay',
                 'protected_soc_source': (

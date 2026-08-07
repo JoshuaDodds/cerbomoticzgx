@@ -120,6 +120,31 @@
     over several days and confirm the ranking is stable when the battery does
     *not* start the window at 100% SoC, and across BUY/RETAIN/SELL afternoons.
     The single validated sample so far began at 100%.
+  - **PV-surplus export corrected (2026-08-07); pre-correction candidate
+    numbers are void too.** The evaluator credited PV surplus as exported while
+    the battery still had room. On a 07:00 plan at 4% SoC this put the live row
+    €1.52 above the Today tile across 16 morning `IDLE` slots, but the defect
+    was not confined to the baseline: it inflated every candidate, and for
+    `pv_first_self_sufficiency` and `winter_self_sufficiency` — which forbid
+    active export — it was 100% of their reported revenue (€4.88 and €4.37 that
+    day). The installation never commands an export setpoint for surplus, so
+    none of it was real. Both the DP and the settlement step now absorb surplus
+    first, bounded by headroom and charge rate; commanded discharges are
+    unaffected. `tests/test_101_ess_strategy_cli.py` now asserts the live row
+    against `frontend.data.day_summary` directly, which is the only check that
+    catches the two surfaces drifting apart.
+  - **The Winter-style row is a stand-in, not a Winter Mode preview.** It shares
+    only one property with `lib/ai_powered_ess_winter.py`: no routine
+    battery-to-grid export. It holds a static `MIN_SOC_RESERVE_WINTER` floor
+    rather than one sized from forecast household demand to the next
+    replenishment window plus a learned uncertainty margin, it never takes the
+    exceptional-spread export the real engine permits, and it has no
+    replenishment-window charge scheduling. Do not decide whether to flip
+    `WINTER_MODE` from this row. Note it is *not* `pv_first_self_sufficiency`
+    either: PV-first forbids grid charging, which is precisely the cheap-window
+    replenishment Winter Mode is built around. On a high-PV summer day starting
+    near 100% SoC the two converge, because replenishment is never needed —
+    expect them to separate in winter.
   - Read `carried_energy_kwh` / `carried_energy_value_eur` alongside every
     whole-day figure. A today-only total credits a policy for selling stored
     energy but never debits the emptier battery it hands to tomorrow, so a

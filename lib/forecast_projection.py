@@ -13,6 +13,14 @@ from typing import Any
 
 DEFAULT_SLOT_DURATION_H = 0.25
 
+# At/above this SoC the battery is treated as full, so PV surplus feeds the grid.
+# Below it, a neutral-setpoint slot's surplus stores into the battery instead of
+# exporting: the optimizer deliberately never imposes an export setpoint on PV
+# surplus (see ``_post_process`` in lib/ai_powered_ess.py), so the Victron routes
+# it in real time. Shared so the dashboard and the read-only strategy evaluator
+# cannot drift into crediting different amounts of surplus as exported.
+PV_SURPLUS_FULL_SOC = 99.0
+
 
 def slot_remaining_fraction(
     slot: dict[str, Any],

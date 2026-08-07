@@ -566,7 +566,7 @@ def test_strategy_panel_compares_every_row_on_the_reports_own_whole_day_basis():
     now comes from plan_baseline, computed by the same code as the candidates.
     """
     js = APP_JS.read_text(encoding="utf-8")
-    panel = js[js.index("function advisorStrategyRow("):]
+    panel = js[js.index("function advisorStrategyCells("):]
     panel = panel[:panel.index("\nasync function runAdvisorTool(")]
 
     assert "report.plan_baseline" in panel
@@ -578,6 +578,84 @@ def test_strategy_panel_compares_every_row_on_the_reports_own_whole_day_basis():
     assert "day_summary" not in panel
     assert "candidate.cash_net_eur" not in panel
     assert "candidate.economic_net_eur" not in panel
+
+
+def test_strategy_comparison_renders_as_a_table_that_restacks_on_phones():
+    js = APP_JS.read_text(encoding="utf-8")
+    css = APP_CSS.read_text(encoding="utf-8")
+    mobile = MOBILE_CSS.read_text(encoding="utf-8")
+
+    assert "advisor-strategy-table" in js
+    assert 'scope="row"' in js and 'scope="col"' in js
+    # One markup path for every viewport: the stacked phone layout labels each
+    # value from data-label rather than from a second rendering branch.
+    assert "ADVISOR_STRATEGY_COLUMNS" in js
+    assert 'data-label="${_esc(ADVISOR_STRATEGY_COLUMNS[i]' in js
+    assert ".advisor-table-wrap" in css and "overflow-x: auto" in css
+    assert ".advisor-strategy-table" in css
+    assert "content: attr(data-label)" in mobile
+    # The desktop scroll floor must be dropped once rows restack, or the phone
+    # layout would still force the wrapper to scroll sideways.
+    assert "min-width: 620px" in css
+    assert ".advisor-strategy-table { min-width: 0; }" in mobile
+    # .advisor-tools is a two-up grid whose cell stays ~514px even at 1920px, so
+    # without this the sixth column ("Carried to tomorrow") is scrolled out of
+    # sight at every viewport. The class is applied only once a table exists.
+    assert ".advisor-tools > .advisor-tool-card.is-wide { grid-column: 1 / -1; }" in css
+    assert 'card.classList.toggle("is-wide"' in js
+    assert '.querySelector(".advisor-strategy-table")' in js
+
+
+def test_winter_strategy_row_is_never_rendered_without_its_approximation_caveats():
+    js = APP_JS.read_text(encoding="utf-8")
+
+    assert "winter_self_sufficiency: \"Winter-style (approx.)\"" in js
+    assert "function advisorWinterCaveats(" in js
+    assert "advisorWinterCaveats(report && report.winter_candidate)" in js
+    assert "winter.caveats" in js
+    assert "WINTER_MODE" in js
+    # The wording must hold in Winter Mode too — the broker publishes the reserve
+    # in both modes, so claiming the row "cannot be previewed from a Summer plan"
+    # would be plainly false on a winter plan.
+    assert "Summer plan" not in js
+    # A reserve raised to the configured minimum must be disclosed, not hidden.
+    assert "winter.reserve_was_raised" in js
+    # Carried energy is measured per-policy, so the floor travels with the value.
+    assert "floor_soc_percent" in js
+
+
+def test_live_plan_row_names_the_running_optimizer_mode():
+    js = APP_JS.read_text(encoding="utf-8")
+
+    assert "function advisorOptimizerModeLabel(" in js
+    assert '"winter") return "Winter mode"' in js
+    assert '"summer") return "Summer mode"' in js
+    assert "report && report.optimizer_mode" in js
+    assert 'const liveLabel = "Live plan" + (modeLabel ? ` (${modeLabel})` : "");' in js
+
+
+def test_strategy_legend_explains_every_row_in_dashboard_terms_not_financial_ones():
+    js = APP_JS.read_text(encoding="utf-8")
+    css = APP_CSS.read_text(encoding="utf-8")
+
+    assert "const ADVISOR_STRATEGY_LEGEND" in js
+    # The vocabulary already used elsewhere on the dashboard: the literal
+    # control_action values (BUY/SELL/RETAIN/IDLE), and "reserve" as used by
+    # MIN_SOC_RESERVE_* / the Settings tab — not the euro-denominated column
+    # headers above it, which describe outcome, not policy.
+    legend = js[js.index("const ADVISOR_STRATEGY_LEGEND"):js.index("function advisorStrategyCells(")]
+    assert "BUY" in legend and "SELL" in legend and "RETAIN" in legend and "IDLE" in legend
+    assert "protected reserve" in legend
+    assert "live_plan" in legend
+    assert "market_arbitrage" in legend
+    assert "protected_hybrid" in legend
+    assert "pv_first_self_sufficiency" in legend
+    assert "winter_self_sufficiency" in legend
+    # One legend entry per row, in the table's own top-to-bottom order.
+    assert "legendRows" in js
+    assert '[["live_plan", liveLabel]]' in js
+    assert "<dl class=\"advisor-strategy-legend\">" in js
+    assert ".advisor-strategy-legend" in css
 
 
 def test_advisor_exposes_read_only_forecast_and_strategy_tools():

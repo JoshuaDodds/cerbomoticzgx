@@ -1187,6 +1187,9 @@ def test_publish_plan_json_serializes_weather_datetime_maps(monkeypatch, tmp_pat
         "ESS_MIN_SELL_PRICE": "0.18",
         "ESS_BATTERY_CYCLE_COST": "0.03",
         "ESS_ARBITRAGE_MARGIN": "0.03",
+        # Deliberately not the 20.0 fallback, so the assertion below proves the
+        # published reserve is read from configuration rather than defaulted.
+        "MIN_SOC_RESERVE_WINTER": "40",
     }
     monkeypatch.setattr(
         energy_broker,
@@ -1319,6 +1322,12 @@ def test_publish_plan_json_serializes_weather_datetime_maps(monkeypatch, tmp_pat
     assert strategy_config["protected_soc_percent"] == 46.0
     assert payload["strategy_shadow"]["mode"] == "read_only_offline_replay"
     assert payload["strategy_shadow"]["protected_soc_source"] == "winter_policy"
+    # Deliberately a sibling of strategy_candidate_config, which the evaluator
+    # validates against a closed field list: a key added inside it would make
+    # every plan this build publishes unreadable. The evaluator's approximate
+    # Winter-Mode row is silently dropped if this key is renamed or removed, so
+    # assert it here rather than relying on hand-written plans in the CLI tests.
+    assert payload["winter_reserve_soc_percent"] == 40.0
     assert payload["planning_policy"]["selected"] == "today_first"
     assert payload["planning_policy"]["reason_code"] == "DAILY_SETTLEMENT_PROTECTED"
     assert payload["optimizer_mode"] == "winter"
