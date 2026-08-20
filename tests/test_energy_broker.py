@@ -1,4 +1,5 @@
 from pathlib import Path
+from datetime import datetime, timedelta
 import sys
 import json
 import types
@@ -1222,6 +1223,8 @@ def test_publish_plan_json_serializes_weather_datetime_maps(monkeypatch, tmp_pat
             "load": 0.3,
             "reason": "test",
             "reason_code": "TEST",
+            "strategy": "protected_hybrid",
+            "protected_soc": 55.0,
         }],
         "victron_slots": [],
         "slot_duration_h": 0.25,
@@ -1262,6 +1265,13 @@ def test_publish_plan_json_serializes_weather_datetime_maps(monkeypatch, tmp_pat
             "reason_code": "DAILY_SETTLEMENT_PROTECTED",
             "today_sacrifice_eur": 10.0,
             "future_gain_eur": 3.0,
+        },
+        "strategy": "protected_hybrid",
+        "adaptive_policy": {
+            "enabled": True,
+            "selected": "protected_hybrid",
+            "reason_code": "CONSERVATIVE_POLICY_PREFERRED",
+            "trade_hurdle_eur": 1.5,
         },
         "optimizer_mode": "winter",
         "winter_policy": {
@@ -1330,6 +1340,12 @@ def test_publish_plan_json_serializes_weather_datetime_maps(monkeypatch, tmp_pat
     assert payload["winter_reserve_soc_percent"] == 40.0
     assert payload["planning_policy"]["selected"] == "today_first"
     assert payload["planning_policy"]["reason_code"] == "DAILY_SETTLEMENT_PROTECTED"
+    assert payload["active_strategy"] == "protected_hybrid"
+    assert payload["adaptive_policy"]["selected"] == "protected_hybrid"
+    assert payload["schedule"][0]["strategy"] == "protected_hybrid"
+    assert payload["schedule"][0]["protected_soc"] == 55.0
+    assert payload["controller_authority"] == "optimizer"
+    assert payload["control_suppressed"] is False
     assert payload["optimizer_mode"] == "winter"
     assert payload["winter_policy"] == {
         "mode": "winter",
@@ -1470,7 +1486,11 @@ def test_settlement_writes_predicted_vs_actual(monkeypatch, tmp_path):
 
     from datetime import datetime, timezone, timedelta
     res = {"control_action": "SELL", "slot_duration_h": 0.25,
-           "schedule": [{"grid_energy": -2.0, "price": 0.30, "sell": 0.30}]}
+           "schedule": [{
+               "grid_energy": -2.0, "price": 0.30, "sell": 0.30,
+               "reason": "Selling stored energy at €0.300/kWh — the highest price in the horizon",
+               "reason_code": "PRICE_PEAK",
+           }]}
 
     t1 = datetime(2026, 7, 10, 10, 0, tzinfo=timezone.utc)
     t2 = t1 + timedelta(minutes=15)   # next slot -> the prior slot settles
@@ -1518,6 +1538,10 @@ def test_settlement_writes_predicted_vs_actual(monkeypatch, tmp_path):
     assert len(settlements) == 1
     s = settlements[0]
     assert s["predicted_control_action"] == "SELL"
+    assert s["predicted_reason"] == (
+        "Selling stored energy at €0.300/kWh — the highest price in the horizon"
+    )
+    assert s["predicted_reason_code"] == "PRICE_PEAK"
     assert s["actual_control_action"] == "SELL"
     assert not s["incomplete"]
     assert abs(s["actual_export_kwh"] - 2.0) < 1e-6
@@ -1671,6 +1695,124 @@ def test_realized_action_from_live_flow():
     assert energy_broker._realized_action(None, None) == "IDLE"
 
 
+def test_realized_action_requires_soc_movement_for_settled_buy_or_sell():
+    """Power direction alone must not relabel a reserve-floor load interval."""
+    # The inverter can show charge-direction power while the battery is pinned
+    # at 0% (or while a transition is settling). That is still RETAIN until the
+    # endpoint SoC proves that energy entered the battery.
+    assert energy_broker._realized_action(
+        1900, 625, soc_start=0.0, soc_end=0.0
+    ) == "RETAIN"
+    assert energy_broker._realized_action(
+        1900, 625, soc_start=0.0, soc_end=0.6
+    ) == "BUY"
+    # Likewise, exporting while the battery SoC is unchanged is not confirmed
+    # battery SELL (it may be PV-only export or meter-direction noise).
+    assert energy_broker._realized_action(
+        -4000, -1500, soc_start=6.0, soc_end=6.0
+    ) == "IDLE"
+    assert energy_broker._realized_action(
+        -4000, -1500, soc_start=6.0, soc_end=5.0
+    ) == "SELL"
+
+
+def test_settlement_does_not_call_grid_load_retain_a_buy_at_soc_floor(
+    monkeypatch, tmp_path
+):
+    """The persisted timeline uses SoC endpoints when classifying a slot."""
+    from datetime import datetime, timedelta, timezone
+
+    monkeypatch.setattr(
+        energy_broker,
+        "retrieve_setting",
+        lambda name: str(tmp_path) if name == "HISTORY_DIR" else None,
+    )
+    monkeypatch.setattr(
+        energy_broker, "STATE", DummyState({"c1_daily_yield": 0.0, "c2_daily_yield": 0.0})
+    )
+    monkeypatch.setattr(energy_broker, "_LAST_SLOT_PATH", str(tmp_path / "last_slot.json"))
+    import lib.ess_cost_basis as _cb
+    monkeypatch.setattr(_cb, "_path", lambda: str(tmp_path / "cost_basis.json"))
+
+    result = {
+        "control_action": "RETAIN",
+        "slot_duration_h": 0.25,
+        "schedule": [{"grid_energy": 0.3, "price": 0.30, "sell": 0.30}],
+    }
+    start = datetime(2026, 8, 15, 6, 45, tzinfo=timezone.utc)
+    energy_broker._settle_prior_slot(
+        result,
+        batt_soc=0.0,
+        today_actuals={"imp_kwh": 0.0, "imp_cost": 0.0, "exp_kwh": 0.0, "exp_rev": 0.0},
+        now=start,
+    )
+    energy_broker._settle_prior_slot(
+        result,
+        batt_soc=0.0,
+        today_actuals={"imp_kwh": 0.3, "imp_cost": 0.09, "exp_kwh": 0.0, "exp_rev": 0.0},
+        now=start + timedelta(minutes=15),
+        realized_power={"grid_w": 1900, "batt_w": 625},
+    )
+
+    records = [
+        json.loads(line)
+        for path in tmp_path.glob("ess-*.ndjson")
+        for line in path.read_text().splitlines()
+        if line.strip()
+    ]
+    settlement = next(row for row in records if row.get("kind") == "settlement")
+    assert settlement["predicted_control_action"] == "RETAIN"
+    assert settlement["actual_control_action"] == "RETAIN"
+
+
+def test_settlement_keeps_retain_instruction_when_floor_soc_ticks_up(
+    monkeypatch, tmp_path
+):
+    """A reserve-floor SoC tick is physical evidence, not an optimizer BUY."""
+    from datetime import datetime, timedelta, timezone
+
+    monkeypatch.setattr(
+        energy_broker,
+        "retrieve_setting",
+        lambda name: str(tmp_path) if name == "HISTORY_DIR" else None,
+    )
+    monkeypatch.setattr(
+        energy_broker, "STATE", DummyState({"c1_daily_yield": 0.0, "c2_daily_yield": 0.0})
+    )
+    monkeypatch.setattr(energy_broker, "_LAST_SLOT_PATH", str(tmp_path / "last_slot.json"))
+    import lib.ess_cost_basis as _cb
+    monkeypatch.setattr(_cb, "_path", lambda: str(tmp_path / "cost_basis.json"))
+
+    result = {
+        "control_action": "RETAIN",
+        "slot_duration_h": 0.25,
+        "schedule": [{"grid_energy": 0.3, "price": 0.30, "sell": 0.30}],
+    }
+    start = datetime(2026, 8, 16, 5, 45, tzinfo=timezone.utc)
+    energy_broker._settle_prior_slot(
+        result,
+        batt_soc=0.0,
+        today_actuals={"imp_kwh": 0.0, "imp_cost": 0.0, "exp_kwh": 0.0, "exp_rev": 0.0},
+        now=start,
+    )
+    energy_broker._settle_prior_slot(
+        result,
+        batt_soc=0.3,
+        today_actuals={"imp_kwh": 0.448, "imp_cost": 0.14, "exp_kwh": 0.0, "exp_rev": 0.0},
+        now=start + timedelta(minutes=15),
+        realized_power={"grid_w": 1809, "batt_w": 655},
+    )
+
+    settlement = next(
+        json.loads(line)
+        for path in tmp_path.glob("ess-*.ndjson")
+        for line in path.read_text().splitlines()
+        if json.loads(line).get("kind") == "settlement"
+    )
+    assert settlement["actual_control_action"] == "RETAIN"
+    assert settlement["observed_power_action"] == "BUY"
+
+
 def test_is_truthy_parses_false_string():
     # Regression: bool("False") is True, which made HOME_CONNECT_APPLIANCE_SCHEDULING
     # (and similar flags) ignore a "False" setting.
@@ -1715,19 +1857,190 @@ def test_grid_assist_stands_down_during_ai_buy_slot(monkeypatch):
     assert len(applied) == 1                    # retain setpoint applied outside a BUY
 
 
-def test_ai_ess_override_stands_optimizer_down(monkeypatch):
-    monkeypatch.setattr(energy_broker, "retrieve_setting",
-                        lambda name: "1" if name == "AI_POWERED_ESS_ALGORITHM" else None)
-    monkeypatch.setattr(energy_broker, "STATE", DummyState({"ai_ess_override_enabled": "True", "batt_soc": 57}))
-    prices = MagicMock(return_value=[{"start": "2026-06-29T09:00:00+02:00", "total": 0.2}])
-    monkeypatch.setattr(energy_broker, "get_all_price_points", prices)
-    optimizer = MagicMock()
+def _stub_observational_optimizer_run(monkeypatch, state_values):
+    """Prepare a complete optimizer pass while exposing every control write."""
+    from datetime import datetime, timedelta, timezone
+    import lib.weather as weather
+
+    start = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    prices = [
+        {"start": (start + timedelta(minutes=15 * i)).isoformat(), "total": 0.20}
+        for i in range(2)
+    ]
+    monkeypatch.setattr(
+        energy_broker, "retrieve_setting",
+        lambda name: "1" if name == "AI_POWERED_ESS_ALGORITHM" else None,
+    )
+    defaults = {
+        "batt_soc": 57,
+        "ac_in_power": 500,
+        "pv_power": 0,
+        "ac_out_power": 500,
+        "batt_power": 0,
+    }
+    defaults.update(state_values)
+    monkeypatch.setattr(energy_broker, "STATE", DummyState(defaults))
+    monkeypatch.setattr(energy_broker, "get_all_price_points", lambda: prices)
+    monkeypatch.setattr(
+        energy_broker, "_build_pv_forecast_by_slot",
+        lambda slots, slot_h: {slot["start"]: 0.0 for slot in slots},
+    )
+    monkeypatch.setattr(
+        energy_broker, "_build_load_forecast_by_slot",
+        lambda slots, slot_h: {slot["start"]: 0.2 for slot in slots},
+    )
+    monkeypatch.setattr(
+        weather, "weather_context_for_slots",
+        lambda *args, **kwargs: {"available": False, "summary": {}, "slots": {}},
+    )
+    monkeypatch.setattr(energy_broker, "_apply_pv_nowcast", lambda pv, *args: pv)
+    monkeypatch.setattr(
+        energy_broker, "_apply_appliance_reservations_to_forecast",
+        lambda load, **kwargs: (load, {"enabled": False}),
+    )
+    monkeypatch.setattr(
+        energy_broker, "_apply_ev_smart_charge_to_forecast",
+        lambda load, *args, **kwargs: (load, {"plan": {}}),
+    )
+    optimizer = MagicMock(return_value={
+        "schedule": [{
+            "time": prices[0]["start"], "action": "hold",
+            "control_action": "RETAIN", "soc_start": 57.0, "soc_end": 57.0,
+            "grid_energy": 0.2, "price": 0.20, "sell": 0.20,
+            "load": 0.2, "pv": 0.0,
+        }],
+        "victron_slots": [{"start": start, "duration": 900, "target_soc": 80}],
+        "slot_duration_h": 0.25, "setpoint": 0.0,
+        "control_action": "RETAIN", "grid_assist": True, "mode": "hold",
+        "current_price": 0.20, "limit_feed_in": False,
+    })
     monkeypatch.setattr(energy_broker, "optimize_schedule", optimizer)
+    controls = {
+        "setpoint": MagicMock(),
+        "feed": MagicMock(),
+        "minimum": MagicMock(),
+        "clear": MagicMock(),
+        "publish": MagicMock(),
+    }
+    monkeypatch.setattr(energy_broker, "ac_power_setpoint", controls["setpoint"])
+    monkeypatch.setattr(energy_broker, "limit_grid_feed_in", controls["feed"])
+    monkeypatch.setattr(energy_broker, "set_minimum_ess_soc", controls["minimum"])
+    monkeypatch.setattr(energy_broker, "clear_victron_schedules", controls["clear"])
+    monkeypatch.setattr(energy_broker, "publish_message", controls["publish"])
+    monkeypatch.setattr(energy_broker, "get_today_energy_actuals", lambda: {})
+    history = MagicMock()
+    settlement = MagicMock()
+    plans = []
+    monkeypatch.setattr(energy_broker, "_append_history", history)
+    monkeypatch.setattr(energy_broker, "_settle_prior_slot", settlement)
+    monkeypatch.setattr(
+        energy_broker, "_publish_plan_json",
+        lambda result, **kwargs: plans.append(result.copy()),
+    )
+    return optimizer, controls, history, settlement, plans
 
-    energy_broker.run_ai_optimizer()
 
-    prices.assert_not_called()
-    optimizer.assert_not_called()
+def test_ai_ess_override_observes_and_settles_without_control_writes(monkeypatch):
+    optimizer, controls, history, settlement, plans = _stub_observational_optimizer_run(
+        monkeypatch, {"ai_ess_override_enabled": "True"}
+    )
+
+    assert energy_broker.run_ai_optimizer() is True
+
+    optimizer.assert_called_once()
+    history.assert_called_once()
+    settlement.assert_called_once()
+    assert plans[0]["controller_authority"] == "manual_override"
+    assert plans[0]["reason_code"] == "MANUAL_OVERRIDE_OBSERVATION"
+    for control in controls.values():
+        control.assert_not_called()
+
+
+def test_grid_offline_allows_emergency_reserve_discharge_without_control_writes(monkeypatch):
+    optimizer, controls, history, settlement, plans = _stub_observational_optimizer_run(
+        monkeypatch,
+        {"ac_in_connected": 0, "batt_soc": 35, "batt_power": -1200,
+         "ac_in_power": 0, "ac_out_power": 1200},
+    )
+
+    assert energy_broker.run_ai_optimizer() is True
+
+    optimizer.assert_called_once()
+    history.assert_called_once()
+    settlement.assert_called_once()
+    assert plans[0]["controller_authority"] == "grid_offline"
+    assert plans[0]["control_action"] == "IDLE"
+    assert plans[0]["reason_code"] == "GRID_OFFLINE_PASS_THROUGH"
+    assert plans[0]["victron_slots"] == []
+    assert all(
+        row["control_action"] == "IDLE"
+        and row["grid_energy"] == 0.0
+        and row["protected_soc"] == 0.0
+        for row in plans[0]["schedule"]
+    )
+    for control in controls.values():
+        control.assert_not_called()
+
+
+def test_grid_connection_state_requires_explicit_offline_value(monkeypatch):
+    monkeypatch.setattr(energy_broker, "STATE", DummyState({}))
+    assert energy_broker._grid_connection_state() is None
+    monkeypatch.setattr(energy_broker, "STATE", DummyState({"ac_in_connected": "0"}))
+    assert energy_broker._grid_connection_state() is False
+    monkeypatch.setattr(energy_broker, "STATE", DummyState({"ac_in_connected": "1"}))
+    assert energy_broker._grid_connection_state() is True
+
+
+def test_grid_offline_trajectory_can_use_winter_emergency_reserve(monkeypatch):
+    monkeypatch.setattr(
+        energy_broker,
+        "retrieve_setting",
+        lambda name: {
+            "BATTERY_CAPACITY_KWH": "10",
+            "AC_DC_CHARGE_EFFICIENCY": "1",
+            "AC_DC_DISCHARGE_EFFICIENCY": "1",
+        }.get(name),
+    )
+    start = datetime.now().astimezone()
+    result = energy_broker._grid_offline_pass_through({
+        "schedule": [
+            {"time": start, "load": 2.0, "pv": 0.0},
+            {"time": start + timedelta(minutes=15), "load": 2.0, "pv": 0.0},
+        ],
+        "victron_slots": [{"start": start, "duration": 900, "target_soc": 40}],
+        "winter_policy": {"protected_soc_percent": 40.0},
+    }, 40.0)
+
+    assert result["victron_slots"] == []
+    assert [row["soc_end"] for row in result["schedule"]] == [20.0, 0.0]
+    assert all(row["control_action"] == "IDLE" for row in result["schedule"])
+    assert result["winter_policy"]["protected_soc_percent"] == 0.0
+    assert result["winter_policy"]["grid_connected_backup_reserve_percent"] == 40.0
+
+
+def test_grid_offline_blocks_event_driven_and_legacy_control_paths(monkeypatch):
+    state = DummyState({
+        "ac_in_connected": 0,
+        "ai_grid_assist": "on",
+        "batt_soc": 80,
+    })
+    monkeypatch.setattr(energy_broker, "STATE", state)
+    setpoint = MagicMock()
+    schedule_clear = MagicMock()
+    publish = MagicMock()
+    monkeypatch.setattr(energy_broker, "ac_power_setpoint", setpoint)
+    monkeypatch.setattr(energy_broker, "clear_victron_schedules", schedule_clear)
+    monkeypatch.setattr(energy_broker, "publish_message", publish)
+
+    energy_broker.manage_grid_usage_based_on_current_price(price=0.10, power=2000)
+    energy_broker.manage_sale_of_stored_energy_to_the_grid()
+    energy_broker.set_charging_schedule(slots=[{"start": datetime.now().astimezone()}])
+    energy_broker._apply_grid_assist_setpoint(2000)
+
+    assert state.get("ai_grid_assist") == "off"
+    setpoint.assert_not_called()
+    schedule_clear.assert_not_called()
+    publish.assert_not_called()
 
 
 def test_run_ai_optimizer_skips_when_optimizer_lock_is_held(monkeypatch, caplog):

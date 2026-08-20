@@ -205,7 +205,7 @@ class OptimizationEngine:
 
         # Mode selection is external and frozen at process start.  A winter
         # engine always uses the explicit winter reserve, never calendar logic.
-        self.min_soc = _clamp(_safe_float('MIN_SOC_RESERVE_WINTER', 20.0), 0.0, 100.0)
+        self.min_soc = _clamp(_safe_float('MIN_SOC_RESERVE_WINTER', 40.0), 0.0, 100.0)
         self.max_soc = 100.0
         # Preserve the operator's ceiling exactly. A conflicting ceiling below
         # the winter reserve is not silently raised; the optimizer instead
@@ -400,12 +400,13 @@ class OptimizationEngine:
         """Build post-trough SoC checkpoints and export-protection envelopes."""
         positive_net = [max(0.0, slot['load'] - slot['pv']) for slot in slots]
         stress_house_load = [max(0.0, slot['load']) for slot in slots]
-        dates = {slot['start'].date() for slot in slots}
         average_load_kw = (
             sum(slot['load'] for slot in slots) / max(EPS, len(slots) * slot_h))
-        terminal_house = 0.0
-        if len(dates) <= 1:
-            terminal_house = average_load_kw * WINTER_UNKNOWN_HORIZON_HOURS
+        # A known multi-day horizon still ends at an arbitrary boundary. Protect
+        # the same bounded continuation after its final slot as we do when only
+        # today's prices are available; otherwise publishing tomorrow's prices
+        # paradoxically removes the emergency household-energy allowance.
+        terminal_house = average_load_kw * WINTER_UNKNOWN_HORIZON_HOURS
 
         checkpoints = {}
         window_details = []

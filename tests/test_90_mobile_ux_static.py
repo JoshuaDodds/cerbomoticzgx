@@ -534,6 +534,16 @@ def test_desktop_logo_and_clear_schedule_js_hooks_exist():
     assert 'fetch("/api/victron/clear-schedule", { method: "POST" })' in js
 
 
+def test_victron_schedule_tab_requests_and_renders_live_mqtt_state():
+    js = APP_JS.read_text(encoding="utf-8")
+
+    assert "function requestVictronScheduleRefresh(" in js
+    assert 'fetch("/api/victron/request-schedule", { method: "POST" })' in js
+    assert 'if (tabName === "victron") requestVictronScheduleRefresh();' in js
+    assert "live.victron_schedule" in js
+    assert "renderVictron(lastPlan, lastLive)" in js
+
+
 def test_operator_actions_do_not_use_browser_blocking_dialogs():
     js = APP_JS.read_text(encoding="utf-8")
 
@@ -900,6 +910,15 @@ def test_pl_summary_explains_winter_household_protection_policy():
     assert "protected household requirement" in js
     assert "An exceptional spread cleared every loss and safety hurdle" in js
     assert "Winter Mode degraded safely" in js
+
+
+def test_pl_summary_exposes_adaptive_strategy_and_suppressed_control():
+    js = APP_JS.read_text(encoding="utf-8")
+
+    assert "Adaptive Summer selected" in js
+    assert "pv_first_self_sufficiency" in js
+    assert 'plan.controller_authority === "grid_offline"' in js
+    assert "Victron may use the full emergency reserve" in js
 
 
 def test_monthly_chart_uses_forecast_spread_and_comparable_actual_markers():

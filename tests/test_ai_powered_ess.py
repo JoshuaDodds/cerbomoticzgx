@@ -3,6 +3,9 @@ from datetime import datetime, timedelta
 from dateutil import tz
 import sys
 import os
+from unittest.mock import patch
+
+import pytest
 
 # Add repo root to path
 sys.path.append(os.getcwd())
@@ -796,6 +799,360 @@ class TestAIPoweredESS(unittest.TestCase):
         self.assertIsNotNone(result)
         for step in result['schedule']:
             self.assertGreaterEqual(step['soc_end'], step['soc_start'])
+
+    def test_pv_first_policy_never_buys_grid_energy_or_exports_battery(self):
+        start = datetime(2099, 8, 1, 0, 0, tzinfo=tz.UTC)
+        prices = [
+            {'start': start + timedelta(hours=i), 'total': price}
+            for i, price in enumerate([0.10, 0.45, 0.45, 0.10])
+        ]
+
+        result = self.engine.optimize(
+            50.0, prices, [1.0] * 4, [0.0] * 4,
+            policy_name='pv_first_self_sufficiency')
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result['strategy'], 'pv_first_self_sufficiency')
+        self.assertFalse(any(
+            step['soc_end'] > step['soc_start'] + ai_powered_ess.EPS
+            and step['grid_energy'] > ai_powered_ess.EPS
+            for step in result['schedule']))
+        self.assertFalse(any(
+            step['soc_end'] < step['soc_start'] - ai_powered_ess.EPS
+            and step['grid_energy'] < -ai_powered_ess.EPS
+            for step in result['schedule']))
+
+    def test_hybrid_protects_household_energy_until_next_cheap_window(self):
+        with patch.object(
+                ai_powered_ess, 'retrieve_setting',
+                side_effect=lambda key: {
+                    'ESS_ADAPTIVE_FORECAST_RISK_FACTOR': '0',
+                    'ESS_ADAPTIVE_UNKNOWN_HORIZON_HOURS': '0',
+                }.get(key)):
+            policy = self.engine._policy_constraints(
+                'protected_hybrid',
+                [0.10, 0.40, 0.40, 0.10],
+                [0.0, 1.0, 1.0, 0.0],
+            )
+
+        self.assertEqual(
+            policy['grid_charge_allowed_by_step'], [True, False, False, True])
+        self.assertGreater(policy['protected_floor_by_step'][0], self.engine.min_soc)
+        self.assertLess(
+            policy['protected_floor_by_step'][1],
+            policy['protected_floor_by_step'][0])
+        self.assertTrue(policy['force_floor_recovery'])
+
+    def test_hybrid_protects_bounded_load_beyond_final_known_price(self):
+        with patch.object(
+                ai_powered_ess, 'retrieve_setting',
+                side_effect=lambda key: {
+                    'ESS_ADAPTIVE_FORECAST_RISK_FACTOR': '0',
+                    'ESS_ADAPTIVE_UNKNOWN_HORIZON_HOURS': '4',
+                }.get(key)):
+            policy = self.engine._policy_constraints(
+                'protected_hybrid', [0.10, 0.30], [1.0, 1.0])
+
+        expected_dc = 4.0 / self.engine.discharge_efficiency
+        expected_floor = self.engine.min_soc + (
+            expected_dc / self.engine.battery_capacity * 100.0)
+        self.assertGreaterEqual(
+            policy['protected_floor_by_step'][-1], expected_floor)
+
+    def test_hybrid_replenishes_household_energy_in_cheapest_window(self):
+        """A low live SoC must not turn the safe policy into all-day RETAIN."""
+        start = datetime(2099, 8, 1, 8, 0, tzinfo=tz.UTC)
+        prices = [
+            {'start': start + timedelta(hours=i), 'total': price}
+            for i, price in enumerate(
+                [0.34, 0.33, 0.30, 0.30, 0.301, 0.33, 0.34, 0.33])
+        ]
+        settings = {
+            'ESS_ADAPTIVE_FORECAST_RISK_FACTOR': '0',
+            'ESS_ADAPTIVE_UNKNOWN_HORIZON_HOURS': '0',
+        }
+        with patch.object(
+                ai_powered_ess, 'retrieve_setting',
+                side_effect=lambda key: settings.get(key)):
+            result = self.engine.optimize(
+                2.0, prices, [1.0] * len(prices), [0.0] * len(prices),
+                policy_name='protected_hybrid')
+
+        self.assertIsNotNone(result)
+        cheapest_window = result['schedule'][2:5]
+        self.assertTrue(any(
+            step['control_action'] == 'BUY'
+            for step in cheapest_window
+        ))
+        self.assertGreater(
+            cheapest_window[-1]['soc_end'], 2.0,
+            'household coverage must be procured before the expensive period',
+        )
+        self.assertTrue(all(
+            step['soc_end'] >= step['protected_soc'] - ai_powered_ess.EPS
+            for step in result['schedule'][4:]
+        ))
+
+    def test_pv_first_uses_stored_energy_at_high_price(self):
+        start = datetime(2099, 8, 1, 0, 0, tzinfo=tz.UTC)
+        prices = [
+            {'start': start + timedelta(hours=i), 'total': price}
+            for i, price in enumerate([0.45, 0.45, 0.10, 0.10])
+        ]
+        with patch.object(
+                ai_powered_ess, 'retrieve_setting',
+                side_effect=lambda key: {
+                    'ESS_MODEL_CHARGE_RATE': '0',
+                    'ESS_EXPORT_AC_SETPOINT': '-10000',
+                }.get(key)):
+            result = self.engine.optimize(
+                70.0, prices, [1.0] * 4, [0.0] * 4,
+                policy_name='pv_first_self_sufficiency')
+
+        self.assertIsNotNone(result)
+        self.assertTrue(any(
+            step['control_action'] == 'IDLE'
+            and step['soc_end'] < step['soc_start']
+            for step in result['schedule'][:2]
+        ))
+
+    def test_pv_first_remains_feasible_when_live_soc_is_below_reserve(self):
+        start = datetime(2099, 8, 1, 0, 0, tzinfo=tz.UTC)
+        prices = [
+            {'start': start + timedelta(hours=i), 'total': 0.30}
+            for i in range(3)
+        ]
+
+        result = self.engine.optimize(
+            2.0, prices, [0.2] * 3, [0.0] * 3,
+            policy_name='pv_first_self_sufficiency')
+
+        self.assertIsNotNone(result)
+        self.assertFalse(any(
+            step['grid_energy'] > step['load'] + ai_powered_ess.EPS
+            for step in result['schedule']
+        ))
+
+
+def _adaptive_candidate(name, grid_values, end_soc):
+    start = datetime(2099, 8, 1, 0, 0, tzinfo=tz.UTC)
+    schedule = []
+    soc = 50.0
+    for index, grid_energy in enumerate(grid_values):
+        final_soc = end_soc if index == len(grid_values) - 1 else soc
+        schedule.append({
+            'time': start + timedelta(hours=index),
+            'action': 'hold',
+            'control_action': 'IDLE',
+            'soc_start': soc,
+            'soc_end': final_soc,
+            'grid_energy': grid_energy,
+            'price': 0.20,
+            'sell': 0.20,
+            'strategy': name,
+            'protected_soc': 5.0,
+        })
+        soc = final_soc
+    return {'schedule': schedule, 'strategy': name}
+
+
+def test_adaptive_selector_requires_material_trade_benefit(monkeypatch, tmp_path):
+    state_path = tmp_path / 'policy.json'
+    settings = {
+        'ESS_ADAPTIVE_POLICY_STATE_PATH': str(state_path),
+        'ESS_ADAPTIVE_TRADE_MIN_BENEFIT_EUR': '1.0',
+        'ESS_ADAPTIVE_POLICY_MIN_DWELL_MIN': '0',
+        'ESS_ADAPTIVE_POLICY_SWITCH_MARGIN_EUR': '0',
+        'ESS_ADAPTIVE_FORECAST_RISK_FACTOR': '0.20',
+    }
+    monkeypatch.setattr(
+        ai_powered_ess, 'retrieve_setting', lambda key: settings.get(key))
+    engine = ai_powered_ess.OptimizationEngine()
+    engine.min_soc = 5.0
+    engine.battery_capacity = 10.0
+    engine.discharge_efficiency = 1.0
+    engine.cycle_cost = 0.0
+    engine.arbitrage_margin = 0.0
+    engine.terminal_value_factor = 1.0
+    engine.expected_peak_price = 0.0
+    candidates = {
+        'market_arbitrage': _adaptive_candidate(
+            'market_arbitrage', [-5.0], 5.0),
+        'pv_first_self_sufficiency': _adaptive_candidate(
+            'pv_first_self_sufficiency', [-4.5], 5.0),
+        'protected_hybrid': _adaptive_candidate(
+            'protected_hybrid', [-4.6], 5.0),
+    }
+
+    selected, metadata = ai_powered_ess._select_adaptive_policy(
+        candidates, engine,
+        opportunity_model={'forecast_risk_eur': 0.25})
+
+    assert selected['strategy'] == 'protected_hybrid'
+    assert metadata['reason_code'] == 'CONSERVATIVE_POLICY_PREFERRED'
+    assert metadata['trade_hurdle_eur'] == 1.05
+    assert metadata['forecast_risk_eur'] == 0.05
+
+
+def test_adaptive_selector_does_not_let_common_forecast_error_hide_trade_win(
+        monkeypatch, tmp_path):
+    """Historical day error is scaled, not charged twice as a blanket €2."""
+    state_path = tmp_path / 'policy.json'
+    settings = {
+        'ESS_ADAPTIVE_POLICY_STATE_PATH': str(state_path),
+        'ESS_ADAPTIVE_TRADE_MIN_BENEFIT_EUR': '1.0',
+        'ESS_ADAPTIVE_FORECAST_RISK_MAX_EUR': '2.0',
+        'ESS_ADAPTIVE_FORECAST_RISK_FACTOR': '0.20',
+        'ESS_ADAPTIVE_POLICY_MIN_DWELL_MIN': '0',
+        'ESS_ADAPTIVE_POLICY_SWITCH_MARGIN_EUR': '0',
+    }
+    monkeypatch.setattr(
+        ai_powered_ess, 'retrieve_setting', lambda key: settings.get(key))
+    engine = ai_powered_ess.OptimizationEngine()
+    engine.min_soc = 5.0
+    engine.battery_capacity = 10.0
+    engine.discharge_efficiency = 1.0
+    engine.cycle_cost = 0.0
+    engine.arbitrage_margin = 0.0
+    engine.terminal_value_factor = 1.0
+    engine.expected_peak_price = 0.0
+    candidates = {
+        'market_arbitrage': _adaptive_candidate(
+            'market_arbitrage', [-12.5], 5.0),
+        'protected_hybrid': _adaptive_candidate(
+            'protected_hybrid', [-5.0], 5.0),
+    }
+
+    selected, metadata = ai_powered_ess._select_adaptive_policy(
+        candidates, engine,
+        opportunity_model={'forecast_risk_eur': 20.0})
+
+    assert selected['strategy'] == 'market_arbitrage'
+    assert metadata['reason_code'] == 'TRADE_MATERIAL_BENEFIT'
+    assert metadata['forecast_risk_eur'] == 0.4
+    assert metadata['trade_hurdle_eur'] == 1.4
+
+
+def test_adaptive_selector_accepts_clearly_superior_trade(monkeypatch, tmp_path):
+    state_path = tmp_path / 'policy.json'
+    settings = {
+        'ESS_ADAPTIVE_POLICY_STATE_PATH': str(state_path),
+        'ESS_ADAPTIVE_TRADE_MIN_BENEFIT_EUR': '1.0',
+        'ESS_ADAPTIVE_POLICY_MIN_DWELL_MIN': '0',
+        'ESS_ADAPTIVE_POLICY_SWITCH_MARGIN_EUR': '0',
+    }
+    monkeypatch.setattr(
+        ai_powered_ess, 'retrieve_setting', lambda key: settings.get(key))
+    engine = ai_powered_ess.OptimizationEngine()
+    engine.min_soc = 5.0
+    engine.battery_capacity = 10.0
+    engine.discharge_efficiency = 1.0
+    engine.cycle_cost = 0.0
+    engine.arbitrage_margin = 0.0
+    engine.terminal_value_factor = 1.0
+    engine.expected_peak_price = 0.0
+    candidates = {
+        'market_arbitrage': _adaptive_candidate(
+            'market_arbitrage', [-12.0], 5.0),
+        'pv_first_self_sufficiency': _adaptive_candidate(
+            'pv_first_self_sufficiency', [-4.0], 5.0),
+        'protected_hybrid': _adaptive_candidate(
+            'protected_hybrid', [-4.5], 5.0),
+    }
+
+    selected, metadata = ai_powered_ess._select_adaptive_policy(
+        candidates, engine,
+        opportunity_model={'forecast_risk_eur': 0.25})
+
+    assert selected['strategy'] == 'market_arbitrage'
+    assert metadata['reason_code'] == 'TRADE_MATERIAL_BENEFIT'
+
+
+def test_adaptive_selector_caps_legacy_forecast_risk(monkeypatch, tmp_path):
+    state_path = tmp_path / 'policy.json'
+    settings = {
+        'ESS_ADAPTIVE_POLICY_STATE_PATH': str(state_path),
+        'ESS_ADAPTIVE_TRADE_MIN_BENEFIT_EUR': '1.0',
+        'ESS_ADAPTIVE_FORECAST_RISK_MAX_EUR': '2.0',
+        'ESS_ADAPTIVE_FORECAST_RISK_FACTOR': '0.20',
+        'ESS_ADAPTIVE_POLICY_MIN_DWELL_MIN': '0',
+        'ESS_ADAPTIVE_POLICY_SWITCH_MARGIN_EUR': '0',
+    }
+    monkeypatch.setattr(
+        ai_powered_ess, 'retrieve_setting', lambda key: settings.get(key))
+    engine = ai_powered_ess.OptimizationEngine()
+    engine.min_soc = 5.0
+    engine.battery_capacity = 10.0
+    engine.discharge_efficiency = 1.0
+    engine.cycle_cost = 0.0
+    engine.arbitrage_margin = 0.0
+    engine.terminal_value_factor = 1.0
+    engine.expected_peak_price = 0.0
+    candidates = {
+        'market_arbitrage': _adaptive_candidate(
+            'market_arbitrage', [-20.0], 5.0),
+        'protected_hybrid': _adaptive_candidate(
+            'protected_hybrid', [-4.5], 5.0),
+    }
+
+    selected, metadata = ai_powered_ess._select_adaptive_policy(
+        candidates, engine,
+        opportunity_model={'forecast_risk_eur': 14.5})
+
+    assert selected['strategy'] == 'market_arbitrage'
+    assert metadata['raw_forecast_risk_eur'] == 14.5
+    assert metadata['capped_forecast_risk_eur'] == 2.0
+    assert metadata['forecast_risk_eur'] == 0.4
+    assert metadata['trade_hurdle_eur'] == 1.4
+
+
+def test_adaptive_terminal_credit_is_limited_to_unknown_household_need(monkeypatch):
+    monkeypatch.setattr(
+        ai_powered_ess,
+        'retrieve_setting',
+        lambda key: '2' if key == 'ESS_ADAPTIVE_UNKNOWN_HORIZON_HOURS' else None,
+    )
+    engine = ai_powered_ess.OptimizationEngine()
+    engine.min_soc = 5.0
+    engine.battery_capacity = 10.0
+    engine.discharge_efficiency = 1.0
+    engine.cycle_cost = 0.0
+    engine.arbitrage_margin = 0.0
+    engine.expected_peak_price = 0.30
+    plan = _adaptive_candidate(
+        'pv_first_self_sufficiency', [0.0, 0.0], 100.0)
+    plan['slot_duration_h'] = 1.0
+    for step in plan['schedule']:
+        step.update({'load': 1.0, 'pv': 0.0})
+
+    metrics = ai_powered_ess._adaptive_plan_score(plan, engine)
+
+    assert metrics['terminal_credited_kwh'] == 2.0
+    assert metrics['terminal_value_eur'] == pytest.approx(0.6)
+
+
+def test_adaptive_feature_gate_off_preserves_single_market_path(monkeypatch):
+    market = {'schedule': [{'strategy': 'market_arbitrage'}]}
+
+    class FakeEngine:
+        def set_cost_basis_floor(self, _value):
+            pass
+
+        def optimize_with_daily_policy(self, *args, **kwargs):
+            return market
+
+        def optimize(self, *args, **kwargs):
+            raise AssertionError('conservative candidates must not run while gated off')
+
+    monkeypatch.setattr(ai_powered_ess, 'OptimizationEngine', FakeEngine)
+    monkeypatch.setattr(
+        ai_powered_ess, 'retrieve_setting',
+        lambda key: 'False' if key == 'ESS_ADAPTIVE_POLICY_ENABLED' else None)
+
+    result = ai_powered_ess.optimize_schedule(
+        50.0, [{'start': datetime.now(tz.UTC), 'total': 0.20}])
+
+    assert result is market
 
 if __name__ == '__main__':
     unittest.main()

@@ -163,22 +163,46 @@
   terminal SoC and realised settlement. Do not use future actual PV/load to choose a
   historical "winner", and do not change Summer/Winter behaviour from one scenario.
 
-- **Per-day strategy override (proposed, not implemented)** — Requested: select
-  an alternative strategy in the Advisor and have it drive dispatch for the rest
-  of the day, reverting to the AI optimizer at midnight. Deliberately deferred
-  until the corrected counterfactual has collected enough days to show a
-  candidate genuinely and repeatably beating the live plan — the original
-  motivation for the feature rested on the void horizon-vs-today comparison
-  above. Design notes for when it is revisited: the three candidates are
-  *constraint sets*, not planners, so this must be a policy override applied to
-  the existing engine at the `optimize_schedule()` choke point, never a second
-  optimizer. It needs one new DP constraint (`allow_active_battery_export`,
-  defaulting to today's behaviour), read-time expiry from a durable JSON store
-  so a missed tick or restart cannot strand it, refusal in Winter Mode
-  (separate engine, separate reserve policy), a hard invariant that it can never
-  lower the planning floor below `current_min_soc_reserve()` or touch
-  `VICTRON_HARDWARE_MIN_SOC`, and `strategy_override` recorded into the plan
-  JSON and history so every slot stays attributable.
+- **Adaptive Summer policy — attended production validation required** — The
+  production Summer engine can now compare three *constraint sets* through the
+  same DP (`market_arbitrage`, `pv_first_self_sufficiency`, and
+  `protected_hybrid`) when `ESS_ADAPTIVE_POLICY_ENABLED=True`. It is not a
+  second optimizer and it does not use the simplified Advisor/CLI replay.
+  Trading must beat the best conservative plan by the configured minimum plus
+  the configured fraction of capped learned forecast risk; lifecycle and
+  arbitrage risk are already present in each candidate score. Policy dwell and
+  switch margin prevent replan churn. Protected hybrid merges neighbouring
+  low-price slots into a procurement valley, must replenish its household-energy
+  layer by the end of that valley, and protects it through the next valley plus
+  a configurable load allowance beyond the final known price slot. The selected
+  strategy, all candidate scores,
+  hurdle and reason are persisted in plan JSON/history. Keep the gate **off by
+  default** until these checks have passed over at least 14 complete days:
+
+  - Confirm thin-spread/cloudy days select PV-first or protected hybrid and use
+    stored energy above the protected floor for expensive household demand,
+    without routine full charge-to-empty cycling.
+  - Confirm Trading is selected only on clearly profitable spreads and that its
+    recorded incremental benefit exceeds `trade_hurdle_eur`; compare realized
+    net grid result and battery throughput against similar pre-change days.
+  - Confirm the selected strategy does not flap every quarter hour, especially
+    around the 13:00 next-day price publication and weather-nowcast changes.
+  - Confirm a same-day-only horizon and a multi-day horizon both retain the
+    bounded unknown-horizon household layer rather than dumping at the final
+    visible slot.
+
+  The older request for a manual per-day Advisor strategy override remains
+  deferred; the automatic selector must be validated first.
+
+- **Winter reserve/outage validation** — The 40% winter floor is a logical,
+  grid-connected emergency backup reserve. It is not written to Victron
+  `MinimumSocLimit`. With an explicit replicated `ac_in_connected=0`, verify the
+  optimizer continues forecasts/history/settlement but sends no setpoint,
+  grid-assist, schedule, feed-limit or minimum-SoC writes, reports
+  `GRID_OFFLINE_PASS_THROUGH`, and allows Victron to use the reserve down toward
+  zero for household survival. Repeat after startup with the grid state still
+  unknown and confirm it is not falsely treated as offline. Manual Override must
+  likewise remain observable while suppressing control writes.
 
 ## EV smart-charge scheduling — operator validation / learning follow-up
 

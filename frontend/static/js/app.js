@@ -135,6 +135,7 @@ function activateTab(tabName) {
   if (tab) tab.classList.add("active");
   panel.classList.add("active");
   syncMobileNavState();
+  if (tabName === "victron") requestVictronScheduleRefresh();
   if (tabName === "logs") connectLogsStream(); else disconnectLogsStream();
 }
 
@@ -743,6 +744,13 @@ function renderDaySummary(plan) {
 function planStrategySummary(plan) {
   const now = new Date();
   const winterPolicy = plan.optimizer_mode === "winter" ? (plan.winter_policy || {}) : null;
+  const adaptivePolicy = plan.optimizer_mode !== "winter" ? (plan.adaptive_policy || null) : null;
+  if (plan.control_suppressed && plan.controller_authority === "grid_offline") {
+    return "Grid outage: optimizer control is suspended. Victron may use the full emergency reserve to support the house while forecasting and settlement continue.";
+  }
+  if (plan.control_suppressed && plan.controller_authority === "manual_override") {
+    return "Manual Override: optimizer control is suspended; live measurements, settlement and the observational plan continue updating.";
+  }
   const configuredSlotHours = Number(plan.slot_duration_h);
   const slotHours = Number.isFinite(configuredSlotHours) && configuredSlotHours > 0
     ? configuredSlotHours : 0.25;
@@ -813,7 +821,14 @@ function planStrategySummary(plan) {
   if (buys.length && sells.length) strategy = "Buy low, then sell at the stronger price peaks";
   else if (buys.length) strategy = "Buy low to cover the planned energy requirement";
   else if (sells.length) strategy = "Sell stored energy only at the strongest remaining prices";
-  return `From now until midnight: ${parts.join(", then ")}. ${strategy} to minimise cost and maximise the day's net result.`;
+  const adaptiveNames = {
+    market_arbitrage: "Trading",
+    pv_first_self_sufficiency: "PV-first self-sufficiency",
+    protected_hybrid: "protected hybrid",
+  };
+  const adaptiveName = adaptivePolicy && adaptiveNames[adaptivePolicy.selected];
+  const prefix = adaptiveName ? `Adaptive Summer selected ${adaptiveName}. ` : "";
+  return `${prefix}From now until midnight: ${parts.join(", then ")}. ${strategy} to minimise cost and maximise the day's net result.`;
 }
 
 // ---- Render: hours tree ----
@@ -1308,16 +1323,29 @@ function fmtDur(sec) {
   const h = Math.floor(sec / 3600), m = Math.round((sec % 3600) / 60);
   return (h ? h + "h " : "") + m + "m";
 }
-function renderVictron(plan) {
+function renderVictron(plan, live = lastLive) {
   const box = $("#victron-schedules");
   if (!box) return;
-  if (!plan || !plan.available) { box.innerHTML = "<span class='muted'>no plan yet…</span>"; return; }
-  const slots = plan.victron_slots || [];
+  const actual = live && live.victron_schedule;
+  const hasActual = !!(actual && actual.available);
+  if (!hasActual && (!plan || !plan.available)) {
+    box.innerHTML = "<span class='muted'>waiting for CerboGX schedule state…</span>";
+    return;
+  }
+  const slots = hasActual ? (actual.slots || []) : (plan.victron_slots || []);
   let html = "";
   for (let i = 0; i < 5; i++) {
     const s = slots[i];
     let right;
-    if (s) {
+    if (hasActual && s && s.enabled === false) {
+      right = `<span class="muted">Disabled</span>`;
+    } else if (hasActual && s && !s.complete) {
+      right = `<span class="muted">Reading current settings…</span>`;
+    } else if (hasActual && s) {
+      const day = _esc(s.day_label || "Scheduled");
+      const time = _esc(s.start || "--:--");
+      right = `<span class="vic-on">${day} ${time} <span class="muted">(${fmtDur(s.duration)})</span> &nbsp;→ ${Number(s.target_soc).toFixed(0)}%</span>`;
+    } else if (s) {
       let day = "";
       try { day = new Date(s.start).toLocaleDateString([], { weekday: "long" }); } catch (_) {}
       const time = (s.start || "").slice(11, 16);
@@ -1328,6 +1356,18 @@ function renderVictron(plan) {
     html += `<div class="vic-row"><span class="vic-name">Schedule ${i + 1}</span>${right}<span class="vic-chev">›</span></div>`;
   }
   box.innerHTML = html;
+}
+
+let _victronScheduleRequestAt = 0;
+async function requestVictronScheduleRefresh() {
+  // Route/hash setup can activate the same tab twice in quick succession.
+  // Coalesce that harmless duplication while still refreshing on every real visit.
+  const now = Date.now();
+  if (now - _victronScheduleRequestAt < 1000) return;
+  _victronScheduleRequestAt = now;
+  try {
+    await fetch("/api/victron/request-schedule", { method: "POST" });
+  } catch (_) { /* the cached/plan fallback remains visible while offline */ }
 }
 
 function renderMeta(plan) {
@@ -1389,7 +1429,7 @@ async function refreshPlan() {
       lastHoursGen = lastPlan.generated_at;
     }
     safeRenderChart();
-    renderVictron(lastPlan);
+    renderVictron(lastPlan, lastLive);
     renderMeta(lastPlan);
   } catch (e) {
     noteServerFailure();
@@ -1791,6 +1831,7 @@ function applyLive(data) {
   updateControlButtons();
   safeRenderPowerFlow();
   renderVehicle();
+  renderVictron(lastPlan, lastLive);
   if (lastPlan) renderMeta(lastPlan);
 }
 
@@ -1927,7 +1968,7 @@ async function clearImportSchedule() {
     if (!response.ok || !body.ok) throw new Error(body.error || "clear failed");
     if (lastPlan) {
       lastPlan = { ...lastPlan, victron_slots: [] };
-      renderVictron(lastPlan);
+      renderVictron(lastPlan, lastLive);
     }
     btn.textContent = "Cleared";
     setTimeout(() => { btn.textContent = label; }, 1200);

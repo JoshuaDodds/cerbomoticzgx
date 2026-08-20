@@ -152,6 +152,11 @@ def test_settled_slots_for_today_are_schedule_shaped(monkeypatch, tmp_path):
         "slot_start": now.isoformat(),
         "slot_end": (now + timedelta(minutes=15)).isoformat(),
         "predicted_control_action": "IDLE",
+        "predicted_reason": (
+            "Surplus solar at €0.200/kWh — battery not discharging; "
+            "Victron charges from it, or exports the excess once the battery is full"
+        ),
+        "predicted_reason_code": "PV_SURPLUS",
         "actual_import_kwh": 0.1,
         "actual_export_kwh": 0.3,
         "actual_cost": 0.02,
@@ -176,7 +181,7 @@ def test_settled_slots_for_today_are_schedule_shaped(monkeypatch, tmp_path):
     cycle = {
         "kind": "cycle",
         "ts": (now + timedelta(minutes=15) - timedelta(milliseconds=50)).isoformat(),
-        "control_action": "SELL",
+        "control_action": "IDLE",
         "realized_action": "IDLE",
     }
     path.write_text(json.dumps(cycle) + "\n" + json.dumps(rec) + "\n")
@@ -188,7 +193,9 @@ def test_settled_slots_for_today_are_schedule_shaped(monkeypatch, tmp_path):
     assert slot["settled"] is True
     assert slot["control_action"] == "IDLE"
     assert slot["planned_control_action"] == "IDLE"
-    assert slot["actual_action_quality"] == "cycle_observation"
+    assert slot["actual_action_quality"] == "controller_instruction"
+    assert slot["reason"] == rec["predicted_reason"]
+    assert slot["reason_code"] == "PV_SURPLUS"
     assert slot["grid_energy"] == -0.19999999999999998
     assert slot["pv"] == 0.4
     assert slot["actual_net_eur"] == 0.07
@@ -204,6 +211,143 @@ def test_settled_slots_for_today_are_schedule_shaped(monkeypatch, tmp_path):
     assert slot["actual_ev_observed_until"] == (
         now + timedelta(minutes=15)
     ).isoformat()
+
+
+def test_settled_reason_explains_a_genuine_action_deviation():
+    reason = data._settled_reason_text(
+        "RETAIN",
+        "Holding the battery; covering loads from grid/PV (€0.250/kWh)",
+        "IDLE",
+    )
+    assert reason == (
+        "Planned RETAIN: Holding the battery; covering loads from grid/PV (€0.250/kWh) "
+        "Measured outcome: IDLE."
+    )
+    assert data._settled_reason_code("RETAIN", "HOLD_PRESERVE", "IDLE") == (
+        "HOLD_PRESERVE → MEASURED_IDLE"
+    )
+
+
+def test_settled_retain_keeps_instruction_despite_reserve_floor_charge_evidence(
+        monkeypatch, tmp_path):
+    """Meter direction must not overwrite a known RETAIN controller action."""
+    monkeypatch.setattr(data, "_env", lambda: {"HISTORY_DIR": str(tmp_path)})
+    start = datetime.now().astimezone().replace(
+        hour=5, minute=45, second=0, microsecond=0
+    )
+    end = start + timedelta(minutes=15)
+    path = tmp_path / f"ess-{start.date().isoformat()}.ndjson"
+    rows = [
+        {
+            "kind": "cycle",
+            "ts": start.isoformat(),
+            "control_action": "RETAIN",
+            "realized_action": "BUY",
+            "reason_code": "RESERVE_POLICY",
+        },
+        {
+            "kind": "settlement",
+            "slot_start": start.isoformat(),
+            "slot_end": end.isoformat(),
+            "predicted_control_action": "RETAIN",
+            "predicted_reason": "At minimum reserve (0%); holding — loads covered by grid/PV",
+            "predicted_reason_code": "RESERVE_POLICY",
+            # Old history could contain this flow-derived false label.
+            "actual_control_action": "BUY",
+            "actual_import_kwh": 0.448,
+            "actual_export_kwh": 0.0,
+            "actual_load_kwh": 0.255,
+            "soc_start": 0.0,
+            "soc_end": 0.3,
+        },
+    ]
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+
+    slots = data._settled_slots_for_day(start.date())
+
+    assert len(slots) == 1
+    assert slots[0]["control_action"] == "RETAIN"
+    assert slots[0]["actual_action_quality"] == "controller_instruction"
+    assert slots[0]["reason"] == rows[1]["predicted_reason"]
+    assert slots[0]["reason_code"] == "RESERVE_POLICY"
+
+def test_settled_reason_reconstructs_known_legacy_reason_codes():
+    assert data._legacy_planned_reason(
+        {"price_buy": 0.250, "soc_start": 0.0}, "RETAIN", "RESERVE_POLICY"
+    ) == "At minimum reserve (0%); holding — loads covered by grid/PV"
+    assert data._legacy_planned_reason(
+        {"price_buy": 0.163}, "IDLE", "PV_SURPLUS"
+    ) == (
+        "Surplus solar at €0.163/kWh — battery not discharging; "
+        "Victron charges from it, or exports the excess once the battery is full"
+    )
+
+
+def test_settled_action_uses_soc_endpoints_to_correct_legacy_labels():
+    # Historical rows written before endpoint-aware classification can contain a
+    # false BUY/SELL label. Net grid energy alone is not proof that the battery
+    # charged or discharged.
+    assert data._normalize_settled_action({
+        "actual_control_action": "BUY",
+        "soc_start": 0.0,
+        "soc_end": 0.0,
+        "actual_import_kwh": 0.43,
+        "actual_export_kwh": 0.0,
+    }) == "RETAIN"
+    assert data._normalize_settled_action({
+        "actual_control_action": "SELL",
+        "soc_start": 6.0,
+        "soc_end": 6.0,
+        "actual_import_kwh": 0.0,
+        "actual_export_kwh": 1.0,
+    }) == "IDLE"
+    assert data._normalize_settled_action({
+        "actual_control_action": "BUY",
+        "soc_start": 0.0,
+        "soc_end": 0.6,
+        "actual_import_kwh": 0.43,
+        "actual_export_kwh": 0.0,
+    }) == "BUY"
+    assert data._normalize_settled_action({
+        "actual_control_action": "SELL",
+        "soc_start": 6.0,
+        "soc_end": 5.0,
+        "actual_import_kwh": 0.0,
+        "actual_export_kwh": 1.0,
+    }) == "SELL"
+    assert data._normalize_settled_action({
+        "actual_control_action": "BUY",
+        "soc_start": 0.0,
+        "soc_end": 0.1,
+        "actual_import_kwh": 0.43,
+        "actual_export_kwh": 0.0,
+    }) == "RETAIN"
+    assert data._normalize_settled_action({
+        "actual_control_action": "SELL",
+        "soc_start": 0.1,
+        "soc_end": 0.0,
+        "actual_import_kwh": 0.0,
+        "actual_export_kwh": 1.0,
+    }) == "IDLE"
+    assert data._normalize_settled_action({
+        "actual_control_action": "RETAIN",
+        "soc_start": 10.0,
+        "soc_end": 10.0,
+        "actual_import_kwh": 0.2,
+        "actual_export_kwh": 0.2,
+    }) == "RETAIN"
+    # Early rows without persisted meter deltas can still reject a label that
+    # contradicts both SoC endpoints.
+    assert data._normalize_settled_action({
+        "actual_control_action": "BUY",
+        "soc_start": 100.0,
+        "soc_end": 99.0,
+    }) == "RETAIN"
+    assert data._normalize_settled_action({
+        "actual_control_action": "SELL",
+        "soc_start": 6.0,
+        "soc_end": 6.0,
+    }) == "IDLE"
 
 
 def test_settled_ev_history_uses_meter_session_boundaries_not_plan(
@@ -255,7 +399,9 @@ def test_settled_ev_history_uses_meter_session_boundaries_not_plan(
 
     assert slot["actual_ev_kwh"] == 0.41
     assert "planned_ev_kwh" not in slot
-    assert slot["control_action"] == "IDLE"
+    # The Timeline label is the controller instruction; the old instantaneous
+    # realized_action is power-flow context and must not overwrite it.
+    assert slot["control_action"] == "BUY"
     assert slot["planned_control_action"] == "BUY"
     assert slot["actual_ev_observed_from"] == (
         now + timedelta(minutes=8)
@@ -369,6 +515,29 @@ def test_plan_exposes_ev_smart_charge_snapshot(monkeypatch, tmp_path):
     plan = data.get_plan()
 
     assert plan["ev_smart_charge"]["status"] == "planned"
+
+
+def test_plan_exposes_adaptive_strategy_and_control_authority(monkeypatch, tmp_path):
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps({
+        "generated_at": datetime.now().astimezone().isoformat(),
+        "schedule": [],
+        "adaptive_policy": {
+            "selected": "protected_hybrid",
+            "reason_code": "CONSERVATIVE_POLICY_PREFERRED",
+        },
+        "active_strategy": "protected_hybrid",
+        "controller_authority": "grid_offline",
+        "control_suppressed": True,
+    }))
+    monkeypatch.setattr(data, "_env", lambda: {"AI_PLAN_EXPORT_PATH": str(plan_path)})
+
+    plan = data.get_plan()
+
+    assert plan["adaptive_policy"]["selected"] == "protected_hybrid"
+    assert plan["active_strategy"] == "protected_hybrid"
+    assert plan["controller_authority"] == "grid_offline"
+    assert plan["control_suppressed"] is True
 
 
 def test_ev_smart_charge_dashboard_uses_configured_job_and_plan_paths(monkeypatch, tmp_path):

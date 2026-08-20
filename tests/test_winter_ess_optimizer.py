@@ -454,3 +454,31 @@ def test_discharge_blocked_slot_cannot_feed_ev_load_from_home_battery(settings):
 
     assert result is not None
     assert all(step['soc_end'] >= step['soc_start'] for step in result['schedule'])
+
+
+def test_unknown_horizon_household_buffer_is_kept_for_multi_day_prices(settings):
+    prices = _prices([0.10, 0.35] * 16)
+    # Force the test horizon over midnight regardless of its local start time.
+    assert len({row['start'].date() for row in prices}) > 1
+    engine = winter.OptimizationEngine()
+    slots, slot_h = engine._normalise(prices, [0.5] * len(prices), [0] * len(prices))
+    windows = engine._replenishment_windows(slots)
+
+    _, _, details = engine._coverage(slots, slot_h, windows)
+
+    last = details[-1]
+    assert last['house_kwh'] >= 0.5 * winter.WINTER_UNKNOWN_HORIZON_HOURS
+
+
+def test_high_price_uses_energy_above_winter_backup_reserve(settings):
+    settings['MIN_SOC_RESERVE_WINTER'] = '40'
+    result = winter.OptimizationEngine().optimize(
+        70, _prices([0.50, 0.50, 0.10]), [1.0, 1.0, 0.0], [0.0] * 3)
+
+    assert result is not None
+    assert any(
+        step['control_action'] == 'IDLE'
+        and step['soc_end'] < step['soc_start']
+        for step in result['schedule'][:2]
+    )
+    assert min(step['soc_end'] for step in result['schedule']) >= 40
