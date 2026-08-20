@@ -260,15 +260,18 @@ def test_exceptional_stress_envelope_does_not_rely_on_forecast_pv(settings):
     assert not _active_sells(result)
 
 
-def test_cost_basis_protects_opening_tranche_but_allows_new_cheap_energy(settings):
+def test_cost_basis_waits_for_best_exceptional_sale(settings):
     engine = winter.OptimizationEngine()
-    engine.set_cost_basis_floor(0.60)  # AC recovery floor 0.667, above sale price.
+    engine.set_cost_basis_floor(0.60)  # Recovery is impossible in this horizon.
     result = engine.optimize(
         60, _prices([0.08, 0.08, 0.55, 0.55, 0.08]), [0] * 5, [0] * 5)
 
     assert result['winter_policy']['selected_candidate'] == 'exceptional_arbitrage'
-    assert _active_sells(result)
-    assert min(step['soc_end'] for step in _active_sells(result)) >= 60
+    sells = _active_sells(result)
+    assert sells
+    assert sells[0]['sell'] == pytest.approx(0.55)
+    assert min(step['soc_end'] for step in sells) < 60
+    assert min(step['soc_end'] for step in sells) >= 20
 
 
 def test_absolute_sell_floor_blocks_exceptional_export(settings):
@@ -358,6 +361,23 @@ def test_normal_pv_surplus_is_idle_not_active_battery_export(settings):
     assert result['setpoint'] == 0.0
     assert result['pv_surplus'] is True
     assert not _active_sells(result)
+
+
+def test_excess_pv_is_curtailed_without_making_winter_plan_infeasible(settings):
+    settings.update({
+        'ESS_MAX_GRID_EXPORT_KW': '1',
+        'ESS_BATTERY_CYCLE_COST': '0',
+        'ESS_ARBITRAGE_MARGIN': '0',
+    })
+    result = winter.OptimizationEngine().optimize(
+        100, _prices([0.20, 0.20, 0.20]), [0] * 3, [5] * 3)
+
+    assert result is not None
+    assert result['pv_curtailed_kwh'] == pytest.approx(12.0)
+    assert all(step['grid_energy'] == pytest.approx(-1.0)
+               for step in result['schedule'])
+    assert all(step['soc_end'] >= step['soc_start']
+               for step in result['schedule'])
 
 
 def test_non_finite_price_and_forecasts_are_sanitized(settings):

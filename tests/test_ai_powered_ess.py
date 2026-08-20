@@ -1,4 +1,6 @@
 import unittest
+import json
+import time
 from datetime import datetime, timedelta
 from dateutil import tz
 import sys
@@ -194,6 +196,14 @@ class TestAIPoweredESS(unittest.TestCase):
 
         result = self.engine.optimize(10.0, prices)
         self.assertLessEqual(len(result['victron_slots']), 5)
+        for step in result['schedule']:
+            if step['control_action'] != 'BUY' or step['grid_energy'] <= 1e-6:
+                continue
+            self.assertTrue(any(
+                slot['start'] <= step['time']
+                < slot['start'] + timedelta(seconds=slot['duration'])
+                for slot in result['victron_slots']
+            ), f"BUY at {step['time']} is not executable by a published Victron slot")
 
     def test_iso_string_timestamps_do_not_crash(self):
         # Regression: production Tibber data provides ISO-8601 strings for
@@ -291,6 +301,52 @@ class TestAIPoweredESS(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertLessEqual(result['schedule'][-1]['soc_end'], e.min_soc + e.soc_step)
         self.assertTrue(any(s['control_action'] == 'SELL' for s in result['schedule']))
+
+    def test_same_day_horizon_retains_bounded_household_energy(self):
+        base_time = datetime(2099, 6, 28, 20, 0, tzinfo=tz.UTC)
+        prices = [
+            {'start': base_time + timedelta(hours=i), 'total': 0.40}
+            for i in range(4)
+        ]
+        engine = self._arb_engine(terminal_value_factor=1.0)
+        engine.expected_peak_price = 0.50
+        engine.battery_capacity = 10.0
+        engine.discharge_efficiency = 1.0
+
+        with patch(
+                'lib.ai_powered_ess.retrieve_setting',
+                side_effect=lambda key: (
+                    '2' if key == 'ESS_ADAPTIVE_UNKNOWN_HORIZON_HOURS' else None)):
+            result = engine.optimize(
+                90.0, prices,
+                load_forecast=[1.0] * len(prices),
+                pv_forecast=[0.0] * len(prices))
+
+        self.assertIsNotNone(result)
+        # Two continuation hours at 1kW require 2kWh above reserve, not a full
+        # battery and not an artificial dump to the minimum boundary.
+        self.assertGreaterEqual(result['schedule'][-1]['soc_end'], 25.0 - 1e-6)
+        self.assertLessEqual(result['schedule'][-1]['soc_end'], 35.0 + 1e-6)
+
+    def test_excess_pv_is_curtailed_instead_of_making_plan_infeasible(self):
+        base_time = datetime.now(tz.UTC).replace(second=0, microsecond=0)
+        prices = [
+            {'start': base_time + timedelta(hours=i), 'total': 0.20}
+            for i in range(2)
+        ]
+        engine = self._arb_engine()
+        engine.max_power_export = 1.0
+        result = engine.optimize(
+            100.0, prices,
+            load_forecast=[0.0, 0.0],
+            pv_forecast=[5.0, 5.0])
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result['schedule'][-1]['soc_end'], 100.0)
+        self.assertGreater(result['pv_curtailed_kwh'], 0.0)
+        self.assertTrue(all(
+            step['grid_energy'] >= -1.0 - 1e-6
+            for step in result['schedule']))
 
     def test_classify_action_four_modes(self):
         c = self.engine._classify_action
@@ -497,29 +553,40 @@ class TestAIPoweredESS(unittest.TestCase):
         self.assertEqual(self.engine.cost_basis_sell_floor, 0.0)
         self.assertEqual(self.engine._effective_sell_floor(), 0.0)
 
-    def test_cost_basis_floor_blocks_selling_below_cost(self):
-        # Energy bought at a high basis must not be dumped into a lower-priced
-        # "peak". Prices top out at 0.30; a 0.40/kWh DC basis (floor ~0.44 AC)
-        # means no slot clears the floor, so the battery is never actively sold.
+    def test_unrecoverable_cost_basis_waits_for_best_forward_sale(self):
+        # Historical acquisition cost is sunk. When no visible price can recover
+        # it, wait for the best forward sale rather than stranding the battery or
+        # dumping it into an earlier inferior slot.
         base_time = datetime.now(tz.UTC).replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-        prices = []
-        for i in range(24):
-            t = base_time + timedelta(hours=i)
-            prices.append({'start': t, 'total': 0.30 if i % 6 == 0 else 0.25, 'level': 'NORMAL'})
+        values = [0.20, 0.25, 0.30, 0.25]
+        prices = [
+            {'start': base_time + timedelta(hours=i), 'total': value, 'level': 'NORMAL'}
+            for i, value in enumerate(values)
+        ]
 
         eng = self._arb_engine(min_sell_price=0.0)
-        eng.set_cost_basis_floor(0.40)          # floor ~0.421/kWh AC (>0.30)
+        eng.set_cost_basis_floor(0.40)
         result = eng.optimize(90.0, prices)
         self.assertIsNotNone(result)
-        self.assertFalse(any(s['action'] == 'sell' for s in result['schedule']),
-                         "must not actively discharge below the cost-basis floor")
+        active_sells = [
+            step for step in result['schedule']
+            if step['action'] == 'sell' and step['soc_end'] < step['soc_start']
+        ]
+        self.assertTrue(active_sells)
+        self.assertEqual(active_sells[0]['sell'], 0.30)
+        self.assertFalse(any(
+            step['action'] == 'sell'
+            and step['soc_end'] < step['soc_start']
+            and step['sell'] < 0.30
+            for step in result['schedule'][:2]))
 
     def test_cost_basis_protects_initial_energy_without_blocking_future_arbitrage(self):
         # Regression from 2026-07-18: a nearly empty pack acquired a high basis
         # from a small €0.31/kWh low-SoC charge. Applying that basis to *all future*
         # energy suppressed a clearly profitable €0.13 -> €0.32 cycle until PV
-        # diluted the persisted basis hours later. Protect the initial 3% tranche,
-        # but allow newly purchased energy above it to charge and discharge.
+        # diluted the persisted basis hours later. The initial tranche may wait
+        # for the best forward price, while newly purchased energy must remain
+        # free to charge and discharge.
         base_time = datetime.now(tz.UTC).replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
         prices = [
             {'start': base_time + timedelta(hours=i),
@@ -540,8 +607,7 @@ class TestAIPoweredESS(unittest.TestCase):
         self.assertTrue(buys, "future cheap energy should still be purchased")
         self.assertTrue(sells, "newly purchased energy should still be sellable")
         self.assertGreater(max(s['soc_end'] for s in buys), 90.0)
-        self.assertGreaterEqual(result['schedule'][-1]['soc_end'], 3.0 - 1e-6,
-                                "the expensive initial tranche must remain protected")
+        self.assertEqual(result['schedule'][-1]['soc_end'], 0.0)
 
     def test_static_min_sell_floor_still_blocks_all_battery_exports(self):
         # Unlike the dynamic basis, ESS_MIN_SELL_PRICE is an absolute operator
@@ -556,11 +622,10 @@ class TestAIPoweredESS(unittest.TestCase):
         result = eng.optimize(3.0, prices, [0.0] * 12, [0.0] * 12)
         self.assertFalse(any(s['control_action'] == 'SELL' for s in result['schedule']))
 
-    def test_cost_basis_protected_tranche_can_be_carried_between_plan_segments(self):
-        # The daily-settlement policy optimizes today and tomorrow separately.
-        # Tomorrow may begin at 96% after a cheap charge today, but only the
-        # original 3% carries the old basis; the second segment must not relabel
-        # all 96% as historically expensive energy.
+    def test_explicit_opening_tranche_does_not_block_best_forward_sale(self):
+        # Legacy callers may still identify the opening tranche explicitly. A
+        # sunk basis may delay it until the best visible opportunity, but cannot
+        # strand it when recovery above basis is impossible.
         base_time = datetime.now(tz.UTC).replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
         prices = [
             {'start': base_time + timedelta(hours=i), 'total': 0.32, 'level': 'NORMAL'}
@@ -577,7 +642,7 @@ class TestAIPoweredESS(unittest.TestCase):
         )
 
         self.assertTrue(any(s['control_action'] == 'SELL' for s in result['schedule']))
-        self.assertGreaterEqual(result['schedule'][-1]['soc_end'], 3.0 - 1e-6)
+        self.assertEqual(result['schedule'][-1]['soc_end'], 0.0)
 
     def test_frontload_charging_matches_full_power(self):
         # The DP may plan a gentle trickle on flat-price slots; re-timing should
@@ -678,6 +743,43 @@ class TestAIPoweredESS(unittest.TestCase):
         self.assertTrue(grid_buys)
         self.assertTrue(any(s['price'] > 0.20 + 1e-9 for s in grid_buys))
 
+    def test_frontload_never_moves_grid_buy_into_adjacent_pv_only_slot(self):
+        """Every final BUY must remain covered by the original control window."""
+        self.engine.battery_capacity = 10.0
+        self.engine.charge_efficiency = 1.0
+        self.engine.discharge_efficiency = 1.0
+        self.engine.max_charge_power = 5.0
+        self.engine.max_discharge_power = 5.0
+        self.engine.max_power_import = 4.0
+        self.engine.max_power_export = 5.0
+        self.engine.min_soc = 0.0
+        self.engine.max_grid_charge_soc = 100.0
+        self.engine.terminal_value_factor = 0.0
+        self.engine.soc_step = 10.0
+        self.engine.soc_states = [float(value) for value in range(0, 101, 10)]
+        base = datetime.now(tz.UTC).replace(minute=0, second=0, microsecond=0) \
+            + timedelta(hours=1)
+        prices = [
+            {'start': base + timedelta(hours=index), 'total': price}
+            for index, price in enumerate((1.0, 0.1, 2.0))
+        ]
+
+        result = self.engine.optimize(
+            0.0, prices,
+            load_forecast=[0.0, 0.0, 0.0],
+            pv_forecast=[1.0, 0.0, 0.0],
+        )
+
+        self.assertEqual(result['schedule'][0]['control_action'], 'IDLE')
+        for step in result['schedule']:
+            if step['control_action'] != 'BUY':
+                continue
+            self.assertTrue(any(
+                slot['start'] <= step['time']
+                < slot['start'] + timedelta(seconds=slot['duration'])
+                for slot in result['victron_slots']
+            ), f"BUY at {step['time']} is outside every Victron charge slot")
+
     def test_pv_only_charging_is_reported_as_idle_not_grid_buy(self):
         base = datetime.now(tz.UTC).replace(second=0, microsecond=0)
         sched = [{
@@ -700,61 +802,22 @@ class TestAIPoweredESS(unittest.TestCase):
         self.assertEqual(result['control_action'], 'IDLE')
         self.assertEqual(result['setpoint'], 0.0)
 
-    def test_daily_settlement_policy_protects_today_from_small_future_gain(self):
-        full = {
-            'schedule': [
-                self._policy_step(28, 18, 10.0),
-                self._policy_step(29, 8, -17.0),
-            ]
-        }
-        today_first = {
-            'schedule': [
-                self._policy_step(28, 18, 0.0),
-                self._policy_step(29, 8, -4.0),
-            ]
-        }
-        model = {
-            'exceptional_threshold_eur': 8.0,
-            'forecast_risk_eur': 1.0,
-            'historical_price_p95': 2.0,
-        }
+    def test_daily_policy_uses_one_unified_horizon_solve(self):
+        base_time = datetime(2099, 6, 28, 18, 0, tzinfo=tz.UTC)
+        prices = [
+            {'start': base_time + timedelta(hours=i), 'total': 0.25}
+            for i in range(12)
+        ]
+        engine = self._arb_engine()
+        with patch.object(engine, 'optimize', wraps=engine.optimize) as optimize:
+            result = engine.optimize_with_daily_policy(
+                60.0, prices, [0.5] * len(prices), [0.0] * len(prices))
 
-        selected, policy = ai_powered_ess._select_daily_settlement_candidate(
-            full, today_first, model)
-
-        self.assertIs(selected, today_first)
-        self.assertEqual(policy['selected'], 'today_first')
-        self.assertEqual(policy['reason_code'], 'DAILY_SETTLEMENT_PROTECTED')
-        self.assertAlmostEqual(policy['today_sacrifice_eur'], 10.0)
-        self.assertAlmostEqual(policy['future_gain_eur'], 3.0)
-
-    def test_daily_settlement_policy_allows_exceptional_future_gain(self):
-        full = {
-            'schedule': [
-                self._policy_step(28, 18, 2.0),
-                self._policy_step(29, 8, -50.0),
-            ]
-        }
-        today_first = {
-            'schedule': [
-                self._policy_step(28, 18, 0.0),
-                self._policy_step(29, 8, -10.0),
-            ]
-        }
-        model = {
-            'exceptional_threshold_eur': 8.0,
-            'forecast_risk_eur': 1.0,
-            'historical_price_p95': 2.0,
-        }
-
-        selected, policy = ai_powered_ess._select_daily_settlement_candidate(
-            full, today_first, model)
-
-        self.assertIs(selected, full)
-        self.assertEqual(policy['selected'], 'full_horizon')
-        self.assertEqual(policy['reason_code'], 'EXCEPTIONAL_FUTURE_GAIN_ACCEPTED')
-        self.assertAlmostEqual(policy['today_sacrifice_eur'], 2.0)
-        self.assertAlmostEqual(policy['future_gain_eur'], 38.0)
+        self.assertIsNotNone(result)
+        self.assertEqual(optimize.call_count, 1)
+        self.assertEqual(
+            result['planning_policy']['reason_code'],
+            'UNIFIED_HORIZON_OBJECTIVE')
 
     def test_optimize_with_daily_policy_same_day_attaches_policy(self):
         base_time = datetime(2099, 6, 28, 18, 0, tzinfo=tz.UTC)
@@ -778,7 +841,9 @@ class TestAIPoweredESS(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertIn('planning_policy', result)
         self.assertEqual(result['planning_policy']['selected'], 'full_horizon')
-        self.assertEqual(result['planning_policy']['reason_code'], 'SAME_DAY_HORIZON')
+        self.assertEqual(
+            result['planning_policy']['reason_code'],
+            'UNIFIED_HORIZON_OBJECTIVE')
 
     def test_discharge_blocked_slot_cannot_feed_ev_load_from_home_battery(self):
         start = datetime.now(tz.UTC).replace(minute=0, second=0, microsecond=0)
@@ -1068,6 +1133,83 @@ def test_adaptive_selector_accepts_clearly_superior_trade(monkeypatch, tmp_path)
     assert metadata['reason_code'] == 'TRADE_MATERIAL_BENEFIT'
 
 
+def test_adaptive_selector_accepts_explicit_zero_hurdle_and_risk(monkeypatch, tmp_path):
+    settings = {
+        'ESS_ADAPTIVE_POLICY_STATE_PATH': str(tmp_path / 'policy.json'),
+        'ESS_ADAPTIVE_TRADE_MIN_BENEFIT_EUR': '0',
+        'ESS_ADAPTIVE_FORECAST_RISK_MAX_EUR': '0',
+        'ESS_ADAPTIVE_FORECAST_RISK_FACTOR': '0',
+        'ESS_ADAPTIVE_POLICY_MIN_DWELL_MIN': '0',
+        'ESS_ADAPTIVE_POLICY_SWITCH_MARGIN_EUR': '0',
+    }
+    monkeypatch.setattr(
+        ai_powered_ess, 'retrieve_setting', lambda key: settings.get(key))
+    engine = ai_powered_ess.OptimizationEngine()
+    engine.min_soc = 5.0
+    engine.battery_capacity = 10.0
+    engine.discharge_efficiency = 1.0
+    engine.cycle_cost = 0.0
+    engine.arbitrage_margin = 0.0
+    engine.terminal_value_factor = 1.0
+    engine.expected_peak_price = 0.0
+    candidates = {
+        'market_arbitrage': _adaptive_candidate(
+            'market_arbitrage', [-5.1], 5.0),
+        'protected_hybrid': _adaptive_candidate(
+            'protected_hybrid', [-5.0], 5.0),
+    }
+
+    selected, metadata = ai_powered_ess._select_adaptive_policy(
+        candidates, engine, opportunity_model={'forecast_risk_eur': 0.0})
+
+    assert selected['strategy'] == 'market_arbitrage'
+    assert metadata['trade_hurdle_eur'] == 0.0
+    assert metadata['forecast_risk_eur'] == 0.0
+
+
+def test_adaptive_selector_ranks_lifecycle_objective_not_raw_grid_cash(
+        monkeypatch, tmp_path):
+    settings = {
+        'ESS_ADAPTIVE_POLICY_STATE_PATH': str(tmp_path / 'policy.json'),
+        'ESS_ADAPTIVE_TRADE_MIN_BENEFIT_EUR': '0',
+        'ESS_ADAPTIVE_FORECAST_RISK_MAX_EUR': '0',
+        'ESS_ADAPTIVE_FORECAST_RISK_FACTOR': '0',
+        'ESS_ADAPTIVE_POLICY_MIN_DWELL_MIN': '0',
+        'ESS_ADAPTIVE_POLICY_SWITCH_MARGIN_EUR': '0',
+        'ESS_ADAPTIVE_UNKNOWN_HORIZON_HOURS': '0',
+    }
+    monkeypatch.setattr(
+        ai_powered_ess, 'retrieve_setting', lambda key: settings.get(key))
+    engine = ai_powered_ess.OptimizationEngine()
+    engine.min_soc = 0.0
+    engine.battery_capacity = 10.0
+    engine.discharge_efficiency = 1.0
+    engine.cycle_cost = 0.5
+    engine.arbitrage_margin = 0.5
+    engine.terminal_value_factor = 0.0
+    engine.expected_peak_price = 0.0
+    candidates = {
+        # Raw grid result +€6, but discharging 5 kWh costs €5 under the
+        # production lifecycle/margin objective, leaving an economic score +€1.
+        'market_arbitrage': _adaptive_candidate(
+            'market_arbitrage', [-6.0], 0.0),
+        # Raw result +€3 with no discharge: economically superior despite the
+        # lower headline export reward.
+        'protected_hybrid': _adaptive_candidate(
+            'protected_hybrid', [-3.0], 50.0),
+    }
+    for candidate in candidates.values():
+        candidate['schedule'][0].update({'price': 1.0, 'sell': 1.0})
+
+    selected, metadata = ai_powered_ess._select_adaptive_policy(
+        candidates, engine, opportunity_model={'forecast_risk_eur': 0.0})
+
+    assert selected['strategy'] == 'protected_hybrid'
+    assert metadata['candidates']['market_arbitrage']['grid_net_eur'] == 6.0
+    assert metadata['candidates']['market_arbitrage']['score_eur'] == 1.0
+    assert metadata['candidates']['protected_hybrid']['score_eur'] == 3.0
+
+
 def test_adaptive_selector_caps_legacy_forecast_risk(monkeypatch, tmp_path):
     state_path = tmp_path / 'policy.json'
     settings = {
@@ -1131,6 +1273,211 @@ def test_adaptive_terminal_credit_is_limited_to_unknown_household_need(monkeypat
     assert metrics['terminal_value_eur'] == pytest.approx(0.6)
 
 
+def test_terminal_factor_zero_disables_expected_peak_continuation(monkeypatch):
+    monkeypatch.setattr(
+        ai_powered_ess,
+        'retrieve_setting',
+        lambda key: '6' if key == 'ESS_ADAPTIVE_UNKNOWN_HORIZON_HOURS' else None,
+    )
+    engine = ai_powered_ess.OptimizationEngine()
+    engine.terminal_value_factor = 0.0
+    engine.expected_peak_price = 0.50
+
+    continuation = ai_powered_ess._continuation_assumptions(
+        engine, [0.20, 0.30], [1.0, 1.0], 1.0)
+
+    assert continuation['terminal_price_eur_per_ac_kwh'] == 0.0
+
+
+def test_continuation_uses_trailing_time_of_day_load_not_daytime_mean(monkeypatch):
+    monkeypatch.setattr(
+        ai_powered_ess,
+        'retrieve_setting',
+        lambda key: '6' if key == 'ESS_ADAPTIVE_UNKNOWN_HORIZON_HOURS' else None,
+    )
+    engine = ai_powered_ess.OptimizationEngine()
+    engine.discharge_efficiency = 1.0
+
+    continuation = ai_powered_ess._continuation_assumptions(
+        engine,
+        [0.20] * 24,
+        [-5.0] * 12 + [1.0] * 12,
+        1.0,
+    )
+
+    assert continuation['continuation_dc_kwh'] == pytest.approx(6.0)
+
+
+def test_adaptive_terminal_credit_excludes_protected_household_floor(monkeypatch):
+    monkeypatch.setattr(
+        ai_powered_ess,
+        'retrieve_setting',
+        lambda key: '6' if key == 'ESS_ADAPTIVE_UNKNOWN_HORIZON_HOURS' else None,
+    )
+    engine = ai_powered_ess.OptimizationEngine()
+    engine.min_soc = 5.0
+    engine.battery_capacity = 10.0
+    engine.discharge_efficiency = 1.0
+    engine.cycle_cost = 0.0
+    engine.arbitrage_margin = 0.0
+    engine.terminal_value_factor = 1.0
+    engine.expected_peak_price = 0.30
+    plan = _adaptive_candidate('protected_hybrid', [0.0], 35.0)
+    plan['slot_duration_h'] = 1.0
+    plan['schedule'][0].update({
+        'load': 1.0,
+        'pv': 0.0,
+        'protected_soc': 25.0,
+    })
+
+    metrics = ai_powered_ess._adaptive_plan_score(plan, engine)
+
+    assert metrics['terminal_credited_kwh'] == pytest.approx(1.0)
+    assert metrics['terminal_value_eur'] == pytest.approx(0.30)
+
+
+def test_material_signature_changes_for_control_relevant_inputs():
+    now = datetime.now(tz.UTC).replace(second=0, microsecond=0)
+    prices = [{'start': now, 'total': 0.20}]
+    baseline = ai_powered_ess._price_horizon_signature(
+        prices, [0.2], [0.0], [], 50.0)
+
+    assert ai_powered_ess._price_horizon_signature(
+        [{'start': now, 'total': 0.25}], [0.2], [0.0], [], 50.0) != baseline
+    assert ai_powered_ess._price_horizon_signature(
+        prices, [0.4], [0.0], [], 50.0) != baseline
+    assert ai_powered_ess._price_horizon_signature(
+        prices, [0.2], [0.3], [], 50.0) != baseline
+    assert ai_powered_ess._price_horizon_signature(
+        prices, [0.2], [0.0], [now], 50.0) != baseline
+    assert ai_powered_ess._price_horizon_signature(
+        prices, [0.2], [0.0], [], 54.0) != baseline
+
+
+def test_executable_objective_matches_non_flat_frontloaded_schedule():
+    """Candidate selection must score the exact Victron-shaped trajectory."""
+    engine = ai_powered_ess.OptimizationEngine()
+    engine.battery_capacity = 10.0
+    engine.charge_efficiency = 1.0
+    engine.discharge_efficiency = 1.0
+    engine.min_soc = 5.0
+    engine.max_grid_charge_soc = 100.0
+    engine.max_charge_power = 5.0
+    engine.max_discharge_power = 5.0
+    engine.max_power_import = 5.0
+    engine.max_power_export = 5.0
+    engine.export_price_factor = 1.0
+    engine.export_fee = 0.0
+    engine.cycle_cost = 0.0
+    engine.arbitrage_margin = 0.0
+    engine.terminal_value_factor = 0.0
+    engine.slot_minutes = 60.0
+    engine.soc_step = 1.0
+    engine.soc_states = [float(value) for value in range(101)]
+    base = datetime.now(tz.UTC).replace(minute=0, second=0, microsecond=0) \
+        + timedelta(hours=1)
+    prices = [
+        {'start': base + timedelta(hours=index), 'total': price}
+        for index, price in enumerate((0.20, 0.10, 0.50))
+    ]
+
+    result = engine.optimize(
+        5.0, prices,
+        load_forecast=[0.0, 0.0, 0.0],
+        pv_forecast=[0.0, 0.0, 0.0],
+    )
+    score = ai_powered_ess._adaptive_plan_score(result, engine)
+
+    assert -result['objective_cost_eur'] == pytest.approx(
+        score['score_eur'], abs=1e-6)
+
+
+def test_falling_price_charge_run_uses_staged_victron_targets():
+    """A later cheap slot must not pull its charge into an earlier dear slot."""
+    engine = ai_powered_ess.OptimizationEngine()
+    engine.battery_capacity = 10.0
+    engine.charge_efficiency = 1.0
+    engine.discharge_efficiency = 1.0
+    engine.min_soc = 0.0
+    engine.max_grid_charge_soc = 100.0
+    engine.max_charge_power = 6.0
+    engine.max_discharge_power = 10.0
+    engine.max_power_import = 6.0
+    engine.max_power_export = 10.0
+    engine.export_price_factor = 1.0
+    engine.export_fee = 0.0
+    engine.min_sell_price = 0.0
+    engine.cycle_cost = 0.0
+    engine.arbitrage_margin = 0.0
+    engine.terminal_value_factor = 0.0
+    engine.slot_minutes = 60.0
+    engine.soc_step = 10.0
+    engine.soc_states = [float(value) for value in range(0, 101, 10)]
+    base = datetime.now(tz.UTC).replace(minute=0, second=0, microsecond=0) \
+        + timedelta(hours=1)
+    prices = [
+        {'start': base + timedelta(hours=index), 'total': price}
+        for index, price in enumerate((0.30, 0.10, 0.50))
+    ]
+
+    result = engine.optimize(
+        0.0, prices,
+        load_forecast=[0.0, 0.0, 0.0],
+        pv_forecast=[0.0, 0.0, 0.0],
+    )
+
+    assert len(result['victron_slots']) == 2
+    assert [slot['target_soc'] for slot in result['victron_slots']] == [40, 100]
+    assert result['schedule'][0]['grid_energy'] == pytest.approx(4.0)
+    assert result['schedule'][1]['grid_energy'] == pytest.approx(6.0)
+    assert -result['objective_cost_eur'] == pytest.approx(3.2)
+
+
+def test_saturated_falling_price_run_can_share_fifth_target():
+    """Do not spend a sixth target when a merge cannot front-load energy."""
+    engine = ai_powered_ess.OptimizationEngine()
+    engine.battery_capacity = 10.0
+    engine.charge_efficiency = 1.0
+    engine.discharge_efficiency = 1.0
+    engine.min_soc = 0.0
+    engine.max_grid_charge_soc = 100.0
+    engine.max_charge_power = 5.0
+    engine.max_discharge_power = 5.0
+    engine.max_power_import = 5.0
+    engine.max_power_export = 5.0
+    engine.export_price_factor = 1.0
+    engine.export_fee = 0.0
+    engine.min_sell_price = 0.0
+    engine.cycle_cost = 0.0
+    engine.arbitrage_margin = 0.0
+    engine.terminal_value_factor = 0.0
+    engine.slot_minutes = 60.0
+    engine.soc_step = 10.0
+    engine.soc_states = [float(value) for value in range(0, 101, 10)]
+    base = datetime.now(tz.UTC).replace(minute=0, second=0, microsecond=0) \
+        + timedelta(hours=1)
+    tariff = [0.10, 0.60] * 4 + [0.20, 0.19, 0.80, 0.80]
+    prices = [
+        {'start': base + timedelta(hours=index), 'total': price}
+        for index, price in enumerate(tariff)
+    ]
+
+    result = engine.optimize(
+        0.0, prices,
+        load_forecast=[0.0] * len(prices),
+        pv_forecast=[0.0] * len(prices),
+    )
+
+    assert len(result['victron_slots']) == 5
+    final_window = result['victron_slots'][-1]
+    assert final_window['start'] == base + timedelta(hours=8)
+    assert final_window['duration'] == 7200
+    assert final_window['target_soc'] == 100
+    assert result['schedule'][8]['grid_energy'] == pytest.approx(5.0)
+    assert result['schedule'][9]['grid_energy'] == pytest.approx(5.0)
+    assert -result['objective_cost_eur'] == pytest.approx(16.05)
+
+
 def test_adaptive_feature_gate_off_preserves_single_market_path(monkeypatch):
     market = {'schedule': [{'strategy': 'market_arbitrage'}]}
 
@@ -1153,6 +1500,178 @@ def test_adaptive_feature_gate_off_preserves_single_market_path(monkeypatch):
         50.0, [{'start': datetime.now(tz.UTC), 'total': 0.20}])
 
     assert result is market
+    assert result['optimizer_runtime_ms'] >= 0
+
+
+def test_adaptive_replans_only_selected_policy_between_full_evaluations(
+        monkeypatch, tmp_path):
+    now = datetime.now(tz.UTC)
+    prices = [{'start': now + timedelta(hours=1), 'total': 0.20}]
+    state_path = tmp_path / 'policy.json'
+    state_path.write_text(json.dumps({
+        'selected': 'protected_hybrid',
+        'selected_at': time.time(),
+        'evaluated_at': time.time(),
+        'price_horizon_signature': ai_powered_ess._price_horizon_signature(
+            prices, current_soc=50.0),
+    }))
+    settings = {
+        'ESS_ADAPTIVE_POLICY_ENABLED': 'True',
+        'ESS_ADAPTIVE_POLICY_STATE_PATH': str(state_path),
+        'ESS_ADAPTIVE_FULL_EVALUATION_INTERVAL_MIN': '60',
+        'ESS_ADAPTIVE_UNKNOWN_HORIZON_HOURS': '0',
+    }
+    calls = []
+    plan = _adaptive_candidate('protected_hybrid', [0.0], 5.0)
+    plan['slot_duration_h'] = 1.0
+
+    class FakeEngine:
+        min_soc = 5.0
+        battery_capacity = 10.0
+        discharge_efficiency = 1.0
+        cycle_cost = 0.0
+        arbitrage_margin = 0.0
+        terminal_value_factor = 1.0
+        expected_peak_price = 0.0
+        slot_minutes = 60.0
+
+        def set_cost_basis_floor(self, _value):
+            pass
+
+        def optimize_with_daily_policy(self, *args, **kwargs):
+            calls.append(kwargs.get('policy_name', 'market_arbitrage'))
+            return plan
+
+    monkeypatch.setattr(ai_powered_ess, 'OptimizationEngine', FakeEngine)
+    monkeypatch.setattr(
+        ai_powered_ess, 'retrieve_setting', lambda key: settings.get(key))
+
+    result = ai_powered_ess.optimize_schedule(50.0, prices)
+
+    assert calls == ['protected_hybrid']
+    assert result['adaptive_policy']['full_evaluation'] is False
+    assert result['adaptive_policy']['reason_code'] \
+        == 'SCHEDULED_POLICY_REEVALUATION_PENDING'
+
+
+@pytest.mark.parametrize('force_expired', [True, False])
+def test_adaptive_full_comparison_runs_when_interval_or_inputs_change(
+        monkeypatch, tmp_path, force_expired):
+    now = datetime.now(tz.UTC)
+    prices = [{'start': now + timedelta(hours=1), 'total': 0.20}]
+    state_path = tmp_path / 'policy.json'
+    stored_prices = prices if force_expired else [
+        {'start': prices[0]['start'], 'total': 0.19},
+    ]
+    state_path.write_text(json.dumps({
+        'selected': 'protected_hybrid',
+        'selected_at': time.time() - 7200,
+        'evaluated_at': time.time() - (7200 if force_expired else 30),
+        'price_horizon_signature': ai_powered_ess._price_horizon_signature(
+            stored_prices, current_soc=50.0),
+    }))
+    settings = {
+        'ESS_ADAPTIVE_POLICY_ENABLED': 'True',
+        'ESS_ADAPTIVE_POLICY_STATE_PATH': str(state_path),
+        'ESS_ADAPTIVE_FULL_EVALUATION_INTERVAL_MIN': '60',
+        'ESS_ADAPTIVE_UNKNOWN_HORIZON_HOURS': '0',
+        'ESS_ADAPTIVE_POLICY_MIN_DWELL_MIN': '0',
+        'ESS_ADAPTIVE_POLICY_SWITCH_MARGIN_EUR': '0',
+    }
+    calls = []
+
+    class FakeEngine:
+        min_soc = 5.0
+        battery_capacity = 10.0
+        discharge_efficiency = 1.0
+        cycle_cost = 0.0
+        arbitrage_margin = 0.0
+        terminal_value_factor = 1.0
+        expected_peak_price = 0.0
+        slot_minutes = 60.0
+
+        def set_cost_basis_floor(self, _value):
+            pass
+
+        def optimize_with_daily_policy(self, *args, **kwargs):
+            policy = kwargs.get('policy_name', 'market_arbitrage')
+            calls.append(policy)
+            plan = _adaptive_candidate(policy, [0.0], 5.0)
+            plan['slot_duration_h'] = 1.0
+            return plan
+
+    monkeypatch.setattr(ai_powered_ess, 'OptimizationEngine', FakeEngine)
+    monkeypatch.setattr(
+        ai_powered_ess, 'retrieve_setting', lambda key: settings.get(key))
+
+    result = ai_powered_ess.optimize_schedule(50.0, prices)
+
+    assert calls == [
+        'market_arbitrage',
+        'pv_first_self_sufficiency',
+        'protected_hybrid',
+    ]
+    assert result['adaptive_policy']['full_evaluation'] is True
+    assert result['optimizer_runtime_ms'] >= 0
+
+
+def test_adaptive_infeasible_reused_policy_falls_back_to_full_comparison(
+        monkeypatch, tmp_path):
+    now = datetime.now(tz.UTC)
+    prices = [{'start': now + timedelta(hours=1), 'total': 0.20}]
+    state_path = tmp_path / 'policy.json'
+    state_path.write_text(json.dumps({
+        'selected': 'protected_hybrid',
+        'selected_at': time.time(),
+        'evaluated_at': time.time(),
+        'price_horizon_signature': ai_powered_ess._price_horizon_signature(
+            prices, current_soc=50.0),
+    }))
+    settings = {
+        'ESS_ADAPTIVE_POLICY_ENABLED': 'True',
+        'ESS_ADAPTIVE_POLICY_STATE_PATH': str(state_path),
+        'ESS_ADAPTIVE_FULL_EVALUATION_INTERVAL_MIN': '60',
+        'ESS_ADAPTIVE_UNKNOWN_HORIZON_HOURS': '0',
+        'ESS_ADAPTIVE_POLICY_MIN_DWELL_MIN': '0',
+        'ESS_ADAPTIVE_POLICY_SWITCH_MARGIN_EUR': '0',
+    }
+    calls = []
+
+    class FakeEngine:
+        min_soc = 5.0
+        battery_capacity = 10.0
+        discharge_efficiency = 1.0
+        cycle_cost = 0.0
+        arbitrage_margin = 0.0
+        terminal_value_factor = 1.0
+        expected_peak_price = 0.0
+        slot_minutes = 60.0
+
+        def set_cost_basis_floor(self, _value):
+            pass
+
+        def optimize_with_daily_policy(self, *args, **kwargs):
+            policy = kwargs.get('policy_name', 'market_arbitrage')
+            calls.append(policy)
+            if calls == ['protected_hybrid']:
+                return None
+            plan = _adaptive_candidate(policy, [0.0], 5.0)
+            plan['slot_duration_h'] = 1.0
+            return plan
+
+    monkeypatch.setattr(ai_powered_ess, 'OptimizationEngine', FakeEngine)
+    monkeypatch.setattr(
+        ai_powered_ess, 'retrieve_setting', lambda key: settings.get(key))
+
+    result = ai_powered_ess.optimize_schedule(50.0, prices)
+
+    assert calls == [
+        'protected_hybrid',
+        'market_arbitrage',
+        'pv_first_self_sufficiency',
+        'protected_hybrid',
+    ]
+    assert result['adaptive_policy']['full_evaluation'] is True
 
 if __name__ == '__main__':
     unittest.main()

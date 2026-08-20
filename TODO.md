@@ -175,8 +175,13 @@
   low-price slots into a procurement valley, must replenish its household-energy
   layer by the end of that valley, and protects it through the next valley plus
   a configurable load allowance beyond the final known price slot. The selected
-  strategy, all candidate scores,
-  hurdle and reason are persisted in plan JSON/history. Keep the gate **off by
+  strategy, candidate scores from the latest full comparison,
+  hurdle and reason are persisted in plan JSON/history. The selected policy is
+  solved each optimizer cycle; all candidates are re-scored hourly and whenever
+  a material price, load/PV, SoC, EV-block or horizon change invalidates the
+  cached selection, avoiding continuous three-policy CPU load without coarsening
+  the 1% SoC lattice. All candidates now use one continuous horizon,
+  one objective and one global five-window budget. Keep the gate **off by
   default** until these checks have passed over at least 14 complete days:
 
   - Confirm thin-spread/cloudy days select PV-first or protected hybrid and use
@@ -190,6 +195,15 @@
   - Confirm a same-day-only horizon and a multi-day horizon both retain the
     bounded unknown-horizon household layer rather than dumping at the final
     visible slot.
+  - Confirm every planned BUY is represented by one of at most five Victron
+    windows after repeated fragmented-price replans, and that the final target
+    SoC remains reachable—there must be no post-hoc window truncation or BUY
+    pulled backward into an adjacent PV-only slot by full-power reporting.
+  - Record full-comparison and selected-policy runtimes on the production host.
+    Read `optimizer_runtime_ms` from the plan; a cycle over 30 seconds also logs
+    a warning. One hour is the maximum quiet-input interval, but material-input
+    invalidation may compare all policies sooner; validate both paths before
+    enabling this on the production host.
 
   The older request for a manual per-day Advisor strategy override remains
   deferred; the automatic selector must be validated first.
@@ -203,6 +217,29 @@
   zero for household survival. Repeat after startup with the grid state still
   unknown and confirm it is not falsely treated as offline. Manual Override must
   likewise remain observable while suppressing control writes.
+
+- **ESS economics follow-up — annual export accounting, efficiency calibration,
+  and exposure-specific risk** — The live 2026 Tibber NL model now subtracts the
+  documented €0.0248/kWh sale fee while annual imports still cover exports under
+  saldering. It does **not** know the contract-year import/export allowance, and
+  saldering ends on 2027-01-01. Add a provider-aware persisted annual position,
+  seeded from an authoritative bill/API, before treating export beyond annual
+  imports as equivalent to import avoidance; do not guess a post-2026 tariff.
+  Settled Tibber reward remains authoritative. References: [Tibber NL salderen
+  and terugleveren](https://support.tibber.com/nl/articles/4669873-salderen-en-terugleveren-bij-tibber)
+  and the [Dutch government saldering timeline](https://www.rijksoverheid.nl/themas/klimaat-milieu-en-natuur/energie-thuis/salderingsregeling).
+
+  - Build a read-only clean-cycle report from metered battery AC/DC energy before
+    changing `AC_DC_*_EFFICIENCY`. The current 0.96/0.96 values are now consistent
+    across config and fallbacks but are still an operator estimate, not a measured
+    whole-system calibration.
+  - Learn load-underforecast and PV-overforecast distributions separately and by
+    forecast-pipeline version. Shadow-score base and adverse scenarios and compare
+    differential regret before adding exposure-specific uncertainty to dispatch;
+    do not charge common forecast error to every candidate again.
+  - Review observed `pv_curtailed_kwh` after high-PV/full-battery days. It is
+    forecast feasibility slack, not measured inverter clipping, and must never be
+    counted as export reward or trigger battery discharge.
 
 ## EV smart-charge scheduling — operator validation / learning follow-up
 

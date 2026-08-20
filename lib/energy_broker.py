@@ -1583,9 +1583,9 @@ def _grid_offline_pass_through(result, current_soc):
         soc = 0.0
     capacity_kwh = max(0.001, _get_float_setting('BATTERY_CAPACITY_KWH', 42.0))
     charge_efficiency = max(
-        0.01, min(1.0, _get_float_setting('AC_DC_CHARGE_EFFICIENCY', 0.90)))
+        0.01, min(1.0, _get_float_setting('AC_DC_CHARGE_EFFICIENCY', 0.96)))
     discharge_efficiency = max(
-        0.01, min(1.0, _get_float_setting('AC_DC_DISCHARGE_EFFICIENCY', 0.90)))
+        0.01, min(1.0, _get_float_setting('AC_DC_DISCHARGE_EFFICIENCY', 0.96)))
 
     for original in (passive.get('schedule') or []):
         step = dict(original)
@@ -2273,7 +2273,7 @@ def _apply_ev_smart_charge_to_forecast(
         native_h = max(0.25, float(slot_duration_h or 0.25))
         sub_count = max(1, int(round(native_h / 0.25)))
         export_factor = _get_float_setting("ESS_EXPORT_PRICE_FACTOR", 1.0)
-        export_fee = _get_float_setting("ESS_EXPORT_FEE", 0.0)
+        export_fee = _get_float_setting("ESS_EXPORT_FEE", 0.0248)
         def _positive_state_number(key, default):
             try:
                 value = float(STATE.get(key))
@@ -2691,7 +2691,7 @@ def _strategy_candidate_config_snapshot(result: dict | None = None) -> dict:
         'arbitrage_margin_eur_per_dc_kwh': max(
             0.0, _get_float_setting('ESS_ARBITRAGE_MARGIN', 0.0)),
         'export_price_factor': _get_float_setting('ESS_EXPORT_PRICE_FACTOR', 1.0),
-        'export_fee_eur_per_kwh': _get_float_setting('ESS_EXPORT_FEE', 0.0),
+        'export_fee_eur_per_kwh': _get_float_setting('ESS_EXPORT_FEE', 0.0248),
         # The live engine values usable AC output at its terminal price.  The
         # replay model tracks DC-side stored energy, so preserve the same value
         # per DC kWh by applying the configured discharge efficiency here.
@@ -3556,7 +3556,7 @@ def _settle_prior_slot(
                         import_kwh=imp_kwh or 0.0,
                         pv_kwh=pv_kwh or 0.0,
                         price_buy=pbuy,
-                        charge_efficiency=_get_float_setting('AC_DC_CHARGE_EFFICIENCY', 0.90),
+                        charge_efficiency=_get_float_setting('AC_DC_CHARGE_EFFICIENCY', 0.96),
                     )
                     cost_basis_now = cb.get('basis')
             except Exception as e:
