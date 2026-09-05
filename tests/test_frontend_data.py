@@ -4,6 +4,7 @@ import types
 import pytest
 from pathlib import Path
 from datetime import datetime, timedelta
+from dotenv import dotenv_values
 
 from frontend import data
 from frontend.config_schema import CONFIG_SCHEMA
@@ -49,6 +50,28 @@ def test_config_schema_exposes_grid_charge_cap_and_advisor_safe_knobs():
     assert "ADVISOR_MAX_INPUT_CHARS" in keys
     assert "ADVISOR_RETRIEVAL_MAX_DAYS" in keys
     assert "ADVISOR_RETRIEVAL_MAX_CHARS" in keys
+
+
+def test_adaptive_optimizer_tunables_are_in_env_and_configuration_ui():
+    editable = {
+        "ESS_ADAPTIVE_POLICY_ENABLED",
+        "ESS_ADAPTIVE_TRADE_MIN_BENEFIT_EUR",
+        "ESS_ADAPTIVE_FORECAST_RISK_MAX_EUR",
+        "ESS_ADAPTIVE_FORECAST_RISK_FACTOR",
+        "ESS_ADAPTIVE_UNKNOWN_HORIZON_HOURS",
+        "ESS_ADAPTIVE_POLICY_MIN_DWELL_MIN",
+        "ESS_ADAPTIVE_POLICY_SWITCH_MARGIN_EUR",
+        "ESS_ADAPTIVE_FULL_EVALUATION_INTERVAL_MIN",
+    }
+    internal_paths = {"ESS_ADAPTIVE_POLICY_STATE_PATH"}
+    expected = editable | internal_paths
+
+    assert expected <= set(dotenv_values(".env.example"))
+    if Path(".env").exists():
+        assert expected <= set(dotenv_values(".env"))
+    assert editable <= _schema_keys()
+    # Filesystem paths are deliberately not writable through the dashboard.
+    assert not (internal_paths & _schema_keys())
 
 
 def test_advisor_model_schema_offers_curated_models_without_restricting_custom_cli():

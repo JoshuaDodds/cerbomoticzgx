@@ -199,11 +199,12 @@
     windows after repeated fragmented-price replans, and that the final target
     SoC remains reachable—there must be no post-hoc window truncation or BUY
     pulled backward into an adjacent PV-only slot by full-power reporting.
-  - Record full-comparison and selected-policy runtimes on the production host.
-    Read `optimizer_runtime_ms` from the plan; a cycle over 30 seconds also logs
-    a warning. One hour is the maximum quiet-input interval, but material-input
-    invalidation may compare all policies sooner; validate both paths before
-    enabling this on the production host.
+  - Record runtimes on the production host with Adaptive Summer **off** (the
+    always-on Trading DP), then with it **on** for both a selected-policy replan
+    and a full comparison. Read `optimizer_runtime_ms` from the plan; a cycle
+    over 30 seconds also logs a warning. One hour is the maximum quiet-input
+    interval, but material-input invalidation may compare all policies sooner;
+    validate every path before enabling Adaptive Summer unattended.
 
   The older request for a manual per-day Advisor strategy override remains
   deferred; the automatic selector must be validated first.
@@ -229,10 +230,19 @@
   and terugleveren](https://support.tibber.com/nl/articles/4669873-salderen-en-terugleveren-bij-tibber)
   and the [Dutch government saldering timeline](https://www.rijksoverheid.nl/themas/klimaat-milieu-en-natuur/energie-thuis/salderingsregeling).
 
+  **Deadline: complete and validate the annual-position/tariff design by
+  2026-11-30**, before the discontinuous 2027-01-01 saldering change. Keep the
+  post-2026 control model gated until Tibber's authoritative tariff is known.
+
   - Build a read-only clean-cycle report from metered battery AC/DC energy before
     changing `AC_DC_*_EFFICIENCY`. The current 0.96/0.96 values are now consistent
     across config and fallbacks but are still an operator estimate, not a measured
     whole-system calibration.
+  - Winter currently satisfies Victron's five-window limit by selecting a
+    bounded set of cheap troughs before its DP solve. This is executable and
+    tested, but the preselection is tariff-first rather than globally
+    objective-aware. Shadow-compare a shared in-DP window budget before changing
+    Winter control; do not replace the safe current path without measured value.
   - Learn load-underforecast and PV-overforecast distributions separately and by
     forecast-pipeline version. Shadow-score base and adverse scenarios and compare
     differential regret before adding exposure-specific uncertainty to dispatch;
@@ -240,6 +250,42 @@
   - Review observed `pv_curtailed_kwh` after high-PV/full-battery days. It is
     forecast feasibility slack, not measured inverter clipping, and must never be
     counted as export reward or trigger battery discharge.
+
+- **Tibber MTD accounting reconciliation — wait for settled August evidence** —
+  An attended read-only investigation on **2026-08-22** found that the three
+  currently visible accounting surfaces disagree materially. The Tibber app at
+  05:10 showed 896 kWh / €213.45 consumed and 706 kWh / €214.53 produced
+  (**+€1.08**). Our locally persisted final live-counter snapshots showed
+  €200.99 cost and €235.54 reward (**+€34.55**, including the running current
+  day). A direct authenticated GraphQL aggregate for the 21 completed August
+  days returned 893.178 kWh / €214.333080 cost and 705.121 kWh /
+  €211.320659 profit (**−€3.012421**). Adding the direct live subscription sample
+  at 09:20 (`accumulatedConsumption=10.789`, `accumulatedCost=3.43797`, no
+  production/reward yet) produced a provisional API-composed MTD result of
+  **−€6.450391**.
+
+  The exact server-side aggregate shapes are
+  `consumption(resolution: DAILY, first: 31, after: <month-start cursor>)
+  { pageInfo { totalConsumption totalCost } }` and the corresponding
+  `production { pageInfo { totalProduction totalProfit } }`. The unfinished day
+  comes only from `liveMeasurement` fields `accumulatedConsumption`,
+  `accumulatedCost`, `accumulatedProduction`, and `accumulatedReward`;
+  `MONTHLY` resolution currently returns completed months only. Tibber documents
+  the historical connections as non-real-time, and this account has previously
+  received corrections several days late. Do **not** rewrite settled history or
+  change the dashboard accounting source from this provisional mid-month sample.
+
+  - Re-run the same GraphQL aggregates after the next authoritative meter update
+    and again after the August invoice/month close. Capture the app totals and
+    invoice variable-energy lines at the same time.
+  - Compare each completed local day with Tibber's finalized DAILY node, including
+    kWh, `cost`, and `profit`, to distinguish delayed meter correction from tariff,
+    sale-fee, bonus, or Grid Rewards accounting. Preserve the original live samples
+    as audit evidence.
+  - Only after that reconciliation decide whether Month should remain explicitly a
+    **local operational estimate**, or use cached finalized DAILY GraphQL totals for
+    completed days plus the live accumulator for today. Never present a mixed source
+    as settled without source/last-update/coverage metadata.
 
 ## EV smart-charge scheduling — operator validation / learning follow-up
 

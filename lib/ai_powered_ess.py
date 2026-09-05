@@ -39,6 +39,7 @@ from pathlib import Path
 from dateutil import parser as date_parser
 
 from lib.config_retrieval import retrieve_setting
+from lib.forecast_projection import PV_SURPLUS_FULL_SOC
 
 # Defaults for tunables that can be overridden via .env (see OptimizationEngine).
 # Seasonal SoC reserve (percentage) kept in the battery at all times.
@@ -51,6 +52,11 @@ SOC_STEP = 5.0
 
 # Numerical tolerance used for float comparisons.
 EPS = 1e-6
+
+# Victron exposes five scheduled-charge entries. This is a hardware/control
+# contract rather than a user tunable, so enforcement and reporting must share
+# one code constant and cannot drift from the device limit.
+VICTRON_CHARGE_WINDOW_BUDGET = 5
 
 # Canonical CONTROL ACTION (what we COMMAND) — the single label shown by the
 # console, web UI, plan JSON and history so every surface agrees. Labelled by the
@@ -709,6 +715,51 @@ class OptimizationEngine:
                     active_grid_charge = dc_change_kwh > EPS and import_kwh > EPS
                     active_battery_export = dc_change_kwh < -EPS and export_kwh > EPS
 
+                    # A neutral Victron setpoint does not export forecast PV
+                    # while the battery still has charge headroom: it stores
+                    # the surplus first and feeds only what cannot fit across
+                    # the meter.  The dashboard has always settled forecast
+                    # economics this way, but the production DP used to credit
+                    # the complete raw surplus.  That phantom revenue could
+                    # make it preserve today's charged battery for a supposed
+                    # export tomorrow which the hardware would instead store.
+                    #
+                    # First reject a lattice state when one more complete SoC
+                    # step can be stored without importing.  For the remaining
+                    # sub-step surplus, remove the amount Victron can still
+                    # absorb from both the objective and the reported meter
+                    # flow.  This is deliberately conservative about the
+                    # fractional SoC increase, but never invents export credit.
+                    metered_grid_energy = grid_energy
+                    metered_export_kwh = export_kwh
+                    if (export_kwh > EPS
+                            and dc_change_kwh >= -EPS
+                            and nsoc < PV_SURPLUS_FULL_SOC - EPS):
+                        extra_dc = self.soc_step / 100.0 * cap
+                        can_store_next_step = (
+                            nsoc + self.soc_step <= 100.0 + EPS
+                            and (dc_change_kwh + extra_dc) / slot_duration_h
+                            <= self.max_charge_power + EPS
+                            and grid_energy + extra_dc / self.charge_efficiency
+                            <= EPS
+                        )
+                        if can_store_next_step:
+                            continue
+
+                        headroom_dc = max(
+                            0.0, (100.0 - nsoc) / 100.0 * cap)
+                        remaining_rate_dc = max(
+                            0.0,
+                            self.max_charge_power * slot_duration_h
+                            - max(0.0, dc_change_kwh),
+                        )
+                        absorbable_ac = min(
+                            headroom_dc, remaining_rate_dc,
+                        ) / max(EPS, self.charge_efficiency)
+                        metered_export_kwh = max(
+                            0.0, export_kwh - absorbable_ac)
+                        metered_grid_energy = -metered_export_kwh
+
                     if active_grid_charge and not policy['allow_active_grid_charge']:
                         continue
                     if (active_grid_charge
@@ -810,7 +861,8 @@ class OptimizationEngine:
                             False,
                         ))
 
-                    step_cost = import_kwh * buy - export_kwh * sell
+                    step_cost = (
+                        import_kwh * buy - metered_export_kwh * sell)
 
                     # Battery wear (cycle_cost) + (#1) arbitrage margin: a per-kWh
                     # cost on energy drawn from the battery (discharge), so the
@@ -823,7 +875,7 @@ class OptimizationEngine:
                     total = base_cost + step_cost
                     cumulative_spill = base_spill + pv_curtailed_kwh
                     for next_windows, next_saturated, starts_stage in target_stage_options:
-                        if next_windows > 5:
+                        if next_windows > VICTRON_CHARGE_WINDOW_BUDGET:
                             continue
                         next_state = (
                             nsoc, next_windows, active_grid_charge,
@@ -837,7 +889,7 @@ class OptimizationEngine:
                             dp[t + 1][next_state] = total
                             spill_dp[t + 1][next_state] = cumulative_spill
                             parent[t + 1][next_state] = (
-                                state, grid_energy, pv_curtailed_kwh,
+                                state, metered_grid_energy, pv_curtailed_kwh,
                                 starts_stage)
 
             # Exact Pareto pruning for the Victron-window state dimension.
@@ -1134,7 +1186,7 @@ class OptimizationEngine:
             'rejected': 'calendar_day_split',
             'reason_code': 'UNIFIED_HORIZON_OBJECTIVE',
             'objective': 'grid_result_minus_wear_and_margin_plus_bounded_continuation',
-            'victron_window_budget': 5,
+            'victron_window_budget': VICTRON_CHARGE_WINDOW_BUDGET,
         }
         return out
 
@@ -1177,14 +1229,39 @@ class OptimizationEngine:
             except Exception:
                 return str(s['time'])
 
+        def _when(s):
+            """Human label that does not hide a cross-day opportunity."""
+            try:
+                current_day = cur['time'].date()
+                sell_day = s['time'].date()
+                if sell_day == current_day:
+                    return _hm(s)
+                if sell_day == current_day + timedelta(days=1):
+                    return f"tomorrow at {_hm(s)}"
+                return s['time'].strftime('%a %H:%M')
+            except Exception:
+                return _hm(s)
+
         # "Next sell" must be the next REAL discharge-to-grid (control action
         # SELL), not a PV-surplus slot (internal action 'sell' but actually IDLE),
         # so "sell later at HH:MM" points at the genuine peak, not a surplus slot.
         def _is_real_sell(s):
             return control_action_for(s['action'], s['soc_start'],
                                       s['soc_end'], s['grid_energy']) == 'SELL'
-        next_sell = next((s for s in schedule[idx + 1:] if _is_real_sell(s)), None)
-        horizon_max = max((s['price'] for s in schedule[idx:]), default=price)
+        future_sells = [s for s in schedule[idx + 1:] if _is_real_sell(s)]
+        # The first lattice-sized discharge may only cover household load and
+        # export a few Wh. Point at the best visible executable sell instead of
+        # promising that the energy bought now is materially sold in that first
+        # tiny slot (which can also be on the wrong calendar day).
+        next_sell = max(
+            future_sells,
+            key=lambda s: s.get('sell', s['price']),
+            default=None,
+        )
+        horizon_max = max(
+            (s.get('sell', s['price']) for s in schedule[idx:]),
+            default=cur.get('sell', price),
+        )
 
         if mode == 'buy':
             if cur.get('grid_energy', 0.0) <= EPS:
@@ -1194,8 +1271,8 @@ class OptimizationEngine:
             if next_sell:
                 ns_sell = next_sell.get('sell', next_sell['price'])
                 return ('PRECHARGE_FOR_PEAK',
-                        f"Charging at €{price:.3f}/kWh to sell later at "
-                        f"{_hm(next_sell)} (€{ns_sell:.3f}/kWh)")
+                        f"Charging at €{price:.3f}/kWh for the best visible sell "
+                        f"opportunity {_when(next_sell)} (€{ns_sell:.3f}/kWh)")
             return ('PRICE_LOW', f"Charging while the price is low (€{price:.3f}/kWh)")
 
         if mode == 'sell':
@@ -1210,7 +1287,7 @@ class OptimizationEngine:
                 return ('PV_SURPLUS',
                         f"Surplus solar at €{price:.3f}/kWh — battery not discharging; "
                         f"Victron charges from it, or exports the excess once the battery is full")
-            if price >= horizon_max - EPS:
+            if cur.get('sell', price) >= horizon_max - EPS:
                 return ('PRICE_PEAK',
                         f"Selling stored energy at €{price:.3f}/kWh — the highest price in the horizon")
             return ('PRICE_HIGH',
@@ -1224,7 +1301,7 @@ class OptimizationEngine:
                 ns_sell = next_sell.get('sell', next_sell['price'])
                 return ('BUY_CHEAPER_THAN_STORED_VALUE',
                         f"Holding the battery; grid (€{price:.3f}/kWh) is cheaper than the stored "
-                        f"energy's value at {_hm(next_sell)} (€{ns_sell:.3f}/kWh) — "
+                        f"energy's best visible value {_when(next_sell)} (€{ns_sell:.3f}/kWh) — "
                         f"covering loads from grid/PV")
             return ('HOLD_PRESERVE',
                     f"Holding the battery; covering loads from grid/PV (€{price:.3f}/kWh)")
@@ -1392,7 +1469,7 @@ class OptimizationEngine:
         # silently drop a window assumed by the forecast trajectory.
         for s in victron_slots:
             s['avg_price'] = sum(s['_prices']) / len(s['_prices'])
-        if len(victron_slots) > 5:
+        if len(victron_slots) > VICTRON_CHARGE_WINDOW_BUDGET:
             raise RuntimeError(
                 'optimizer produced more than five executable charge windows')
         victron_slots.sort(key=lambda x: x['start'])
@@ -1994,7 +2071,9 @@ def format_plan_summary(result, *, batt_soc=None, source="", price_points=None,
 
     out.append(line)
     vslots = result.get('victron_slots', [])
-    out.append(f"VICTRON GRID-CHARGE SLOTS ({len(vslots)} / 5 max)")
+    out.append(
+        "VICTRON GRID-CHARGE SLOTS "
+        f"({len(vslots)} / {VICTRON_CHARGE_WINDOW_BUDGET} max)")
     if vslots:
         for i, s in enumerate(vslots):
             try:

@@ -137,6 +137,91 @@ class TestAIPoweredESS(unittest.TestCase):
         self.assertTrue(result['pv_surplus'])
         self.assertEqual(result['setpoint'], 0.0)
 
+    def test_optimizer_stores_pv_before_crediting_neutral_export(self):
+        """A below-full battery cannot earn phantom neutral PV export."""
+        self.engine.battery_capacity = 10.0
+        self.engine.charge_efficiency = 1.0
+        self.engine.discharge_efficiency = 1.0
+        self.engine.min_soc = 0.0
+        self.engine.soc_step = 10.0
+        self.engine.soc_states = [float(value) for value in range(0, 101, 10)]
+        self.engine.max_charge_power = 10.0
+        self.engine.max_discharge_power = 10.0
+        self.engine.max_power_import = 10.0
+        self.engine.max_power_export = 10.0
+        self.engine.terminal_value_factor = 0.0
+        base = datetime.now(tz.UTC).replace(
+            minute=0, second=0, microsecond=0) + timedelta(hours=1)
+
+        result = self.engine.optimize(
+            50.0,
+            [{'start': base, 'total': 0.50}],
+            load_forecast=[0.0],
+            pv_forecast=[1.0],
+            policy_name='pv_first_self_sufficiency',
+        )
+
+        step = result['schedule'][0]
+        self.assertEqual(step['soc_start'], 50.0)
+        self.assertEqual(step['soc_end'], 60.0)
+        self.assertEqual(step['grid_energy'], 0.0)
+        self.assertNotEqual(step['control_action'], 'SELL')
+
+    def test_sub_lattice_pv_surplus_is_not_credited_as_export(self):
+        """Fractional surplus is conservatively absorbed, not sold on paper."""
+        self.engine.battery_capacity = 10.0
+        self.engine.charge_efficiency = 1.0
+        self.engine.discharge_efficiency = 1.0
+        self.engine.min_soc = 0.0
+        self.engine.soc_step = 10.0
+        self.engine.soc_states = [float(value) for value in range(0, 101, 10)]
+        self.engine.max_charge_power = 10.0
+        self.engine.max_discharge_power = 10.0
+        self.engine.max_power_import = 10.0
+        self.engine.max_power_export = 10.0
+        self.engine.terminal_value_factor = 0.0
+        base = datetime.now(tz.UTC).replace(
+            minute=0, second=0, microsecond=0) + timedelta(hours=1)
+
+        result = self.engine.optimize(
+            50.0,
+            [{'start': base, 'total': 0.50}],
+            load_forecast=[0.0],
+            pv_forecast=[0.5],
+            policy_name='pv_first_self_sufficiency',
+        )
+
+        step = result['schedule'][0]
+        self.assertEqual(step['soc_end'], 50.0)
+        self.assertEqual(step['grid_energy'], 0.0)
+        self.assertEqual(result['objective_cost_eur'], 0.0)
+
+    def test_buy_reason_names_best_cross_day_sell_not_first_tiny_export(self):
+        base = datetime(2026, 8, 20, 14, 0, tzinfo=tz.UTC)
+        schedule = [
+            {
+                'time': base, 'action': 'buy', 'soc_start': 20.0,
+                'soc_end': 60.0, 'grid_energy': 4.0,
+                'price': 0.20, 'sell': 0.18,
+            },
+            {
+                'time': base + timedelta(hours=6), 'action': 'sell',
+                'soc_start': 60.0, 'soc_end': 59.0, 'grid_energy': -0.05,
+                'price': 0.35, 'sell': 0.33,
+            },
+            {
+                'time': base + timedelta(hours=18),
+                'action': 'sell', 'soc_start': 59.0, 'soc_end': 20.0,
+                'grid_energy': -4.0, 'price': 0.40, 'sell': 0.38,
+            },
+        ]
+
+        code, reason = self.engine._explain_action(schedule, 0)
+
+        self.assertEqual(code, 'PRECHARGE_FOR_PEAK')
+        self.assertIn('tomorrow at 08:00', reason)
+        self.assertIn('€0.380/kWh', reason)
+
     def test_stored_discharge_sell_keeps_forced_setpoint(self):
         # Real battery discharge to grid (SoC falling) must keep the planned
         # negative export setpoint so the discharge is rate-controlled/spread.

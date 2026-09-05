@@ -25,7 +25,7 @@ CONFIG_SCHEMA = [
             {"key": "ESS_ADAPTIVE_FORECAST_RISK_FACTOR", "label": "Coverage / forecast risk factor", "type": "float",
              "desc": "Fractional allowance applied to protected household energy and capped historical forecast risk (0.20 = 20%)."},
             {"key": "ESS_ADAPTIVE_UNKNOWN_HORIZON_HOURS", "label": "Unknown-horizon coverage (h)", "type": "float",
-             "desc": "Hours of bounded household load protected beyond the final published price slot by the hybrid Summer plan."},
+             "desc": "Hours of bounded trailing household load protected or credited beyond the final published price slot. Used by all Summer candidates; hybrid also enforces it as a reserve."},
             {"key": "ESS_ADAPTIVE_POLICY_MIN_DWELL_MIN", "label": "Strategy minimum dwell (min)", "type": "int",
              "desc": "Minimum time to keep an adaptive Summer strategy unless another candidate clears the configured switch margin."},
             {"key": "ESS_ADAPTIVE_POLICY_SWITCH_MARGIN_EUR", "label": "Strategy switch margin (€)", "type": "float",

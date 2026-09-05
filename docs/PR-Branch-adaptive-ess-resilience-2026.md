@@ -38,6 +38,13 @@ a calendar-split candidate selector with different economics.
 - Both optimizers now model unavoidable forecast PV spill explicitly. Export is
   clamped to the physical site limit, `pv_curtailed_kwh` is published, and the
   battery can never discharge merely to create more spill.
+- Summer-plan economics now follow the same neutral-setpoint PV routing as the
+  Victron and dashboard: forecast surplus is stored while battery headroom and
+  charge rate remain, and only the unavoidable remainder earns export reward.
+  This removes phantom next-day export credit that could distort cross-day
+  charge/hold decisions. Timeline BUY/HOLD explanations name the best visible
+  sell opportunity and say when it is tomorrow rather than pointing at the
+  first immaterial lattice discharge.
 - The five-window Victron limit is an optimization constraint. Post-processing
   asserts the invariant instead of silently dropping a charge window assumed by
   the SoC/economic trajectory. Falling tariffs use distinct intermediate target
@@ -100,8 +107,9 @@ same-day household carry, explicit zero adaptive hurdles and terminal disable,
 protected-floor/trailing-load continuation, executable BUY/window coverage after
 charge-rate re-time, falling-price target staging and safe saturated-stage
 merging, excess-PV feasibility/no discharge-into-spill,
-unrecoverable cost-basis behavior, scheduled/material full comparisons, and
-selected-policy infeasibility fallback.
+neutral-PV storage/no phantom sub-lattice export credit, cross-day sell-reason
+selection, unrecoverable cost-basis behavior, scheduled/material full
+comparisons, and selected-policy infeasibility fallback.
 
 ### Attended QA checklist
 
@@ -114,6 +122,8 @@ selected-policy infeasibility fallback.
 3. On a sunny/full-battery case near the export cap, confirm planning remains
    available and `pv_curtailed_kwh` is non-negative; grid export must never
    exceed `ESS_MAX_GRID_EXPORT_KW`.
+   Before the battery is full, confirm a neutral PV-surplus slot does not earn
+   forecast export reward while that energy can still be stored.
 4. With Adaptive Summer enabled, confirm `adaptive_policy.full_evaluation=True`
    hourly, after the next-day horizon arrives, and after a material forecast/SoC
    change; intervening replans should say
@@ -125,7 +135,7 @@ selected-policy infeasibility fallback.
    trading. Then simulate only through the existing tested offline-state harness
    (not by interrupting live mains): explicit offline must suppress all writes
    and release the logical reserve toward zero.
-7. Observe optimizer duration on the production host for a full comparison and
-   an intervening selected-policy replan using `optimizer_runtime_ms`. Record any
-   full comparison approaching the scheduler budget before considering the
-   adaptive gate unattended.
+7. Observe `optimizer_runtime_ms` on the production host first with Adaptive
+   Summer off, then with it on for a full comparison and an intervening
+   selected-policy replan. Record any path approaching 30 seconds before
+   considering the adaptive gate unattended.
