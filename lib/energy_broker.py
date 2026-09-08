@@ -396,6 +396,8 @@ def should_start_selling(price_now: float, batt_soc: float, ess_net_metering_bat
 
 
 def manage_sale_of_stored_energy_to_the_grid() -> None:
+    if _grid_connection_state() is False:
+        return
     # Defer to the AI optimizer when it is enabled and healthy (log only on change).
     if _is_truthy(retrieve_setting('AI_POWERED_ESS_ALGORITHM'), False):
         healthy = _ai_optimizer_active_and_healthy()
@@ -454,6 +456,14 @@ def manage_grid_usage_based_on_current_price(price: float = None, power: any = N
     Manages and allows automatic or manual toggle of a "passthrough" mode control loop which matches power consumption
     to a grid setpoint to allow consumption from grid while having a fallback to battery in case of grid instability.
     """
+    # No grid-dependent setpoint is meaningful while Victron explicitly reports
+    # islanded operation. This also blocks the event-driven retain loop between
+    # optimizer cycles, leaving the emergency reserve available to the house.
+    if _grid_connection_state() is False:
+        if STATE.get('ai_grid_assist') == 'on':
+            STATE.set('ai_grid_assist', 'off')
+        return
+
     # When the AI optimizer is in control, the legacy auto/manual grid logic must
     # stand down so it does not clobber the AI's setpoint. The one exception is
     # AI grid-assist ("retain") mode, where we DO match the grid setpoint to the
@@ -526,6 +536,8 @@ def set_charging_schedule(
     slots=None,
     charge_context=None,
 ):
+    if _grid_connection_state() is False:
+        return
     # Defer to the AI optimizer when it is enabled and healthy (log only on change).
     if _is_truthy(retrieve_setting('AI_POWERED_ESS_ALGORITHM'), False):
         healthy = _ai_optimizer_active_and_healthy()
@@ -1519,8 +1531,143 @@ def _manual_grid_charge_on() -> bool:
 
 
 def _ai_ess_override_on() -> bool:
-    """Runtime dashboard override: AI ESS stands down completely while true."""
+    """Return whether runtime ESS *control* is disabled by the dashboard.
+
+    Override deliberately does not disable sensing, planning, settlement, history,
+    or dashboard publication. It removes only hardware-write authority.
+    """
     return _is_truthy(STATE.get('ai_ess_override_enabled'), False)
+
+
+def _grid_connection_state():
+    """Return ``True``/``False`` for an explicit Victron grid state, else ``None``.
+
+    Missing startup telemetry must not be interpreted as a grid failure. Only an
+    explicit false/zero value from ``Ac/ActiveIn/Connected`` removes optimizer
+    write authority. This keeps the winter reserve as a grid-connected emergency
+    buffer while allowing Victron to use it when the grid is actually unavailable.
+    """
+    has_state = STATE.has('ac_in_connected') if hasattr(STATE, 'has') else (
+        STATE.get('ac_in_connected') is not None
+    )
+    if not has_state:
+        return None
+    value = STATE.get('ac_in_connected')
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    normalized = str(value or '').strip().lower()
+    if normalized in {'1', 'true', 'yes', 'on', 'connected'}:
+        return True
+    if normalized in {'0', 'false', 'no', 'off', 'disconnected'}:
+        return False
+    return None
+
+
+def _grid_offline_pass_through(result, current_soc):
+    """Replace a grid-dependent plan with an observational outage trajectory.
+
+    The seasonal reserve is a grid-connected planning guardrail. During an
+    explicit outage Victron owns the islanded system and may discharge the
+    battery below that reserve to keep the house powered. Publishing the
+    optimizer's original BUY/SELL/RETAIN rows in that state would be misleading
+    even when writes are suppressed, so model only passive PV/load battery flow
+    and never advertise a grid action or Victron charge slot.
+    """
+    passive = dict(result or {})
+    schedule = []
+    try:
+        soc = min(100.0, max(0.0, float(current_soc)))
+    except (TypeError, ValueError):
+        soc = 0.0
+    capacity_kwh = max(0.001, _get_float_setting('BATTERY_CAPACITY_KWH', 42.0))
+    charge_efficiency = max(
+        0.01, min(1.0, _get_float_setting('AC_DC_CHARGE_EFFICIENCY', 0.96)))
+    discharge_efficiency = max(
+        0.01, min(1.0, _get_float_setting('AC_DC_DISCHARGE_EFFICIENCY', 0.96)))
+
+    for original in (passive.get('schedule') or []):
+        step = dict(original)
+        try:
+            load_kwh = max(0.0, float(step.get('load') or 0.0))
+        except (TypeError, ValueError):
+            load_kwh = 0.0
+        try:
+            pv_kwh = max(0.0, float(step.get('pv') or 0.0))
+        except (TypeError, ValueError):
+            pv_kwh = 0.0
+
+        start_soc = soc
+        unserved_kwh = 0.0
+        if pv_kwh >= load_kwh:
+            stored_kwh = (pv_kwh - load_kwh) * charge_efficiency
+            soc = min(100.0, soc + stored_kwh / capacity_kwh * 100.0)
+        else:
+            required_dc_kwh = (load_kwh - pv_kwh) / discharge_efficiency
+            available_dc_kwh = soc / 100.0 * capacity_kwh
+            supplied_dc_kwh = min(required_dc_kwh, available_dc_kwh)
+            soc = max(0.0, soc - supplied_dc_kwh / capacity_kwh * 100.0)
+            unserved_kwh = max(
+                0.0,
+                (required_dc_kwh - supplied_dc_kwh) * discharge_efficiency,
+            )
+
+        step.update({
+            'action': (
+                'buy' if soc > start_soc + 1e-6
+                else 'self_supply' if soc < start_soc - 1e-6
+                else 'hold'
+            ),
+            'control_action': 'IDLE',
+            'soc_start': round(start_soc, 4),
+            'soc_end': round(soc, 4),
+            'grid_energy': 0.0,
+            'strategy': 'grid_offline_pass_through',
+            'protected_soc': 0.0,
+            'reason_code': 'GRID_OFFLINE_PASS_THROUGH',
+            'reason': (
+                'Grid unavailable — Victron may use the emergency reserve to '
+                'support the house; optimizer control is suspended'
+            ),
+        })
+        if unserved_kwh > 1e-6:
+            step['forecast_unserved_load_kwh'] = round(unserved_kwh, 4)
+        schedule.append(step)
+
+    passive.update({
+        'schedule': schedule,
+        'victron_slots': [],
+        'strategy': 'grid_offline_pass_through',
+        'setpoint': 0.0,
+        'mode': 'passive',
+        'control_action': 'IDLE',
+        'grid_assist': False,
+        'limit_feed_in': False,
+        'reason_code': 'GRID_OFFLINE_PASS_THROUGH',
+        'reason': (
+            'Grid unavailable — optimizer control is suspended; Victron may '
+            'use the emergency reserve to support the house'
+        ),
+        'controller_authority': 'grid_offline',
+        'control_suppressed': True,
+    })
+    if passive.get('adaptive_policy'):
+        passive['adaptive_policy'] = {
+            **passive['adaptive_policy'],
+            'suspended': True,
+            'suspension_reason': 'grid_offline',
+        }
+    if passive.get('winter_policy'):
+        configured_reserve = passive['winter_policy'].get('protected_soc_percent')
+        passive['winter_policy'] = {
+            **passive['winter_policy'],
+            'grid_connected_backup_reserve_percent': configured_reserve,
+            'protected_soc_percent': 0.0,
+            'suspended': True,
+            'suspension_reason': 'grid_offline',
+        }
+    return passive
 
 
 def _apply_sell_hysteresis(result):
@@ -1780,6 +1927,8 @@ def _grid_assist_setpoint_watts(load_watts=None, cover_all_load: bool = False) -
 
 def _apply_grid_assist_setpoint(load_watts=None, deadband_w: int = 50, cover_all_load: bool = False) -> None:
     """Apply the retain-mode grid setpoint (PV-aware), avoiding redundant writes."""
+    if _grid_connection_state() is False:
+        return
     target = _grid_assist_setpoint_watts(load_watts, cover_all_load=cover_all_load)
     try:
         current_sp = float(STATE.get('ac_power_setpoint') or 0)
@@ -2124,7 +2273,7 @@ def _apply_ev_smart_charge_to_forecast(
         native_h = max(0.25, float(slot_duration_h or 0.25))
         sub_count = max(1, int(round(native_h / 0.25)))
         export_factor = _get_float_setting("ESS_EXPORT_PRICE_FACTOR", 1.0)
-        export_fee = _get_float_setting("ESS_EXPORT_FEE", 0.0)
+        export_fee = _get_float_setting("ESS_EXPORT_FEE", 0.0248)
         def _positive_state_number(key, default):
             try:
                 value = float(STATE.get(key))
@@ -2542,7 +2691,7 @@ def _strategy_candidate_config_snapshot(result: dict | None = None) -> dict:
         'arbitrage_margin_eur_per_dc_kwh': max(
             0.0, _get_float_setting('ESS_ARBITRAGE_MARGIN', 0.0)),
         'export_price_factor': _get_float_setting('ESS_EXPORT_PRICE_FACTOR', 1.0),
-        'export_fee_eur_per_kwh': _get_float_setting('ESS_EXPORT_FEE', 0.0),
+        'export_fee_eur_per_kwh': _get_float_setting('ESS_EXPORT_FEE', 0.0248),
         # The live engine values usable AC output at its terminal price.  The
         # replay model tracks DC-side stored energy, so preserve the same value
         # per DC kWh by applying the configured discharge efficiency here.
@@ -2603,6 +2752,8 @@ def _publish_plan_json(result, *, batt_soc, price_points, pv_remaining,
             'load': s.get('load'),
             'reason': s.get('reason'),
             'reason_code': s.get('reason_code'),
+            'strategy': s.get('strategy') or result.get('strategy'),
+            'protected_soc': s.get('protected_soc'),
             'planned_ev_kwh': s.get('planned_ev_kwh', 0.0),
             'non_ev_load_kwh': s.get('non_ev_load_kwh'),
             'ev_target_kw': s.get('ev_target_kw', 0.0),
@@ -2730,6 +2881,14 @@ def _publish_plan_json(result, *, batt_soc, price_points, pv_remaining,
             # The script remains strictly read-only: this metadata is an audit
             # snapshot, never an instruction to select or apply a candidate.
             'strategy_candidate_config': _strategy_candidate_config_snapshot(result),
+            # Deliberately a sibling of strategy_candidate_config rather than a
+            # member of it: that mapping is validated against a closed field
+            # list, so adding a key there would reject every plan this build
+            # writes. The evaluator uses this to offer an approximate
+            # Winter-Mode comparison row while Summer Mode is running, where
+            # the snapshot's own reserve is the summer one.
+            'winter_reserve_soc_percent': min(100.0, max(0.0, _get_float_setting(
+                'MIN_SOC_RESERVE_WINTER', 40.0))),
             'strategy_shadow': {
                 'mode': 'read_only_offline_replay',
                 'protected_soc_source': (
@@ -2743,7 +2902,11 @@ def _publish_plan_json(result, *, batt_soc, price_points, pv_remaining,
                 ),
             },
             'planning_policy': _json_safe(result.get('planning_policy')),
+            'adaptive_policy': _json_safe(result.get('adaptive_policy')),
             'winter_policy': _json_safe(result.get('winter_policy')),
+            'active_strategy': result.get('strategy'),
+            'controller_authority': result.get('controller_authority') or 'optimizer',
+            'control_suppressed': bool(result.get('control_suppressed', False)),
             'victron_slots': victron_slots,
             'schedule': schedule,
         }
@@ -2757,7 +2920,14 @@ def _publish_plan_json(result, *, batt_soc, price_points, pv_remaining,
         logging.warning(f"AI_ESS: Failed to publish plan JSON for frontend: {e}")
 
 
-def _realized_action(grid_w, batt_w, deadband_w: int = 200) -> str:
+def _realized_action(
+    grid_w,
+    batt_w,
+    deadband_w: int = 200,
+    *,
+    soc_start=None,
+    soc_end=None,
+) -> str:
     """Canonical action describing what the system is ACTUALLY doing right now, from
     the live power flow (W; + = import/charge, − = export/discharge).
 
@@ -2768,6 +2938,14 @@ def _realized_action(grid_w, batt_w, deadband_w: int = 200) -> str:
     re-evaluation while the Victron charge schedule is still topping up). Recording
     the realized action alongside the decision makes that explicit instead of
     looking like a mislabel.
+
+    When the settled slot has both endpoint SoC readings, a positive/negative
+    battery-power reading is not sufficient by itself to call the slot BUY/SELL.
+    Victron can report charge-direction power while the battery is pinned at its
+    empty/reserve floor (and can report brief direction noise during transitions).
+    BUY and SELL therefore require the corresponding measured SoC movement when
+    endpoints are supplied. Without endpoints we retain the power-only fallback for
+    live status and backwards compatibility.
     """
     try:
         g = float(grid_w) if grid_w is not None else 0.0
@@ -2776,9 +2954,26 @@ def _realized_action(grid_w, batt_w, deadband_w: int = 200) -> str:
         return "IDLE"
     charging, discharging = b > deadband_w, b < -deadband_w
     importing, exporting = g > deadband_w, g < -deadband_w
-    if discharging and exporting:
+
+    soc_known = soc_start is not None and soc_end is not None
+    try:
+        # SoC telemetry is coarse enough that a tenth of a percentage point can
+        # be reporting noise. Require >0.2 percentage points before persisting a
+        # settled BUY/SELL label; the timeline applies the same threshold when
+        # repairing older rows.
+        soc_rising = float(soc_end) > float(soc_start) + 0.2
+        soc_falling = float(soc_end) < float(soc_start) - 0.2
+    except (TypeError, ValueError):
+        soc_known = False
+        soc_rising = soc_falling = False
+
+    # A real stored-energy export must be confirmed by a falling SoC. This keeps
+    # PV-only export (or a transient meter sign) out of the historical SELL label.
+    if discharging and exporting and (not soc_known or soc_falling):
         return "SELL"
-    if charging and importing:
+    # Likewise, importing while the battery is pinned at its floor is ordinary
+    # grid-backed household operation, not a confirmed BUY interval.
+    if charging and importing and (not soc_known or soc_rising):
         return "BUY"
     if importing:
         return "RETAIN"          # grid covering load; battery held
@@ -2904,6 +3099,9 @@ def _append_history(
             "ts": now.isoformat(),
             "kind": "cycle",
             "optimizer_mode": result.get('optimizer_mode') or OPTIMIZER_MODE,
+            "active_strategy": result.get('strategy'),
+            "controller_authority": result.get('controller_authority') or 'optimizer',
+            "control_suppressed": bool(result.get('control_suppressed', False)),
             "soc": batt_soc,
             "control_action": result.get('control_action'),
             # What the system was actually doing (from live flow) when this record
@@ -2971,6 +3169,17 @@ def _append_history(
             "day_export_kwh": act.get('exp_kwh'),
             "day_export_reward": act.get('exp_rev'),
         }
+        adaptive_policy = result.get('adaptive_policy') or {}
+        if adaptive_policy:
+            record.update({
+                "adaptive_policy_selected": adaptive_policy.get('selected'),
+                "adaptive_policy_reason_code": adaptive_policy.get('reason_code'),
+                "adaptive_trade_hurdle_eur": _num(
+                    adaptive_policy.get('trade_hurdle_eur')),
+                "adaptive_trade_incremental_benefit_eur": _num(
+                    adaptive_policy.get('trade_incremental_benefit_eur')),
+                "adaptive_candidate_scores": adaptive_policy.get('candidates'),
+            })
         winter_policy = result.get('winter_policy') or {}
         if winter_policy:
             record.update({
@@ -3167,10 +3376,6 @@ def _settle_prior_slot(
             # Vehicle SoC is supporting context only; delivered energy always
             # comes from the ABB meter because Tesla SoC is rounded/modelled.
             'ev_soc': _f(STATE.get('tesla_soc')),
-            'actual_control_action': _realized_action(
-                (realized_power or {}).get('grid_w'),
-                (realized_power or {}).get('batt_w'),
-            ) if realized_power is not None else None,
             'slot_key': cur_slot,
         }
         sched0 = (result.get('schedule') or [{}])[0]
@@ -3188,6 +3393,11 @@ def _settle_prior_slot(
         w0 = _slot_weather(sched0)
         cur['prediction'] = {
             'control_action': result.get('control_action'),
+            # Store the original planner explanation with the slot snapshot.
+            # A closed Timeline row should retain why the optimizer selected the
+            # action; settlement replaces the forecast numbers, not that context.
+            'reason': sched0.get('reason') or result.get('reason'),
+            'reason_code': sched0.get('reason_code') or result.get('reason_code'),
             'predicted_grid_kwh': _f(sched0.get('grid_energy')),
             'price_buy': _f(sched0.get('price')),
             'price_sell': _f(sched0.get('sell')),
@@ -3309,6 +3519,20 @@ def _settle_prior_slot(
             )
 
             pred = prev.get('prediction') or {}
+            # A power-flow classification is useful diagnostic evidence, but it
+            # is not a controller instruction. Victron may briefly charge at its
+            # reserve floor while the optimizer has deliberately instructed
+            # RETAIN, and may export PV while it has deliberately instructed
+            # IDLE. Keep the evidence separately rather than relabelling the
+            # action that governed the closed slot.
+            observed_power_action = None
+            if realized_power is not None:
+                observed_power_action = _realized_action(
+                    (realized_power or {}).get('grid_w'),
+                    (realized_power or {}).get('batt_w'),
+                    soc_start=soc_start,
+                    soc_end=soc_end,
+                )
             pg = pred.get('predicted_grid_kwh')
             pbuy = pred.get('price_buy') or 0.0
             psell = pred.get('price_sell') if pred.get('price_sell') is not None else pbuy
@@ -3332,7 +3556,7 @@ def _settle_prior_slot(
                         import_kwh=imp_kwh or 0.0,
                         pv_kwh=pv_kwh or 0.0,
                         price_buy=pbuy,
-                        charge_efficiency=_get_float_setting('AC_DC_CHARGE_EFFICIENCY', 0.90),
+                        charge_efficiency=_get_float_setting('AC_DC_CHARGE_EFFICIENCY', 0.96),
                     )
                     cost_basis_now = cb.get('basis')
             except Exception as e:
@@ -3345,9 +3569,13 @@ def _settle_prior_slot(
                 'slot_end': now.isoformat(),
                 'incomplete': incomplete,
                 'predicted_control_action': pred.get('control_action'),
-                # Measured endpoint action, kept separate from the prediction so
-                # historical Timeline rows never masquerade a plan as an outcome.
-                'actual_control_action': cur.get('actual_control_action'),
+                'predicted_reason': pred.get('reason'),
+                'predicted_reason_code': pred.get('reason_code'),
+                # This is the optimizer instruction applied to the closed slot.
+                # It remains the Timeline label; the physical-flow estimate below
+                # is retained only for diagnostics.
+                'actual_control_action': pred.get('control_action'),
+                'observed_power_action': observed_power_action,
                 'predicted_grid_kwh': pg,
                 'predicted_net_eur': round(predicted_net, 4) if predicted_net is not None else None,
                 'actual_import_kwh': round(imp_kwh, 3) if imp_kwh is not None else None,
@@ -3501,11 +3729,15 @@ def _run_ai_optimizer_once():
     """
     if not _is_truthy(retrieve_setting('AI_POWERED_ESS_ALGORITHM'), False):
         return
-    if _ai_ess_override_on():
-        if STATE.get('ai_grid_assist') == 'on':
-            STATE.set('ai_grid_assist', 'off')
-        logging.info("AI_ESS: Override active; optimizer standing down.")
-        return
+
+    override_active = _ai_ess_override_on()
+    grid_state = _grid_connection_state()
+    control_suppression = (
+        'grid_offline' if grid_state is False
+        else 'manual_override' if override_active
+        else None
+    )
+    control_allowed = control_suppression is None
 
     try:
         # 1. Retrieve data
@@ -3711,10 +3943,14 @@ def _run_ai_optimizer_once():
             ','.join(appliance_context.get('devices') or []),
         )
 
+        if control_suppression == 'grid_offline':
+            result = _grid_offline_pass_through(result, batt_soc)
+
         # 4. Negative-price grid feed-in protection.
         # When the current price is negative, exporting costs money, so limit
         # system feed-in to 0W. Auto-revert to unlimited otherwise.
-        if _is_truthy(retrieve_setting('NEGATIVE_PRICE_FEED_IN_LIMIT_ENABLED'), True):
+        if (control_allowed and _is_truthy(
+                retrieve_setting('NEGATIVE_PRICE_FEED_IN_LIMIT_ENABLED'), True)):
             if result.get('limit_feed_in'):
                 limit_grid_feed_in(enabled=True, watts=0)
             else:
@@ -3723,13 +3959,14 @@ def _run_ai_optimizer_once():
         # Reconcile Victron's independent hardware safety floor. This must not
         # mirror the optimizer's seasonal reserve: current SoC below
         # MinimumSocLimit triggers Victron Recharge outside the optimized schedule.
-        set_minimum_ess_soc()
+        if control_allowed:
+            set_minimum_ess_soc()
 
         # 4b. Manual override wins over the plan; otherwise damp SELL flapping.
         # The manual grid-charge toggle forces a retain hold (grid covers all
         # loads incl. a full-power EV charge). When it's off, suppress jittery
         # SELL<->HOLD flips that the stateless re-plan would otherwise produce.
-        if _manual_grid_charge_on():
+        if control_allowed and _manual_grid_charge_on():
             result['control_action'] = 'RETAIN'
             result['grid_assist'] = True
             result['mode'] = 'hold'
@@ -3739,13 +3976,42 @@ def _run_ai_optimizer_once():
                 "Manual grid-charge override active: holding the battery; grid "
                 "covers all loads (including full-power EV charging)"
             )
-        else:
+        elif control_allowed:
             result = _apply_sell_hysteresis(result)
             result = _apply_low_soc_retain_before_cheaper_buy(result, batt_soc)
 
         # 5. Apply immediate control for the current slot.
         setpoint = result.get('setpoint', 0.0)
-        if result.get('grid_assist'):  # HOLD (retain)
+        if not control_allowed:
+            # Remove event-driven retain authority before publishing the passive
+            # state. This changes internal state only and sends no Victron write.
+            if STATE.get('ai_grid_assist') == 'on':
+                STATE.set('ai_grid_assist', 'off')
+            applied_setpoint = STATE.get('ac_power_setpoint')
+            try:
+                applied_setpoint = float(applied_setpoint)
+            except (TypeError, ValueError):
+                applied_setpoint = 0.0
+            if control_suppression == 'grid_offline':
+                applied_control_action = 'IDLE'
+                result['reason_code'] = 'GRID_OFFLINE_PASS_THROUGH'
+                result['reason'] = (
+                    'Grid unavailable — optimizer control is suspended; Victron '
+                    'may use the emergency reserve to support the house'
+                )
+            else:
+                applied_control_action = _realized_action(
+                    realized_power.get('grid_w'), realized_power.get('batt_w'))
+                result['reason_code'] = 'MANUAL_OVERRIDE_OBSERVATION'
+                result['reason'] = (
+                    'Manual override active — observing and settling system '
+                    'behaviour without changing Victron control'
+                )
+            result['mode'] = 'passive'
+            result['grid_assist'] = False
+            result['controller_authority'] = control_suppression
+            result['control_suppressed'] = True
+        elif result.get('grid_assist'):  # HOLD (retain)
             # Cover the PV-deficit portion of the house load from the grid so the
             # battery is held; when PV covers the load, stay at 0 so surplus PV
             # charges the battery / exports. Applied immediately here and
@@ -3804,9 +4070,10 @@ def _run_ai_optimizer_once():
         result['victron_slots'] = victron_slots
         # Clear-then-program leaves a brief empty-slot window; missing a grid charge
         # is the safe failure mode, and the next optimizer cycle self-heals it.
-        clear_victron_schedules()
+        if control_allowed:
+            clear_victron_schedules()
 
-        for i, slot in enumerate(victron_slots):
+        for i, slot in enumerate(victron_slots if control_allowed else []):
             if i >= 5:
                 break
             start_dt = slot['start']
@@ -3855,7 +4122,12 @@ def _run_ai_optimizer_once():
         # The full plan view is available via the web UI and scripts/ai_ess_dryrun.py,
         # so we keep the service log clean with a one-line summary instead of the
         # multi-line plan table.
-        charge_slot_note = ". Victron charge slots scheduled." if victron_slots else ""
+        charge_slot_note = (
+            ". Victron charge slots scheduled."
+            if control_allowed and victron_slots else
+            f". Control suppressed ({control_suppression}); observational plan only."
+            if not control_allowed else ""
+        )
         if OPTIMIZER_MODE == 'winter':
             winter_policy = result.get('winter_policy') or {}
             logging.info(
@@ -3864,6 +4136,16 @@ def _run_ai_optimizer_once():
                 winter_policy.get('protected_soc_percent'),
                 winter_policy.get('next_replenishment_time'),
                 winter_policy.get('warning') or 'none',
+            )
+        elif result.get('adaptive_policy'):
+            adaptive = result['adaptive_policy']
+            logging.info(
+                "AI_ESS: Adaptive Summer policy — selected=%s reason=%s "
+                "trade_advantage=%s€ hurdle=%s€",
+                adaptive.get('selected'),
+                adaptive.get('reason_code'),
+                adaptive.get('trade_incremental_benefit_eur'),
+                adaptive.get('trade_hurdle_eur'),
             )
         logging.info(
             "AI_ESS: Optimization complete — mode=%s action=%s setpoint=%sW SoC=%.0f%% price=%.3f%s",

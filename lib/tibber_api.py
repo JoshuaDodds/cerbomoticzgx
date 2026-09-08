@@ -4,6 +4,7 @@ import requests
 import json
 import os
 import threading
+import importlib
 
 from datetime import datetime, timezone, timedelta
 from dateutil import parser, tz
@@ -56,6 +57,44 @@ client = VictronClient().get_client()
 _PRICE_CACHE = {}
 DEFAULT_PRICE_CACHE_PATH = "/dev/shm/cerbo_tibber_price_cache.json"
 
+
+class _TibberBackoffCompatibility:
+    """Correct tibber.py's invalid reconnect exception list locally.
+
+    tibber.py 0.6/0.7 passes a ``list`` to ``backoff.on_exception``. Python's
+    ``except`` statement accepts an exception class or tuple, never a list, so
+    the first websocket timeout otherwise terminates gql's background reconnect
+    task with ``TypeError``. Keep the compatibility shim scoped to tibber's home
+    module and include the raw timeout raised by current gql/websockets versions.
+    """
+
+    def __init__(self, wrapped):
+        self._wrapped = wrapped
+
+    def __getattr__(self, name):
+        return getattr(self._wrapped, name)
+
+    def on_exception(self, wait_gen, exception, *args, **kwargs):
+        if isinstance(exception, list):
+            exception = tuple(exception)
+            if TimeoutError not in exception:
+                exception += (TimeoutError,)
+        return self._wrapped.on_exception(
+            wait_gen, exception, *args, **kwargs
+        )
+
+
+def _install_tibber_backoff_compatibility(home) -> bool:
+    """Install the reconnect fix only in the module defining this Tibber home."""
+    try:
+        module = importlib.import_module(type(home).__module__)
+        current = getattr(module, "backoff")
+    except (ImportError, AttributeError):
+        return False
+    if not isinstance(current, _TibberBackoffCompatibility):
+        module.backoff = _TibberBackoffCompatibility(current)
+    return True
+
 def live_measurements(home=None):
     # Resolve the account-backed home at CALL time (it's initialised in the
     # background), and skip gracefully if Tibber isn't ready yet — the caller/
@@ -104,8 +143,13 @@ def live_measurements(home=None):
     # in most cases to resolve this.
     logging.info(f"Tibber: Live measurements starting...")
     try:
+        _install_tibber_backoff_compatibility(home)
         home.start_live_feed(user_agent=f"cerbomoticzgx/{retrieve_setting('VERSION')}",
-                             retries=10,
+                             # A finite retry count leaves gql waiting on a failed
+                             # background connection task after a prolonged outage.
+                             # The main service is long-lived, so transient websocket
+                             # reconnects should continue with bounded backoff.
+                             retries=None,
                              retry_interval=10)
     except (TransportClosed, ConnectionClosedError, TransportQueryError) as e:
         # TransportQueryError covers Tibber refusing to start the live stream

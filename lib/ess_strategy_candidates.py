@@ -1,7 +1,7 @@
 """Pure, shadow-only ESS strategy candidate evaluator.
 
 This module deliberately has no dependency on settings, MQTT, the energy
-broker, or either live optimizer.  It evaluates three deterministic planning
+broker, or either live optimizer.  It evaluates deterministic planning
 policies against caller-supplied slots so research and later scenario analysis
 cannot alter an active Victron plan by import side effect.
 
@@ -16,6 +16,11 @@ The candidates are intentionally small and explicit:
 ``protected_hybrid``
     May use grid energy only to restore a supplied protected household reserve,
     and may export only energy above that reserve.
+``winter_self_sufficiency``
+    Opt-in, and only when the caller supplies a winter reserve.  Grid charging
+    permitted, no routine battery-to-grid export, held above that reserve.  It
+    is a coarse stand-in for Winter Mode's routine policy, never the winter
+    engine itself — see :data:`WINTER_APPROXIMATION_CAVEATS`.
 
 It is *not* an executor and it does not choose a winner.  A future caller may
 run scenario variants and apply a separate, explicitly guarded Pareto policy.
@@ -25,11 +30,30 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass
 from math import isfinite
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Iterable, Optional
+
+from lib.forecast_projection import PV_SURPLUS_FULL_SOC
 
 
 EPS = 1e-9
+
+# Why the winter candidate is a stand-in and not "what Winter Mode would do".
+# Surfaces that show it must show these too; the real engine lives in
+# ``lib.ai_powered_ess_winter`` and is selected once at startup.
+WINTER_APPROXIMATION_CAVEATS = (
+    "Holds a static winter reserve, while the real engine sizes its floor from "
+    "forecast household demand until the next replenishment window plus a "
+    "learned uncertainty margin.",
+    "May buy up to the full configured grid-charge cap in the cheapest slots "
+    "and hold it, while the real engine replenishes only what forecast "
+    "household demand requires. This is the largest difference: without the "
+    "demand sizing it behaves closer to market arbitrage with export removed.",
+    "Never exports, while the real engine allows an exceptional-spread export "
+    "once it clears its economic hurdle and still covers household demand.",
+    "Uses this evaluator's fixed SoC lattice and no replenishment-window "
+    "charge scheduling, so its timing is coarser than the real engine's.",
+)
 
 
 @dataclass(frozen=True)
@@ -205,18 +229,25 @@ def evaluate_shadow_candidates(
     *,
     initial_soc_percent: float,
     config: CandidateConfig,
+    winter_reserve_soc_percent: Optional[float] = None,
 ) -> "OrderedDict[str, CandidateResult]":
-    """Evaluate isolated market/PV-first/hybrid candidates.
+    """Evaluate isolated market/PV-first/hybrid candidates, plus opt-in winter.
 
     The caller supplies a *deterministic* price/load/PV horizon.  No current
     clock, configuration value, filesystem state, network service, or live
     optimizer is read.  Results are deliberately returned side-by-side instead
     of selecting or executing one.
+
+    ``winter_reserve_soc_percent`` is opt-in.  When supplied it adds a fourth,
+    *approximate* stand-in for Winter Mode's routine policy: self-sufficiency
+    funded by cheap grid replenishment, with no routine battery-to-grid export,
+    held above the winter reserve.  It is deliberately not the winter engine —
+    see :data:`WINTER_APPROXIMATION_CAVEATS` before drawing conclusions from it.
     """
 
     normalized = _validate_slots(slots)
     initial_soc = _validate_soc(initial_soc_percent, "initial_soc_percent")
-    policies = (
+    policies = [
         _Policy(
             candidate_id="market_arbitrage",
             required_floor_soc_percent=config.min_soc_percent,
@@ -241,7 +272,22 @@ def evaluate_shadow_candidates(
             ),
             allow_active_battery_export=True,
         ),
-    )
+    ]
+    if winter_reserve_soc_percent is not None:
+        winter_floor = _validate_soc(
+            winter_reserve_soc_percent, "winter_reserve_soc_percent")
+        # The winter reserve is a floor, never a way to plan below the physical
+        # minimum this configuration already guarantees.
+        winter_floor = min(100.0, max(winter_floor, config.min_soc_percent))
+        policies.append(_Policy(
+            candidate_id="winter_self_sufficiency",
+            required_floor_soc_percent=winter_floor,
+            # Winter Mode's defining mechanism is cheap-window grid
+            # replenishment, which is exactly what pv_first forbids.
+            allow_active_grid_charge=True,
+            grid_charge_ceiling_soc_percent=config.grid_charge_soc_cap_percent,
+            allow_active_battery_export=False,
+        ))
     return OrderedDict(
         (policy.candidate_id, _evaluate_policy(normalized, initial_soc, config, policy))
         for policy in policies
@@ -540,11 +586,67 @@ def _transition(
     )
 
 
+def _could_have_stored_more(step: CandidateStep, config: CandidateConfig) -> bool:
+    """True when a non-discharging export slot should have charged instead.
+
+    This installation never commands an export setpoint for PV surplus: the
+    optimizer leaves the setpoint neutral and the Victron stores surplus while
+    the battery has room, feeding the grid only once it cannot accept more (see
+    ``_post_process`` in :mod:`lib.ai_powered_ess`).  Without this, a candidate
+    credits itself with morning surplus revenue the hardware would not produce
+    — worst of all for the two policies that forbid active export, whose entire
+    export would otherwise be exactly this phantom.
+
+    The test is local and lattice-exact: storing one more SoC step is rejected
+    only when it stays within the charge rate and does not turn the slot into an
+    import, so genuinely unstorable surplus still exports.
+    """
+    if step.grid_export_kwh <= EPS or step.dc_change_kwh < -EPS:
+        return False
+    if step.soc_end_percent >= PV_SURPLUS_FULL_SOC - EPS:
+        return False
+    if step.soc_end_percent + config.soc_step_percent > 100.0 + EPS:
+        return False
+    extra_dc = config.soc_step_percent / 100.0 * config.battery_capacity_kwh
+    if (step.dc_change_kwh + extra_dc) / step.duration_h > config.max_charge_kw + EPS:
+        return False
+    return step.grid_energy_kwh + extra_dc / config.charge_efficiency <= EPS
+
+
+def settled_export_kwh(step: CandidateStep, config: CandidateConfig) -> float:
+    """Export that actually reaches the meter for one step.
+
+    A commanded battery discharge exports as planned.  Otherwise the surplus is
+    absorbed first, limited by remaining headroom and the charge rate, and only
+    the unstorable remainder crosses the meter.  This mirrors what the dashboard
+    settles for the live plan, so a plan row and a candidate row are credited on
+    identical physics.
+    """
+    if step.grid_export_kwh <= EPS:
+        return 0.0
+    if step.dc_change_kwh < -EPS:
+        return step.grid_export_kwh
+    headroom_dc = max(
+        0.0,
+        (100.0 - step.soc_end_percent) / 100.0 * config.battery_capacity_kwh,
+    )
+    rate_dc = max(
+        0.0,
+        config.max_charge_kw * step.duration_h - max(0.0, step.dc_change_kwh),
+    )
+    absorbable_ac = min(headroom_dc, rate_dc) / config.charge_efficiency
+    return max(0.0, step.grid_export_kwh - absorbable_ac)
+
+
 def _transition_is_allowed(
     step: CandidateStep,
     policy: _Policy,
     config: CandidateConfig,
 ) -> bool:
+    # Physical before policy: no candidate may export surplus the battery would
+    # have absorbed, whatever its policy permits.
+    if _could_have_stored_more(step, config):
+        return False
     # Do not use an already-missing protected reserve to cover load or export.
     # Holding below the floor is allowed only while a later transition may
     # recover it gradually within the physical charge-rate limit.
@@ -619,6 +721,25 @@ def _terminal_value(
     return usable_dc * config.terminal_value_eur_per_dc_kwh
 
 
+def _local_date(value: Any) -> Optional[date]:
+    """Return the calendar day a slot/step timestamp falls on, or None.
+
+    Aware timestamps resolve in their own UTC offset, which is the local day the
+    price slot was published for.  ``datetime`` is checked first because it is a
+    subclass of ``date``.
+    """
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).date()
+        except ValueError:
+            return None
+    return None
+
+
 def _horizon_crosses_day(slots: tuple[DeterministicSlot, ...]) -> bool:
     """True only when supplied slot timestamps prove a multi-day horizon.
 
@@ -629,25 +750,128 @@ def _horizon_crosses_day(slots: tuple[DeterministicSlot, ...]) -> bool:
     """
     dates = set()
     for slot in slots:
-        value = slot.start
-        if isinstance(value, datetime):
-            dates.add(value.date())
-        elif isinstance(value, date):
-            dates.add(value)
-        elif isinstance(value, str):
-            try:
-                dates.add(datetime.fromisoformat(value.replace("Z", "+00:00")).date())
-            except ValueError:
-                return False
-        else:
+        parsed = _local_date(slot.start)
+        if parsed is None:
             return False
+        dates.add(parsed)
     return len(dates) > 1
 
 
+@dataclass(frozen=True)
+class WindowTotals:
+    """Metrics for one sub-window of an already-evaluated candidate schedule.
+
+    This is a *reporting* projection, never a second optimization.  The
+    candidate still plans over the whole supplied horizon, so a strategy that
+    rationally holds charge through midnight keeps that decision; only the
+    attribution of its cash flows is restricted to the window.
+    """
+
+    slot_count: int
+    window_start: Any
+    window_end: Any
+    cash_net_eur: float
+    import_cost_eur: float
+    export_reward_eur: float
+    lifecycle_cost_eur: float
+    economic_net_eur: float
+    grid_import_kwh: float
+    grid_export_kwh: float
+    # Planned export the battery would have absorbed instead, so a row that
+    # loses revenue here can be seen to have stored it rather than lost it.
+    stored_surplus_kwh: float
+    dc_charge_kwh: float
+    dc_discharge_kwh: float
+    dc_throughput_kwh: float
+    full_equivalent_cycles: float
+    opening_soc_percent: Optional[float]
+    closing_soc_percent: Optional[float]
+
+
+def first_local_day_steps(
+    steps: Iterable[CandidateStep],
+) -> tuple[CandidateStep, ...]:
+    """Return the steps falling on the first calendar day of a schedule.
+
+    A published plan begins at the current slot, so this is the remainder of
+    today.  An unparseable leading timestamp yields no steps rather than a
+    silently mis-attributed window.
+    """
+    ordered = tuple(steps)
+    if not ordered:
+        return ()
+    first_day = _local_date(ordered[0].start)
+    if first_day is None:
+        return ()
+    return tuple(
+        step for step in ordered if _local_date(step.start) == first_day
+    )
+
+
+def _window_end(steps: tuple[CandidateStep, ...]) -> Any:
+    if not steps:
+        return None
+    last = steps[-1]
+    if isinstance(last.start, datetime):
+        return last.start + timedelta(hours=last.duration_h)
+    return None
+
+
+def summarize_steps(
+    steps: Iterable[CandidateStep],
+    config: CandidateConfig,
+) -> WindowTotals:
+    """Total one window of candidate steps using the evaluator's own arithmetic.
+
+    Import/export are taken exactly as the model booked them so a candidate and
+    a live-plan baseline summed by this function stay directly comparable.
+    """
+    ordered = tuple(steps)
+    # Settle export rather than trusting the planned figure. Candidate schedules
+    # are already constrained against phantom surplus export, but a live plan's
+    # own rows are not: its DP can emit a neutral-setpoint slot that "exports"
+    # while the battery has room, which the hardware would store instead.
+    exports = tuple(settled_export_kwh(step, config) for step in ordered)
+    stored_surplus = sum(
+        step.grid_export_kwh - export for step, export in zip(ordered, exports))
+    import_cost = sum(step.grid_import_kwh * step.buy_price for step in ordered)
+    export_reward = sum(
+        export * step.sell_price for step, export in zip(ordered, exports))
+    dc_charge = sum(max(0.0, step.dc_change_kwh) for step in ordered)
+    dc_discharge = sum(max(0.0, -step.dc_change_kwh) for step in ordered)
+    lifecycle_cost = dc_discharge * config.cycle_cost_eur_per_dc_kwh
+    cash_net = export_reward - import_cost
+    throughput = dc_charge + dc_discharge
+    return WindowTotals(
+        slot_count=len(ordered),
+        window_start=ordered[0].start if ordered else None,
+        window_end=_window_end(ordered),
+        cash_net_eur=cash_net,
+        import_cost_eur=import_cost,
+        export_reward_eur=export_reward,
+        lifecycle_cost_eur=lifecycle_cost,
+        economic_net_eur=cash_net - lifecycle_cost,
+        grid_import_kwh=sum(step.grid_import_kwh for step in ordered),
+        grid_export_kwh=sum(exports),
+        stored_surplus_kwh=stored_surplus,
+        dc_charge_kwh=dc_charge,
+        dc_discharge_kwh=dc_discharge,
+        dc_throughput_kwh=throughput,
+        full_equivalent_cycles=throughput / (2.0 * config.battery_capacity_kwh),
+        opening_soc_percent=ordered[0].soc_start_percent if ordered else None,
+        closing_soc_percent=ordered[-1].soc_end_percent if ordered else None,
+    )
+
+
 __all__ = [
+    "WINTER_APPROXIMATION_CAVEATS",
     "CandidateConfig",
     "CandidateResult",
     "CandidateStep",
     "DeterministicSlot",
+    "WindowTotals",
     "evaluate_shadow_candidates",
+    "first_local_day_steps",
+    "settled_export_kwh",
+    "summarize_steps",
 ]

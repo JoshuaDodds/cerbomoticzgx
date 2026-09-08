@@ -182,9 +182,9 @@ class OptimizationEngine:
     def __init__(self):
         self.battery_capacity = max(0.1, _safe_float('BATTERY_CAPACITY_KWH', 45.0))
         self.charge_efficiency = _clamp(
-            _safe_float('AC_DC_CHARGE_EFFICIENCY', 0.90), 0.01, 1.0)
+            _safe_float('AC_DC_CHARGE_EFFICIENCY', 0.96), 0.01, 1.0)
         self.discharge_efficiency = _clamp(
-            _safe_float('AC_DC_DISCHARGE_EFFICIENCY', 0.90), 0.01, 1.0)
+            _safe_float('AC_DC_DISCHARGE_EFFICIENCY', 0.96), 0.01, 1.0)
         self.max_power_import = max(0.0, _safe_float('ESS_MAX_GRID_IMPORT_KW', 10.0))
         self.max_power_export = max(0.0, _safe_float('ESS_MAX_GRID_EXPORT_KW', 10.0))
         self.max_charge_power = max(
@@ -192,7 +192,7 @@ class OptimizationEngine:
         self.max_discharge_power = max(
             0.0, _safe_float('ESS_MAX_DISCHARGE_KW', self.max_power_export))
         self.export_price_factor = _safe_float('ESS_EXPORT_PRICE_FACTOR', 1.0)
-        self.export_fee = _safe_float('ESS_EXPORT_FEE', 0.0)
+        self.export_fee = _safe_float('ESS_EXPORT_FEE', 0.0248)
         self.min_sell_price = _safe_float('ESS_MIN_SELL_PRICE', 0.0)
         self.cycle_cost = max(0.0, _safe_float('ESS_BATTERY_CYCLE_COST', 0.0))
         self.arbitrage_margin = max(0.0, _safe_float('ESS_ARBITRAGE_MARGIN', 0.0))
@@ -205,7 +205,7 @@ class OptimizationEngine:
 
         # Mode selection is external and frozen at process start.  A winter
         # engine always uses the explicit winter reserve, never calendar logic.
-        self.min_soc = _clamp(_safe_float('MIN_SOC_RESERVE_WINTER', 20.0), 0.0, 100.0)
+        self.min_soc = _clamp(_safe_float('MIN_SOC_RESERVE_WINTER', 40.0), 0.0, 100.0)
         self.max_soc = 100.0
         # Preserve the operator's ceiling exactly. A conflicting ceiling below
         # the winter reserve is not silently raised; the optimizer instead
@@ -400,12 +400,13 @@ class OptimizationEngine:
         """Build post-trough SoC checkpoints and export-protection envelopes."""
         positive_net = [max(0.0, slot['load'] - slot['pv']) for slot in slots]
         stress_house_load = [max(0.0, slot['load']) for slot in slots]
-        dates = {slot['start'].date() for slot in slots}
         average_load_kw = (
             sum(slot['load'] for slot in slots) / max(EPS, len(slots) * slot_h))
-        terminal_house = 0.0
-        if len(dates) <= 1:
-            terminal_house = average_load_kw * WINTER_UNKNOWN_HORIZON_HOURS
+        # A known multi-day horizon still ends at an arbitrary boundary. Protect
+        # the same bounded continuation after its final slot as we do when only
+        # today's prices are available; otherwise publishing tomorrow's prices
+        # paradoxically removes the emergency household-energy allowance.
+        terminal_house = average_load_kw * WINTER_UNKNOWN_HORIZON_HOURS
 
         checkpoints = {}
         window_details = []
@@ -484,10 +485,18 @@ class OptimizationEngine:
             index for start, end in windows for index in range(start, end + 1)
         }
         economics = self._exceptional_economics(slots)
+        best_forward_sell = [0.0] * steps
+        best_seen = float('-inf')
+        for index in range(steps - 1, -1, -1):
+            best_seen = max(best_seen, self._sell_price(slots[index]['buy']))
+            best_forward_sell[index] = best_seen
         dp = [{state: float('inf') for state in self.soc_states} for _ in range(steps + 1)]
+        spill_dp = [{state: float('inf') for state in self.soc_states}
+                    for _ in range(steps + 1)]
         parent = [{state: None for state in self.soc_states} for _ in range(steps + 1)]
         start_soc = self.initial_protected_soc
         dp[0][start_soc] = 0.0
+        spill_dp[0][start_soc] = 0.0
 
         for index, slot in enumerate(slots):
             net_load = slot['load'] - slot['pv']
@@ -497,6 +506,7 @@ class OptimizationEngine:
                 base = dp[index][soc]
                 if base == float('inf'):
                     continue
+                base_spill = spill_dp[index][soc]
                 max_down_pct = self.max_discharge_power * slot_h / self.battery_capacity * 100.0
                 max_up_pct = self.max_charge_power * slot_h / self.battery_capacity * 100.0
                 first_state = bisect_left(self.soc_states, soc - max_down_pct - EPS)
@@ -520,10 +530,18 @@ class OptimizationEngine:
                         if -dc_change > self.max_discharge_power * slot_h + EPS:
                             continue
                         ac_for_battery = dc_change * self.discharge_efficiency
-                    grid_energy = net_load + ac_for_battery
-                    if grid_energy > self.max_power_import * slot_h + EPS:
+                    raw_grid_energy = net_load + ac_for_battery
+                    if raw_grid_energy > self.max_power_import * slot_h + EPS:
                         continue
-                    if -grid_energy > self.max_power_export * slot_h + EPS:
+                    export_limit_kwh = self.max_power_export * slot_h
+                    pv_curtailed_kwh = max(
+                        0.0, -raw_grid_energy - export_limit_kwh)
+                    grid_energy = raw_grid_energy + pv_curtailed_kwh
+
+                    # Never discharge stored energy merely to increase PV spill.
+                    # The clamped grid outcome would be identical and the extra
+                    # battery throughput has no operational or economic value.
+                    if dc_change < -EPS and pv_curtailed_kwh > EPS:
                         continue
 
                     active_grid_charge = dc_change > EPS and grid_energy > EPS
@@ -541,7 +559,11 @@ class OptimizationEngine:
                             continue
                         if next_soc < export_envelope[index] - EPS:
                             continue
-                        if sell < self.cost_basis_sell_floor - EPS \
+                        recoverable_basis_floor = min(
+                            self.cost_basis_sell_floor,
+                            best_forward_sell[index],
+                        )
+                        if sell < recoverable_basis_floor - EPS \
                                 and next_soc < self.initial_protected_soc - EPS:
                             continue
 
@@ -555,14 +577,24 @@ class OptimizationEngine:
                     if dc_change < -EPS:
                         cost += -dc_change * (self.cycle_cost + self.arbitrage_margin)
                     total = base + cost
-                    if total < dp[index + 1][next_soc] - EPS:
+                    cumulative_spill = base_spill + pv_curtailed_kwh
+                    old_cost = dp[index + 1][next_soc]
+                    old_spill = spill_dp[index + 1][next_soc]
+                    if (total < old_cost - EPS
+                            or (abs(total - old_cost) <= EPS
+                                and cumulative_spill < old_spill - EPS)):
                         dp[index + 1][next_soc] = total
-                        parent[index + 1][next_soc] = (soc, grid_energy)
+                        spill_dp[index + 1][next_soc] = cumulative_spill
+                        parent[index + 1][next_soc] = (
+                            soc, grid_energy, pv_curtailed_kwh)
 
         viable = [state for state in self.soc_states if dp[steps][state] < float('inf')]
         if not viable:
             return None
-        end_soc = min(viable, key=lambda state: dp[steps][state])
+        end_soc = min(
+            viable,
+            key=lambda state: (dp[steps][state], spill_dp[steps][state]),
+        )
         objective = dp[steps][end_soc]
         schedule = []
         current_soc = end_soc
@@ -570,7 +602,7 @@ class OptimizationEngine:
             previous = parent[position][current_soc]
             if previous is None:
                 return None
-            previous_soc, grid_energy = previous
+            previous_soc, grid_energy, pv_curtailed_kwh = previous
             slot = slots[position - 1]
             action = self._classify_action(previous_soc, current_soc, grid_energy)
             schedule.insert(0, {
@@ -579,6 +611,7 @@ class OptimizationEngine:
                 'soc_start': previous_soc,
                 'soc_end': current_soc,
                 'grid_energy': round(grid_energy, 4),
+                'pv_curtailed_kwh': round(pv_curtailed_kwh, 4),
                 'pv': round(slot['pv'], 4),
                 'load': round(slot['load'], 4),
                 'price': slot['buy'],
@@ -689,6 +722,8 @@ class OptimizationEngine:
             'current_price': first['price'],
             'limit_feed_in': first['price'] < 0,
             'slot_duration_h': slot_h,
+            'pv_curtailed_kwh': round(sum(
+                step.get('pv_curtailed_kwh', 0.0) for step in schedule), 4),
         }
 
     def optimize(self, current_soc_percent, price_data, load_forecast=None,

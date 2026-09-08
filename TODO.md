@@ -80,7 +80,7 @@
   - Do not tune `HVAC_ALPHA_HEAT` or claim heating validation from summer cooling
     data. Winter needs its own meaningful heating sample.
 
-- **ESS dispatch-efficiency counterfactuals** — The exported AI plan now contains
+- **ESS dispatch-efficiency counterfactuals** — The exported AI plan contains
   an explicit, timestamped physical/economic snapshot for an offline comparison
   of three simplified candidates: market arbitrage, PV-first self-sufficiency,
   and a protected hybrid. Run it explicitly, never from the live service:
@@ -93,12 +93,199 @@
   every live guardrail/device response. After deployment, issue one normal replan
   before using the command so the exported plan has its explicit assumptions; a
   pre-upgrade plan requires the visibly labelled `--use-research-defaults` mode.
+
+  **Comparison basis corrected (2026-08-06); earlier candidate numbers are void.**
+  The report previously totalled each candidate over the *whole* plan horizon —
+  roughly 32 hours once tomorrow's Tibber prices publish around 13:00 — while the
+  Advisor panel scored it against the dashboard's today-only tile. Tomorrow's
+  revenue was therefore read as today's, and the alternatives looked
+  overwhelmingly better than the active plan (a representative afternoon showed
+  market arbitrage at `+€19.92` against a live `+€6.74`). Every row is now one
+  calendar day, midnight to midnight: the already-settled part of today
+  (`plan.today_actuals`, an identical constant in every row) plus that policy's
+  planned remainder. Candidates still optimize over the full known horizon;
+  only the reported window is today. `plan_baseline` re-totals the active plan's
+  own per-slot flows through the same function as the candidates, so the rows
+  differ only by policy, and it ties to the dashboard Today tile in attended
+  checks. `schema_version` is 2.
+
+  On the same afternoon's plan the corrected ranking inverted: live plan `+€7.09`
+  (after wear `+€5.90`), market arbitrage `+€5.84` (`+€4.76`), protected hybrid
+  `+€0.03` (`−€0.52`), PV-first `−€5.74` (`−€5.78`). `market_arbitrage`'s
+  constraint set is in fact already the live engine's own (same reserve floor,
+  same grid-charge cap, export permitted), which is consistent with a small
+  spread rather than a large one.
+
+  - **Open validation (started 2026-08-06):** watch the Advisor strategy panel
+    over several days and confirm the ranking is stable when the battery does
+    *not* start the window at 100% SoC, and across BUY/RETAIN/SELL afternoons.
+    The single validated sample so far began at 100%.
+  - **PV-surplus export corrected (2026-08-07); pre-correction candidate
+    numbers are void too.** The evaluator credited PV surplus as exported while
+    the battery still had room. On a 07:00 plan at 4% SoC this put the live row
+    €1.52 above the Today tile across 16 morning `IDLE` slots, but the defect
+    was not confined to the baseline: it inflated every candidate, and for
+    `pv_first_self_sufficiency` and `winter_self_sufficiency` — which forbid
+    active export — it was 100% of their reported revenue (€4.88 and €4.37 that
+    day). The installation never commands an export setpoint for surplus, so
+    none of it was real. Both the DP and the settlement step now absorb surplus
+    first, bounded by headroom and charge rate; commanded discharges are
+    unaffected. `tests/test_101_ess_strategy_cli.py` now asserts the live row
+    against `frontend.data.day_summary` directly, which is the only check that
+    catches the two surfaces drifting apart.
+  - **The Winter-style row is a stand-in, not a Winter Mode preview.** It shares
+    only one property with `lib/ai_powered_ess_winter.py`: no routine
+    battery-to-grid export. It holds a static `MIN_SOC_RESERVE_WINTER` floor
+    rather than one sized from forecast household demand to the next
+    replenishment window plus a learned uncertainty margin, it never takes the
+    exceptional-spread export the real engine permits, and it has no
+    replenishment-window charge scheduling. Do not decide whether to flip
+    `WINTER_MODE` from this row. Note it is *not* `pv_first_self_sufficiency`
+    either: PV-first forbids grid charging, which is precisely the cheap-window
+    replenishment Winter Mode is built around. On a high-PV summer day starting
+    near 100% SoC the two converge, because replenishment is never needed —
+    expect them to separate in winter.
+  - Read `carried_energy_kwh` / `carried_energy_value_eur` alongside every
+    whole-day figure. A today-only total credits a policy for selling stored
+    energy but never debits the emptier battery it hands to tomorrow, so a
+    policy that ends the day flat can outscore one that ends it full purely by
+    borrowing from tomorrow. On the sample above the four policies sat within
+    about €0.90 of each other once carried value was added back.
+  - Do not reintroduce a comparison against `day_summary`: that tile applies
+    different per-slot rules (it suppresses IDLE PV-surplus export revenue and
+    fraction-weights the active slot). `tests/test_90_mobile_ux_static.py`
+    pins this out of the Advisor panel.
+
   Before proposing a seasonal-policy change,
   collect comparable snapshots over at least 14 complete days and compare net grid result
   (export reward minus import cost),
   import/export, battery DC throughput/full-equivalent cycles, minimum/protected SoC,
   terminal SoC and realised settlement. Do not use future actual PV/load to choose a
   historical "winner", and do not change Summer/Winter behaviour from one scenario.
+
+- **Adaptive Summer policy — attended production validation required** — The
+  production Summer engine can now compare three *constraint sets* through the
+  same DP (`market_arbitrage`, `pv_first_self_sufficiency`, and
+  `protected_hybrid`) when `ESS_ADAPTIVE_POLICY_ENABLED=True`. It is not a
+  second optimizer and it does not use the simplified Advisor/CLI replay.
+  Trading must beat the best conservative plan by the configured minimum plus
+  the configured fraction of capped learned forecast risk; lifecycle and
+  arbitrage risk are already present in each candidate score. Policy dwell and
+  switch margin prevent replan churn. Protected hybrid merges neighbouring
+  low-price slots into a procurement valley, must replenish its household-energy
+  layer by the end of that valley, and protects it through the next valley plus
+  a configurable load allowance beyond the final known price slot. The selected
+  strategy, candidate scores from the latest full comparison,
+  hurdle and reason are persisted in plan JSON/history. The selected policy is
+  solved each optimizer cycle; all candidates are re-scored hourly and whenever
+  a material price, load/PV, SoC, EV-block or horizon change invalidates the
+  cached selection, avoiding continuous three-policy CPU load without coarsening
+  the 1% SoC lattice. All candidates now use one continuous horizon,
+  one objective and one global five-window budget. Keep the gate **off by
+  default** until these checks have passed over at least 14 complete days:
+
+  - Confirm thin-spread/cloudy days select PV-first or protected hybrid and use
+    stored energy above the protected floor for expensive household demand,
+    without routine full charge-to-empty cycling.
+  - Confirm Trading is selected only on clearly profitable spreads and that its
+    recorded incremental benefit exceeds `trade_hurdle_eur`; compare realized
+    net grid result and battery throughput against similar pre-change days.
+  - Confirm the selected strategy does not flap every quarter hour, especially
+    around the 13:00 next-day price publication and weather-nowcast changes.
+  - Confirm a same-day-only horizon and a multi-day horizon both retain the
+    bounded unknown-horizon household layer rather than dumping at the final
+    visible slot.
+  - Confirm every planned BUY is represented by one of at most five Victron
+    windows after repeated fragmented-price replans, and that the final target
+    SoC remains reachable—there must be no post-hoc window truncation or BUY
+    pulled backward into an adjacent PV-only slot by full-power reporting.
+  - Record runtimes on the production host with Adaptive Summer **off** (the
+    always-on Trading DP), then with it **on** for both a selected-policy replan
+    and a full comparison. Read `optimizer_runtime_ms` from the plan; a cycle
+    over 30 seconds also logs a warning. One hour is the maximum quiet-input
+    interval, but material-input invalidation may compare all policies sooner;
+    validate every path before enabling Adaptive Summer unattended.
+
+  The older request for a manual per-day Advisor strategy override remains
+  deferred; the automatic selector must be validated first.
+
+- **Winter reserve/outage validation** — The 40% winter floor is a logical,
+  grid-connected emergency backup reserve. It is not written to Victron
+  `MinimumSocLimit`. With an explicit replicated `ac_in_connected=0`, verify the
+  optimizer continues forecasts/history/settlement but sends no setpoint,
+  grid-assist, schedule, feed-limit or minimum-SoC writes, reports
+  `GRID_OFFLINE_PASS_THROUGH`, and allows Victron to use the reserve down toward
+  zero for household survival. Repeat after startup with the grid state still
+  unknown and confirm it is not falsely treated as offline. Manual Override must
+  likewise remain observable while suppressing control writes.
+
+- **ESS economics follow-up — annual export accounting, efficiency calibration,
+  and exposure-specific risk** — The live 2026 Tibber NL model now subtracts the
+  documented €0.0248/kWh sale fee while annual imports still cover exports under
+  saldering. It does **not** know the contract-year import/export allowance, and
+  saldering ends on 2027-01-01. Add a provider-aware persisted annual position,
+  seeded from an authoritative bill/API, before treating export beyond annual
+  imports as equivalent to import avoidance; do not guess a post-2026 tariff.
+  Settled Tibber reward remains authoritative. References: [Tibber NL salderen
+  and terugleveren](https://support.tibber.com/nl/articles/4669873-salderen-en-terugleveren-bij-tibber)
+  and the [Dutch government saldering timeline](https://www.rijksoverheid.nl/themas/klimaat-milieu-en-natuur/energie-thuis/salderingsregeling).
+
+  **Deadline: complete and validate the annual-position/tariff design by
+  2026-11-30**, before the discontinuous 2027-01-01 saldering change. Keep the
+  post-2026 control model gated until Tibber's authoritative tariff is known.
+
+  - Build a read-only clean-cycle report from metered battery AC/DC energy before
+    changing `AC_DC_*_EFFICIENCY`. The current 0.96/0.96 values are now consistent
+    across config and fallbacks but are still an operator estimate, not a measured
+    whole-system calibration.
+  - Winter currently satisfies Victron's five-window limit by selecting a
+    bounded set of cheap troughs before its DP solve. This is executable and
+    tested, but the preselection is tariff-first rather than globally
+    objective-aware. Shadow-compare a shared in-DP window budget before changing
+    Winter control; do not replace the safe current path without measured value.
+  - Learn load-underforecast and PV-overforecast distributions separately and by
+    forecast-pipeline version. Shadow-score base and adverse scenarios and compare
+    differential regret before adding exposure-specific uncertainty to dispatch;
+    do not charge common forecast error to every candidate again.
+  - Review observed `pv_curtailed_kwh` after high-PV/full-battery days. It is
+    forecast feasibility slack, not measured inverter clipping, and must never be
+    counted as export reward or trigger battery discharge.
+
+- **Tibber MTD accounting reconciliation — wait for settled August evidence** —
+  An attended read-only investigation on **2026-08-22** found that the three
+  currently visible accounting surfaces disagree materially. The Tibber app at
+  05:10 showed 896 kWh / €213.45 consumed and 706 kWh / €214.53 produced
+  (**+€1.08**). Our locally persisted final live-counter snapshots showed
+  €200.99 cost and €235.54 reward (**+€34.55**, including the running current
+  day). A direct authenticated GraphQL aggregate for the 21 completed August
+  days returned 893.178 kWh / €214.333080 cost and 705.121 kWh /
+  €211.320659 profit (**−€3.012421**). Adding the direct live subscription sample
+  at 09:20 (`accumulatedConsumption=10.789`, `accumulatedCost=3.43797`, no
+  production/reward yet) produced a provisional API-composed MTD result of
+  **−€6.450391**.
+
+  The exact server-side aggregate shapes are
+  `consumption(resolution: DAILY, first: 31, after: <month-start cursor>)
+  { pageInfo { totalConsumption totalCost } }` and the corresponding
+  `production { pageInfo { totalProduction totalProfit } }`. The unfinished day
+  comes only from `liveMeasurement` fields `accumulatedConsumption`,
+  `accumulatedCost`, `accumulatedProduction`, and `accumulatedReward`;
+  `MONTHLY` resolution currently returns completed months only. Tibber documents
+  the historical connections as non-real-time, and this account has previously
+  received corrections several days late. Do **not** rewrite settled history or
+  change the dashboard accounting source from this provisional mid-month sample.
+
+  - Re-run the same GraphQL aggregates after the next authoritative meter update
+    and again after the August invoice/month close. Capture the app totals and
+    invoice variable-energy lines at the same time.
+  - Compare each completed local day with Tibber's finalized DAILY node, including
+    kWh, `cost`, and `profit`, to distinguish delayed meter correction from tariff,
+    sale-fee, bonus, or Grid Rewards accounting. Preserve the original live samples
+    as audit evidence.
+  - Only after that reconciliation decide whether Month should remain explicitly a
+    **local operational estimate**, or use cached finalized DAILY GraphQL totals for
+    completed days plus the live accumulator for today. Never present a mixed source
+    as settled without source/last-update/coverage metadata.
 
 ## EV smart-charge scheduling — operator validation / learning follow-up
 

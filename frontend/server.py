@@ -514,6 +514,14 @@ def api_victron_clear_schedule():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.route("/api/victron/request-schedule", methods=["POST"])
+def api_victron_request_schedule():
+    """Ask Venus MQTT for the authoritative values of all five charge slots."""
+    if live.request_victron_schedule_refresh():
+        return jsonify({"ok": True})
+    return jsonify({"ok": False, "error": "Victron MQTT is not connected"}), 503
+
+
 @app.route("/api/restart", methods=["POST"])
 def api_restart():
     """Request the existing supervised restart path via MQTT.

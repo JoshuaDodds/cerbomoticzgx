@@ -110,6 +110,21 @@ def test_clear_import_schedule_route_reports_helper_failure(monkeypatch):
     assert "mqtt publish failed" in body["error"]
 
 
+def test_request_victron_schedule_route_requests_authoritative_mqtt_values(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        server.live,
+        "request_victron_schedule_refresh",
+        lambda: calls.append("refresh") or True,
+    )
+
+    response = server.app.test_client().post("/api/victron/request-schedule")
+
+    assert response.status_code == 200
+    assert response.get_json() == {"ok": True}
+    assert calls == ["refresh"]
+
+
 def test_restart_route_publishes_existing_shutdown_topic(monkeypatch):
     calls = []
 
