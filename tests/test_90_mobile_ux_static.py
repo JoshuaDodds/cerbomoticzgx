@@ -21,6 +21,19 @@ def test_mobile_stylesheet_loads_after_desktop_stylesheet():
     assert html.index("css/app.css") < html.index("css/app.mobile.css")
 
 
+def test_desktop_overview_gives_solar_forecast_more_room_without_changing_mobile():
+    css = APP_CSS.read_text(encoding="utf-8")
+
+    assert "@media (min-width: 901px)" in css
+    assert (
+        "grid-template-columns: minmax(320px, .95fr) minmax(0, 2.05fr);"
+        in css
+    )
+    # The existing phone override remains present and is not replaced by the
+    # desktop-only adjustment.
+    assert "@media (max-width: 720px) { .overview-row { grid-template-columns: 1fr; } }" in css
+
+
 def test_powerflow_ev_card_uses_per_phase_current_like_vehicle_tab():
     powerflow = POWERFLOW_JS.read_text(encoding="utf-8")
     live = LIVE_PY.read_text(encoding="utf-8")
@@ -94,7 +107,7 @@ def test_desktop_grid_and_house_phase_rows_match_solar_spacing():
 
     assert "const desktopPhaseStep = r.h * 0.062" in powerflow
     assert (
-        "const y = y0 + r.h * (firefoxDesktop ? 0.51 : 0.47) + i * desktopPhaseStep"
+        "const y = y0 + r.h * (desktopDetailLayout ? 0.51 : 0.47) + i * desktopPhaseStep"
         in powerflow
     )
     assert (
@@ -102,21 +115,21 @@ def test_desktop_grid_and_house_phase_rows_match_solar_spacing():
         in powerflow
     )
     assert (
-        "const y = y0 + r.h * (firefoxDesktop ? 0.70 : 0.66) + i * desktopPhaseStep"
+        "const y = y0 + r.h * (desktopDetailLayout ? 0.70 : 0.66) + i * desktopPhaseStep"
         in powerflow
     )
 
 
-def test_firefox_desktop_powerflow_reserves_extra_svg_header_space_only_there():
+def test_desktop_powerflow_reserves_extra_svg_header_space_in_every_browser():
     powerflow = POWERFLOW_JS.read_text(encoding="utf-8")
 
-    assert "const IS_FIREFOX" in powerflow
-    assert "const firefoxDesktop = !mobile && IS_FIREFOX" in powerflow
-    assert "const rowH = (IS_FIREFOX ? 0.45 : 0.36) * H" in powerflow
-    assert "firefoxDesktop ? 0.37 : 0.31" in powerflow
-    assert "firefoxDesktop ? 0.40 : 0.34" in powerflow
-    assert "firefoxDesktop ? 0.37 : 0.33" in powerflow
-    assert "firefoxDesktop ? 0.36 : 0.26" in powerflow
+    assert "const desktopDetailLayout = !mobile;" in powerflow
+    assert "const rowH = 0.45 * H;" in powerflow
+    assert "desktopDetailLayout ? 0.37 : 0.31" in powerflow
+    assert "desktopDetailLayout ? 0.40 : 0.34" in powerflow
+    assert "desktopDetailLayout ? 0.37 : 0.33" in powerflow
+    assert "desktopDetailLayout ? 0.36 : 0.26" in powerflow
+    assert "IS_FIREFOX" not in powerflow
 
 
 def test_hvac_dashboard_uses_capability_driven_compact_controls():
@@ -521,6 +534,16 @@ def test_desktop_logo_and_clear_schedule_js_hooks_exist():
     assert 'fetch("/api/victron/clear-schedule", { method: "POST" })' in js
 
 
+def test_victron_schedule_tab_requests_and_renders_live_mqtt_state():
+    js = APP_JS.read_text(encoding="utf-8")
+
+    assert "function requestVictronScheduleRefresh(" in js
+    assert 'fetch("/api/victron/request-schedule", { method: "POST" })' in js
+    assert 'if (tabName === "victron") requestVictronScheduleRefresh();' in js
+    assert "live.victron_schedule" in js
+    assert "renderVictron(lastPlan, lastLive)" in js
+
+
 def test_operator_actions_do_not_use_browser_blocking_dialogs():
     js = APP_JS.read_text(encoding="utf-8")
 
@@ -542,6 +565,118 @@ def test_advisor_latest_report_loads_on_browser_startup():
     assert 'fetch("/api/advisor/latest")' in js
     assert "loadAdvisorLatest();" in js
     assert "function clearAdvisorChat(" in js
+
+
+def test_strategy_panel_compares_every_row_on_the_reports_own_whole_day_basis():
+    """The alternatives must be read against the report's own live-plan row.
+
+    The day-summary tile is built with different per-slot rules (it suppresses
+    IDLE PV-surplus revenue and folds in fraction-weighted actuals), so scoring
+    candidates against it overstated them by several euro. The comparison row
+    now comes from plan_baseline, computed by the same code as the candidates.
+    """
+    js = APP_JS.read_text(encoding="utf-8")
+    panel = js[js.index("function advisorStrategyCells("):]
+    panel = panel[:panel.index("\nasync function runAdvisorTool(")]
+
+    assert "report.plan_baseline" in panel
+    assert "settled_today" in panel
+    assert "whole_day_cash_net_eur" in panel
+    assert "whole_day_economic_net_eur" in panel
+    assert "carried_energy_kwh" in panel
+    # The horizon-wide totals and the dashboard tile must not drive these rows.
+    assert "day_summary" not in panel
+    assert "candidate.cash_net_eur" not in panel
+    assert "candidate.economic_net_eur" not in panel
+
+
+def test_strategy_comparison_renders_as_a_table_that_restacks_on_phones():
+    js = APP_JS.read_text(encoding="utf-8")
+    css = APP_CSS.read_text(encoding="utf-8")
+    mobile = MOBILE_CSS.read_text(encoding="utf-8")
+
+    assert "advisor-strategy-table" in js
+    assert 'scope="row"' in js and 'scope="col"' in js
+    # One markup path for every viewport: the stacked phone layout labels each
+    # value from data-label rather than from a second rendering branch.
+    assert "ADVISOR_STRATEGY_COLUMNS" in js
+    assert 'data-label="${_esc(ADVISOR_STRATEGY_COLUMNS[i]' in js
+    assert ".advisor-table-wrap" in css and "overflow-x: auto" in css
+    assert ".advisor-strategy-table" in css
+    assert "content: attr(data-label)" in mobile
+    # The desktop scroll floor must be dropped once rows restack, or the phone
+    # layout would still force the wrapper to scroll sideways.
+    assert "min-width: 620px" in css
+    assert ".advisor-strategy-table { min-width: 0; }" in mobile
+    # .advisor-tools is a two-up grid whose cell stays ~514px even at 1920px, so
+    # without this the sixth column ("Carried to tomorrow") is scrolled out of
+    # sight at every viewport. The class is applied only once a table exists.
+    assert ".advisor-tools > .advisor-tool-card.is-wide { grid-column: 1 / -1; }" in css
+    assert 'card.classList.toggle("is-wide"' in js
+    assert '.querySelector(".advisor-strategy-table")' in js
+
+
+def test_winter_strategy_row_is_never_rendered_without_its_approximation_caveats():
+    js = APP_JS.read_text(encoding="utf-8")
+
+    assert "winter_self_sufficiency: \"Winter-style (approx.)\"" in js
+    assert "function advisorWinterCaveats(" in js
+    assert "advisorWinterCaveats(report && report.winter_candidate)" in js
+    assert "winter.caveats" in js
+    assert "WINTER_MODE" in js
+    # The wording must hold in Winter Mode too — the broker publishes the reserve
+    # in both modes, so claiming the row "cannot be previewed from a Summer plan"
+    # would be plainly false on a winter plan.
+    assert "Summer plan" not in js
+    # A reserve raised to the configured minimum must be disclosed, not hidden.
+    assert "winter.reserve_was_raised" in js
+    # Carried energy is measured per-policy, so the floor travels with the value.
+    assert "floor_soc_percent" in js
+
+
+def test_live_plan_row_names_the_running_optimizer_mode():
+    js = APP_JS.read_text(encoding="utf-8")
+
+    assert "function advisorOptimizerModeLabel(" in js
+    assert '"winter") return "Winter mode"' in js
+    assert '"summer") return "Summer mode"' in js
+    assert "report && report.optimizer_mode" in js
+    assert 'const liveLabel = "Live plan" + (modeLabel ? ` (${modeLabel})` : "");' in js
+
+
+def test_strategy_legend_explains_every_row_in_dashboard_terms_not_financial_ones():
+    js = APP_JS.read_text(encoding="utf-8")
+    css = APP_CSS.read_text(encoding="utf-8")
+
+    assert "const ADVISOR_STRATEGY_LEGEND" in js
+    # The vocabulary already used elsewhere on the dashboard: the literal
+    # control_action values (BUY/SELL/RETAIN/IDLE), and "reserve" as used by
+    # MIN_SOC_RESERVE_* / the Settings tab — not the euro-denominated column
+    # headers above it, which describe outcome, not policy.
+    legend = js[js.index("const ADVISOR_STRATEGY_LEGEND"):js.index("function advisorStrategyCells(")]
+    assert "BUY" in legend and "SELL" in legend and "RETAIN" in legend and "IDLE" in legend
+    assert "protected reserve" in legend
+    assert "live_plan" in legend
+    assert "market_arbitrage" in legend
+    assert "protected_hybrid" in legend
+    assert "pv_first_self_sufficiency" in legend
+    assert "winter_self_sufficiency" in legend
+    # One legend entry per row, in the table's own top-to-bottom order.
+    assert "legendRows" in js
+    assert '[["live_plan", liveLabel]]' in js
+    assert "<dl class=\"advisor-strategy-legend\">" in js
+    assert ".advisor-strategy-legend" in css
+
+
+def test_advisor_exposes_read_only_forecast_and_strategy_tools():
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    js = APP_JS.read_text(encoding="utf-8")
+    css = APP_CSS.read_text(encoding="utf-8")
+
+    assert 'id="advisor-forecast-validation"' in html
+    assert 'id="advisor-ess-strategies"' in html
+    assert 'fetch(`/api/advisor/tools/${tool}`' in js
+    assert "CURRENT LIVE PLAN" in js
     assert 'fetch("/api/advisor/clear", { method: "POST" })' in js
     assert "function copyAdvisorMessage(" in js
     assert "function deleteAdvisorExchange(" in js
@@ -775,6 +910,15 @@ def test_pl_summary_explains_winter_household_protection_policy():
     assert "protected household requirement" in js
     assert "An exceptional spread cleared every loss and safety hurdle" in js
     assert "Winter Mode degraded safely" in js
+
+
+def test_pl_summary_exposes_adaptive_strategy_and_suppressed_control():
+    js = APP_JS.read_text(encoding="utf-8")
+
+    assert "Adaptive Summer selected" in js
+    assert "pv_first_self_sufficiency" in js
+    assert 'plan.controller_authority === "grid_offline"' in js
+    assert "Victron may use the full emergency reserve" in js
 
 
 def test_monthly_chart_uses_forecast_spread_and_comparable_actual_markers():

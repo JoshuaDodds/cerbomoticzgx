@@ -24,6 +24,7 @@ from lib.config_paths import env_path as runtime_env_path
 from lib import history_store as _hist
 from lib import tesla_budget as _tesla_budget
 from lib.ev_history import attribute_ev_grid_cost, measured_ev_sessions
+from lib.forecast_projection import PV_SURPLUS_FULL_SOC, slot_remaining_fraction
 
 DEFAULT_PLAN_PATH = "/dev/shm/cerbo_ai_plan.json"
 MIN_FORECAST_BOX_SAMPLES = 8
@@ -273,8 +274,14 @@ def projected_today_net_eur() -> float | None:
     if not schedule:
         return None
     try:
-        today = datetime.now().date().isoformat()
-        summary = day_summary(schedule, raw.get("today_actuals"))
+        now = datetime.now().astimezone()
+        today = now.date().isoformat()
+        summary = day_summary(
+            schedule,
+            raw.get("today_actuals"),
+            as_of=now,
+            slot_duration_h=_f(raw.get("slot_duration_h")) or 0.25,
+        )
         row = next((d for d in summary.get("days", []) if d.get("date") == today), None)
         if not row or row.get("net") is None:
             return None
@@ -393,12 +400,7 @@ def is_idle(slot) -> bool:
     return str(slot.get("control_action") or "").upper() == "IDLE"
 
 
-# At/above this SoC the battery is treated as full, so PV surplus feeds the grid.
-# Below it, an IDLE slot's surplus stores into the battery instead of exporting.
-PV_SURPLUS_FULL_SOC = 99.0
-
-
-def _forward_grid_econ(slot):
+def _forward_grid_econ(slot, *, fraction: float = 1.0):
     """Projected grid economics ``(import_kwh, import_cost, export_kwh, export_rev)``
     for an unsettled slot, matched to what will actually settle at the meter.
 
@@ -410,9 +412,15 @@ def _forward_grid_econ(slot):
     so the running projection still converges to the settled day total without
     booking phantom self-consumption "profit".
     """
-    g = slot.get("grid_energy", 0.0) or 0.0
-    buy = slot.get("price", 0.0) or 0.0
-    sell = slot.get("sell", buy) or buy
+    # The active optimiser slot begins at the preceding 15-minute boundary,
+    # whereas Tibber's cumulative daily counters already include its elapsed
+    # energy.  Only book the portion after ``as_of`` as forecast.
+    try:
+        g = float(slot.get("grid_energy", 0.0) or 0.0) * float(fraction)
+        buy = float(slot.get("price", 0.0) or 0.0)
+        sell = float(slot.get("sell", buy) or buy)
+    except (TypeError, ValueError):
+        return 0.0, 0.0, 0.0, 0.0
     if g > 0:
         return g, g * buy, 0.0, 0.0
     if g < 0:
@@ -467,6 +475,148 @@ def _actual_load_by_slot(day) -> dict:
     return out
 
 
+def _normalize_settled_action(rec, action=None):
+    """Classify a closed slot from measured energy and SoC endpoints.
+
+    Older settlement rows were labelled from instantaneous battery-power direction.
+    That can call ordinary grid-backed household load ``BUY`` when the battery is
+    pinned at its reserve floor, or call PV-only export ``SELL`` when the battery
+    did not discharge.  Endpoint SoC is the deciding evidence for a historical
+    battery action; return ``None`` when the row does not contain enough evidence
+    and the caller should retain its legacy action/fallback.
+    """
+    if action is None:
+        action = rec.get("actual_control_action")
+
+    def _number(value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    soc_start = _number(rec.get("soc_start"))
+    soc_end = _number(rec.get("soc_end"))
+    imp = _number(rec.get("actual_import_kwh"))
+    exp = _number(rec.get("actual_export_kwh"))
+    if soc_start is None or soc_end is None:
+        return None
+
+    # Ignore sub-meter noise.  SoC is stored in percentage points, whereas the
+    # import/export values are kWh for the closed 15-minute interval.
+    soc_delta = soc_end - soc_start
+    has_import = (imp or 0.0) > 0.01
+    has_export = (exp or 0.0) > 0.01
+    # The vehicle/inverter SoC is reported in coarse percentage steps. A tenth
+    # of a percentage point can appear while the battery is effectively flat,
+    # so require a larger movement before calling a grid interval BUY/SELL.
+    soc_rising = soc_delta > 0.2
+    soc_falling = soc_delta < -0.2
+
+    # Some early settlement rows predate persisted meter deltas. Even without
+    # grid-direction evidence, an old BUY cannot be trusted when SoC did not
+    # rise, and an old SELL cannot be trusted when SoC did not fall. Preserve
+    # only the labels that do not contradict the endpoint observation.
+    if imp is None and exp is None:
+        prior = str(action).upper() if action else None
+        if prior == "BUY" and not soc_rising:
+            return "RETAIN"
+        if prior == "SELL" and not soc_falling:
+            return "IDLE"
+        return prior
+
+    # Import and export are normally mutually exclusive net-meter readings. If
+    # a malformed/overlapping record contains both, do not invent a battery
+    # action from contradictory evidence.
+    if has_import and has_export:
+        return str(action).upper() if action else None
+    if has_import:
+        return "BUY" if soc_rising else "RETAIN"
+    if has_export:
+        return "SELL" if soc_falling else "IDLE"
+    # With no meaningful grid flow, preserve an existing measured label (if any)
+    # rather than inventing an action from endpoint rounding alone.
+    return str(action).upper() if action else None
+
+
+def _settled_reason_text(planned_action, planned_reason, actual_action):
+    """Keep the original decision rationale visible after a slot closes."""
+    planned_action = str(planned_action or "").upper()
+    actual_action = str(actual_action or "").upper()
+    if planned_reason:
+        if not planned_action or planned_action == actual_action:
+            return str(planned_reason)
+        return (
+            f"Planned {planned_action}: {planned_reason} "
+            f"Measured outcome: {actual_action}."
+        )
+    if planned_action:
+        if planned_action == actual_action:
+            return f"Planned {planned_action.lower()} action; original explanation is unavailable in this older history row"
+        return (
+            f"Planned {planned_action.lower()} action; original explanation is unavailable in this older history row. "
+            f"Measured outcome: {actual_action}."
+        )
+    return "Measured outcome from history"
+
+
+def _legacy_planned_reason(rec, planned_action, planned_reason_code):
+    """Best-effort readable rationale for history written before text was stored."""
+    code = str(planned_reason_code or "").upper()
+    try:
+        price = float(rec.get("price_buy"))
+        price_text = f"€{price:.3f}/kWh"
+    except (TypeError, ValueError):
+        price_text = "the current price"
+    try:
+        soc = float(rec.get("soc_start"))
+    except (TypeError, ValueError):
+        soc = None
+
+    if code == "PV_SURPLUS":
+        return (
+            f"Surplus solar at {price_text} — battery not discharging; "
+            "Victron charges from it, or exports the excess once the battery is full"
+        )
+    if code == "RESERVE_POLICY":
+        reserve = f" ({soc:.0f}%)" if soc is not None else ""
+        return f"At minimum reserve{reserve}; holding — loads covered by grid/PV"
+    if code == "PRECHARGE_FOR_PEAK":
+        return f"Charging at {price_text} for a later price peak"
+    if code == "PRICE_LOW":
+        return f"Charging while the price is low ({price_text})"
+    if code == "PRICE_PEAK":
+        return f"Selling stored energy at {price_text} — the highest price in the horizon"
+    if code == "PRICE_HIGH":
+        return f"Selling stored energy at {price_text} (a profitable high price)"
+    if code == "BUY_CHEAPER_THAN_STORED_VALUE":
+        return f"Holding the battery; grid at {price_text} was preferred to using stored energy"
+    if code == "HOLD_PRESERVE":
+        return f"Holding the battery; covering loads from grid/PV ({price_text})"
+    if code == "STORED_CHEAPER_THAN_GRID":
+        return f"Using stored energy — cheaper than buying from the grid at {price_text}"
+    if code == "AVOID_PRICE_AWAIT_DIP":
+        return f"Running off the battery; deferring grid buying from {price_text}"
+    if code == "BELOW_SELL_FLOOR":
+        return f"Price {price_text} is below the sell floor; using stored energy instead"
+    if code == "LOW_SOC_DEFER_CHEAPER_BUY":
+        return "Holding the battery at reserve; deferring charge to a cheaper buy window"
+    if code == "SELL_DAMPED_HYSTERESIS":
+        return "Holding stored energy while the sell decision is damped against churn"
+    if code == "MANUAL_GRID_CHARGE":
+        return f"Manual grid assist requested at {price_text}"
+    return None
+
+
+def _settled_reason_code(planned_action, planned_reason_code, actual_action):
+    """Expose the planner code, marking only a genuine settled deviation."""
+    planned_action = str(planned_action or "").upper()
+    actual_action = str(actual_action or "").upper()
+    code = str(planned_reason_code or "").upper()
+    if planned_action and actual_action and planned_action != actual_action:
+        return f"{code or planned_action} → MEASURED_{actual_action}"
+    return code or "SETTLED_ACTUAL"
+
+
 def _settled_slots_for_day(day, cutoff=None) -> list:
     """Read one day's settled slots from history as schedule-shaped rows.
 
@@ -491,8 +641,13 @@ def _settled_slots_for_day(day, cutoff=None) -> list:
         timestamp = _parse_time(record.get("ts"))
         action = record.get("realized_action")
         if timestamp is not None and action:
-            cycle_actions.append((timestamp, str(action).upper()))
-    cycle_actions.sort(key=lambda item: item[0])
+            cycle_actions.append({
+                "timestamp": timestamp,
+                "action": str(action).upper(),
+                "planned_action": str(record.get("control_action") or "").upper(),
+                "reason_code": record.get("reason_code"),
+            })
+    cycle_actions.sort(key=lambda item: item["timestamp"])
 
     def _num(v):
         try:
@@ -510,20 +665,57 @@ def _settled_slots_for_day(day, cutoff=None) -> list:
             continue
         end = _parse_time(rec.get("slot_end"))
 
-        actual_action = rec.get("actual_control_action")
-        actual_action_quality = (
-            "endpoint_observation" if actual_action else "unavailable"
+        planned_action = str(rec.get("predicted_control_action") or "").upper()
+        planned_reason = rec.get("predicted_reason")
+        planned_reason_code = rec.get("predicted_reason_code")
+        # The Timeline action represents the instruction the controller applied,
+        # not a momentary inference from power flow. At the SoC floor, reserve
+        # management can produce a small positive battery current even though
+        # the optimizer correctly instructed RETAIN. If a mid-slot replan
+        # really changed the instruction, the last cycle inside the interval is
+        # the most accurate record of that change.
+        planned_observed = [
+            item for item in cycle_actions
+            if start <= item["timestamp"] < end and item["planned_action"]
+        ]
+        if planned_observed:
+            final_plan = planned_observed[-1]
+            if not planned_action:
+                planned_action = final_plan["planned_action"]
+            planned_reason_code = planned_reason_code or final_plan["reason_code"]
+
+        actual_action = (
+            planned_observed[-1]["planned_action"]
+            if planned_observed else planned_action
         )
+        actual_action_quality = (
+            "controller_instruction" if actual_action else "unavailable"
+        )
+        if not actual_action:
+            # Legacy rows before control instructions were persisted have only
+            # power/meter evidence. Repair their old labels conservatively, but
+            # never use this fallback to overwrite a known instruction.
+            actual_action = rec.get("actual_control_action")
+            normalized_action = _normalize_settled_action(rec, actual_action)
+            if normalized_action is not None:
+                actual_action = normalized_action
+                actual_action_quality = "endpoint_observation"
         if not actual_action and end is not None:
             observed = [
-                (timestamp, action)
-                for timestamp, action in cycle_actions
-                if start <= timestamp <= end
+                item for item in cycle_actions
+                if start <= item["timestamp"] < end
             ]
             if observed:
-                actual_action = observed[-1][1]
+                actual_action = observed[-1]["action"]
                 actual_action_quality = "cycle_observation"
+        planned_reason = planned_reason or _legacy_planned_reason(
+            rec, planned_action, planned_reason_code
+        )
         actual_action = str(actual_action or "UNKNOWN").upper()
+        reason = _settled_reason_text(planned_action, planned_reason, actual_action)
+        reason_code = _settled_reason_code(
+            planned_action, planned_reason_code, actual_action
+        )
 
         imp_f = _num(rec.get("actual_import_kwh"))
         exp_f = _num(rec.get("actual_export_kwh"))
@@ -602,10 +794,10 @@ def _settled_slots_for_day(day, cutoff=None) -> list:
             "settled": True,
             "closed_at": rec.get("slot_end"),
             "control_action": actual_action,
-            "planned_control_action": rec.get("predicted_control_action"),
+            "planned_control_action": planned_action or None,
             "actual_action_quality": actual_action_quality,
-            "reason": "Measured outcome from history",
-            "reason_code": "SETTLED_ACTUAL",
+            "reason": reason,
+            "reason_code": reason_code,
             "grid_energy": grid,
             "price": _num(rec.get("price_buy")) or 0.0,
             "sell": _num(rec.get("price_sell")) or _num(rec.get("price_buy")) or 0.0,
@@ -810,13 +1002,29 @@ def group_by_hour(schedule: list) -> list:
     return result
 
 
-def day_summary(schedule: list, today_actuals: dict | None) -> dict:
-    """Per-calendar-day cost forecast, folding in today's actuals."""
+def day_summary(
+    schedule: list,
+    today_actuals: dict | None,
+    *,
+    as_of: datetime | None = None,
+    slot_duration_h: float = 0.25,
+) -> dict:
+    """Per-calendar-day cost forecast, folding in today's actuals.
+
+    ``as_of`` makes the current slot's forecast strictly forward-looking.  It
+    is optional for compatibility with callers rendering a wholly historical
+    schedule, where every supplied slot remains a complete forecast slot.
+    """
     days = {}
     order = []
     for slot in schedule:
         dt = _parse_time(slot.get("time"))
         if dt is None:
+            continue
+        fraction = (slot_remaining_fraction(
+            slot, as_of=as_of, default_duration_h=slot_duration_h)
+            if as_of is not None else 1.0)
+        if fraction <= 0.0:
             continue
         d = dt.date().isoformat()
         if d not in days:
@@ -828,13 +1036,14 @@ def day_summary(schedule: list, today_actuals: dict | None) -> dict:
         # non-full battery charges it (SoC up / cost basis down, no grid revenue)
         # rather than exporting — see _forward_grid_econ — so the forecast stays
         # complete and converges to the settled actuals without phantom profit.
-        f_imp_kwh, f_imp_cost, f_exp_kwh, f_exp_rev = _forward_grid_econ(slot)
+        f_imp_kwh, f_imp_cost, f_exp_kwh, f_exp_rev = _forward_grid_econ(
+            slot, fraction=fraction)
         days[d]["import_kwh"] += f_imp_kwh
         days[d]["import_cost"] += f_imp_cost
         days[d]["export_kwh"] += f_exp_kwh
         days[d]["export_rev"] += f_exp_rev
 
-    today = datetime.now().date().isoformat()
+    today = (as_of.date() if as_of is not None else datetime.now().date()).isoformat()
     rows = []
     _keys = ("import_kwh", "import_cost", "export_kwh", "export_rev")
     for d in order:
@@ -883,6 +1092,7 @@ def get_plan() -> dict:
             age_s = None
 
     schedule = raw.get("schedule", [])
+    projection_as_of = datetime.now().astimezone()
     forecast_start = schedule[0].get("time") if schedule else None
     timeline_schedule = settled_slots_for_today(forecast_start) + schedule
     return {
@@ -904,11 +1114,20 @@ def get_plan() -> dict:
         "slot_duration_h": raw.get("slot_duration_h"),
         "current": raw.get("current", {}),
         "winter_policy": raw.get("winter_policy"),
+        "adaptive_policy": raw.get("adaptive_policy"),
+        "active_strategy": raw.get("active_strategy"),
+        "controller_authority": raw.get("controller_authority") or "optimizer",
+        "control_suppressed": bool(raw.get("control_suppressed", False)),
         "today": raw.get("today", {}),
         "victron_slots": raw.get("victron_slots", []),
         "ev_smart_charge": raw.get("ev_smart_charge") or raw.get("ev_charge_plan"),
         "hours": group_by_hour(timeline_schedule),
-        "day_summary": day_summary(schedule, raw.get("today_actuals")),
+        "day_summary": day_summary(
+            schedule,
+            raw.get("today_actuals"),
+            as_of=projection_as_of,
+            slot_duration_h=_f(raw.get("slot_duration_h")) or 0.25,
+        ),
         "mtd_net": mtd_net_eur(),
     }
 

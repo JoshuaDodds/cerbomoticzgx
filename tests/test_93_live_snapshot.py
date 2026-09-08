@@ -90,6 +90,95 @@ def test_snapshot_bad_values_become_none_not_exceptions():
     assert snap["system_state"] is None
 
 
+def test_victron_schedule_topics_are_subscribed_as_authoritative_settings():
+    topics = MqttLive()._build_topics("portal-123")
+
+    for index in range(5):
+        prefix = (
+            "N/portal-123/settings/0/Settings/CGwacs/BatteryLife/"
+            f"Schedule/Charge/{index}/"
+        )
+        assert topics[f"victron_schedule_{index}_day"] == prefix + "Day"
+        assert topics[f"victron_schedule_{index}_start"] == prefix + "Start"
+        assert topics[f"victron_schedule_{index}_duration"] == prefix + "Duration"
+        assert topics[f"victron_schedule_{index}_soc"] == prefix + "Soc"
+
+
+def test_snapshot_exposes_actual_victron_schedule_including_recurring_days():
+    snap = _snapshot_with({
+        "victron_schedule_0_day": "1",
+        "victron_schedule_0_start": "23400",
+        "victron_schedule_0_duration": "5400",
+        "victron_schedule_0_soc": "80",
+        "victron_schedule_1_day": "7",
+        "victron_schedule_1_start": "3600",
+        "victron_schedule_1_duration": "1800",
+        "victron_schedule_1_soc": "65",
+        "victron_schedule_2_day": "-1",
+    })
+
+    schedule = snap["victron_schedule"]
+    assert schedule["available"] is True
+    assert schedule["slots"][0] == {
+        "index": 0,
+        "day": 1,
+        "day_label": "Monday",
+        "start_seconds": 23400,
+        "start": "06:30",
+        "duration": 5400,
+        "target_soc": 80,
+        "enabled": True,
+        "complete": True,
+    }
+    assert schedule["slots"][1]["day_label"] == "Every day"
+    assert schedule["slots"][2]["enabled"] is False
+    assert schedule["slots"][2]["complete"] is True
+
+
+def test_snapshot_marks_partially_received_victron_schedule_as_incomplete():
+    snap = _snapshot_with({"victron_schedule_0_day": 2})
+
+    schedule = snap["victron_schedule"]
+    assert schedule["available"] is True
+    assert schedule["slots"][0]["enabled"] is True
+    assert schedule["slots"][0]["complete"] is False
+
+
+def test_snapshot_has_no_authoritative_schedule_before_mqtt_values_arrive():
+    assert _snapshot_with({})["victron_schedule"] == {
+        "available": False,
+        "updated_at": None,
+        "slots": [],
+    }
+
+
+def test_schedule_refresh_reads_each_setting_from_victron():
+    class FakeClient:
+        def __init__(self):
+            self.calls = []
+
+        def publish(self, topic, payload="", **_kwargs):
+            self.calls.append((topic, payload))
+
+    tracker = MqttLive()
+    tracker._client = FakeClient()
+    tracker._portal_id = "portal-123"
+    tracker._connected = True
+
+    assert tracker.request_victron_schedule_refresh() is True
+    assert len(tracker._client.calls) == 20
+    assert tracker._client.calls[0] == (
+        "R/portal-123/settings/0/Settings/CGwacs/BatteryLife/"
+        "Schedule/Charge/0/Day",
+        "",
+    )
+    assert tracker._client.calls[-1] == (
+        "R/portal-123/settings/0/Settings/CGwacs/BatteryLife/"
+        "Schedule/Charge/4/Soc",
+        "",
+    )
+
+
 def test_local_ev_meter_overrides_stale_charging_status_at_idle_power():
     snap = _snapshot_with({
         "ev_w": "4",

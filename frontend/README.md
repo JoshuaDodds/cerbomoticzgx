@@ -189,9 +189,12 @@ sharing the host's `/dev/shm` (so it can read the published plan). Expose
   records without transition events say that energy was measured within the
   displayed 15-minute interval instead of presenting the interval boundary as an
   exact charging start.
-- **Victron Schedule** (tab): mirrors the five Victron/CerboGX scheduled-charge
-  slots from the published optimizer plan. The **Clear schedule** button calls the
-  same broker helper used internally to disable those five Victron slots.
+- **Victron Schedule** (tab): subscribes to the five authoritative
+  Victron/CerboGX scheduled-charge slots and explicitly reads their current
+  `Day`, `Start`, `Duration`, and `Soc` settings whenever the tab opens. Changes
+  made by the optimizer, Cerbo UI, or another controller therefore update live;
+  the optimizer plan is only a startup fallback. The **Clear schedule** button
+  calls the same broker helper used internally to disable those five slots.
 - **Vehicle** (tab): creates one durable Tesla charge-by job (50–100% target and an
   offset-aware deadline), shows feasibility/cost/savings, and presents the plan as readable
   day-by-day rows with exact windows, kWh, SoC progress, price status, cost and energy source.
@@ -364,6 +367,8 @@ reuses `MOSQUITTO_IP` and `VRM_PORTAL_ID`.
   before its local artifacts disappear. Cancel releases Grid assist immediately when Run Now
   enabled it, but preserves Grid assist when it was already enabled before Run Now.
 - `POST /api/victron/clear-schedule` — clear the five Victron scheduled-charge slots.
+- `POST /api/victron/request-schedule` — request all current slot settings through
+  Victron MQTT; their `N/...` responses flow through the live SSE snapshot.
 - `GET /healthz` — liveness.
 
 ## Notes / roadmap

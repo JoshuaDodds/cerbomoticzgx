@@ -119,8 +119,9 @@
         <div class="tab-actions import-schedule-actions">
           <button id="clear-import-schedule" type="button" class="btn-secondary btn-danger">Clear schedule</button>
         </div>
-        <p class="cfg-note">The grid-charge schedule the optimizer has programmed into the
-          CerboGX (Settings → ESS → Scheduled charging). 5 slots, mirrored here.</p>
+        <p class="cfg-note">The actual grid-charge schedule currently stored in the
+          CerboGX (Settings → ESS → Scheduled charging). All 5 slots update live,
+          regardless of which controller or user edited them.</p>
         <div id="victron-schedules" class="card"></div>
       </section>
 
@@ -232,6 +233,24 @@
             </form>
           </div>
           <div id="advisor-meta" class="advisor-meta muted"></div>
+          <section class="advisor-tools" aria-label="Read-only local evidence tools">
+            <div class="advisor-tool-card">
+              <div>
+                <strong>Forecast validation</strong>
+                <p>Compare the current forecast with the Weather/HVAC trial. This never enables a forecast setting.</p>
+              </div>
+              <button id="advisor-forecast-validation" type="button" class="btn-secondary">Validate forecasts</button>
+              <div id="advisor-forecast-validation-result" class="advisor-tool-result muted">Not run in this browser session.</div>
+            </div>
+            <div class="advisor-tool-card">
+              <div>
+                <strong>ESS strategy comparison</strong>
+                <p>Compare read-only alternatives against the frozen live plan. It never changes dispatch.</p>
+              </div>
+              <button id="advisor-ess-strategies" type="button" class="btn-secondary">Compare strategies</button>
+              <div id="advisor-ess-strategies-result" class="advisor-tool-result muted">Not run in this browser session.</div>
+            </div>
+          </section>
           <div id="advisor-report" class="advisor-report">
             <span class="muted">No review yet — run the daily review or ask a question.</span>
           </div>

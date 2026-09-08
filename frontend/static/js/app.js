@@ -135,6 +135,7 @@ function activateTab(tabName) {
   if (tab) tab.classList.add("active");
   panel.classList.add("active");
   syncMobileNavState();
+  if (tabName === "victron") requestVictronScheduleRefresh();
   if (tabName === "logs") connectLogsStream(); else disconnectLogsStream();
 }
 
@@ -743,6 +744,13 @@ function renderDaySummary(plan) {
 function planStrategySummary(plan) {
   const now = new Date();
   const winterPolicy = plan.optimizer_mode === "winter" ? (plan.winter_policy || {}) : null;
+  const adaptivePolicy = plan.optimizer_mode !== "winter" ? (plan.adaptive_policy || null) : null;
+  if (plan.control_suppressed && plan.controller_authority === "grid_offline") {
+    return "Grid outage: optimizer control is suspended. Victron may use the full emergency reserve to support the house while forecasting and settlement continue.";
+  }
+  if (plan.control_suppressed && plan.controller_authority === "manual_override") {
+    return "Manual Override: optimizer control is suspended; live measurements, settlement and the observational plan continue updating.";
+  }
   const configuredSlotHours = Number(plan.slot_duration_h);
   const slotHours = Number.isFinite(configuredSlotHours) && configuredSlotHours > 0
     ? configuredSlotHours : 0.25;
@@ -813,7 +821,14 @@ function planStrategySummary(plan) {
   if (buys.length && sells.length) strategy = "Buy low, then sell at the stronger price peaks";
   else if (buys.length) strategy = "Buy low to cover the planned energy requirement";
   else if (sells.length) strategy = "Sell stored energy only at the strongest remaining prices";
-  return `From now until midnight: ${parts.join(", then ")}. ${strategy} to minimise cost and maximise the day's net result.`;
+  const adaptiveNames = {
+    market_arbitrage: "Trading",
+    pv_first_self_sufficiency: "PV-first self-sufficiency",
+    protected_hybrid: "protected hybrid",
+  };
+  const adaptiveName = adaptivePolicy && adaptiveNames[adaptivePolicy.selected];
+  const prefix = adaptiveName ? `Adaptive Summer selected ${adaptiveName}. ` : "";
+  return `${prefix}From now until midnight: ${parts.join(", then ")}. ${strategy} to minimise cost and maximise the day's net result.`;
 }
 
 // ---- Render: hours tree ----
@@ -1308,16 +1323,29 @@ function fmtDur(sec) {
   const h = Math.floor(sec / 3600), m = Math.round((sec % 3600) / 60);
   return (h ? h + "h " : "") + m + "m";
 }
-function renderVictron(plan) {
+function renderVictron(plan, live = lastLive) {
   const box = $("#victron-schedules");
   if (!box) return;
-  if (!plan || !plan.available) { box.innerHTML = "<span class='muted'>no plan yet…</span>"; return; }
-  const slots = plan.victron_slots || [];
+  const actual = live && live.victron_schedule;
+  const hasActual = !!(actual && actual.available);
+  if (!hasActual && (!plan || !plan.available)) {
+    box.innerHTML = "<span class='muted'>waiting for CerboGX schedule state…</span>";
+    return;
+  }
+  const slots = hasActual ? (actual.slots || []) : (plan.victron_slots || []);
   let html = "";
   for (let i = 0; i < 5; i++) {
     const s = slots[i];
     let right;
-    if (s) {
+    if (hasActual && s && s.enabled === false) {
+      right = `<span class="muted">Disabled</span>`;
+    } else if (hasActual && s && !s.complete) {
+      right = `<span class="muted">Reading current settings…</span>`;
+    } else if (hasActual && s) {
+      const day = _esc(s.day_label || "Scheduled");
+      const time = _esc(s.start || "--:--");
+      right = `<span class="vic-on">${day} ${time} <span class="muted">(${fmtDur(s.duration)})</span> &nbsp;→ ${Number(s.target_soc).toFixed(0)}%</span>`;
+    } else if (s) {
       let day = "";
       try { day = new Date(s.start).toLocaleDateString([], { weekday: "long" }); } catch (_) {}
       const time = (s.start || "").slice(11, 16);
@@ -1328,6 +1356,18 @@ function renderVictron(plan) {
     html += `<div class="vic-row"><span class="vic-name">Schedule ${i + 1}</span>${right}<span class="vic-chev">›</span></div>`;
   }
   box.innerHTML = html;
+}
+
+let _victronScheduleRequestAt = 0;
+async function requestVictronScheduleRefresh() {
+  // Route/hash setup can activate the same tab twice in quick succession.
+  // Coalesce that harmless duplication while still refreshing on every real visit.
+  const now = Date.now();
+  if (now - _victronScheduleRequestAt < 1000) return;
+  _victronScheduleRequestAt = now;
+  try {
+    await fetch("/api/victron/request-schedule", { method: "POST" });
+  } catch (_) { /* the cached/plan fallback remains visible while offline */ }
 }
 
 function renderMeta(plan) {
@@ -1389,7 +1429,7 @@ async function refreshPlan() {
       lastHoursGen = lastPlan.generated_at;
     }
     safeRenderChart();
-    renderVictron(lastPlan);
+    renderVictron(lastPlan, lastLive);
     renderMeta(lastPlan);
   } catch (e) {
     noteServerFailure();
@@ -1791,6 +1831,7 @@ function applyLive(data) {
   updateControlButtons();
   safeRenderPowerFlow();
   renderVehicle();
+  renderVictron(lastPlan, lastLive);
   if (lastPlan) renderMeta(lastPlan);
 }
 
@@ -1927,7 +1968,7 @@ async function clearImportSchedule() {
     if (!response.ok || !body.ok) throw new Error(body.error || "clear failed");
     if (lastPlan) {
       lastPlan = { ...lastPlan, victron_slots: [] };
-      renderVictron(lastPlan);
+      renderVictron(lastPlan, lastLive);
     }
     btn.textContent = "Cleared";
     setTimeout(() => { btn.textContent = label; }, 1200);
@@ -2451,6 +2492,212 @@ function runAdvisor(question, callbacks) {
 }
 const _advReview = $("#advisor-review");
 if (_advReview) _advReview.addEventListener("click", () => runAdvisor(null));
+
+function advisorToolEur(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? `${number >= 0 ? "+" : "−"}€${Math.abs(number).toFixed(2)}` : "—";
+}
+
+function renderForecastValidationTool(report) {
+  const load = report && report.load ? report.load : {};
+  const current = load.baseline && load.baseline.mae_kwh;
+  const trial = load.shadow && load.shadow.mae_kwh;
+  const recommendation = (report && report.overall && report.overall.recommendation) || "KEEP_APPLY_OFF";
+  const decision = recommendation === "KEEP_APPLY_OFF"
+    ? "Keep forecast adjustments OFF" : recommendation;
+  const reasons = (load.gate && Array.isArray(load.gate.reasons)) ? load.gate.reasons : [];
+  return `<div class="advisor-tool-summary"><strong>${_esc(decision)}</strong>
+    <span>Current forecast error ${_esc(current == null ? "—" : `${Number(current).toFixed(4)} kWh/slot`)}</span>
+    <span>Weather/HVAC trial error ${_esc(trial == null ? "—" : `${Number(trial).toFixed(4)} kWh/slot`)}</span>
+    ${reasons.length ? `<ul>${reasons.map((reason) => `<li>${_esc(reason)}</li>`).join("")}</ul>` : ""}
+  </div>`;
+}
+
+function advisorCandidateLabel(candidateId) {
+  return ({
+    market_arbitrage: "Market arbitrage",
+    pv_first_self_sufficiency: "PV-first self-sufficiency",
+    protected_hybrid: "Protected hybrid",
+    winter_self_sufficiency: "Winter-style (approx.)",
+  })[candidateId] || candidateId;
+}
+
+function advisorOptimizerModeLabel(mode) {
+  const m = String(mode || "").trim().toLowerCase();
+  if (m === "winter") return "Winter mode";
+  if (m === "summer") return "Summer mode";
+  return null;
+}
+
+// One line per row, in the vocabulary the rest of the dashboard already uses
+// (BUY/SELL/RETAIN/IDLE are the literal control_action values shown elsewhere;
+// "reserve"/"grid charging"/"export" match the .env and Settings wording) —
+// not the €-denominated column headers, which describe outcome, not policy.
+const ADVISOR_STRATEGY_LEGEND = {
+  live_plan: "The AI optimizer actually controlling the battery right now — chooses BUY / SELL / RETAIN / IDLE each cycle from live prices and forecasts.",
+  market_arbitrage: "No protected reserve — BUYs and SELLs freely down to the minimum SoC reserve, whichever the price favors.",
+  protected_hybrid: "BUYs only enough to hold a protected reserve, then SELLs freely from whatever is stored above it.",
+  pv_first_self_sufficiency: "Never BUYs or SELLs — solar and the protected reserve cover household load alone.",
+  winter_self_sufficiency: "BUYs up to the reserve to cover household load, like Winter Mode's routine policy, but never SELLs.",
+};
+
+// Every row below is a whole calendar day: the already-settled part of today
+// plus that policy's planned remainder. The report supplies the live plan's own
+// figure on exactly that basis, so this must NOT fall back to the day-summary
+// tile — that number is built with different per-slot rules and mixing the two
+// is what made the alternatives look far better than they are.
+function advisorStrategyCells(today) {
+  if (!today) return null;
+  // Spell out the floor the carried figure is measured above: rows holding a
+  // higher reserve are not carrying less by choice, and side by side that reads
+  // as a handicap unless the basis is visible in the cell itself.
+  const floor = today.floor_soc_percent == null
+    ? "" : ` above ${Number(today.floor_soc_percent).toFixed(0)}%`;
+  const carried = today.carried_energy_kwh == null
+    ? "—"
+    : `${Number(today.carried_energy_kwh).toFixed(1)} kWh${floor} (${advisorToolEur(today.carried_energy_value_eur)})`;
+  const closing = today.closing_soc_percent == null
+    ? "—"
+    : `${Number(today.closing_soc_percent).toFixed(0)}%`;
+  return [
+    advisorToolEur(today.whole_day_cash_net_eur),
+    advisorToolEur(today.whole_day_economic_net_eur),
+    `${Number(today.full_equivalent_cycles || 0).toFixed(2)}`,
+    closing,
+    carried,
+  ];
+}
+
+// data-label mirrors each column heading so the narrow-viewport stacked layout
+// can label every value without a second markup path.
+// MUST stay a hard-coded literal: these are interpolated into a quoted
+// data-label attribute, and _esc() escapes & < > but NOT quotes. Sourcing this
+// from report data would turn it into an attribute-breakout injection point.
+const ADVISOR_STRATEGY_COLUMNS = [
+  "Grid result", "After wear", "Cycles", "SoC at midnight", "Carried to tomorrow",
+];
+
+function advisorStrategyRow(label, today, opts) {
+  const active = !!(opts && opts.active);
+  const cls = active ? ' class="is-active"' : "";
+  const name = `${_esc(label)}${active ? ' <span class="advisor-strategy-flag">active</span>' : ""}`;
+  const cells = advisorStrategyCells(today);
+  if (!cells) {
+    const why = (opts && opts.note) || "no result for today";
+    return `<tr${cls}><th scope="row">${name}</th><td colspan="5" data-label="Result">${_esc(why)}</td></tr>`;
+  }
+  const tds = cells.map((cell, i) =>
+    `<td data-label="${_esc(ADVISOR_STRATEGY_COLUMNS[i] || "")}">${_esc(cell)}</td>`).join("");
+  return `<tr${cls}><th scope="row">${name}</th>${tds}</tr>`;
+}
+
+function renderEssStrategyTool(report) {
+  const plan = lastPlan || {};
+  const current = plan.current || {};
+  const liveAction = current.control_action || current.action || "—";
+  const liveReason = current.reason_code || "";
+  const baseline = (report && report.plan_baseline) || {};
+  const settled = report && report.settled_today;
+  const candidates = Object.entries((report && report.candidates) || {});
+  const modeLabel = advisorOptimizerModeLabel(report && report.optimizer_mode);
+  const liveLabel = "Live plan" + (modeLabel ? ` (${modeLabel})` : "");
+  const liveRow = advisorStrategyRow(liveLabel, baseline.available ? baseline.today : null, {
+    active: true,
+    note: `not comparable — ${baseline.unavailable_reason
+      || "the published plan is missing per-slot grid flows"}`,
+  });
+  const rows = candidates.map(([candidateId, candidate]) => advisorStrategyRow(
+    advisorCandidateLabel(candidateId),
+    (candidate && candidate.feasible) ? candidate.today : null,
+    { note: `unavailable — ${(candidate && candidate.rejection_reason) || "unknown reason"}` },
+  )).join("");
+  const settledNote = settled
+    ? `Already settled today, identical in every row: ${_esc(advisorToolEur(settled.cash_net_eur))}.`
+    : "This plan carries no settled totals for today, so the rows below cover only the planned remainder of today.";
+  // Rows in the same top-to-bottom order as the table, so the legend reads as
+  // a caption for it rather than a second, separately-ordered list.
+  const legendRows = [["live_plan", liveLabel]]
+    .concat(candidates.map(([candidateId]) => [candidateId, advisorCandidateLabel(candidateId)]))
+    .map(([id, label]) => (ADVISOR_STRATEGY_LEGEND[id]
+      ? `<div><dt>${_esc(label)}</dt><dd>${_esc(ADVISOR_STRATEGY_LEGEND[id])}</dd></div>`
+      : "")).join("");
+  return `<div class="advisor-tool-summary">
+    <div class="advisor-live-plan"><strong>CURRENT LIVE PLAN</strong>
+      <span>AI Optimizer — ${_esc(liveAction)}${liveReason ? ` · ${_esc(liveReason)}` : ""}.</span>
+      <small>This is the plan currently used for forecast and dispatch. None of the alternatives below is active.</small>
+    </div>
+    <p class="muted">Whole day, midnight to midnight — the same basis as the Today tile. ${settledNote} Alternatives still plan over the full known horizon; only their result is limited to today.</p>
+    <div class="advisor-table-wrap"><table class="advisor-strategy-table">
+      <thead><tr>
+        <th scope="col">Strategy</th>
+        ${ADVISOR_STRATEGY_COLUMNS.map((c) => `<th scope="col">${_esc(c)}</th>`).join("")}
+      </tr></thead>
+      <tbody>${liveRow}${rows || '<tr><td colspan="6">No candidate data was returned.</td></tr>'}</tbody>
+    </table></div>
+    <p class="muted">Grid result = export reward − import cost. After battery wear subtracts estimated battery cycle cost. Carried energy is what a policy leaves above its own floor at midnight — a today-only total credits selling it without debiting the emptier battery handed to tomorrow.</p>
+    <p class="advisor-strategy-legend-heading">What drives each strategy:</p>
+    <dl class="advisor-strategy-legend">${legendRows}</dl>
+    ${advisorWinterCaveats(report && report.winter_candidate)}
+  </div>`;
+}
+
+// The winter row is a stand-in built from this evaluator's constraint model, not
+// the winter engine. Never render the figure without the caveats beside it.
+function advisorWinterCaveats(winter) {
+  if (!winter) return "";
+  const items = (winter.caveats || []).map((c) => `<li>${_esc(c)}</li>`).join("");
+  const raised = winter.reserve_was_raised
+    ? ` (raised from the requested ${_esc(Number(winter.requested_reserve_soc_percent || 0).toFixed(0))}% to the configured minimum)`
+    : "";
+  return `<details class="advisor-strategy-note">
+    <summary>Winter-style row is an approximation held above a ${_esc(Number(winter.reserve_soc_percent || 0).toFixed(0))}% reserve — how it differs</summary>
+    <p>It is not <code>${_esc(winter.engine_module || "the winter engine")}</code>. That engine is selected once at startup by <code>WINTER_MODE</code> and is not what this row simulates${raised}. It differs in that it:</p>
+    <ul>${items}</ul>
+  </details>`;
+}
+
+async function runAdvisorTool(tool, button, result) {
+  if (!button || button.disabled) return;
+  const label = button.textContent;
+  button.disabled = true;
+  button.textContent = "Running…";
+  if (result) result.innerHTML = '<span class="muted">Reading the saved plan and history…</span>';
+  try {
+    const response = await fetch(`/api/advisor/tools/${tool}`, { method: "POST" });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || !payload.ok) throw new Error(payload.error || "tool failed");
+    if (result) {
+      result.innerHTML = tool === "forecast-validation"
+        ? renderForecastValidationTool(payload.report)
+        : renderEssStrategyTool(payload.report);
+      // Widen this card only once a comparison table actually exists, so the
+      // two-up tool grid is left alone until there is something to widen for.
+      const card = result.closest(".advisor-tool-card");
+      if (card) card.classList.toggle("is-wide", !!result.querySelector(".advisor-strategy-table"));
+    }
+  } catch (error) {
+    if (result) {
+      result.innerHTML = `<span class="banner">${_esc(error.message || "Could not run the read-only report.")}</span>`;
+      // Release the widened row: an error banner must not keep the card
+      // stretched across a layout sized for a table that is no longer there.
+      const card = result.closest(".advisor-tool-card");
+      if (card) card.classList.remove("is-wide");
+    }
+  } finally {
+    button.disabled = false;
+    button.textContent = label;
+  }
+}
+
+const _advForecastValidation = $("#advisor-forecast-validation");
+if (_advForecastValidation) _advForecastValidation.addEventListener("click", () => {
+  runAdvisorTool("forecast-validation", _advForecastValidation, $("#advisor-forecast-validation-result"));
+});
+const _advEssStrategies = $("#advisor-ess-strategies");
+if (_advEssStrategies) _advEssStrategies.addEventListener("click", () => {
+  runAdvisorTool("ess-strategies", _advEssStrategies, $("#advisor-ess-strategies-result"));
+});
+
 async function clearAdvisorChat() {
   if (_advisorBusy) return;
   const confirmed = await advisorConfirm({

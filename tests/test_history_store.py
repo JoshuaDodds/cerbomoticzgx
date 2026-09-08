@@ -8,6 +8,7 @@ in production (no DuckDB -> never compacts -> pure NDJSON, nothing lost).
 import json
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -36,6 +37,68 @@ def test_read_day_parses_ndjson_and_skips_blank_and_torn_lines(tmp_path):
 
 def test_read_day_missing_returns_empty(tmp_path):
     assert hs.read_day("2026-06-15", str(tmp_path)) == []
+
+
+def test_strict_read_rejects_nonfinal_malformed_ndjson_but_allows_torn_tail(tmp_path):
+    path = Path(tmp_path) / "ess-2026-06-15.ndjson"
+    path.write_text(
+        '{"kind": "cycle"}\n'
+        '{"kind":\n'
+        '{"kind": "settlement"}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(hs.HistoryStoreReadError, match="non-final NDJSON"):
+        hs.read_day_strict("2026-06-15", str(tmp_path))
+
+    path.write_text(
+        '{"kind": "cycle"}\n'
+        '{"kind":\n',
+        encoding="utf-8",
+    )
+    assert hs.read_day_strict("2026-06-15", str(tmp_path)) == [{"kind": "cycle"}]
+
+
+@pytest.mark.parametrize("line", ["[]", "null", '"not a record"'])
+def test_strict_read_rejects_non_object_ndjson_records(tmp_path, line):
+    path = Path(tmp_path) / "ess-2026-06-15.ndjson"
+    path.write_text(line + "\n", encoding="utf-8")
+
+    with pytest.raises(hs.HistoryStoreReadError, match="invalid NDJSON record"):
+        hs.read_day_strict("2026-06-15", str(tmp_path))
+
+
+@pytest.mark.parametrize(
+    ("line", "message"),
+    [
+        ('{"kind":', "malformed Parquet JSON record"),
+        ("[]", "invalid Parquet JSON record"),
+        (None, "invalid Parquet JSON line"),
+    ],
+)
+def test_strict_read_rejects_malformed_or_non_object_parquet_records(
+    monkeypatch, tmp_path, line, message
+):
+    """Evidence readers must not silently shrink a compacted day."""
+    path = Path(tmp_path) / "ess-2026-07.parquet"
+    path.write_bytes(b"placeholder")
+
+    class Result:
+        def fetchall(self):
+            return [('{"kind": "settlement"}',), (line,)]
+
+    class Connection:
+        def execute(self, _query, _params=None):
+            return Result()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(hs, "_HAVE_DUCKDB", True)
+    monkeypatch.setattr(hs, "duckdb", SimpleNamespace(connect=lambda: Connection()))
+
+    with pytest.raises(hs.HistoryStoreReadError, match=message):
+        hs.read_day_strict("2026-07-01", str(tmp_path))
 
 
 def test_read_day_accepts_date_objects(tmp_path):

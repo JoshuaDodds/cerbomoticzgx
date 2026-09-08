@@ -42,6 +42,16 @@ _MONTH_RE = re.compile(r"ess-(\d{4})-(\d{2})\.parquet$")
 _APPEND_LOCK = threading.Lock()
 
 
+class HistoryStoreReadError(RuntimeError):
+    """A persisted history source cannot be read without losing evidence.
+
+    Normal application readers intentionally degrade to the remaining healthy
+    sources: the control loop must keep running if an old, compacted month is
+    unavailable.  Evidence gates have the opposite requirement.  They must
+    fail closed rather than quietly validate a partial data set.
+    """
+
+
 def duckdb_available() -> bool:
     """True when the Parquet/compaction path is usable."""
     return _HAVE_DUCKDB
@@ -125,6 +135,89 @@ def _read_parquet_day(parquet_path, iso) -> list:
     return out
 
 
+def _read_parquet_day_strict(parquet_path, iso) -> list:
+    """Read one compacted day without dropping corrupt serialized records.
+
+    The normal reader intentionally tolerates a bad historic row so the live
+    controller can continue using whatever healthy history remains.  Offline
+    evidence gates have the opposite contract: every row returned by a
+    successfully enumerated compacted day must be a JSON object, otherwise the
+    candidate data set is incomplete and must be rejected.
+    """
+    esc = parquet_path.replace("'", "''")
+    con = duckdb.connect()
+    try:
+        rows = con.execute(
+            f"SELECT line FROM read_parquet('{esc}') WHERE day = ? ORDER BY ts",
+            [iso],
+        ).fetchall()
+    finally:
+        con.close()
+
+    out = []
+    for row_number, row in enumerate(rows, start=1):
+        try:
+            (line,) = row
+        except (TypeError, ValueError) as error:
+            raise HistoryStoreReadError(
+                f"invalid Parquet row shape in {parquet_path} for {iso} at row {row_number}"
+            ) from error
+        if not isinstance(line, str):
+            raise HistoryStoreReadError(
+                f"invalid Parquet JSON line in {parquet_path} for {iso} at row {row_number}: "
+                f"expected string, got {type(line).__name__}"
+            )
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise HistoryStoreReadError(
+                f"malformed Parquet JSON record in {parquet_path} for {iso} at row "
+                f"{row_number}: {error.msg}"
+            ) from error
+        if not isinstance(record, dict):
+            raise HistoryStoreReadError(
+                f"invalid Parquet JSON record in {parquet_path} for {iso} at row {row_number}: "
+                "expected object"
+            )
+        out.append(record)
+    return out
+
+
+def _parse_ndjson_strict(path) -> list:
+    """Read an append-only day while surfacing filesystem failures.
+
+    A malformed *final* JSON line remains recoverable: it is the documented
+    crash shape for an append-only writer.  A malformed earlier line is not
+    recoverable evidence and must fail the offline gate rather than silently
+    shrinking its sample.
+    """
+    out = []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = [line.strip() for line in fh if line.strip()]
+        for index, line in enumerate(lines):
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as error:
+                if index != len(lines) - 1:
+                    raise HistoryStoreReadError(
+                        f"malformed non-final NDJSON record in {path} at line {index + 1}: "
+                        f"{error.msg}"
+                    ) from error
+                # A partially appended final line is safely ignored.  No later
+                # record can depend on it, and the next cycle writes a complete
+                # independent record.
+                continue
+            if not isinstance(record, dict):
+                raise HistoryStoreReadError(
+                    f"invalid NDJSON record in {path} at line {index + 1}: expected object"
+                )
+            out.append(record)
+    except (FileNotFoundError, OSError) as error:
+        raise HistoryStoreReadError(f"cannot read NDJSON history {path}: {error}") from error
+    return out
+
+
 def read_day(day, hist_dir=None) -> list:
     """All records for a day, oldest-first.
 
@@ -140,6 +233,37 @@ def read_day(day, hist_dir=None) -> list:
     if _HAVE_DUCKDB and os.path.exists(parquet):
         return _read_parquet_day(parquet, iso)
     return []
+
+
+def read_day_strict(day, hist_dir=None) -> list:
+    """Read one day for evidence validation without silent source fallback.
+
+    This deliberately preserves :func:`read_day`'s hot-NDJSON precedence, but
+    surfaces a read failure from an existing NDJSON or Parquet source.  It is
+    for offline validation only; production control code should continue using
+    the resilient reader above.
+    """
+    hist_dir = resolve_history_dir(hist_dir)
+    iso = _iso(day)
+    ndjson = os.path.join(hist_dir, f"ess-{iso}.ndjson")
+    if os.path.exists(ndjson):
+        return _parse_ndjson_strict(ndjson)
+
+    parquet = _month_parquet_for_day(iso, hist_dir)
+    if not os.path.exists(parquet):
+        return []
+    if not _HAVE_DUCKDB:
+        raise HistoryStoreReadError(
+            f"cannot read compacted history {parquet}: DuckDB is unavailable"
+        )
+    try:
+        return _read_parquet_day_strict(parquet, iso)
+    except HistoryStoreReadError:
+        raise
+    except Exception as error:
+        raise HistoryStoreReadError(
+            f"cannot read compacted history {parquet} for {iso}: {error}"
+        ) from error
 
 
 def _ndjson_days(hist_dir) -> set:
@@ -176,6 +300,43 @@ def available_days(hist_dir=None) -> list:
             logging.debug("history_store: parquet day scan failed: %s", e)
         finally:
             con.close()
+    return sorted(days)
+
+
+def available_days_strict(hist_dir=None) -> list:
+    """Enumerate every persisted day, failing closed for any Parquet problem.
+
+    :func:`available_days` intentionally logs and skips a broken cold-month
+    Parquet file so the live controller can remain available.  Forecast
+    validation must not do that: dropping a month can make a partial sample
+    appear to pass an evidence threshold.  Scan each compacted file separately
+    so the error identifies the source that prevented a complete report.
+    """
+    hist_dir = resolve_history_dir(hist_dir)
+    days = _ndjson_days(hist_dir)
+    parquets = sorted(glob.glob(os.path.join(hist_dir, "ess-*.parquet")))
+    if parquets and not _HAVE_DUCKDB:
+        raise HistoryStoreReadError(
+            "cannot enumerate compacted history: DuckDB is unavailable"
+        )
+
+    for parquet in parquets:
+        esc = parquet.replace("'", "''")
+        try:
+            con = duckdb.connect()
+            try:
+                rows = con.execute(
+                    f"SELECT DISTINCT day FROM read_parquet('{esc}')"
+                ).fetchall()
+            finally:
+                con.close()
+        except Exception as error:
+            raise HistoryStoreReadError(
+                f"cannot enumerate compacted history {parquet}: {error}"
+            ) from error
+        for (day,) in rows:
+            if day:
+                days.add(str(day))
     return sorted(days)
 
 

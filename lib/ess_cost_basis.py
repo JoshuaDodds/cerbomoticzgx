@@ -3,16 +3,16 @@
 The AI ESS optimizer is a stateless MPC: every 15-minute cycle it rebuilds the
 plan from scratch using only the *current* SoC and the *forward* price curve. It
 has no memory of what was paid for the energy already sitting in the battery, so
-on a flat-but-high morning it will happily dump a freshly (or expensively)
-charged battery for a few cents of intra-day "spread" and then re-import to cover
-load — a round-trip loss.
+the persisted basis remains useful as a loss-aversion signal.
 
 This module maintains a small, persisted weighted-average **cost basis** (the €/kWh
 actually paid for the DC energy currently stored) that survives re-plans and
-service restarts. The optimizer reads it and refuses to *actively* discharge the
-battery to the grid below that basis (plus losses), so it can never sell stored
-energy for less than it cost to put there. PV-charged energy is treated as free,
-so the floor naturally relaxes once the battery is solar-filled.
+service restarts. The optimizer reads it and waits for the best visible recovery
+opportunity, but treats historical acquisition cost as sunk when no visible sale
+can recover it. This prevents an unrecoverable old basis from stranding energy
+forever; the separate ``ESS_MIN_SELL_PRICE`` remains the absolute operator floor.
+PV-charged energy is treated as free, so the basis naturally relaxes once the
+battery is solar-filled.
 
 Design notes
 ------------
@@ -80,7 +80,7 @@ def current_basis() -> float:
     return max(0.0, s["basis"])
 
 
-def sell_floor(discharge_efficiency: float = 0.90) -> float:
+def sell_floor(discharge_efficiency: float = 0.96) -> float:
     """Minimum sell price (€/kWh AC) needed to recover what the stored energy cost.
 
     Selling 1 kWh of DC energy yields ``discharge_efficiency`` kWh of AC revenue,
@@ -92,12 +92,12 @@ def sell_floor(discharge_efficiency: float = 0.90) -> float:
     basis = current_basis()
     if basis <= _EPS:
         return 0.0
-    eff = discharge_efficiency if discharge_efficiency and discharge_efficiency > _EPS else 0.90
+    eff = discharge_efficiency if discharge_efficiency and discharge_efficiency > _EPS else 0.96
     return basis / eff
 
 
 def update_from_slot(*, soc_start, soc_end, capacity_kwh, import_kwh,
-                     pv_kwh, price_buy, charge_efficiency=0.90) -> dict:
+                     pv_kwh, price_buy, charge_efficiency=0.96) -> dict:
     """Update the cost basis from one settled slot's measured outcome.
 
     :param soc_start/soc_end: measured battery SoC (%) at slot open/close.
@@ -128,7 +128,7 @@ def update_from_slot(*, soc_start, soc_end, capacity_kwh, import_kwh,
     state = load_state()
     basis = max(0.0, state.get("basis", 0.0))
 
-    ceff = charge_efficiency if charge_efficiency and charge_efficiency > _EPS else 0.90
+    ceff = charge_efficiency if charge_efficiency and charge_efficiency > _EPS else 0.96
     imp = max(0.0, float(import_kwh or 0.0))
     pbuy = max(0.0, float(price_buy or 0.0))
 

@@ -110,6 +110,21 @@ def test_clear_import_schedule_route_reports_helper_failure(monkeypatch):
     assert "mqtt publish failed" in body["error"]
 
 
+def test_request_victron_schedule_route_requests_authoritative_mqtt_values(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        server.live,
+        "request_victron_schedule_refresh",
+        lambda: calls.append("refresh") or True,
+    )
+
+    response = server.app.test_client().post("/api/victron/request-schedule")
+
+    assert response.status_code == 200
+    assert response.get_json() == {"ok": True}
+    assert calls == ["refresh"]
+
+
 def test_restart_route_publishes_existing_shutdown_topic(monkeypatch):
     calls = []
 
@@ -628,6 +643,38 @@ def test_advisor_latest_route_returns_saved_report(monkeypatch):
 
     assert response.status_code == 200
     assert response.get_json()["messages"][0]["text"] == "Because."
+
+
+def test_advisor_forecast_validation_route_returns_read_only_report(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_run_forecast_validation",
+        lambda: {"overall": {"recommendation": "KEEP_APPLY_OFF"}},
+    )
+
+    response = server.app.test_client().post("/api/advisor/tools/forecast-validation")
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "ok": True,
+        "report": {"overall": {"recommendation": "KEEP_APPLY_OFF"}},
+    }
+
+
+def test_advisor_strategy_evaluation_route_returns_read_only_report(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_run_ess_strategy_evaluation",
+        lambda: {"read_only": True, "candidates": {}},
+    )
+
+    response = server.app.test_client().post("/api/advisor/tools/ess-strategies")
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "ok": True,
+        "report": {"read_only": True, "candidates": {}},
+    }
 
 
 def test_advisor_clear_route_empties_saved_chat(monkeypatch):

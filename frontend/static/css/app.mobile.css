@@ -7,6 +7,29 @@
   /* Surface the Weather tab's charts inside Trends (Weather isn't in the mobile nav). */
   .trends-weather-mobile { display: block; }
 
+  /* Strategy comparison: six columns cannot stay legible on a phone, so restack
+     each row as a labelled card. data-label carries the column heading, so the
+     desktop markup is reused verbatim and nothing scrolls sideways. */
+  .advisor-strategy-table thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  .advisor-strategy-table,
+  .advisor-strategy-table tbody,
+  .advisor-strategy-table tr,
+  .advisor-strategy-table th,
+  .advisor-strategy-table td { display: block; width: auto; }
+  /* Drop the desktop scroll floor: stacked rows must never force the wrapper
+     to scroll horizontally on a phone. */
+  .advisor-strategy-table { min-width: 0; }
+  .advisor-strategy-table tr { padding: 8px 10px; border-bottom: 1px solid var(--line); }
+  .advisor-strategy-table tbody tr:last-child { border-bottom: 0; }
+  .advisor-strategy-table th[scope="row"] { padding: 0 0 6px; border-bottom: 0; font-size: 13px; }
+  .advisor-strategy-table td { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 3px 0; border-bottom: 0; white-space: normal; text-align: right; }
+  .advisor-strategy-table td::before { content: attr(data-label); flex: 0 0 auto; color: var(--muted); font-size: 11.5px; text-align: left; }
+  .advisor-strategy-table tbody tr.is-active { border-radius: 6px; }
+  .advisor-strategy-table tbody tr.is-active th[scope="row"] { box-shadow: none; }
+
+  /* Two columns are too tight for a strategy name plus its sentence at 390px. */
+  .advisor-strategy-legend > div { grid-template-columns: 1fr; gap: 1px; }
+
   body {
     overflow-x: hidden;
     padding-bottom: calc(74px + env(safe-area-inset-bottom));
@@ -589,6 +612,18 @@
     flex-direction: column;
     align-items: stretch;
     min-width: 0;
+  }
+
+  .advisor-tools {
+    grid-template-columns: 1fr;
+  }
+
+  .advisor-tool-card {
+    grid-template-columns: 1fr;
+  }
+
+  .advisor-tool-card .btn-secondary {
+    width: 100%;
   }
 
   .advisor-ask input,
