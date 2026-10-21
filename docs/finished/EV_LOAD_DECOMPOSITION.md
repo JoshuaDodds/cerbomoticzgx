@@ -12,14 +12,18 @@ measured, quality-labelled data for future forecasts.
 
 ## Meter inputs
 
-| Bus topic (`N/<id>/evcharger/42/...`) | Meaning | Stored as |
+| Bus topic (`N/<id>/acload/42/...`, ABB meter) | Meaning | Stored as |
 |---|---|---|
-| `Ac/Power` | total EV real power, W | cycle `ev_w` |
+| `Ac/Power` | ABB-measured EV real power, W | Domoticz EV day counter and charge-transition history |
 | `Ac/Energy/Forward` | lifetime EV energy, kWh | settlement `ev_charge_kwh` after a validated diff |
 | phase current topics | measured phase current, A | shared current/control metric |
 
 The charger ceiling used only for history plausibility checks is 16 kW. It does
 not constrain charging or any live control path.
+
+Live EV watts for the controller and cycle `ev_w` now come from the separate
+Victron EVCS at `N/<id>/evcharger/40/Ac/Power`. Its lifetime energy counter is
+not used for settlement because the ABB counter is the historical source.
 
 ## New records
 

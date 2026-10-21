@@ -172,16 +172,16 @@ class MqttLive:
             # EV charging power (Watts) — the main service reads it from Domoticz
             # and publishes it here. Absent => the EV node stays hidden.
             "ev_w": "Tesla/vehicle0/charging_watts",   # local evcharger meter: fast + accurate (was the laggy domoticz-derived ev_power, which flapped)
-            # EV charger lifetime forward energy (kWh) + present session time (s),
-            # from the Victron evcharger service (instance 42; matches lib/constants.py).
-            "ev_energy_kwh": f"N/{sid}/evcharger/42/Ac/Energy/Forward",
-            "ev_charge_time": f"N/{sid}/evcharger/42/ChargingTime",
+            # ABB meter lifetime forward energy (kWh) remains the historical
+            # source; session time is a live EVCS reading (instance 40).
+            "ev_energy_kwh": f"N/{sid}/acload/42/Ac/Energy/Forward",
+            "ev_charge_time": f"N/{sid}/evcharger/40/ChargingTime",
             # ABB meter phase currents. The power-flow EV card intentionally sums
             # these three physical measurements to match the Tesla total-current
             # convention; it must not multiply the car's retained ChargeAmps value.
-            "ev_l1_a": f"N/{sid}/evcharger/42/Ac/L1/Current",
-            "ev_l2_a": f"N/{sid}/evcharger/42/Ac/L2/Current",
-            "ev_l3_a": f"N/{sid}/evcharger/42/Ac/L3/Current",
+            "ev_l1_a": f"N/{sid}/acload/42/Ac/L1/Current",
+            "ev_l2_a": f"N/{sid}/acload/42/Ac/L2/Current",
+            "ev_l3_a": f"N/{sid}/acload/42/Ac/L3/Current",
             # Tesla vehicle status (published by tesla_api / ev_charge_controller as
             # {"value": ...}). Read-only in the UI — no Fleet API cost. Absent topics
             # simply leave the field None and the Vehicle tab hides that row.

@@ -160,6 +160,12 @@ class Event:
     def tesla_power(self):
         _value = round(self.value)
         self.gs_client.set("tesla_power_updated_at", time.time())
+        self.adjust_ac_out_power()
+        publish_message("Tesla/vehicle0/charging_watts", message=f"{_value}", retain=True)
+        publish_message("Tesla/vehicle0/Ac/tesla_load", message=f"{_value}", retain=True)
+
+    def tesla_abb_power(self):
+        """Keep historical charge transitions tied to the ABB meter."""
         try:
             record_ev_power_observation(
                 self.value,
@@ -171,9 +177,6 @@ class Event:
             logging.warning(
                 f"EvCharger: unable to record ABB power transition: {e}"
             )
-        self.adjust_ac_out_power()
-        publish_message("Tesla/vehicle0/charging_watts", message=f"{_value}", retain=True)
-        publish_message("Tesla/vehicle0/Ac/tesla_load", message=f"{_value}", retain=True)
 
     def ac_out_power(self):
         manage_grid_usage_based_on_current_price(price=self.gs_client.get('tibber_price_now'), power=int(self.value))

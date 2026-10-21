@@ -40,7 +40,7 @@ def test_powerflow_ev_card_uses_per_phase_current_like_vehicle_tab():
     app = APP_JS.read_text(encoding="utf-8")
 
     for phase in (1, 2, 3):
-        assert f'"ev_l{phase}_a": f"N/{{sid}}/evcharger/42/Ac/L{phase}/Current"' in live
+        assert f'"ev_l{phase}_a": f"N/{{sid}}/acload/42/Ac/L{phase}/Current"' in live
         assert f'out["ev_l{phase}_a"] = _num("ev_l{phase}_a")' in live
     assert "const evMeterPhaseAmps" in powerflow
     assert "live.ev_l1_a, live.ev_l2_a, live.ev_l3_a" in powerflow

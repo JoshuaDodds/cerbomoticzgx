@@ -73,15 +73,17 @@ Topics = dict({
             "tibber_cost_lowest3_today":        f"Tibber/home/price_info/today/lowest/2/cost",
             "tibber_export_schedule_status":    f"Tibber/home/price_info/today/tibber_export_schedule_status",
 
-            # Tesla specific metrics
-            "tesla_power":                  f"N/{systemId0}/evcharger/42/Ac/Power",
+            # Victron EVCS live power (instance 40). ABB meter instance 42 remains
+            # authoritative for historical energy and measured phase currents.
+            "tesla_power":                  f"N/{systemId0}/evcharger/40/Ac/Power",
+            "tesla_abb_power":              f"N/{systemId0}/acload/42/Ac/Power",
             # Lifetime cumulative EV-charge energy (kWh) from the ABB B23/B24 meter.
             # Diffed per-slot at settlement into ev_charge_kwh (the true, restart-safe
             # measured EV energy — no integration or scaling). See docs/EV_LOAD_DECOMPOSITION.md.
-            "tesla_charge_energy_forward":  f"N/{systemId0}/evcharger/42/Ac/Energy/Forward",
-            "tesla_l1_current":             f"N/{systemId0}/evcharger/42/Ac/L1/Current",
-            "tesla_l2_current":             f"N/{systemId0}/evcharger/42/Ac/L2/Current",
-            "tesla_l3_current":             f"N/{systemId0}/evcharger/42/Ac/L3/Current",
+            "tesla_charge_energy_forward":  f"N/{systemId0}/acload/42/Ac/Energy/Forward",
+            "tesla_l1_current":             f"N/{systemId0}/acload/42/Ac/L1/Current",
+            "tesla_l2_current":             f"N/{systemId0}/acload/42/Ac/L2/Current",
+            "tesla_l3_current":             f"N/{systemId0}/acload/42/Ac/L3/Current",
             "tesla_plug_status":            f"Tesla/vehicle0/plugged_status",
             "tesla_is_home":                f"Tesla/vehicle0/is_home",
             "tesla_is_charging":            f"Tesla/vehicle0/is_charging",
@@ -123,6 +125,7 @@ mqtt_msg_value_conversion = dict({
     "batt_soc":     lambda value: round(value, 2),
     "batt_voltage": lambda value: round(value, 2),
     "tesla_power":  lambda value: f"{round(value)};1",
+    "tesla_abb_power": lambda value: f"{round(value)};1",
     "batt_power":   lambda value: f"{round(value)};1",
 })
 
@@ -160,7 +163,8 @@ DzEndpoints = dict({
         str(f"{Topics['system0']['pv_current']}"):      f"{dzEndpoint}{DzDevices['system0']['pv_current']}&nvalue=0&svalue=",
         str(f"{Topics['system0']['system_state']}"):    f"{dzEndpoint}{DzDevices['system0']['system_state']}&nvalue=0&svalue=",
         str(f"{Topics['system0']['tibber_total']}"):    f"{dzEndpoint}{DzDevices['system0']['tibber_total']}&svalue=",
-        str(f"{Topics['system0']['tesla_power']}"):     f"{dzEndpoint}{DzDevices['system0']['tesla_power']}&nvalue=0&svalue=",
+        # Keep the Domoticz EV device and its CounterToday history on ABB input.
+        str(f"{Topics['system0']['tesla_abb_power']}"): f"{dzEndpoint}{DzDevices['system0']['tesla_power']}&nvalue=0&svalue=",
         str(f"{Topics['system0']['batt_power']}"):      f"{dzEndpoint}{DzDevices['system0']['batt_power']}&nvalue=0&svalue=",
     },
     "vehicle0": {
