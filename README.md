@@ -33,6 +33,11 @@ a Domoticz server via its REST API for monitoring and historic tracking
 - Modular - Individual modules can be enabled or disabled in the ```.env``` file    
 - Included a custom module which can be installed on a cerbo gx to read out ABB B2x kWh meters
 - EV Charge Controller - Tesla vehicle charging at lowest rates or using only excess solar energy.
+  Live EV power comes from the Victron EVCS on Cerbo MQTT
+  `N/<portal-id>/evcharger/40/Ac/Power`. The ABB meter remains the source of
+  lifetime energy, charge-transition history, and all three measured phase
+  currents under `N/<portal-id>/acload/42`. Tesla Fleet commands and vehicle
+  status remain in use. See `docs/EVCS_TELEMETRY_2026-10-21.md`.
   While the car is home and plugged in, this controller is authoritative: charging is permitted
   only during an applied smart block, from protected PV surplus, or by the explicit combination
   of Vehicle **Start** plus **Grid assist**. Neither manual flag starts the car by itself, and
@@ -40,7 +45,7 @@ a Domoticz server via its REST API for monitoring and historic tracking
   the current smart block so the controller cannot immediately restart it. Manual/grid starts restore the
   configured full-rate request, bounded by the configured kW and per-phase ceilings, then confirm the pushed
   requested-current state within 60 seconds and continue guarded reconciliation while the
-  explicit override remains active. Actual ABB delivery is observed
+  explicit override remains active. Actual EVCS delivery is observed
   but never used to fight Maxem throttling; Maxem's transient
   `ChargeCurrentRequestMax` availability also does not rewrite the durable plan target.
 - **Deadline-aware EV smart charging** (off by default): create one target-SoC/ready-by job on
@@ -59,7 +64,7 @@ a Domoticz server via its REST API for monitoring and historic tracking
   schedule. The controller retries the limit at 60-second acknowledgement intervals until
   `ChargeLimitSoc` confirms it; confirmed values are not resent. Current/start requests likewise
   remain visibly `at_risk` and continue guarded reconciliation while their intent is active,
-  while owned schedule mutations remain bounded. ABB delivery is observed for actual power flow
+  while owned schedule mutations remain bounded. EVCS delivery is observed for actual power flow
   but never used to fight Maxem throttling. Every Tesla write records a concise
   `EvCharger [Tesla API]` sent/result line, with pushed confirmation logged separately. A command
   rejected because the vehicle buses are asleep gets a 10-second passive grace and one command
@@ -79,7 +84,7 @@ a Domoticz server via its REST API for monitoring and historic tracking
   precision; multi-window plans show their separate continuous deadline fallback explicitly.
   Once accepted delivery rises above 5 A, the controller releases current regulation to Maxem
   rather than repeatedly asserting the configured ceiling. The same handoff occurs
-  when a command was locally blocked/rejected but a newer ABB sample proves the
+  when a command was locally blocked/rejected but a newer EVCS sample proves the
   requested full-rate ramp happened anyway. On startup, an ordinary authorized
   block that is already physically charging does not install a redundant future
   Tesla start schedule; explicit Run Now retains its requested schedule-replacement
@@ -90,10 +95,10 @@ a Domoticz server via its REST API for monitoring and historic tracking
   removes its exact Tesla fallback schedule IDs (including the branch's one legacy ID), then
   deletes the matching local job/plan snapshots and returns the Vehicle UI to idle. Failed
   Tesla cleanup retains the terminal marker for bounded retry instead of hiding an old schedule.
-  An accepted stop is observed against the ABB meter for 60 seconds before another stop may be
-  sent, preventing duplicate commands during normal charger ramp-down. Fresh ABB power below
+  An accepted stop is observed against the EVCS meter for 60 seconds before another stop may be
+  sent, preventing duplicate commands during normal charger ramp-down. Fresh EVCS power below
   250 W is authoritative charger-idle evidence even if Tesla's change-driven charging flag is
-  stale; if the ABB sample is unavailable, the controller falls back conservatively to Tesla.
+  stale; if the EVCS sample is unavailable, the controller falls back conservatively to Tesla.
   Run Now records whether it enabled Grid assist: cancellation releases a module-owned toggle
   immediately, while a Grid assist setting that was already enabled by the user is preserved.
 - **Tesla Fleet Telemetry** (`TESLA_TELEMETRY_ENABLED`, off by default): an optional streaming push
@@ -132,6 +137,7 @@ a Domoticz server via its REST API for monitoring and historic tracking
 - dynamic ESS algorithms for automated buy and sell of energy
 - solar forecasting data specific to your installation using ML models and AI for quite accurate current day production forecasts (courtesy of new VRM API features developed by Victron Energy). Note: A Victron VRM portal account is needed for this feature.
 - **AI Powered ESS Optimization**: A feature-flagged module that optimizes battery charging and discharging schedules using a dynamic-programming search over battery state-of-charge. It plans across the full available Tibber price horizon, accounts for conversion efficiency, PV/load forecasts, battery wear, stored-energy cost and seasonal reserves, and keeps Summer and Winter engines restart-isolated. Summer can optionally compare Trading, PV-first and protected-hybrid constraint sets through the same live engine; Trading is accepted only when its benefit clears a fixed minimum plus learned forecast risk, otherwise the best conservative plan runs. Winter replenishes only enough in low-price windows to protect household coverage and permits routine self-supply above its emergency reserve. Manual Override and an explicit Victron grid outage suppress **writes**, not sensing, settlement or dashboard updates. During an outage the logical 40% winter reserve is released for emergency house use; it is never written as Victron Recharge. The separate `scripts/evaluate_ess_strategies.py` tool remains read-only research and never selects dispatch.
+- **21 October 2026 ESS review and release note:** [Seasonal economics review](docs/ESS_SEASONAL_REVIEW_2026-10-21.md) records the full-history Summer/Winter evidence, the intended Trader and Green objectives, and the staged validation plan. If Winter's full household-coverage checkpoint is infeasible while SoC starts below reserve, its degraded plan now restores the reserve by the earliest feasible selected charge trough, or as far as physically possible by the known horizon. A `green_conservation` Summer-engine policy is available for offline replay; the live selector does not consider it yet. The dashboard now shows core ESS decisions first and places optimizer internals under **Advanced settings**, without changing saved values or control authority.
 - HomeConnect supported appliance control. Schedules appliances to run at cheapest time of day without user intervention
 - **Web dashboard** (`frontend/`): a self-contained operator dashboard (Flask). It shows the Overview entry point, ESS tabs, current decision, a plain-language remaining-day P/L strategy, expandable hour->15-min->reasoning schedule tree (with a collapsed **previous-day settled** view and a moving today-so-far ledger row), a **live power-flow** diagram, **Trends** (toggleable SoC/price chart, actual-vs-forecast PV/load overlay, and daily final-net forecast spread with settled/latest-projection dots), a desktop **Weather** tab with toggleable chart series, sticky header status chips and a stale-backend **Server Offline** banner, guarded Victron Schedule clearing, Replan/Restart/Override/Grid assist operator buttons, and allow-listed `.env` config editing. Runs as its own process/sidecar (`python -m frontend`) or an optional in-process thread. Set `APP_ENV_PATH` when the writable `.env` lives outside the app working directory. See `frontend/README.md`.
 - **Weather shadow mode** (`lib/weather.py` + dashboard Weather tab): fetches keyless Open-Meteo forecasts using `HOME_ADDRESS_LAT` / `HOME_ADDRESS_LONG`, caches them in `data/weather/`, computes Summer cooling or Winter heating anomalies relative to the trailing three-day load baseline, and builds GTI-shaped PV shadow forecasts. Panel azimuth uses a conventional compass bearing (`0=N`, `90=E`, `180=S`, `270=W`) and is converted for the provider. Fair PV comparison records both final branches after the same confidence-qualified live nowcast; a single daylight low/0 W observation is held pending, while a confirmed second source update or fresh near-sunset reading may lower the near-term forecast. `HVAC_LOAD_APPLY` and `PV_WEATHER_APPLY` default to `False`; use `python scripts/validate_forecasts.py --dir data/history` and review its fail-closed evidence gate before enabling either.

@@ -205,7 +205,7 @@ sharing the host's `/dev/shm` (so it can read the published plan). Expose
   multi-block plans show their distinct continuous deadline fallback explicitly. Neither path
   alters unrelated user schedules. Maxem can reduce actual charger power independently; after
   an accepted full-rate bootstrap produces more than 5 A of measured delivery, the app releases
-  current regulation instead of chasing Maxem with repeated commands. A newer ABB
+  current regulation instead of chasing Maxem with repeated commands. A newer EVCS
   ramp above 5 A also closes a locally blocked/rejected bootstrap, and an ordinary
   active block already charging at service startup skips a redundant future-start
   schedule. Preview mode gates only these new
@@ -248,7 +248,13 @@ sharing the host's `/dev/shm` (so it can read the published plan). Expose
   **Clear chat** starts a fresh session.
 - **Configuration** (tab): click any value to edit it (number/select), confirm, and Save.
   Numeric settings expose schema min/max bounds and the server rejects out-of-range
-  writes. On phones, descriptions sit behind an info toggle so edit targets remain large.
+  writes. Seasonal mode, battery reserve/limits, and tariff values appear first in
+  the ESS groups; optimizer internals remain editable under **Advanced settings**.
+  This disclosure does not alter `.env`, the API allow-list, or the AI Advisor's
+  view of tunables. `WINTER_MODE` selects Green/Winter after the supervised
+  restart; the Summer comparison switch still compares Trading, PV-first and
+  protected hybrid, and does not yet include the replay-only Green candidate.
+  On phones, descriptions sit behind an info toggle so edit targets remain large.
 
 ## Config knobs — how writes propagate
 
@@ -341,11 +347,11 @@ reuses `MOSQUITTO_IP` and `VRM_PORTAL_ID`.
   was already off and suppresses the current smart block. The EV controller uses command-first,
   delayed wake escalation and local-meter stop
   verification even if pushed location/plug state is stale. An accepted stop receives a
-  60-second ABB observation grace before another stop can be sent. Fresh ABB idle power also
+  60-second EVCS observation grace before another stop can be sent. Fresh EVCS idle power also
   prevents a stale Tesla charging flag from reopening that completed stop lifecycle. Start restores the configured
   full-rate request (bounded by the configured kW and 1–25 A/phase ceilings), verifies `ChargeCurrentRequest`
   within 60 seconds, and continues guarded reconciliation while the explicit override remains
-  active. ABB power is delivery evidence only, so a
+  active. EVCS power is delivery evidence only, so a
   Maxem reduction cannot cause repeated Fleet current commands.
   While home and plugged, Tesla-app/onboard starts and stops are observations rather than
   overrides: unauthorized starts are stopped, authorized starts are adopted, and an external

@@ -341,6 +341,26 @@ def test_infeasible_checkpoint_degrades_with_warning_not_invented_energy(setting
         assert dc <= 0.1 + 1e-6
 
 
+def test_infeasible_coverage_still_recovers_outage_reserve(settings):
+    settings['ESS_MAX_CHARGE_KW'] = '3'
+    settings['ESS_MAX_GRID_IMPORT_KW'] = '3'
+    # The first one-hour trough cannot reach its coverage checkpoint from 0%,
+    # and the narrow spread does not pay for a cycle.  The last trough is
+    # cheaper, but the reserve must recover at the second feasible trough.
+    result = winter.OptimizationEngine().optimize(
+        0, _prices([0.15, 0.16, 0.15, 0.16, 0.05, 0.16]),
+        [0, 1, 0, 1, 0, 1], [0] * 6)
+
+    assert result is not None
+    assert result['winter_policy']['warning'] == 'coverage_infeasible_safest_feasible_plan'
+    assert result['schedule'][-1]['soc_end'] >= 20
+    assert result['schedule'][2]['soc_end'] >= 20
+    assert _active_buys(result)
+    assert all(step['soc_end'] >= step['soc_start']
+               for step in result['schedule'] if step['soc_start'] < 20)
+    assert len(result['victron_slots']) <= 5
+
+
 def test_negative_and_flat_prices_are_stable(settings):
     negative = winter.OptimizationEngine().optimize(
         20, _prices([-0.05, -0.05, 0.20]), [0] * 3, [0] * 3)

@@ -12,12 +12,12 @@ CONFIG_SCHEMA = [
         "settings": [
             {"key": "AI_POWERED_ESS_ALGORITHM", "label": "AI optimizer enabled", "type": "bool",
              "desc": "Master switch for the AI-powered ESS optimizer."},
-            {"key": "WINTER_MODE", "label": "Winter Mode", "type": "bool",
-             "desc": "Use the restart-isolated winter optimizer and winter SoC reserve. Off keeps the summer optimizer and summer reserve."},
+            {"key": "WINTER_MODE", "label": "Green / Winter mode", "type": "bool",
+             "desc": "On: Green planning with the winter reserve and cheap-price replenishment. Off: Summer Trading with the summer reserve. Switching mode requires a service restart."},
             {"key": "APPLIANCE_OPTIMIZATION_ENABLED", "label": "Appliance optimized scheduling", "type": "bool",
              "desc": "Defer supported appliances to lower-cost times in either Summer or Winter Mode when Home Connect scheduling is enabled. Dishwasher preferred-program enforcement remains active whenever Home Connect scheduling is enabled. Requires a restart."},
-            {"key": "ESS_ADAPTIVE_POLICY_ENABLED", "label": "Adaptive Summer strategy", "type": "bool",
-             "desc": "In Summer Mode, execute the best risk-adjusted Trading, PV-first or protected-hybrid plan. The selected strategy replans every cycle; all three are compared on the configured interval and when the price horizon extends. Defaults off for attended validation; Winter Mode remains separate."},
+            {"key": "ESS_ADAPTIVE_POLICY_ENABLED", "label": "Compare Summer strategies", "type": "bool",
+             "desc": "Compare Trading with PV-first and protected-hybrid plans in Summer Mode. The current alternatives do not yet provide full Green-style grey-day conservation. The selected strategy replans every cycle. Defaults off for attended validation."},
             {"key": "ESS_ADAPTIVE_TRADE_MIN_BENEFIT_EUR", "label": "Minimum Trading advantage (€)", "type": "float",
              "desc": "Minimum forecast benefit Trading must add above the best conservative Summer plan, before the configured fraction of learned forecast risk is added."},
             {"key": "ESS_ADAPTIVE_FORECAST_RISK_MAX_EUR", "label": "Forecast-risk cap (€)", "type": "float",
@@ -78,9 +78,9 @@ CONFIG_SCHEMA = [
             {"key": "ESS_EXPORT_AC_SETPOINT", "label": "Max export setpoint (W)", "type": "float",
              "desc": "Negative AC power setpoint commanded for a forced SELL (e.g. -13000)."},
             {"key": "MIN_SOC_RESERVE_WINTER", "label": "Winter SoC reserve (%)", "type": "float",
-             "desc": "Logical planning floor used when Winter Mode is on; it does not command Victron Recharge."},
+             "desc": "Outage reserve for Green/Winter planning and the offline Summer Green candidate. It does not command Victron Recharge."},
             {"key": "MIN_SOC_RESERVE_SUMMER", "label": "Summer SoC reserve (%)", "type": "float",
-             "desc": "Logical planning floor used when Winter Mode is off; it does not change Victron's hard minimum."},
+             "desc": "Logical floor for live Summer Trading and its current conservative alternatives. It does not change Victron's hard minimum."},
         ],
     },
     {
@@ -323,3 +323,21 @@ for _group in CONFIG_SCHEMA:
     for _setting in _group["settings"]:
         if _setting.get("type") in ("int", "float"):
             _setting["min"], _setting["max"] = _NUMERIC_BOUNDS[_setting["key"]]
+
+# Presentation only: all settings stay in the API, edit allow-list, and Advisor.
+# Keep physical and tariff facts visible; put optimizer internals behind disclosure.
+_ESS_VISIBLE_KEYS = {
+    "AI_POWERED_ESS_ALGORITHM", "WINTER_MODE",
+    "APPLIANCE_OPTIMIZATION_ENABLED", "ESS_ADAPTIVE_POLICY_ENABLED",
+    "ESS_ADAPTIVE_TRADE_MIN_BENEFIT_EUR", "ESS_MIN_SELL_PRICE",
+    "BATTERY_CAPACITY_KWH", "VICTRON_HARDWARE_MIN_SOC",
+    "MIN_SOC_RESERVE_WINTER", "MIN_SOC_RESERVE_SUMMER",
+    "ESS_MAX_GRID_CHARGE_SOC", "ESS_MAX_CHARGE_KW",
+    "ESS_MAX_DISCHARGE_KW", "ESS_MAX_GRID_IMPORT_KW",
+    "ESS_MAX_GRID_EXPORT_KW", "TIBBER_PRICE_RESOLUTION",
+    "ESS_EXPORT_PRICE_FACTOR", "ESS_EXPORT_FEE",
+}
+for _group in CONFIG_SCHEMA[:3]:
+    for _setting in _group["settings"]:
+        if _setting["key"] not in _ESS_VISIBLE_KEYS:
+            _setting["advanced"] = True

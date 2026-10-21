@@ -40,6 +40,16 @@ def _snapshot_with(values):
     return m.snapshot()
 
 
+def test_dashboard_keeps_abb_energy_and_phase_current_with_evcs_session_time():
+    topics = MqttLive()._build_topics("portal-123")
+    assert topics["ev_energy_kwh"] == "N/portal-123/acload/42/Ac/Energy/Forward"
+    assert topics["ev_charge_time"] == "N/portal-123/evcharger/40/ChargingTime"
+    for phase in (1, 2, 3):
+        assert topics[f"ev_l{phase}_a"] == (
+            f"N/portal-123/acload/42/Ac/L{phase}/Current"
+        )
+
+
 def test_snapshot_exposes_v2_fields_when_present():
     snap = _snapshot_with({
         "grid_l1": -2056, "grid_l2": -714, "grid_l3": -1445,

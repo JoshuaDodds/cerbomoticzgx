@@ -458,6 +458,34 @@ class OptimizationEngine:
             ))
         return checkpoints, export_envelope, window_details
 
+    def _reserve_recovery_checkpoint(self, slots, slot_h, windows):
+        """Find the first trough that can restore an opening reserve deficit.
+
+        This conservative bound counts grid-charge headroom only.  It keeps a
+        degraded plan from postponing reserve recovery to a later, marginally
+        cheaper trough after an earlier selected window could already do it.
+        A false-positive bound is harmless: the caller retries without this
+        checkpoint if the full physical DP finds it unreachable.
+        """
+        target = min(self.min_soc, self.max_grid_charge_soc)
+        missing_dc = max(0.0, target - self.initial_protected_soc) \
+            / 100.0 * self.battery_capacity
+        if missing_dc <= EPS:
+            return {}
+        possible_dc = 0.0
+        for start, end in windows:
+            for index in range(start, end + 1):
+                net_load = slots[index]['load'] - slots[index]['pv']
+                grid_room = max(
+                    0.0, self.max_power_import * slot_h - max(0.0, net_load))
+                possible_dc += min(
+                    self.max_charge_power * slot_h,
+                    grid_room * self.charge_efficiency,
+                )
+            if possible_dc >= missing_dc - EPS:
+                return {end: target}
+        return {}
+
     def _exceptional_economics(self, slots):
         low_buy = min(slot['buy'] for slot in slots)
         high_sell = max(self._sell_price(slot['buy']) for slot in slots)
@@ -479,7 +507,7 @@ class OptimizationEngine:
 
     def _run_candidate(self, slots, slot_h, windows, checkpoints,
                        export_envelope, allow_exceptional_export,
-                       discharge_blocked_starts=None):
+                       discharge_blocked_starts=None, recover_reserve=False):
         steps = len(slots)
         allowed_charge = {
             index for start, end in windows for index in range(start, end + 1)
@@ -591,6 +619,16 @@ class OptimizationEngine:
         viable = [state for state in self.soc_states if dp[steps][state] < float('inf')]
         if not viable:
             return None
+        if recover_reserve:
+            # Dropping an unreachable coverage checkpoint must not also make
+            # the outage reserve optional.  Starting below reserve creates an
+            # economic dead zone: charging up to the floor costs money while
+            # none of that energy may be used for routine self-supply.  Reach
+            # the configured floor by the horizon end when physically possible;
+            # otherwise recover as far as the available windows allow.
+            recovery_floor = min(self.min_soc, self.max_grid_charge_soc)
+            recovered = [state for state in viable if state >= recovery_floor - EPS]
+            viable = recovered or [max(viable)]
         end_soc = min(
             viable,
             key=lambda state: (dp[steps][state], spill_dp[steps][state]),
@@ -754,12 +792,18 @@ class OptimizationEngine:
             warning = 'max_grid_charge_soc_below_winter_reserve'
         if normal is None:
             # An unreachable checkpoint (usually a short trough plus a strict
-            # power cap) must not invent energy. Retry without the hard coverage
-            # checkpoint, surface the degraded guarantee, and retain all physical
-            # limits and the configured reserve.
-            normal = self._run_candidate(
-                slots, slot_h, windows, {}, export_envelope, False,
-                discharge_blocked_starts)
+            # power cap) must not invent energy. Try the earliest physically
+            # plausible reserve recovery, then a terminal recovery if the
+            # tighter checkpoint proves unreachable. Keep all physical limits.
+            recovery = self._reserve_recovery_checkpoint(slots, slot_h, windows)
+            if recovery:
+                normal = self._run_candidate(
+                    slots, slot_h, windows, recovery, export_envelope, False,
+                    discharge_blocked_starts, recover_reserve=True)
+            if normal is None:
+                normal = self._run_candidate(
+                    slots, slot_h, windows, {}, export_envelope, False,
+                    discharge_blocked_starts, recover_reserve=True)
             warning = 'coverage_infeasible_safest_feasible_plan'
         if normal is None:
             logging.error("WINTER_ESS: No physically feasible self-sufficiency plan.")
