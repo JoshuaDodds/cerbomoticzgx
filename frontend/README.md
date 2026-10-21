@@ -248,7 +248,13 @@ sharing the host's `/dev/shm` (so it can read the published plan). Expose
   **Clear chat** starts a fresh session.
 - **Configuration** (tab): click any value to edit it (number/select), confirm, and Save.
   Numeric settings expose schema min/max bounds and the server rejects out-of-range
-  writes. On phones, descriptions sit behind an info toggle so edit targets remain large.
+  writes. Seasonal mode, battery reserve/limits, and tariff values appear first in
+  the ESS groups; optimizer internals remain editable under **Advanced settings**.
+  This disclosure does not alter `.env`, the API allow-list, or the AI Advisor's
+  view of tunables. `WINTER_MODE` selects Green/Winter after the supervised
+  restart; the Summer comparison switch still compares Trading, PV-first and
+  protected hybrid, and does not yet include the replay-only Green candidate.
+  On phones, descriptions sit behind an info toggle so edit targets remain large.
 
 ## Config knobs — how writes propagate
 

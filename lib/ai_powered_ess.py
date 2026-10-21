@@ -1047,7 +1047,7 @@ class OptimizationEngine:
                 # make the candidate infeasible by construction.
                 'force_floor_recovery': False,
             }
-        if name != 'protected_hybrid':
+        if name not in ('protected_hybrid', 'green_conservation'):
             return {
                 'policy_name': 'market_arbitrage',
                 'allow_active_grid_charge': True,
@@ -1058,6 +1058,16 @@ class OptimizationEngine:
                 'force_floor_recovery': True,
             }
 
+        # Green is an offline Summer fallback candidate. Use the operator's
+        # existing outage reserve so a grey-day switch does not leave the
+        # battery at the Summer trading floor (which may be zero).
+        coverage_reserve = self.min_soc
+        if name == 'green_conservation':
+            coverage_reserve = max(
+                self.min_soc,
+                _clamp(_safe_float('MIN_SOC_RESERVE_WINTER', self.min_soc),
+                       0.0, 100.0),
+            )
         threshold = _percentile(buy_prices, 0.25)
         risk_factor = _clamp(
             _safe_float('ESS_ADAPTIVE_FORECAST_RISK_FACTOR', 0.20), 0.0, 1.0)
@@ -1103,11 +1113,11 @@ class OptimizationEngine:
             required_dc = required_ac / max(EPS, self.discharge_efficiency)
             required_dc *= 1.0 + risk_factor
             protected = (
-                self.min_soc
+                coverage_reserve
                 + required_dc / self.battery_capacity * 100.0
             )
             snapped = math.ceil(protected / self.soc_step) * self.soc_step
-            return _clamp(snapped, self.min_soc, 100.0)
+            return _clamp(snapped, coverage_reserve, 100.0)
 
         # Outside a cheap valley, retain only the energy still needed to reach
         # the next valley. The floor naturally declines as household demand is
@@ -1126,7 +1136,7 @@ class OptimizationEngine:
                 steps,
             )
             floors[index] = household_floor(index + 1, next_low)
-            ceilings[index] = max(self.min_soc, min(
+            ceilings[index] = max(coverage_reserve, min(
                 self.max_grid_charge_soc, floors[index]))
 
         # Each valley receives one coverage target: enough energy to serve the
@@ -1142,15 +1152,15 @@ class OptimizationEngine:
             )
             target = household_floor(window_end + 1, next_low)
             for index in range(window_start, window_end + 1):
-                floors[index] = self.min_soc
+                floors[index] = coverage_reserve
                 if cheap[index]:
-                    ceilings[index] = max(self.min_soc, min(
+                    ceilings[index] = max(coverage_reserve, min(
                         self.max_grid_charge_soc, target))
             floors[window_end] = target
         return {
             'policy_name': name,
             'allow_active_grid_charge': True,
-            'allow_active_battery_export': True,
+            'allow_active_battery_export': name == 'protected_hybrid',
             'protected_floor_by_step': floors,
             'grid_charge_ceiling_by_step': ceilings,
             'grid_charge_allowed_by_step': cheap,
@@ -1495,7 +1505,7 @@ class OptimizationEngine:
         # so every surface (console, web UI, plan JSON, history) shows the same label.
         for i, step in enumerate(schedule):
             code, text = self._explain_action(schedule, i)
-            if (policy_name == 'protected_hybrid'
+            if (policy_name in ('protected_hybrid', 'green_conservation')
                     and step['action'] == 'hold'
                     and step.get('protected_soc', self.min_soc) > self.min_soc + EPS):
                 code = 'HOUSEHOLD_RESERVE_PROTECTED'

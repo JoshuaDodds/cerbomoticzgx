@@ -1043,6 +1043,53 @@ class TestAIPoweredESS(unittest.TestCase):
             for step in result['schedule'][4:]
         ))
 
+    def test_green_conservation_charges_for_load_without_active_export(self):
+        """The replay-only Summer Green policy can buy but cannot dump stored energy."""
+        start = datetime(2099, 8, 1, 8, 0, tzinfo=tz.UTC)
+        prices = [
+            {'start': start + timedelta(hours=i), 'total': price}
+            for i, price in enumerate([0.34, 0.33, 0.10, 0.10, 0.45, 0.45])
+        ]
+        settings = {
+            'ESS_ADAPTIVE_FORECAST_RISK_FACTOR': '0',
+            'ESS_ADAPTIVE_UNKNOWN_HORIZON_HOURS': '0',
+            'MIN_SOC_RESERVE_WINTER': '40',
+        }
+        with patch.object(ai_powered_ess, 'retrieve_setting',
+                          side_effect=lambda key: settings.get(key)):
+            result = self.engine.optimize(
+                45.0, prices, [1.0] * len(prices), [0.0] * len(prices),
+                policy_name='green_conservation')
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result['strategy'], 'green_conservation')
+        self.assertTrue(any(
+            step['control_action'] == 'BUY' for step in result['schedule'][2:4]
+        ))
+        self.assertTrue(all(
+            step['soc_end'] >= 40.0 - ai_powered_ess.EPS
+            for step in result['schedule']
+        ))
+        self.assertFalse(any(
+            step['soc_end'] < step['soc_start'] - ai_powered_ess.EPS
+            and step['grid_energy'] < -ai_powered_ess.EPS
+            for step in result['schedule']
+        ))
+
+        # Excess solar still flows to the grid when a full battery cannot
+        # absorb it; the prohibition applies to stored-energy export only.
+        with patch.object(ai_powered_ess, 'retrieve_setting',
+                          side_effect=lambda key: settings.get(key)):
+            solar_result = self.engine.optimize(
+                100.0, prices[:2], [0.0, 0.0], [3.0, 3.0],
+                policy_name='green_conservation')
+        self.assertIsNotNone(solar_result)
+        self.assertTrue(any(
+            step['grid_energy'] < -ai_powered_ess.EPS
+            and step['soc_end'] >= step['soc_start'] - ai_powered_ess.EPS
+            for step in solar_result['schedule']
+        ))
+
     def test_pv_first_uses_stored_energy_at_high_price(self):
         start = datetime(2099, 8, 1, 0, 0, tzinfo=tz.UTC)
         prices = [

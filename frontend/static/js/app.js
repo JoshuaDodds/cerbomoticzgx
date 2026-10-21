@@ -1279,6 +1279,8 @@ function makeConfigValueEditable(valueControl, label, activate) {
   });
 }
 
+const openAdvancedConfigGroups = new Set();
+
 function renderConfig(cfg) {
   const box = $("#config");
   box.innerHTML = "";
@@ -1287,7 +1289,7 @@ function renderConfig(cfg) {
   cfg.groups.forEach((g) => {
     const grp = el("div", "card cfg-group");
     grp.appendChild(el("h3", null, g.group));
-    g.settings.forEach((s) => {
+    const appendSetting = (container, s) => {
       const item = el("div", "cfg-item");
       const val = s.effective_label || (s.value === "" ? "—" : s.value);
       const description = s.editor_help || s.desc || "";
@@ -1311,8 +1313,21 @@ function renderConfig(cfg) {
       }
       const valueControl = item.querySelector(".v");
       makeConfigValueEditable(valueControl, s.label, () => startEdit(item, s));
-      grp.appendChild(item);
-    });
+      container.appendChild(item);
+    };
+    g.settings.filter((s) => !s.advanced).forEach((s) => appendSetting(grp, s));
+    const advanced = g.settings.filter((s) => s.advanced);
+    if (advanced.length) {
+      const disclosure = el("details", "cfg-advanced");
+      disclosure.open = openAdvancedConfigGroups.has(g.group);
+      disclosure.addEventListener("toggle", () => {
+        if (disclosure.open) openAdvancedConfigGroups.add(g.group);
+        else openAdvancedConfigGroups.delete(g.group);
+      });
+      disclosure.appendChild(el("summary", null, `Advanced settings (${advanced.length})`));
+      advanced.forEach((s) => appendSetting(disclosure, s));
+      grp.appendChild(disclosure);
+    }
     box.appendChild(grp);
   });
 }
