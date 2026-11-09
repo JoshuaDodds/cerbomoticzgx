@@ -137,7 +137,7 @@ function makeWindowStub() {
   return win;
 }
 
-function loadDashboard() {
+function loadDashboard(setup) {
   const document = makeDocumentStub();
   const window = makeWindowStub();
   const context = {
@@ -157,6 +157,7 @@ function loadDashboard() {
   window.window = context;   // self-reference, some browser code does window.window
   context.self = context;
   vm.createContext(context);
+  if (setup) setup({ context, document, window });
 
   for (const name of SCRIPTS) {
     const filePath = path.join(STATIC_JS, name);

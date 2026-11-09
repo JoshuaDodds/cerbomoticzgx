@@ -196,6 +196,41 @@ class TestAIPoweredESS(unittest.TestCase):
         self.assertEqual(step['grid_energy'], 0.0)
         self.assertEqual(result['objective_cost_eur'], 0.0)
 
+    def test_pv_first_supplies_small_peak_load_from_large_battery(self):
+        """A one-percent state jump must not strand usable battery energy."""
+        self.engine.battery_capacity = 42.0
+        self.engine.charge_efficiency = 0.92
+        self.engine.discharge_efficiency = 0.92
+        self.engine.min_soc = 40.0
+        self.engine.terminal_value_factor = 0.0
+        self.engine.slot_minutes = 15.0
+        self.engine.soc_step = 1.0
+        self.engine.soc_states = [float(value) for value in range(101)]
+        base = datetime.now(tz.UTC).replace(
+            minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        prices = [
+            {'start': base + timedelta(minutes=15 * index), 'total': 0.50}
+            for index in range(4)
+        ]
+
+        result = self.engine.optimize(
+            90.0, prices, [0.35] * 4, [0.0] * 4,
+            policy_name='pv_first_self_sufficiency')
+
+        self.assertIsNotNone(result)
+        self.assertLess(self.engine.soc_step, 1.0)
+        self.assertEqual(result['schedule'][0]['control_action'], 'IDLE')
+        self.assertLess(result['schedule'][0]['grid_energy'], 0.10)
+        self.assertGreaterEqual(result['schedule'][0]['grid_energy'], 0.0)
+        self.assertGreaterEqual(
+            min(step['soc_end'] for step in result['schedule']), 40.0)
+
+        market = self.engine.optimize(
+            90.0, prices, [0.35] * 4, [0.0] * 4,
+            policy_name='market_arbitrage')
+        self.assertIsNotNone(market)
+        self.assertEqual(self.engine.soc_step, 1.0)
+
     def test_buy_reason_names_best_cross_day_sell_not_first_tiny_export(self):
         base = datetime(2026, 8, 20, 14, 0, tzinfo=tz.UTC)
         schedule = [
@@ -1641,7 +1676,7 @@ def test_adaptive_replans_only_selected_policy_between_full_evaluations(
     prices = [{'start': now + timedelta(hours=1), 'total': 0.20}]
     state_path = tmp_path / 'policy.json'
     state_path.write_text(json.dumps({
-        'selected': 'protected_hybrid',
+        'selected': 'green_conservation',
         'selected_at': time.time(),
         'evaluated_at': time.time(),
         'price_horizon_signature': ai_powered_ess._price_horizon_signature(
@@ -1654,7 +1689,7 @@ def test_adaptive_replans_only_selected_policy_between_full_evaluations(
         'ESS_ADAPTIVE_UNKNOWN_HORIZON_HOURS': '0',
     }
     calls = []
-    plan = _adaptive_candidate('protected_hybrid', [0.0], 5.0)
+    plan = _adaptive_candidate('green_conservation', [0.0], 5.0)
     plan['slot_duration_h'] = 1.0
 
     class FakeEngine:
@@ -1680,7 +1715,7 @@ def test_adaptive_replans_only_selected_policy_between_full_evaluations(
 
     result = ai_powered_ess.optimize_schedule(50.0, prices)
 
-    assert calls == ['protected_hybrid']
+    assert calls == ['green_conservation']
     assert result['adaptive_policy']['full_evaluation'] is False
     assert result['adaptive_policy']['reason_code'] \
         == 'SCHEDULED_POLICY_REEVALUATION_PENDING'
@@ -1696,7 +1731,7 @@ def test_adaptive_full_comparison_runs_when_interval_or_inputs_change(
         {'start': prices[0]['start'], 'total': 0.19},
     ]
     state_path.write_text(json.dumps({
-        'selected': 'protected_hybrid',
+        'selected': 'green_conservation',
         'selected_at': time.time() - 7200,
         'evaluated_at': time.time() - (7200 if force_expired else 30),
         'price_horizon_signature': ai_powered_ess._price_horizon_signature(
@@ -1741,7 +1776,7 @@ def test_adaptive_full_comparison_runs_when_interval_or_inputs_change(
     assert calls == [
         'market_arbitrage',
         'pv_first_self_sufficiency',
-        'protected_hybrid',
+        'green_conservation',
     ]
     assert result['adaptive_policy']['full_evaluation'] is True
     assert result['optimizer_runtime_ms'] >= 0
@@ -1753,7 +1788,7 @@ def test_adaptive_infeasible_reused_policy_falls_back_to_full_comparison(
     prices = [{'start': now + timedelta(hours=1), 'total': 0.20}]
     state_path = tmp_path / 'policy.json'
     state_path.write_text(json.dumps({
-        'selected': 'protected_hybrid',
+        'selected': 'green_conservation',
         'selected_at': time.time(),
         'evaluated_at': time.time(),
         'price_horizon_signature': ai_powered_ess._price_horizon_signature(
@@ -1785,7 +1820,7 @@ def test_adaptive_infeasible_reused_policy_falls_back_to_full_comparison(
         def optimize_with_daily_policy(self, *args, **kwargs):
             policy = kwargs.get('policy_name', 'market_arbitrage')
             calls.append(policy)
-            if calls == ['protected_hybrid']:
+            if calls == ['green_conservation']:
                 return None
             plan = _adaptive_candidate(policy, [0.0], 5.0)
             plan['slot_duration_h'] = 1.0
@@ -1798,10 +1833,10 @@ def test_adaptive_infeasible_reused_policy_falls_back_to_full_comparison(
     result = ai_powered_ess.optimize_schedule(50.0, prices)
 
     assert calls == [
-        'protected_hybrid',
+        'green_conservation',
         'market_arbitrage',
         'pv_first_self_sufficiency',
-        'protected_hybrid',
+        'green_conservation',
     ]
     assert result['adaptive_policy']['full_evaluation'] is True
 

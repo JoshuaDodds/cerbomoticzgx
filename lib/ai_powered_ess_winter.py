@@ -397,7 +397,7 @@ class OptimizationEngine:
         )
 
     def _coverage(self, slots, slot_h, windows):
-        """Build post-trough SoC checkpoints and export-protection envelopes."""
+        """Estimate advisory coverage targets and hard export envelopes."""
         positive_net = [max(0.0, slot['load'] - slot['pv']) for slot in slots]
         stress_house_load = [max(0.0, slot['load']) for slot in slots]
         average_load_kw = (
@@ -462,8 +462,8 @@ class OptimizationEngine:
         """Find the first trough that can restore an opening reserve deficit.
 
         This conservative bound counts grid-charge headroom only.  It keeps a
-        degraded plan from postponing reserve recovery to a later, marginally
-        cheaper trough after an earlier selected window could already do it.
+        plan from postponing reserve recovery to a later, marginally cheaper
+        trough after an earlier selected window could already do it.
         A false-positive bound is harmless: the caller retries without this
         checkpoint if the full physical DP finds it unreachable.
         """
@@ -518,10 +518,9 @@ class OptimizationEngine:
         for index in range(steps - 1, -1, -1):
             best_seen = max(best_seen, self._sell_price(slots[index]['buy']))
             best_forward_sell[index] = best_seen
-        dp = [{state: float('inf') for state in self.soc_states} for _ in range(steps + 1)]
-        spill_dp = [{state: float('inf') for state in self.soc_states}
-                    for _ in range(steps + 1)]
-        parent = [{state: None for state in self.soc_states} for _ in range(steps + 1)]
+        dp = [{} for _ in range(steps + 1)]
+        spill_dp = [{} for _ in range(steps + 1)]
+        parent = [{} for _ in range(steps + 1)]
         start_soc = self.initial_protected_soc
         dp[0][start_soc] = 0.0
         spill_dp[0][start_soc] = 0.0
@@ -530,8 +529,7 @@ class OptimizationEngine:
             net_load = slot['load'] - slot['pv']
             buy = slot['buy']
             sell = self._sell_price(buy)
-            for soc in self.soc_states:
-                base = dp[index][soc]
+            for soc, base in dp[index].items():
                 if base == float('inf'):
                     continue
                 base_spill = spill_dp[index][soc]
@@ -539,7 +537,19 @@ class OptimizationEngine:
                 max_up_pct = self.max_charge_power * slot_h / self.battery_capacity * 100.0
                 first_state = bisect_left(self.soc_states, soc - max_down_pct - EPS)
                 last_state = bisect_right(self.soc_states, soc + max_up_pct + EPS)
-                for next_soc in self.soc_states[first_state:last_state]:
+                next_states = set(self.soc_states[first_state:last_state])
+                next_states.add(soc)
+                supply_dc = min(max(0.0, net_load) / self.discharge_efficiency,
+                                self.max_discharge_power * slot_h,
+                                max(0.0, soc - self.min_soc) / 100 * self.battery_capacity)
+                supply_soc = soc - supply_dc / self.battery_capacity * 100
+                next_states.add(round(supply_soc, 9))
+                if net_load < 0:
+                    pv_dc = min(-net_load * self.charge_efficiency,
+                                self.max_charge_power * slot_h,
+                                (100 - soc) / 100 * self.battery_capacity)
+                    next_states.add(round(soc + pv_dc / self.battery_capacity * 100, 9))
+                for next_soc in sorted(next_states):
                     # If telemetry starts below reserve (or max-charge SoC is
                     # configured below it), never discharge farther but permit a
                     # monotonic recovery/hold trajectory instead of inventing an
@@ -579,6 +589,12 @@ class OptimizationEngine:
                         if next_soc > self.max_grid_charge_soc + EPS:
                             continue
 
+                    # Neutral ESS self-supply serves the whole feasible load.
+                    # Partial lattice discharge would consume more energy on
+                    # the hardware than the optimizer allocated for this slot.
+                    if (dc_change < -EPS and grid_energy >= -EPS
+                            and abs(next_soc - supply_soc) > EPS):
+                        continue
                     active_export = dc_change < -EPS and grid_energy < -EPS
                     if active_export:
                         if not allow_exceptional_export or not economics['qualifies']:
@@ -606,8 +622,8 @@ class OptimizationEngine:
                         cost += -dc_change * (self.cycle_cost + self.arbitrage_margin)
                     total = base + cost
                     cumulative_spill = base_spill + pv_curtailed_kwh
-                    old_cost = dp[index + 1][next_soc]
-                    old_spill = spill_dp[index + 1][next_soc]
+                    old_cost = dp[index + 1].get(next_soc, float('inf'))
+                    old_spill = spill_dp[index + 1].get(next_soc, float('inf'))
                     if (total < old_cost - EPS
                             or (abs(total - old_cost) <= EPS
                                 and cumulative_spill < old_spill - EPS)):
@@ -616,12 +632,24 @@ class OptimizationEngine:
                         parent[index + 1][next_soc] = (
                             soc, grid_energy, pv_curtailed_kwh)
 
-        viable = [state for state in self.soc_states if dp[steps][state] < float('inf')]
+            # Bound fractional paths without inventing energy: retain both
+            # cheapest and highest-energy representatives of each SoC bucket.
+            buckets = {}
+            for state in dp[index + 1]:
+                buckets.setdefault(int(state / self.soc_step), []).append(state)
+            retained = set()
+            for states in buckets.values():
+                retained.add(min(states, key=lambda state: (
+                    dp[index + 1][state], spill_dp[index + 1][state], -state)))
+                retained.add(max(states))
+            dp[index + 1] = {state: dp[index + 1][state] for state in retained}
+            spill_dp[index + 1] = {state: spill_dp[index + 1][state] for state in retained}
+
+        viable = list(dp[steps])
         if not viable:
             return None
         if recover_reserve:
-            # Dropping an unreachable coverage checkpoint must not also make
-            # the outage reserve optional.  Starting below reserve creates an
+            # Starting below reserve creates an
             # economic dead zone: charging up to the floor costs money while
             # none of that energy may be used for routine self-supply.  Reach
             # the configured floor by the horizon end when physically possible;
@@ -629,11 +657,32 @@ class OptimizationEngine:
             recovery_floor = min(self.min_soc, self.max_grid_charge_soc)
             recovered = [state for state in viable if state >= recovery_floor - EPS]
             viable = recovered or [max(viable)]
+        # A known price feed ends at an arbitrary time. Credit only the next
+        # few hours of usable household energy, at a conservative visible
+        # tariff. This prevents a plan from draining at the horizon boundary
+        # without forcing it to import at today's peak for an oversized
+        # post-trough coverage checkpoint.
+        positive_net = [max(0.0, slot['load'] - slot['pv']) for slot in slots]
+        continuation_ac = (
+            sum(positive_net) / max(EPS, steps * slot_h)
+            * WINTER_UNKNOWN_HORIZON_HOURS
+        )
+        continuation_dc = (continuation_ac / self.discharge_efficiency
+                           + self._uncertainty_kwh(sum(positive_net)))
+        continuation_price = min(_percentile([slot['buy'] for slot in slots], 0.25),
+                                 sum(slot['buy'] for slot in slots) / len(slots))
+
+        def terminal_credit(state):
+            usable_dc = max(0.0, state - self.min_soc) / 100.0 * self.battery_capacity
+            return (min(usable_dc, continuation_dc)
+                    * self.discharge_efficiency * continuation_price)
+
         end_soc = min(
             viable,
-            key=lambda state: (dp[steps][state], spill_dp[steps][state]),
+            key=lambda state: (dp[steps][state] - terminal_credit(state),
+                               spill_dp[steps][state]),
         )
-        objective = dp[steps][end_soc]
+        objective = dp[steps][end_soc] - terminal_credit(end_soc)
         schedule = []
         current_soc = end_soc
         for position in range(steps, 0, -1):
@@ -693,7 +742,7 @@ class OptimizationEngine:
         trough. Victron has no equivalent concept, so span those steps with one
         schedule targeting the highest planned SoC in that trough. This is
         conservative (it may charge earlier within the same trough) and can never
-        omit energy assumed by the protected trajectory.
+        omit energy assumed by the selected trajectory.
         """
         groups = []
         for window_start, window_end in replenishment_windows:
@@ -707,15 +756,126 @@ class OptimizationEngine:
             first = min(buy_indices)
             last = max(buy_indices)
             max_target = max(schedule[index]['soc_end'] for index in buy_indices)
-            # Victron accepts integer targets. Floor rather than round so a user
-            # ceiling such as 64.5% can never become a 65% hardware instruction.
-            target = math.floor(min(max_target, self.max_grid_charge_soc) + EPS)
+            # Round the desired target up without exceeding the integer user
+            # ceiling. The replay accounts for both overfill and shortfall.
+            target = min(math.ceil(max_target - EPS), math.floor(self.max_grid_charge_soc + EPS))
             groups.append({
                 'start': schedule[first]['time'],
                 'duration': (last - first + 1) * slot_seconds,
                 'target_soc': target,
             })
         return groups
+
+    def _choose_charge_window_starts(self, candidate, slot_h, export_envelope):
+        """Delay grouped charging when the executable cost is lower.
+
+        Re-evaluate the full trajectory, including later imports, stored energy,
+        wear and power limits. Never delay recovery of a breached outage reserve.
+        Window count, end times and configured target ceilings are preserved.
+        """
+        if candidate is None:
+            return None
+        windows = self._victron_slots(candidate['schedule'], int(slot_h * 3600),
+                                      candidate['replenishment_windows'])
+
+        def replay(proposed):
+            trial = dict(candidate, schedule=[dict(step) for step in candidate['schedule']])
+            return self._replay_charge_windows(trial, slot_h, export_envelope,
+                                              windows=proposed)
+
+        best = replay(windows)
+        if self.initial_protected_soc < self.min_soc - EPS:
+            return best
+        for index in range(len(windows)):
+            original = windows[index]
+            end = original['start'] + timedelta(seconds=original['duration'])
+            chosen = original
+            end_index = max(i for i, step in enumerate(candidate['schedule'])
+                            if step['time'] < end)
+            required_end_soc = (best['schedule'][end_index]['soc_end']
+                                if best is not None else original['target_soc'])
+            for step in candidate['schedule']:
+                start = step['time']
+                if not original['start'] < start < end:
+                    continue
+                proposal = dict(original, start=start,
+                                duration=int((end - start).total_seconds()))
+                trial_windows = [dict(window) for window in windows]
+                trial_windows[index] = proposal
+                trial = replay(trial_windows)
+                if (trial is not None
+                        and trial['schedule'][end_index]['soc_end'] >= required_end_soc - EPS
+                        and (best is None or
+                        trial['objective_cost'] < best['objective_cost'] - EPS)):
+                    best = trial
+                    chosen = proposal
+            windows[index] = chosen
+        return best
+
+    def _replay_charge_windows(self, candidate, slot_h, export_envelope, *, windows=None):
+        """Score the physical full-power-to-integer-target schedule we publish.
+
+        Scheduled windows hold the battery after reaching their target. Outside
+        them, self-supply uses the actual carried SoC and never crosses reserve.
+        """
+        if candidate is None:
+            return None
+        schedule = candidate['schedule']
+        if windows is None:
+            windows = self._victron_slots(schedule, int(slot_h * 3600),
+                                          candidate['replenishment_windows'])
+        soc = self.initial_protected_soc
+        cost = 0.0
+        for index, step in enumerate(schedule):
+            window = next((window for window in windows
+                           if window['start'] <= step['time'] < window['start']
+                           + timedelta(seconds=window['duration'])), None)
+            net = step['load'] - step['pv']
+            planned_dc = (step['soc_end'] - step['soc_start']) * self.battery_capacity / 100
+            room = max(0.0, 100 - soc) * self.battery_capacity / 100
+            if window:
+                target_dc = max(0.0, window['target_soc'] - soc) * self.battery_capacity / 100
+                dc = min(room, self.max_charge_power * slot_h,
+                         max(0.0, self.max_power_import * slot_h - net) * self.charge_efficiency,
+                         max(target_dc, max(0.0, -net) * self.charge_efficiency))
+            elif net < 0:
+                dc = min(room, self.max_charge_power * slot_h,
+                         -net * self.charge_efficiency)
+            elif planned_dc < -EPS:
+                floor = self.min_soc
+                if step['action'] == 'sell':
+                    floor = max(floor, export_envelope[index])
+                    demand_dc = -planned_dc
+                else:
+                    demand_dc = net / self.discharge_efficiency
+                dc = -min(demand_dc, self.max_discharge_power * slot_h,
+                          max(0.0, soc - floor) * self.battery_capacity / 100)
+            else:
+                dc = 0.0
+            grid = net + (dc / self.charge_efficiency if dc >= 0
+                          else dc * self.discharge_efficiency)
+            if grid > self.max_power_import * slot_h + EPS:
+                return None
+            spill = max(0.0, -grid - self.max_power_export * slot_h)
+            grid += spill
+            end = soc + dc / self.battery_capacity * 100
+            step.update(soc_start=soc, soc_end=end, grid_energy=round(grid, 4),
+                        pv_curtailed_kwh=round(spill, 4),
+                        action=self._classify_action(soc, end, grid))
+            cost += max(0.0, grid) * step['price'] - max(0.0, -grid) * step['sell']
+            cost += max(0.0, -dc) * (self.cycle_cost + self.arbitrage_margin)
+            soc = end
+        continuation_ac = (sum(max(0.0, step['load'] - step['pv']) for step in schedule)
+                           / (len(schedule) * slot_h) * WINTER_UNKNOWN_HORIZON_HOURS)
+        credit_ac = min(max(0.0, soc - self.min_soc) / 100 * self.battery_capacity
+                        * self.discharge_efficiency, continuation_ac + self._uncertainty_kwh(
+                            sum(max(0.0, step['load'] - step['pv']) for step in schedule))
+                        * self.discharge_efficiency)
+        cost -= credit_ac * min(_percentile([step['price'] for step in schedule], 0.25),
+                                sum(step['price'] for step in schedule) / len(schedule))
+        candidate['objective_cost'] = cost
+        candidate['victron_slots'] = windows
+        return candidate
 
     def _guardrails(self):
         return {
@@ -745,8 +905,7 @@ class OptimizationEngine:
         planned_watts = first['grid_energy'] / slot_h * 1000.0 if slot_h else 0.0
         return {
             'schedule': schedule,
-            'victron_slots': self._victron_slots(
-                schedule, slot_seconds, candidate['replenishment_windows']),
+            'victron_slots': candidate['victron_slots'],
             'optimizer_guardrails': self._guardrails(),
             'winter_policy': winter_policy,
             'optimizer_mode': 'winter',
@@ -782,33 +941,33 @@ class OptimizationEngine:
         self._adapt_soc_lattice(slots, opening_soc)
         self.initial_protected_soc = opening_soc
         windows = self._replenishment_windows(slots)
-        checkpoints, export_envelope, details = self._coverage(slots, slot_h, windows)
+        _, export_envelope, details = self._coverage(slots, slot_h, windows)
 
+        # Forecast coverage is a purchasing target, not a hard reserve. A hard
+        # checkpoint made the planner buy household power at a peak while
+        # protecting nearly-full batteries for later, cheaper hours. Keep only
+        # the operator's outage reserve as a hard floor; the DP and bounded
+        # terminal value choose how much additional energy is worth carrying.
+        recovery = self._reserve_recovery_checkpoint(slots, slot_h, windows)
         normal = self._run_candidate(
-            slots, slot_h, windows, checkpoints, export_envelope, False,
-            discharge_blocked_starts)
+            slots, slot_h, windows, recovery, export_envelope, False,
+            discharge_blocked_starts,
+            recover_reserve=opening_soc < self.min_soc - EPS)
         warning = next((item['warning'] for item in details if item['warning']), None)
         if self.max_grid_charge_soc < self.min_soc - EPS:
             warning = 'max_grid_charge_soc_below_winter_reserve'
-        if normal is None:
-            # An unreachable checkpoint (usually a short trough plus a strict
-            # power cap) must not invent energy. Try the earliest physically
-            # plausible reserve recovery, then a terminal recovery if the
-            # tighter checkpoint proves unreachable. Keep all physical limits.
-            recovery = self._reserve_recovery_checkpoint(slots, slot_h, windows)
-            if recovery:
-                normal = self._run_candidate(
-                    slots, slot_h, windows, recovery, export_envelope, False,
-                    discharge_blocked_starts, recover_reserve=True)
-            if normal is None:
-                normal = self._run_candidate(
-                    slots, slot_h, windows, {}, export_envelope, False,
-                    discharge_blocked_starts, recover_reserve=True)
-            warning = 'coverage_infeasible_safest_feasible_plan'
+        if normal is None and recovery:
+            normal = self._run_candidate(
+                slots, slot_h, windows, {}, export_envelope, False,
+                discharge_blocked_starts, recover_reserve=True)
+            warning = 'reserve_recovery_checkpoint_infeasible'
         if normal is None:
             logging.error("WINTER_ESS: No physically feasible self-sufficiency plan.")
             return None
 
+        normal = self._choose_charge_window_starts(normal, slot_h, export_envelope)
+        if normal is None:
+            return None
         economics = self._exceptional_economics(slots)
         exceptional = None
         benefit = 0.0
@@ -816,8 +975,10 @@ class OptimizationEngine:
         reason = 'Normal winter self-sufficiency selected; exceptional spread hurdle not met'
         if economics['qualifies']:
             exceptional = self._run_candidate(
-                slots, slot_h, windows, checkpoints, export_envelope, True,
-                discharge_blocked_starts)
+                slots, slot_h, windows, recovery, export_envelope, True,
+                discharge_blocked_starts,
+                recover_reserve=opening_soc < self.min_soc - EPS)
+            exceptional = self._choose_charge_window_starts(exceptional, slot_h, export_envelope)
             if exceptional is not None:
                 benefit = normal['objective_cost'] - exceptional['objective_cost']
             if exceptional is not None and benefit >= WINTER_EXCEPTIONAL_MIN_BENEFIT_EUR - EPS:
@@ -840,21 +1001,27 @@ class OptimizationEngine:
             'protected_dc_kwh': 0.0,
             'feasible_soc': self.min_soc,
         }
-        next_time = slots[windows[0][0]]['start'].isoformat() if windows else None
+        eligible_time = slots[windows[0][0]]['start'].isoformat() if windows else None
+        next_time = (selected['victron_slots'][0]['start'].isoformat()
+                     if selected['victron_slots'] else None)
         policy = {
             'mode': 'winter',
             'selected_candidate': selected_name,
             'next_replenishment_time': next_time,
+            'next_eligible_charge_time': eligible_time,
             'forecast_house_energy_required_kwh': round(first_detail['house_kwh'], 3),
             'uncertainty_allowance_kwh': round(first_detail['uncertainty_kwh'], 3),
-            'protected_soc_percent': round(first_detail['feasible_soc'], 2),
-            'protected_energy_kwh': round(first_detail['protected_dc_kwh'], 3),
+            'protected_soc_percent': round(self.min_soc, 2),
+            'protected_energy_kwh': 0.0,
+            'coverage_target_soc_percent': round(first_detail['feasible_soc'], 2),
+            'coverage_target_energy_kwh': round(first_detail['protected_dc_kwh'], 3),
             'exceptional_spread_eur_per_kwh': round(economics['spread'], 4),
             'expected_incremental_benefit_eur': round(max(0.0, benefit), 3),
             'reason_code': reason_code,
             'reason': reason,
             'warning': warning,
-            'active_charge_windows': len(windows),
+            'active_charge_windows': len(selected['victron_slots']),
+            'eligible_charge_windows': len(windows),
             'uncertainty_source': self.uncertainty_model['source'],
             'uncertainty_samples': self.uncertainty_model['samples'],
             'uncertainty_rate': round(self.uncertainty_model['rate'], 4),

@@ -100,6 +100,32 @@ def test_normal_plan_charges_only_for_house_coverage_not_user_max(settings):
     assert not _active_sells(result)
 
 
+def test_peak_import_does_not_protect_battery_for_later_cheap_window(settings):
+    """A narrow future trough must not force peak-price household imports."""
+    settings.update({
+        'BATTERY_CAPACITY_KWH': '42',
+        'AC_DC_CHARGE_EFFICIENCY': '0.92',
+        'AC_DC_DISCHARGE_EFFICIENCY': '0.92',
+        'MIN_SOC_RESERVE_WINTER': '40',
+        'ESS_MAX_GRID_CHARGE_SOC': '100',
+        'OPTIMIZER_SOC_STEP_PCT': '1',
+        'OPTIMIZER_SLOT_MINUTES': '15',
+        'ESS_BATTERY_CYCLE_COST': '0.01',
+        'ESS_ARBITRAGE_MARGIN': '0',
+    })
+    tariffs = [0.50] * 24 + [0.39] + [0.45] * 48 + [0.38] * 30
+    result = winter.OptimizationEngine().optimize(
+        98, _prices(tariffs, minutes=15), [0.5] * len(tariffs),
+        [0] * len(tariffs))
+
+    assert result is not None
+    assert result['winter_policy']['coverage_target_soc_percent'] > 95
+    assert result['winter_policy']['protected_soc_percent'] == 40
+    assert sum(step['grid_energy'] for step in result['schedule'][:24]) < 4
+    assert min(step['soc_end'] for step in result['schedule']) >= 40
+    assert not _active_sells(result)
+
+
 def test_large_battery_can_self_supply_small_quarter_hour_load_without_export(settings):
     settings.update({
         'BATTERY_CAPACITY_KWH': '42',
@@ -126,8 +152,9 @@ def test_pv_forecast_reduces_winter_replenishment_target(settings):
     no_pv = winter.OptimizationEngine().optimize(20, prices, loads, [0] * 7)
     with_pv = winter.OptimizationEngine().optimize(20, prices, loads, [0, 0, 1, 1, 0, 0, 0])
 
-    assert with_pv['winter_policy']['protected_soc_percent'] \
-        < no_pv['winter_policy']['protected_soc_percent']
+    assert with_pv['winter_policy']['coverage_target_soc_percent'] \
+        < no_pv['winter_policy']['coverage_target_soc_percent']
+    assert with_pv['winter_policy']['protected_soc_percent'] == 20.0
 
 
 def test_load_uncertainty_is_learned_from_measured_settlement_history(settings, tmp_path):
@@ -306,7 +333,8 @@ def test_single_day_horizon_protects_unknown_tail_after_last_price(settings):
     # The known post-trough load is 2 kWh. A same-day horizon must add the
     # conservative unknown-price tail instead of assuming a cheap midnight slot.
     assert result['winter_policy']['forecast_house_energy_required_kwh'] > 2.0
-    assert result['winter_policy']['protected_soc_percent'] > 20.0
+    assert result['winter_policy']['coverage_target_soc_percent'] > 20.0
+    assert result['winter_policy']['protected_soc_percent'] == 20.0
 
 
 def test_quarter_hour_resolution_and_physical_power_limits(settings):
@@ -327,7 +355,7 @@ def test_quarter_hour_resolution_and_physical_power_limits(settings):
         assert dc <= limit * 0.25 + 1e-6
 
 
-def test_infeasible_checkpoint_degrades_with_warning_not_invented_energy(settings):
+def test_limited_charge_power_does_not_invent_energy(settings):
     settings['ESS_MAX_CHARGE_KW'] = '0.1'
     settings['ESS_MAX_GRID_IMPORT_KW'] = '1'
     prices = _prices([0.05, 0.60, 0.60, 0.05])
@@ -335,24 +363,24 @@ def test_infeasible_checkpoint_degrades_with_warning_not_invented_energy(setting
     result = winter.OptimizationEngine().optimize(20, prices, loads, [0] * 4)
 
     assert result is not None
-    assert result['winter_policy']['warning'] == 'coverage_infeasible_safest_feasible_plan'
+    assert result['winter_policy']['warning'] is None
     for step in result['schedule']:
         dc = max(0, step['soc_end'] - step['soc_start']) / 100 * 20
         assert dc <= 0.1 + 1e-6
 
 
-def test_infeasible_coverage_still_recovers_outage_reserve(settings):
+def test_outage_reserve_recovers_when_coverage_target_is_unreachable(settings):
     settings['ESS_MAX_CHARGE_KW'] = '3'
     settings['ESS_MAX_GRID_IMPORT_KW'] = '3'
-    # The first one-hour trough cannot reach its coverage checkpoint from 0%,
-    # and the narrow spread does not pay for a cycle.  The last trough is
-    # cheaper, but the reserve must recover at the second feasible trough.
+    # The first one-hour trough cannot reach the old coverage target from 0%.
+    # The last trough is cheaper, but the outage reserve must recover at the
+    # second feasible trough.
     result = winter.OptimizationEngine().optimize(
         0, _prices([0.15, 0.16, 0.15, 0.16, 0.05, 0.16]),
         [0, 1, 0, 1, 0, 1], [0] * 6)
 
     assert result is not None
-    assert result['winter_policy']['warning'] == 'coverage_infeasible_safest_feasible_plan'
+    assert result['winter_policy']['warning'] is None
     assert result['schedule'][-1]['soc_end'] >= 20
     assert result['schedule'][2]['soc_end'] >= 20
     assert _active_buys(result)
@@ -427,7 +455,8 @@ def test_six_fragmented_troughs_never_publish_a_truncated_charge_plan(settings):
     result = winter.OptimizationEngine().optimize(
         20, _prices(values), loads, [0] * len(values))
 
-    assert result['winter_policy']['active_charge_windows'] == 5
+    assert result['winter_policy']['eligible_charge_windows'] == 5
+    assert result['winter_policy']['active_charge_windows'] == len(result['victron_slots'])
     assert len(result['victron_slots']) <= 5
     assert result['victron_slots']
     for step in _active_buys(result):

@@ -195,7 +195,7 @@ sharing the host's `/dev/shm` (so it can read the published plan). Expose
   made by the optimizer, Cerbo UI, or another controller therefore update live;
   the optimizer plan is only a startup fallback. The **Clear schedule** button
   calls the same broker helper used internally to disable those five slots.
-- **Vehicle** (tab): creates one durable Tesla charge-by job (50–100% target and an
+- **Vehicle** (top-level page beside Victron, also in the mobile menu): creates one durable Tesla charge-by job (50–100% target and an
   offset-aware deadline), shows feasibility/cost/savings, and presents the plan as readable
   day-by-day rows with exact windows, kWh, SoC progress, price status, cost and energy source.
   Long-horizon jobs protect gentle daily progress and can advance it with forecast solar when
@@ -252,8 +252,9 @@ sharing the host's `/dev/shm` (so it can read the published plan). Expose
   the ESS groups; optimizer internals remain editable under **Advanced settings**.
   This disclosure does not alter `.env`, the API allow-list, or the AI Advisor's
   view of tunables. `WINTER_MODE` selects Green/Winter after the supervised
-  restart; the Summer comparison switch still compares Trading, PV-first and
-  protected hybrid, and does not yet include the replay-only Green candidate.
+  restart; the Summer comparison switch compares Trading, PV-first and Green
+  conservation. Green can replenish household energy from the grid and does not
+  routinely export battery energy.
   On phones, descriptions sit behind an info toggle so edit targets remain large.
 
 ## Config knobs — how writes propagate
@@ -340,12 +341,26 @@ reuses `MOSQUITTO_IP` and `VRM_PORTAL_ID`.
   (`grid_charging_enabled`) so grid covers loads and the battery is held. Grid assist alone
   never starts the car; together with Vehicle **Start**, it authorizes an immediate full-rate
   grid-backed EV charge.
-- `POST /api/control/ev-charge` — manual EV **Start/Stop** (Vehicle tab). Sets the dedicated
-  `ev_charge_requested` intent. Start alone does not bypass schedule/PV gates: immediate
-  grid-backed charging requires Grid assist to be on as well. Stop records an imperative
+- `POST /api/control/ev-charge` — manual EV **Start/Stop** (Vehicle page). Sets the dedicated
+  `ev_charge_requested` intent. Start requires Grid assist; without it the endpoint returns
+  HTTP 409 (`grid_assist_required`) before writing intent or publishing a control topic.
+  Smart and protected-PV charging run independently and do not need manual Start.
+  Stop records an imperative
   request which stays latched until confirmation or bounded escalation, so it works when intent
-  was already off and suppresses the current smart block. The EV controller uses command-first,
-  delayed wake escalation and local-meter stop
+  was already off and suppresses the current smart block.
+  The Vehicle charge-control card shows request delivery and live charger power separately;
+  an HTTP success means the intent was accepted, not that charging has physically changed.
+  A rejected Start is shown as blocked, with no request queued.
+  A duplicate action is held for 30 seconds after acceptance; the opposite action remains
+  available, and the Vehicle page exposes the existing Grid assist toggle. Button
+  feedback clears after 60 seconds. A pending controller decision is shown only
+  while the retained intent is on, Grid assist is on, the original request is
+  under 15 minutes old, and the controller decision is under three minutes old.
+  Manual Start authorization has no age timeout while Grid assist is on. After
+  progress feedback ages out, the card still reports that manual grid charging
+  is enabled. Stop or disabling Grid assist ends that authorization; physical
+  charging remains under normal controller reconciliation.
+  The controller uses command-first, delayed wake escalation, and local-meter stop
   verification even if pushed location/plug state is stale. An accepted stop receives a
   60-second EVCS observation grace before another stop can be sent. Fresh EVCS idle power also
   prevents a stale Tesla charging flag from reopening that completed stop lifecycle. Start restores the configured

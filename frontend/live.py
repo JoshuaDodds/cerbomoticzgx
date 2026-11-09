@@ -205,6 +205,9 @@ class MqttLive:
             "feed_in_state": "Cerbomoticzgx/GlobalState/feed_in_limit_state",
             "ai_ess_override_enabled": "Cerbomoticzgx/system/ai_ess_override_enabled",
             "grid_charging_enabled": "Cerbomoticzgx/system/grid_charging_enabled",
+            "ev_charge_requested": "Cerbomoticzgx/GlobalState/ev_charge_requested",
+            "ev_charge_requested_at": "Cerbomoticzgx/GlobalState/ev_charge_requested_at",
+            "ev_charge_decision": "Cerbomoticzgx/GlobalState/ev_charge_decision",
             "day_import_kwh": "Tibber/home/energy/day/imported",
             "day_import_cost": "Tibber/home/energy/day/cost",
             "day_export_kwh": "Tibber/home/energy/day/exported",
@@ -561,6 +564,28 @@ class MqttLive:
         out["feed_in_state"] = vals.get("feed_in_state")
         out["ai_ess_override_enabled"] = vals.get("ai_ess_override_enabled")
         out["grid_charging_enabled"] = vals.get("grid_charging_enabled")
+        out["ev_charge_requested"] = vals.get("ev_charge_requested")
+        requested_at = _num("ev_charge_requested_at")
+        out["ev_charge_requested_at"] = requested_at
+        out["ev_charge_request_age_s"] = (
+            max(0.0, time.time() - requested_at)
+            if requested_at is not None and requested_at > 0 else None
+        )
+        decision = vals.get("ev_charge_decision")
+        out["ev_charge_decision"] = None
+        if isinstance(decision, str):
+            code, separator, timestamp = decision.partition("|")
+            try:
+                updated_at = float(timestamp) if separator else None
+            except ValueError:
+                updated_at = None
+            if code and updated_at is not None:
+                out["ev_charge_decision"] = {
+                    "code": code,
+                    "intent": code != "idle",
+                    "updated_at": updated_at,
+                    "age_s": max(0.0, time.time() - updated_at),
+                }
         out["day_import_kwh"] = _num("day_import_kwh")
         out["day_import_cost"] = _num("day_import_cost")
         out["day_export_kwh"] = _num("day_export_kwh")

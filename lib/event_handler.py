@@ -217,12 +217,15 @@ class Event:
         logging.info(f"Grid assisted charging toggled to {grid_import_state}")
 
     def tesla_l1_current(self):
+        self.gs_client.set("tesla_l1_current_updated_at", time.time())
         self.update_charging_amp_totals()
 
     def tesla_l2_current(self):
+        self.gs_client.set("tesla_l2_current_updated_at", time.time())
         self.update_charging_amp_totals()
 
     def tesla_l3_current(self):
+        self.gs_client.set("tesla_l3_current_updated_at", time.time())
         self.update_charging_amp_totals()
 
     def tesla_plug_status(self):

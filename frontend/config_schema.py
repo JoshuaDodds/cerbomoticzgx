@@ -17,7 +17,7 @@ CONFIG_SCHEMA = [
             {"key": "APPLIANCE_OPTIMIZATION_ENABLED", "label": "Appliance optimized scheduling", "type": "bool",
              "desc": "Defer supported appliances to lower-cost times in either Summer or Winter Mode when Home Connect scheduling is enabled. Dishwasher preferred-program enforcement remains active whenever Home Connect scheduling is enabled. Requires a restart."},
             {"key": "ESS_ADAPTIVE_POLICY_ENABLED", "label": "Compare Summer strategies", "type": "bool",
-             "desc": "Compare Trading with PV-first and protected-hybrid plans in Summer Mode. The current alternatives do not yet provide full Green-style grey-day conservation. The selected strategy replans every cycle. Defaults off for attended validation."},
+             "desc": "Compare Trading with PV-first and Green conservation in Summer Mode. Green can buy cheap household energy without routine battery export. The selected strategy replans every cycle. Defaults off for attended validation."},
             {"key": "ESS_ADAPTIVE_TRADE_MIN_BENEFIT_EUR", "label": "Minimum Trading advantage (€)", "type": "float",
              "desc": "Minimum forecast benefit Trading must add above the best conservative Summer plan, before the configured fraction of learned forecast risk is added."},
             {"key": "ESS_ADAPTIVE_FORECAST_RISK_MAX_EUR", "label": "Forecast-risk cap (€)", "type": "float",

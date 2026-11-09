@@ -98,6 +98,9 @@ def _num(value, default=0.0):
 # but a manual full-rate override requires BOTH this intent and the house-battery
 # grid-assist flag. Schedule/PV authority remains independent.
 EV_CHARGE_INTENT_KEY = "ev_charge_requested"
+EV_CHARGE_REQUESTED_AT_KEY = "ev_charge_requested_at"
+EV_CHARGE_DECISION_KEY = "ev_charge_decision"
+EV_CHARGE_DECISION_HEARTBEAT_S = 120
 
 # One-shot "Refresh Data" button (Vehicle tab). Setting this to True wakes the car and forces
 # an immediate status refresh outside the normal engagement gating, then main() clears it back
@@ -181,6 +184,9 @@ class EvCharger:
         self._last_discovery_wake_ts = 0.0 # rate-limit surplus-driven discovery wakes
         self._discovery_backoff_until = 0.0  # longer backoff after finding the car away
         self._last_status_state = None       # last logged state, so we only log on change
+        self._last_manual_decision = None     # diagnostic only; never gates charge control
+        self._last_manual_decision_at = 0.0
+        self._last_authorized_mode = None
         self._grid_current_pending = None    # bounded manual/grid current acknowledgement
         self._grid_current_signature = None  # confirmed target for this intent session
         self._grid_current_confirmed_at = 0.0
@@ -294,6 +300,7 @@ class EvCharger:
         """
         try:
             self._refresh_smart_plan()
+            self._clear_unactionable_manual_start()
             intent = self._intent_on()
             intent_on_edge = intent and not self._intent_was_on       # user just switched charging ON
             manual_stop_requested = self._manual_stop_requested()
@@ -327,6 +334,7 @@ class EvCharger:
                 and not safety_action
                 and not refresh_requested
             ):
+                self._report_manual_charge_decision(telemetry_wait=True)
                 self._log_status(
                     "waiting",
                     "Fleet telemetry bridge awaiting authoritative source "
@@ -350,6 +358,7 @@ class EvCharger:
             # stop the car) OR a refresh was requested. Otherwise stay dormant and make zero
             # Tesla API calls.
             if not (self._local_engagement_signal() or self._intent_off_edge or refresh_requested):
+                self._report_manual_charge_decision()
                 self._log_status("dormant", self._dormant_reason())
                 self._reschedule(30.0)
                 return
@@ -415,7 +424,12 @@ class EvCharger:
                              f"plugged={self.tesla.is_plugged}); next wake-check in ~{int(backoff / 60)}m.")
 
             active = self._control_charging()
-            self._log_status("charging" if active else "engaged", self.vehicle_status_msg())
+            self._report_manual_charge_decision()
+            # A grid Start can return active while its current acknowledgement or
+            # physical delivery is still pending. Log measured/observed charging,
+            # not the controller's ongoing-work flag.
+            self._log_status("charging" if self._charging_now() else "engaged",
+                             self.vehicle_status_msg())
             self._reschedule(20.0 if active else 30.0)
 
         except Exception as E:
@@ -442,6 +456,116 @@ class EvCharger:
             self._last_status_state = state
         else:
             logging.debug(f"EvCharger [{state}]: {detail}")
+
+    def _report_manual_charge_decision(self, *, telemetry_wait=False) -> None:
+        """Publish the observed Start gate only when it changes; never affect control."""
+        intent = self._intent_on()
+        t = self.tesla
+        if not intent:
+            code, message = "idle", "No manual Start request is pending."
+        elif telemetry_wait:
+            code, message = "telemetry", "Waiting for vehicle telemetry before sending a Start command."
+        elif t.is_home is not True:
+            code, message = ("away" if t.is_home is False else "home_unknown"), (
+                "Vehicle is away; Start will wait until it is home."
+                if t.is_home is False else
+                "Vehicle location is unknown; waiting for fresh vehicle telemetry."
+            )
+        elif t.is_plugged is not True:
+            code, message = ("unplugged" if t.is_plugged is False else "plug_unknown"), (
+                "Vehicle is unplugged; Start will wait for a cable."
+                if t.is_plugged is False else
+                "Plug state is unknown; waiting for fresh vehicle telemetry."
+            )
+        elif t.is_supercharging:
+            code, message = "supercharging", "Vehicle is supercharging elsewhere; home charge is unavailable."
+        elif t.is_full:
+            code, message = "at_limit", "Vehicle is already at its charge limit."
+        elif self._charging_now():
+            code, message = "charging", "Vehicle is drawing charge power."
+        elif self._manual_grid_override_on():
+            current_status = (getattr(self, "_grid_current_state_cache", None)
+                              or (None, None))[0]
+            grid_messages = {
+                "invalid_target": "Grid assist is on, but the configured EV charge current is zero; no Start command can be sent.",
+                "command_rejected": "Grid assist is on, but the vehicle rejected the current request; the controller will retry.",
+                "command_cooldown": "Grid assist is on; waiting for the command cooldown before retrying the vehicle.",
+                "confirmation_pending": "Grid assist is on; waiting for vehicle telemetry to confirm the current request.",
+                "confirmed_waiting_for_delivery": "Grid assist is on; current is confirmed, but the charger has not delivered power yet.",
+                "delivery_limited": "Grid assist is on; local delivery is limited by Maxem or site capacity.",
+            }
+            code = f"grid_{current_status}" if current_status in grid_messages else "starting_grid"
+            message = grid_messages.get(current_status, (
+                "Grid assist authorizes Start; waiting for the vehicle command and charger delivery."
+            ))
+        elif getattr(self, "_last_authorized_mode", None):
+            code, message = "starting_scheduled", (
+                "A smart block or protected PV surplus authorizes charging; waiting for charger delivery."
+            )
+        else:
+            code, message = "waiting_authorization", (
+                "Start is pending: Grid assist is off, no active smart charge block applies, "
+                "and protected PV surplus is unavailable. Enable Grid assist for an "
+                "immediate grid-backed charge."
+            )
+        decision = (intent, code, message)
+        changed = decision != getattr(self, "_last_manual_decision", None)
+        now_ts = time.time()
+        if not changed and (not intent or now_ts - getattr(
+                self, "_last_manual_decision_at", 0.0
+        ) < EV_CHARGE_DECISION_HEARTBEAT_S):
+            return
+        # GlobalState's MQTT publisher quotes string values without JSON escaping.
+        # Keep this wire value quote-free so the dashboard can decode it safely.
+        payload = f"{code}|{now_ts:.3f}"
+        try:
+            self.global_state.set(EV_CHARGE_DECISION_KEY, payload)
+        except Exception as exc:
+            logging.warning("EvCharger: could not publish manual charge decision: %s", exc)
+            return
+        self._last_manual_decision = decision
+        self._last_manual_decision_at = now_ts
+        if intent and changed:
+            logging.info("EvCharger [manual Start %s]: %s", code, message)
+
+    def _clear_unactionable_manual_start(self) -> None:
+        """Retire idle intent only after Grid assist authorization is withdrawn.
+
+        Smart and protected-PV charging do not use this flag. Keep an active
+        physical charge under the normal stop/reconciliation path; only an idle
+        request is cleared here, so a stale Start cannot restart it later.
+        """
+        if not self._intent_on():
+            return
+        now_ts = time.time()
+        local_draw = self._local_charger_draw()
+        recent_vehicle_draw = bool(
+            local_draw is None
+            and self.tesla.is_charging
+            and 0 <= now_ts - _num(
+                getattr(self.tesla, "charge_state_update_ts", 0), 0.0
+            ) <= STALE_STATUS_MAX_AGE_S
+        )
+        if local_draw is True or recent_vehicle_draw:
+            return
+        if not self._grid_assist_on():
+            reason = "Grid assist is off"
+        else:
+            # Manual Start + Grid assist is persistent operator authorization.
+            # Missing/idle delivery can mean site load balancing, sleeping
+            # telemetry, or a temporary EVCS pause; age cannot revoke it.
+            # Only UI feedback expires. Stop and Grid assist retain authority.
+            return
+        try:
+            self.global_state.set(EV_CHARGE_INTENT_KEY, False)
+            self.global_state.set(EV_CHARGE_REQUESTED_AT_KEY, 0)
+            publish_message("Tesla/vehicle0/control/charge_requested",
+                            message="False", retain=True)
+        except Exception as exc:
+            logging.warning("EvCharger: could not clear stale manual Start: %s", exc)
+            return
+        self._intent_was_on = False
+        logging.info("EvCharger: cleared idle manual Start intent because %s.", reason)
 
     def _reschedule(self, seconds: float):
         self.main_thread = threading.Timer(seconds, self.main)
@@ -1303,16 +1427,20 @@ class EvCharger:
         return self._vehicle_commandable() and bool(self.tesla.is_charging)
 
     def _local_charger_draw(self) -> bool | None:
-        """Return fresh ABB evidence of EV draw, or ``None`` if unavailable.
+        """Return fresh local evidence of EV draw, or ``None`` if unavailable.
 
         Tesla charge state is change-driven and can remain ``Charging`` after
-        physical delivery has stopped. The dedicated ABB meter is the
-        authoritative local arbiter when its power sample is fresh. Phase
-        current at or above 1 A always wins; otherwise a fresh sub-250 W sample
+        physical delivery has stopped. The EVCS power meter and ABB phase currents are local evidence. Fresh phase
+        current at or above 1 A wins; otherwise a fresh sub-250 W sample
         is the charger's idle electronics, not an active charge.
         """
-        if _num(self.charging_amps) >= 1:
-            return True
+        now = time.time()
+        for phase in (1, 2, 3):
+            timestamp = _num(self.global_state.get(
+                f"tesla_l{phase}_current_updated_at"), 0.0)
+            current = _num(getattr(self, f"l{phase}_charging_amps", 0), 0.0)
+            if timestamp > 0 and -5 <= now - timestamp <= ABB_DRAW_FRESH_S and current >= 1:
+                return True
         updated_at = _num(
             self.global_state.get("tesla_power_updated_at"), 0.0)
         age = time.time() - updated_at
@@ -1504,6 +1632,7 @@ class EvCharger:
         Starts and current changes require home + plugged + non-supercharging state. An explicit
         safety Stop may also use authoritative local draw when those pushed fields are stale.
         """
+        self._last_authorized_mode = None
         t = self.tesla
         smart = {"handled": False}
         if self._smart_enabled():
@@ -1580,6 +1709,7 @@ class EvCharger:
             return False
 
         authorized_mode = self._authorized_charge_mode(smart)
+        self._last_authorized_mode = authorized_mode
         charging_now = self._charging_now()
         controller_session = bool(
             self._charge_mode == "surplus"
@@ -2010,8 +2140,13 @@ class EvCharger:
 
     def _smart_start_confirmed(self, pending: dict) -> bool:
         """Require physical or post-command pushed evidence for charge start."""
-        if _num(self.charging_amps) >= 1:
-            return True
+        now = time.time()
+        for phase in (1, 2, 3):
+            timestamp = _num(self.global_state.get(
+                f"tesla_l{phase}_current_updated_at"), 0.0)
+            current = _num(getattr(self, f"l{phase}_charging_amps", 0), 0.0)
+            if timestamp > 0 and -5 <= now - timestamp <= ABB_DRAW_FRESH_S and current >= 1:
+                return True
         sent_at = _num((pending or {}).get("sent_at"), 0.0)
         if sent_at <= 0:
             return False
