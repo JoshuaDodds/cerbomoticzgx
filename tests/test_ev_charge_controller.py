@@ -101,6 +101,9 @@ def _charger(monkeypatch, tesla, state=None, **attrs):
     c.surplus_amps = attrs.get("surplus_amps", 6)
     c.surplus_watts = attrs.get("surplus_watts", 0)
     c.charging_amps = attrs.get("charging_amps", 0)
+    for phase in (1, 2, 3):
+        setattr(c, f"l{phase}_charging_amps", c.charging_amps)
+        c.global_state.setdefault(f"tesla_l{phase}_current_updated_at", time.time())
     # Only exercised by main() (dynamic_load_reservation_adjustment) — most tests call the
     # smaller helpers directly and never touch these, but main() needs them set.
     c.load_reservation = attrs.get("load_reservation", 1000)
@@ -485,7 +488,8 @@ def test_grid_assist_alone_does_not_authorize_external_charge(monkeypatch):
     assert tesla.calls == ["stop"]
 
 
-def test_ev_start_without_grid_assist_cannot_force_charge(monkeypatch):
+def test_ev_start_without_grid_assist_cannot_force_charge(monkeypatch, caplog):
+    caplog.set_level("INFO")
     state = FakeState({
         "grid_charging_enabled": "False",
         "ev_charge_requested": "True",
@@ -497,6 +501,92 @@ def test_ev_start_without_grid_assist_cannot_force_charge(monkeypatch):
 
     assert c._control_charging() is False
     assert tesla.calls == []
+    c._report_manual_charge_decision()
+    assert state[ecc.EV_CHARGE_DECISION_KEY].split("|", 1)[0] == "waiting_authorization"
+    assert json.loads(
+        '{"value": "' + state[ecc.EV_CHARGE_DECISION_KEY] + '"}'
+    )["value"] == state[ecc.EV_CHARGE_DECISION_KEY]
+    assert "manual Start waiting_authorization" in caplog.text
+    assert "Grid assist is off" in caplog.text
+    first_decision = state[ecc.EV_CHARGE_DECISION_KEY]
+    c._report_manual_charge_decision()
+    assert state[ecc.EV_CHARGE_DECISION_KEY] == first_decision
+    with monkeypatch.context() as clock_patch:
+        first_ts = float(first_decision.split("|", 1)[1])
+        clock_patch.setattr(ecc.time, "time", lambda: first_ts + 122)
+        c._report_manual_charge_decision()
+    assert state[ecc.EV_CHARGE_DECISION_KEY] != first_decision
+    assert caplog.text.count("manual Start waiting_authorization") == 1
+
+    state["grid_charging_enabled"] = "True"
+    c._control_charging()
+    c._report_manual_charge_decision()
+    assert state[ecc.EV_CHARGE_DECISION_KEY].split("|", 1)[0] in {
+        "starting_grid", "charging",
+    }
+
+    state["ev_charge_requested"] = "False"
+    c._report_manual_charge_decision()
+    assert state[ecc.EV_CHARGE_DECISION_KEY].split("|", 1)[0] == "idle"
+
+
+def test_manual_start_decision_reports_vehicle_and_command_gates(monkeypatch):
+    state = FakeState({
+        "ev_charge_requested": "True",
+        "grid_charging_enabled": "True",
+    })
+    tesla = FakeTesla(is_home=None, is_plugged=True, is_charging=False)
+    c = _charger(monkeypatch, tesla, state=state, charging_amps=0)
+
+    c._report_manual_charge_decision()
+    assert state[ecc.EV_CHARGE_DECISION_KEY].split("|", 1)[0] == "home_unknown"
+
+    tesla.is_home = True
+    c._grid_current_state_cache = ("command_rejected", 24)
+    c._report_manual_charge_decision()
+    assert state[ecc.EV_CHARGE_DECISION_KEY].split("|", 1)[0] == "grid_command_rejected"
+
+
+def test_main_retires_old_idle_start_when_grid_assist_is_off(monkeypatch, caplog):
+    caplog.set_level("INFO")
+    _smart_settings(monkeypatch, EV_SMART_CHARGE_ENABLED="False")
+    state = FakeState({
+        "ev_charge_requested": "True",
+        "grid_charging_enabled": "False",
+    })
+    tesla = FakeTesla(is_charging=False)
+    c = _charger(monkeypatch, tesla, state=state, surplus_amps=0,
+                 charging_amps=0, sun=False)
+    monkeypatch.setattr(c, "_refresh_smart_plan", lambda: None)
+    monkeypatch.setattr(c, "_reschedule", lambda _seconds: None)
+
+    c.main()
+
+    assert state["ev_charge_requested"] is False
+    assert state["ev_charge_requested_at"] == 0
+    assert state[ecc.EV_CHARGE_DECISION_KEY].startswith("idle|")
+    assert "cleared idle manual Start intent because Grid assist is off" in caplog.text
+    assert c._last_status_state == "dormant"
+    assert tesla.calls == []
+
+
+@pytest.mark.parametrize("requested_at", [None, 1.0, time.time() - 3600])
+@pytest.mark.parametrize("power", [None, 0.0])
+@pytest.mark.parametrize("charging", [False, True])
+def test_manual_grid_authorization_survives_age_and_idle_delivery(monkeypatch, requested_at, power, charging):
+    state = FakeState({
+        "ev_charge_requested": True, "grid_charging_enabled": True,
+        "ev_charge_requested_at": requested_at,
+        "tesla_power": power, "tesla_power_updated_at": time.time(),
+    })
+    tesla = FakeTesla(is_charging=charging)
+    c = _charger(monkeypatch, tesla, state=state, charging_amps=0)
+    c._clear_unactionable_manual_start()
+    assert state["ev_charge_requested"] is True
+    assert state["ev_charge_requested_at"] == requested_at
+    c._control_charging()
+    assert "stop" not in tesla.calls
+    assert state["ev_charge_requested"] is True
 
 
 def test_disabling_grid_assist_stops_manual_ev_override(monkeypatch):
@@ -674,6 +764,7 @@ def test_accepted_stop_waits_for_local_meter_and_does_not_send_duplicate(
 
     # The next real ABB zero confirms the accepted stop without another API call.
     c.charging_amps = 0
+    c.l1_charging_amps = c.l2_charging_amps = c.l3_charging_amps = 0
     tesla.is_charging = False
     assert c._stop_charge("stop once", force=True) is True
     assert tesla.calls.count("stop") == 1
@@ -692,6 +783,7 @@ def test_real_meter_restart_breaks_accepted_stop_idempotency_guard(monkeypatch):
 
     assert c._stop_charge("stop once", force=True) is True
     c.charging_amps = 0
+    c.l1_charging_amps = c.l2_charging_amps = c.l3_charging_amps = 0
     tesla.is_charging = False
     assert c._stop_charge("observe stop", force=True) is True
 
@@ -777,6 +869,7 @@ def test_confirmed_idle_stop_does_not_reopen_after_grace(monkeypatch):
     assert tesla.calls.count("stop") == 1
 
     c.charging_amps = 0
+    c.l1_charging_amps = c.l2_charging_amps = c.l3_charging_amps = 0
     state["tesla_power"] = 4
     state["tesla_power_updated_at"] = time.time()
     tesla.is_charging = True  # deliberately stale/change-driven
@@ -1147,6 +1240,7 @@ def test_manual_stop_suppresses_owned_between_block_solar(monkeypatch, tmp_path)
 
     c._intent_off_edge = False
     c.charging_amps = 0
+    c.l1_charging_amps = c.l2_charging_amps = c.l3_charging_amps = 0
     tesla.is_charging = False
     tesla.calls.clear()
     c._last_command_ts = 0
@@ -2510,6 +2604,7 @@ def test_tesla_app_stop_is_reversed_inside_authorized_smart_block(
     # A Tesla-app stop does not outrank the active controller block.
     tesla.is_charging = False
     c.charging_amps = 0
+    c.l1_charging_amps = c.l2_charging_amps = c.l3_charging_amps = 0
     c._last_command_ts = 0
     assert c._control_charging(now=now + timedelta(minutes=1)) is True
     assert "start" in tesla.calls

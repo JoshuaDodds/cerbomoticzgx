@@ -56,7 +56,11 @@ def test_abb_power_event_records_transition_without_affecting_control(monkeypatc
     monkeypatch.setattr(event_handler.Event, "adjust_ac_out_power", lambda self: None)
     monkeypatch.setattr(event_handler, "publish_message", lambda *args, **kwargs: None)
 
-    event_handler.Event("unused", 3540.5).tesla_power()
+    event_handler.Event("unused", 3540.5).tesla_abb_power()
 
+    assert observed == [3540.5]
+    assert "tesla_power_updated_at" not in stored
+
+    event_handler.Event("unused", 3540.5).tesla_power()
     assert observed == [3540.5]
     assert "tesla_power_updated_at" in stored

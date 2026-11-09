@@ -562,16 +562,31 @@ def api_control_grid_assist():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+class EvChargePreconditionError(ValueError):
+    """A manual EV Start lacks its required authorization."""
+
+
 def _set_ev_charge_requested(enabled: bool):
     """Manual EV Start/Stop. Sets the DEDICATED ev_charge_requested intent flag the EV controller
-    reads. Immediate grid-backed Start requires grid-assist too; schedule and protected-PV
-    authority remain independent. Stop is latched through bounded wake escalation, suppresses
+    reads. Reject Start before writing intent unless Grid assist is enabled; smart and protected-PV
+    charging do not need manual Start. Stop is latched through bounded wake escalation, suppresses
     the current smart block, and uses local-meter verification even if pushed fields are stale.
     Publishing the retained control topic keeps persistent intent in sync and survives a restart
     via the state restore."""
     from lib.global_state import GlobalStateClient
     state = GlobalStateClient()
+    if enabled and not _boolish(state.get("grid_charging_enabled"), False):
+        raise EvChargePreconditionError(
+            "Enable Grid assist before using manual Start. Smart and protected "
+            "solar charging start automatically when eligible."
+        )
+    if enabled:
+        # Write the age before the intent so the controller cannot see an
+        # undated newly accepted Start during a concurrent tick.
+        state.set("ev_charge_requested_at", time.time())
     state.set("ev_charge_requested", bool(enabled))
+    if not enabled:
+        state.set("ev_charge_requested_at", 0)
     # Stop is an imperative safety action, not merely the false state of a persistent
     # start-intent latch. Preserve a latched request even when intent was already false (for
     # example, a Tesla onboard schedule started the car); the controller clears it only after
@@ -589,6 +604,12 @@ def api_control_ev_charge():
     try:
         _set_ev_charge_requested(enabled)
         return jsonify({"ok": True, "enabled": enabled})
+    except EvChargePreconditionError as e:
+        logging.info("Manual EV charge START rejected: %s", e)
+        return jsonify({
+            "ok": False, "enabled": False,
+            "code": "grid_assist_required", "error": str(e),
+        }), 409
     except Exception as e:
         logging.warning("EV charge request failed: %s", e)
         return jsonify({"ok": False, "error": str(e)}), 500
