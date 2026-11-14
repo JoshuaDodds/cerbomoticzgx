@@ -52,6 +52,29 @@ def test_config_schema_exposes_grid_charge_cap_and_advisor_safe_knobs():
     assert "ADVISOR_RETRIEVAL_MAX_CHARS" in keys
 
 
+def test_ess_configuration_disclosure_keeps_safety_and_tariff_controls_visible():
+    from frontend import data
+
+    groups = data.get_config()
+    ess_groups = groups[:3]
+    entries = {
+        setting["key"]: setting
+        for group in ess_groups for setting in group["settings"]
+    }
+    for key in (
+        "WINTER_MODE", "MIN_SOC_RESERVE_WINTER", "MIN_SOC_RESERVE_SUMMER",
+        "VICTRON_HARDWARE_MIN_SOC", "ESS_MAX_GRID_CHARGE_SOC",
+        "ESS_EXPORT_PRICE_FACTOR", "ESS_EXPORT_FEE",
+    ):
+        assert not entries[key].get("advanced"), key
+    for key in (
+        "OPTIMIZER_SOC_STEP_PCT", "ESS_TERMINAL_VALUE_FACTOR",
+        "ESS_ADAPTIVE_POLICY_MIN_DWELL_MIN", "ESS_PV_INTRADAY_CORRECTION",
+    ):
+        assert entries[key]["advanced"] is True
+        assert key in data._schema_index()  # disclosure never removes edit authority
+
+
 def test_adaptive_optimizer_tunables_are_in_env_and_configuration_ui():
     editable = {
         "ESS_ADAPTIVE_POLICY_ENABLED",

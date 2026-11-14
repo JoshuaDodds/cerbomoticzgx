@@ -56,9 +56,16 @@ class DummyState:
 
 def test_abb_phase_current_topics_use_ac_hierarchy():
     topics = constants.Topics["system0"]
+    assert topics["tesla_power"].endswith("/evcharger/40/Ac/Power")
+    assert topics["tesla_abb_power"].endswith("/acload/42/Ac/Power")
+    assert topics["tesla_charge_energy_forward"].endswith(
+        "/acload/42/Ac/Energy/Forward"
+    )
+    assert topics["tesla_abb_power"] in constants.DzEndpoints["system0"]
+    assert topics["tesla_power"] not in constants.DzEndpoints["system0"]
     for phase in (1, 2, 3):
         assert topics[f"tesla_l{phase}_current"].endswith(
-            f"/evcharger/42/Ac/L{phase}/Current"
+            f"/acload/42/Ac/L{phase}/Current"
         )
 
 

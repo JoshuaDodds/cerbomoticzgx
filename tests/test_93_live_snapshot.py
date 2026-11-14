@@ -40,6 +40,65 @@ def _snapshot_with(values):
     return m.snapshot()
 
 
+def test_dashboard_keeps_abb_energy_and_phase_current_with_evcs_session_time():
+    topics = MqttLive()._build_topics("portal-123")
+    assert topics["ev_energy_kwh"] == "N/portal-123/acload/42/Ac/Energy/Forward"
+    assert topics["ev_charge_time"] == "N/portal-123/evcharger/40/ChargingTime"
+    for phase in (1, 2, 3):
+        assert topics[f"ev_l{phase}_a"] == (
+            f"N/portal-123/acload/42/Ac/L{phase}/Current"
+        )
+    assert topics["ev_charge_decision"] == (
+        "Cerbomoticzgx/GlobalState/ev_charge_decision"
+    )
+    assert topics["ev_charge_requested"] == (
+        "Cerbomoticzgx/GlobalState/ev_charge_requested"
+    )
+    assert topics["ev_charge_requested_at"] == (
+        "Cerbomoticzgx/GlobalState/ev_charge_requested_at"
+    )
+
+
+def test_snapshot_exposes_manual_ev_start_decision():
+    decision = {
+        "intent": True,
+        "code": "waiting_authorization",
+        "updated_at": 123.0,
+    }
+    parsed = _snapshot_with({"ev_charge_decision": "waiting_authorization|123.0"})[
+        "ev_charge_decision"]
+    assert parsed.pop("age_s") >= 0
+    assert parsed == decision
+    assert _snapshot_with({"ev_charge_decision": None})[
+        "ev_charge_decision"] is None
+
+    live_client = MqttLive()
+    topic = "Cerbomoticzgx/GlobalState/ev_charge_decision"
+    live_client._key_by_topic[topic] = "ev_charge_decision"
+    message = type("Message", (), {
+        "topic": topic,
+        "payload": b'{"value": "waiting_authorization|123.0"}',
+    })()
+    live_client._on_message(None, None, message)
+    parsed = live_client.snapshot()["ev_charge_decision"]
+    assert parsed.pop("age_s") >= 0
+    assert parsed == decision
+
+
+def test_snapshot_exposes_original_manual_request_age():
+    requested_at = time.time() - 20
+    snapshot = _snapshot_with({
+        "ev_charge_requested": "True",
+        "ev_charge_requested_at": str(requested_at),
+    })
+    assert snapshot["ev_charge_requested"] == "True"
+    assert snapshot["ev_charge_requested_at"] == pytest.approx(requested_at)
+    assert snapshot["ev_charge_request_age_s"] == pytest.approx(20, abs=2)
+
+    snapshot = _snapshot_with({"ev_charge_requested": "False"})
+    assert snapshot["ev_charge_request_age_s"] is None
+
+
 def test_snapshot_exposes_v2_fields_when_present():
     snap = _snapshot_with({
         "grid_l1": -2056, "grid_l2": -714, "grid_l3": -1445,

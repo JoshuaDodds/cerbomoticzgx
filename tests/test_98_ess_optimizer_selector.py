@@ -144,11 +144,11 @@ def test_winter_mode_is_second_ai_ess_dashboard_setting():
     ai_group = next(group for group in CONFIG_SCHEMA if group["group"] == "AI ESS Optimizer")
     assert ai_group["settings"][1] == {
         "key": "WINTER_MODE",
-        "label": "Winter Mode",
+        "label": "Green / Winter mode",
         "type": "bool",
         "desc": (
-            "Use the restart-isolated winter optimizer and winter SoC reserve. "
-            "Off keeps the summer optimizer and summer reserve."
+            "On: Green planning with the winter reserve and cheap-price replenishment. "
+            "Off: Summer Trading with the summer reserve. Switching mode requires a service restart."
         ),
     }
 

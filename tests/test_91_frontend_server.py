@@ -1,6 +1,7 @@
 from frontend import server
 from frontend import advisor
 import sys
+import time
 import types
 
 
@@ -20,6 +21,16 @@ def test_hvac_top_level_navigation_sits_between_battery_and_victron():
     assert battery < hvac < victron
     assert 'id="hvac-dashboard"' in body
     assert 'id="hvac-mobile-link"' in body
+
+
+def test_vehicle_has_own_top_level_navigation_and_charge_status():
+    body = server.app.test_client().get("/").get_data(as_text=True)
+    assert body.index('data-app-view="live"') < body.index('data-app-view="vehicle"')
+    assert 'id="vehicle-view" class="app-view vehicle-view"' in body
+    assert 'data-mobile-app-view="vehicle"' in body
+    assert 'data-tab="vehicle"' not in body
+    assert 'id="ev-charge-status"' in body
+    assert 'id="ev-charge-observed"' in body
 
 
 def test_config_route_uses_curated_advisor_model_selector_for_builtin_provider(monkeypatch):
@@ -230,7 +241,51 @@ def test_manual_ev_stop_sets_intent_off_and_latched_force_stop(monkeypatch):
     assert response.status_code == 200
     assert calls == [
         ("ev_charge_requested", False),
+        ("ev_charge_requested_at", 0),
         ("vehicle_stop_requested", True),
+    ]
+    assert published
+
+
+def test_manual_ev_start_requires_grid_assist_before_writing_intent(monkeypatch, caplog):
+    import lib.global_state as global_state
+
+    values = {"grid_charging_enabled": False}
+    writes = []
+    published = []
+
+    class FakeState:
+        def get(self, key):
+            return values.get(key)
+
+        def set(self, key, value):
+            writes.append((key, value))
+
+    monkeypatch.setattr(global_state, "GlobalStateClient", FakeState)
+    monkeypatch.setattr(server, "publish_message",
+                        lambda *args, **kwargs: published.append((args, kwargs)))
+    caplog.set_level("INFO")
+
+    response = server.app.test_client().post(
+        "/api/control/ev-charge", json={"enabled": True})
+    assert response.status_code == 409
+    assert response.json["code"] == "grid_assist_required"
+    assert response.json["ok"] is False
+    assert writes == []
+    assert published == []
+    assert "START rejected" in caplog.text
+    assert "START requested" not in caplog.text
+
+    values["grid_charging_enabled"] = True
+    response = server.app.test_client().post(
+        "/api/control/ev-charge", json={"enabled": True})
+    assert response.status_code == 200
+    assert response.json == {"ok": True, "enabled": True}
+    assert writes[0][0] == "ev_charge_requested_at"
+    assert time.time() - writes[0][1] < 5
+    assert writes[1:] == [
+        ("ev_charge_requested", True),
+        ("vehicle_stop_requested", False),
     ]
     assert published
 

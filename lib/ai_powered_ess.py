@@ -423,6 +423,8 @@ class OptimizationEngine:
         self.soc_step = _safe_float('OPTIMIZER_SOC_STEP_PCT', SOC_STEP)
         if self.soc_step <= 0:
             self.soc_step = SOC_STEP
+        self.configured_soc_step = self.soc_step
+        self._last_adaptive_soc_step = None
         self.soc_states = [i * self.soc_step for i in range(int(100 / self.soc_step) + 1)]
 
     # ------------------------------------------------------------------ #
@@ -483,8 +485,8 @@ class OptimizationEngine:
         return buy_price * self.export_price_factor - self.export_fee
 
     def _snap_soc(self, soc: float) -> float:
-        snapped = round(soc / self.soc_step) * self.soc_step
-        return max(0.0, min(snapped, 100.0))
+        value = max(0.0, min(float(soc), 100.0))
+        return min(self.soc_states, key=lambda state: abs(state - value))
 
     # ------------------------------------------------------------------ #
     # Optimization
@@ -575,10 +577,41 @@ class OptimizationEngine:
         sell_prices = [self._sell_price(b) for b in buy_prices]
         net_loads = [p['load'] - p['pv'] for p in future_prices]
 
+        # PV-first cannot actively export battery energy. On a large battery,
+        # one configured 1% transition can exceed a quarter-hour house load;
+        # the DP then rejects every useful discharge and imports at the peak.
+        # Refine only this candidate, and bound the extra work on Cerbo hardware.
+        if (self._last_adaptive_soc_step is not None
+                and abs(self.soc_step - self._last_adaptive_soc_step) <= EPS):
+            self.soc_step = self.configured_soc_step
+        else:
+            # Tests and offline callers may deliberately set the lattice on
+            # an engine instance before planning. Preserve that explicit step.
+            self.configured_soc_step = self.soc_step
+        if policy_name in ('pv_first_self_sufficiency', 'green_conservation'):
+            positive_net = sorted(value for value in net_loads if value > 0.05)
+            if positive_net:
+                representative_load = _percentile(positive_net, 0.10)
+                useful_step = (representative_load * 0.9
+                               / self.discharge_efficiency
+                               / self.battery_capacity * 100.0)
+                self.soc_step = min(self.soc_step, max(0.5, useful_step))
+        self.soc_states = [
+            round(i * self.soc_step, 6)
+            for i in range(int(100 / self.soc_step) + 1)
+        ]
+        if self.soc_states[-1] < 100.0 - EPS:
+            self.soc_states.append(100.0)
+        self._last_adaptive_soc_step = self.soc_step
+
         policy = self._policy_constraints(
             policy_name, buy_prices, net_loads,
             slot_duration_h=slot_duration_h)
         protected_floor_by_step = policy['protected_floor_by_step']
+        if not policy['allow_active_battery_export']:
+            self.soc_states = sorted(set(self.soc_states + [
+                _clamp(float(current_soc_percent), 0.0, 100.0),
+                *protected_floor_by_step]))
 
         # A reserve breach may be caused by live-meter/BMS drift rather than a
         # deliberate discharge.  In that state we may safely retain only when a
@@ -655,7 +688,19 @@ class OptimizationEngine:
                 max_down_pct = self.max_discharge_power * slot_duration_h / max(cap, EPS) * 100.0
                 lower = bisect_left(self.soc_states, soc - max_down_pct - EPS)
                 upper = bisect_right(self.soc_states, soc + max_up_pct + EPS)
-                for nsoc in self.soc_states[lower:upper]:
+                next_states = self.soc_states[lower:upper]
+                if soc not in next_states:
+                    next_states = next_states + [soc]
+                # Include exact household self-supply alongside the lattice. These states carry real energy forward;
+                # no rounding loss is charged as export or hidden grid import.
+                if net_load > EPS and not policy['allow_active_battery_export']:
+                    supply_soc = max(protected_floor_by_step[t],
+                                     soc - min(net_load / self.discharge_efficiency,
+                                               self.max_discharge_power * slot_duration_h)
+                                     / cap * 100.0)
+                    if supply_soc < soc - EPS:
+                        next_states = next_states + [round(supply_soc, 9)]
+                for nsoc in next_states:
                     # Never discharge further below the seasonal reserve. A
                     # live/BMS SoC can already sit just below that threshold.
                     # Then allow RETAIN (same SoC) only while a known cheaper
@@ -933,6 +978,20 @@ class OptimizationEngine:
                     )
                 ]
                 frontier.append((state[1], cost, spill, saturated))
+            if not policy['allow_active_battery_export']:
+                # Exact household transitions must not create an exponential
+                # subset search. Keep the cheapest and highest-energy physical
+                # state per lattice bucket and charge-stage state.
+                buckets = {}
+                for state in retained:
+                    key = (int(state[0] / self.soc_step), *state[1:])
+                    buckets.setdefault(key, []).append(state)
+                retained = set()
+                for states in buckets.values():
+                    retained.add(min(states, key=lambda state: (
+                        dp[t + 1][state], spill_dp[t + 1][state], -state[0])))
+                    retained.add(max(states, key=lambda state: (
+                        state[0], -dp[t + 1][state])))
             dp[t + 1] = {
                 state: dp[t + 1][state] for state in retained}
             spill_dp[t + 1] = {
@@ -1047,7 +1106,7 @@ class OptimizationEngine:
                 # make the candidate infeasible by construction.
                 'force_floor_recovery': False,
             }
-        if name != 'protected_hybrid':
+        if name not in ('protected_hybrid', 'green_conservation'):
             return {
                 'policy_name': 'market_arbitrage',
                 'allow_active_grid_charge': True,
@@ -1058,6 +1117,26 @@ class OptimizationEngine:
                 'force_floor_recovery': True,
             }
 
+        # Green is the live Summer conservation candidate. Use the operator's
+        # existing outage reserve so a grey-day switch does not leave the
+        # battery at the Summer trading floor (which may be zero).
+        coverage_reserve = self.min_soc
+        if name == 'green_conservation':
+            coverage_reserve = max(
+                self.min_soc,
+                _clamp(_safe_float('MIN_SOC_RESERVE_WINTER', self.min_soc),
+                       0.0, 100.0),
+            )
+        if name == 'green_conservation':
+            return {
+                'policy_name': name,
+                'allow_active_grid_charge': True,
+                'allow_active_battery_export': False,
+                'protected_floor_by_step': [coverage_reserve] * steps,
+                'grid_charge_ceiling_by_step': ceilings,
+                'grid_charge_allowed_by_step': [True] * steps,
+                'force_floor_recovery': True,
+            }
         threshold = _percentile(buy_prices, 0.25)
         risk_factor = _clamp(
             _safe_float('ESS_ADAPTIVE_FORECAST_RISK_FACTOR', 0.20), 0.0, 1.0)
@@ -1103,11 +1182,11 @@ class OptimizationEngine:
             required_dc = required_ac / max(EPS, self.discharge_efficiency)
             required_dc *= 1.0 + risk_factor
             protected = (
-                self.min_soc
+                coverage_reserve
                 + required_dc / self.battery_capacity * 100.0
             )
             snapped = math.ceil(protected / self.soc_step) * self.soc_step
-            return _clamp(snapped, self.min_soc, 100.0)
+            return _clamp(snapped, coverage_reserve, 100.0)
 
         # Outside a cheap valley, retain only the energy still needed to reach
         # the next valley. The floor naturally declines as household demand is
@@ -1126,7 +1205,7 @@ class OptimizationEngine:
                 steps,
             )
             floors[index] = household_floor(index + 1, next_low)
-            ceilings[index] = max(self.min_soc, min(
+            ceilings[index] = max(coverage_reserve, min(
                 self.max_grid_charge_soc, floors[index]))
 
         # Each valley receives one coverage target: enough energy to serve the
@@ -1142,15 +1221,15 @@ class OptimizationEngine:
             )
             target = household_floor(window_end + 1, next_low)
             for index in range(window_start, window_end + 1):
-                floors[index] = self.min_soc
+                floors[index] = coverage_reserve
                 if cheap[index]:
-                    ceilings[index] = max(self.min_soc, min(
+                    ceilings[index] = max(coverage_reserve, min(
                         self.max_grid_charge_soc, target))
             floors[window_end] = target
         return {
             'policy_name': name,
             'allow_active_grid_charge': True,
-            'allow_active_battery_export': True,
+            'allow_active_battery_export': name == 'protected_hybrid',
             'protected_floor_by_step': floors,
             'grid_charge_ceiling_by_step': ceilings,
             'grid_charge_allowed_by_step': cheap,
@@ -1495,7 +1574,7 @@ class OptimizationEngine:
         # so every surface (console, web UI, plan JSON, history) shows the same label.
         for i, step in enumerate(schedule):
             code, text = self._explain_action(schedule, i)
-            if (policy_name == 'protected_hybrid'
+            if (policy_name in ('protected_hybrid', 'green_conservation')
                     and step['action'] == 'hold'
                     and step.get('protected_soc', self.min_soc) > self.min_soc + EPS):
                 code = 'HOUSEHOLD_RESERVE_PROTECTED'
@@ -1682,9 +1761,17 @@ def _select_adaptive_policy(candidates, engine, opportunity_model=None,
         return None, {'enabled': True, 'reason_code': 'NO_FEASIBLE_CANDIDATE'}
 
     conservative_names = [
-        name for name in ('pv_first_self_sufficiency', 'protected_hybrid')
+        name for name in ('pv_first_self_sufficiency', 'green_conservation', 'protected_hybrid')
         if name in metrics
     ]
+    green_schedule = (candidates.get('green_conservation') or {}).get('schedule') or []
+    if 'green_conservation' in metrics and sum(
+            (_as_float(step.get('load'), 0.0) or 0.0)
+            - (_as_float(step.get('pv'), 0.0) or 0.0)
+            for step in green_schedule) > EPS:
+        # On a forecast energy deficit, use the grid-capable conservation
+        # baseline. PV-first cannot replenish the battery through a grey spell.
+        conservative_names = ['green_conservation']
     best_conservative = max(
         conservative_names,
         key=lambda name: metrics[name]['score_eur'],
@@ -1742,7 +1829,9 @@ def _select_adaptive_policy(candidates, engine, opportunity_model=None,
         within_dwell = time.time() - float(previous.get('selected_at')) < dwell_s
     except (TypeError, ValueError):
         within_dwell = False
-    if (within_dwell and previous_name in metrics and previous_name != selected
+    if (within_dwell and previous_name in metrics
+            and (previous_name == trade or previous_name in conservative_names)
+            and previous_name != selected
             and metrics[selected]['score_eur']
             < metrics[previous_name]['score_eur'] + switch_margin):
         selected = previous_name
@@ -1827,6 +1916,7 @@ def _price_horizon_signature(price_data, load_forecast=None, pv_forecast=None,
             blocked.append(str(value))
     soc = _as_float(current_soc)
     payload = {
+        'policy_revision': 'green-exact-supply-v1',
         'prices': prices,
         'load': forecast_rows(load_forecast),
         'pv': forecast_rows(pv_forecast),
@@ -1895,7 +1985,7 @@ def optimize_schedule(current_soc, price_data, load_forecast=None, pv_forecast=N
         previous_policy in {
             'market_arbitrage',
             'pv_first_self_sufficiency',
-            'protected_hybrid',
+            'green_conservation',
         }
         and recent_evaluation
         and previous.get('price_horizon_signature') == signature
@@ -1934,11 +2024,12 @@ def optimize_schedule(current_soc, price_data, load_forecast=None, pv_forecast=N
             discharge_blocked_slots=discharge_blocked_slots,
             policy_name='pv_first_self_sufficiency',
         ),
-        'protected_hybrid': engine.optimize_with_daily_policy(
+        'green_conservation': engine.optimize_with_daily_policy(
             current_soc, price_data, load_forecast, pv_forecast,
             discharge_blocked_slots=discharge_blocked_slots,
-            policy_name='protected_hybrid',
+            policy_name='green_conservation',
         ),
+
     }
     selected, metadata = _select_adaptive_policy(
         candidates, engine, evaluation_signature=signature)

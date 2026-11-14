@@ -40,7 +40,7 @@ def test_powerflow_ev_card_uses_per_phase_current_like_vehicle_tab():
     app = APP_JS.read_text(encoding="utf-8")
 
     for phase in (1, 2, 3):
-        assert f'"ev_l{phase}_a": f"N/{{sid}}/evcharger/42/Ac/L{phase}/Current"' in live
+        assert f'"ev_l{phase}_a": f"N/{{sid}}/acload/42/Ac/L{phase}/Current"' in live
         assert f'out["ev_l{phase}_a"] = _num("ev_l{phase}_a")' in live
     assert "const evMeterPhaseAmps" in powerflow
     assert "live.ev_l1_a, live.ev_l2_a, live.ev_l3_a" in powerflow
@@ -263,7 +263,7 @@ def test_overview_entry_precedes_ess_and_desktop_uses_power_flow_default():
 
     assert 'data-app-view="overview">Overview</a>' in html
     assert html.index('data-app-view="overview"') < html.index('data-app-view="ess"')
-    assert 'const APP_VIEWS = ["overview", "ess", "battery", "hvac", "live"]' in js
+    assert 'const APP_VIEWS = ["overview", "ess", "battery", "hvac", "live", "vehicle"]' in js
     assert 'return "overview"' in js
     assert 'if (view === "overview" && !isMobileLayout()) activateTab("live")' in js
     assert 'body[data-app-view="ess"] .overview' in css
@@ -388,12 +388,13 @@ def test_override_and_grid_assist_controls_exist_after_restart():
 
     assert 'id="override"' in html
     assert 'id="grid-assist"' in html
+    assert 'id="vehicle-grid-assist"' in html
     assert 'id="mobile-override"' in html
     assert 'id="mobile-grid-assist"' in html
     assert html.index('id="restart"') < html.index('id="override"') < html.index('id="grid-assist"')
     assert html.index('id="mobile-restart"') < html.index('id="mobile-override"') < html.index('id="mobile-grid-assist"')
     assert html.count("data-ai-override") == 2
-    assert html.count("data-grid-assist") == 2
+    assert html.count("data-grid-assist") == 3
     assert '"/api/control/ai-override"' in js
     assert '"/api/control/grid-assist"' in js
     assert "function toggleControl(" in js
