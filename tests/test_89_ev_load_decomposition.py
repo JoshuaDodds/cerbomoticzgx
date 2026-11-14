@@ -56,9 +56,16 @@ class DummyState:
 
 def test_abb_phase_current_topics_use_ac_hierarchy():
     topics = constants.Topics["system0"]
+    assert topics["tesla_power"].endswith("/evcharger/40/Ac/Power")
+    assert topics["tesla_abb_power"].endswith("/acload/42/Ac/Power")
+    assert topics["tesla_charge_energy_forward"].endswith(
+        "/acload/42/Ac/Energy/Forward"
+    )
+    assert topics["tesla_abb_power"] in constants.DzEndpoints["system0"]
+    assert topics["tesla_power"] not in constants.DzEndpoints["system0"]
     for phase in (1, 2, 3):
         assert topics[f"tesla_l{phase}_current"].endswith(
-            f"/evcharger/42/Ac/L{phase}/Current"
+            f"/acload/42/Ac/L{phase}/Current"
         )
 
 
@@ -276,6 +283,9 @@ def test_cycle_history_records_projected_final_net_for_current_day(monkeypatch, 
         applied_setpoint=-1000,
         today_actuals={"imp_cost": 2.0, "exp_rev": 1.0},
         realized_power={},
+        # This test asserts a full, not-yet-elapsed current slot.  Production
+        # passes its real cycle timestamp, which clips an already active slot.
+        now=now,
     )
 
     path = next(tmp_path.glob("ess-*.ndjson"))
@@ -286,6 +296,54 @@ def test_cycle_history_records_projected_final_net_for_current_day(monkeypatch, 
     assert rec["forecast_remaining_import_cost_eur"] == 0.0
     assert rec["forecast_remaining_export_reward_eur"] == 0.6
     assert rec["plan_horizon_net_eur"] == -4.4
+
+
+def test_cycle_history_only_books_unelapsed_current_slot_economics(monkeypatch, tmp_path):
+    """Avoid double-counting the active BUY/SELL slot with live daily counters."""
+    now = datetime.now().astimezone().replace(
+        hour=14, minute=5, second=0, microsecond=0
+    )
+    slot_start = now.replace(minute=0)
+    monkeypatch.setattr(energy_broker, "retrieve_setting",
+                        lambda name: str(tmp_path) if name == "HISTORY_DIR" else None)
+    monkeypatch.setattr(energy_broker, "STATE", DummyState({}))
+    result = {
+        "slot_duration_h": 0.25,
+        "schedule": [
+            {
+                "time": slot_start, "grid_energy": 3.75,
+                "price": 0.20, "sell": 0.20, "reason_code": "GRID_CHARGE",
+                "soc_start": 50,
+            },
+            {
+                "time": slot_start, "grid_energy": -3.75,
+                "price": 0.30, "sell": 0.30, "reason_code": "PRICE_PEAK",
+                "soc_start": 50,
+            },
+        ],
+        "control_action": "BUY",
+        "mode": "buy",
+        "reason_code": "GRID_CHARGE",
+        "current_price": 0.20,
+        "weather_context": {},
+    }
+
+    energy_broker._append_history(
+        result,
+        batt_soc=50,
+        applied_setpoint=0,
+        today_actuals={"imp_cost": 1.0, "exp_rev": 0.5},
+        realized_power={},
+        now=now,
+    )
+
+    path = next(tmp_path.glob("ess-*.ndjson"))
+    rec = json.loads(path.read_text().splitlines()[-1])
+    # Ten minutes remain, so each 3.75 kWh plan row contributes 2.5 kWh only.
+    assert rec["forecast_remaining_import_cost_eur"] == 0.5
+    assert rec["forecast_remaining_export_reward_eur"] == 0.75
+    assert rec["plan_today_remaining_net_eur"] == 0.25
+    assert rec["forecast_day_net_eur"] == -0.25
 
 
 # ---------------------------------------------------------------------------

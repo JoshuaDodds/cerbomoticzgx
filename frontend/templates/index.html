@@ -22,6 +22,7 @@
         <a href="#battery" class="app-nav-link" data-app-view="battery">Battery</a>
         <a href="#hvac" id="hvac-nav-link" class="app-nav-link" data-app-view="hvac" hidden>HVAC</a>
         <a href="#live" class="app-nav-link" data-app-view="live">Victron</a>
+        <a href="#vehicle" class="app-nav-link" data-app-view="vehicle">Vehicle</a>
       </nav>
     </div>
     <div id="mobile-key-stat" class="mobile-key-stat" aria-live="polite" hidden></div>
@@ -48,7 +49,6 @@
       <button class="tab active" data-tab="schedule">Timeline</button>
       <button class="tab" data-tab="victron">Victron Schedule</button>
       <button class="tab" data-tab="weather">Weather</button>
-      <button class="tab" data-tab="vehicle">Vehicle</button>
       <button class="tab" data-tab="advisor">Advisor</button>
       <button class="tab" data-tab="config">Configuration</button>
       <button class="tab" data-tab="logs">Logs</button>
@@ -119,8 +119,9 @@
         <div class="tab-actions import-schedule-actions">
           <button id="clear-import-schedule" type="button" class="btn-secondary btn-danger">Clear schedule</button>
         </div>
-        <p class="cfg-note">The grid-charge schedule the optimizer has programmed into the
-          CerboGX (Settings → ESS → Scheduled charging). 5 slots, mirrored here.</p>
+        <p class="cfg-note">The actual grid-charge schedule currently stored in the
+          CerboGX (Settings → ESS → Scheduled charging). All 5 slots update live,
+          regardless of which controller or user edited them.</p>
         <div id="victron-schedules" class="card"></div>
       </section>
 
@@ -135,7 +136,77 @@
         </div>
       </section>
 
-      <section id="tab-vehicle" class="tab-panel">
+      <section id="tab-advisor" class="tab-panel">
+        <div class="card advisor">
+          <p class="cfg-note">A read-only AI review of optimizer behaviour. Daily review uses the
+            current plan and performance; open questions can retrieve bounded history, logs,
+            runtime state, and approved code excerpts. It never changes config or control.</p>
+          <div class="advisor-controls">
+            <button id="advisor-clear" class="btn-secondary btn-danger">Clear chat</button>
+            <button id="advisor-review" class="btn-secondary">Run daily review</button>
+            <form id="advisor-ask" class="advisor-ask">
+              <input id="advisor-q" type="text" autocomplete="off"
+                     aria-label="Ask the AI Advisor a question"
+                     placeholder="Ask a question, e.g. Why did we sell at 15:00 yesterday?"/>
+              <button id="advisor-submit" type="submit" class="btn-secondary">Ask</button>
+              <span id="advisor-submit-status" class="sr-only" role="status" aria-live="polite"></span>
+            </form>
+          </div>
+          <div id="advisor-meta" class="advisor-meta muted"></div>
+          <section class="advisor-tools" aria-label="Read-only local evidence tools">
+            <div class="advisor-tool-card">
+              <div>
+                <strong>Forecast validation</strong>
+                <p>Compare the current forecast with the Weather/HVAC trial. This never enables a forecast setting.</p>
+              </div>
+              <button id="advisor-forecast-validation" type="button" class="btn-secondary">Validate forecasts</button>
+              <div id="advisor-forecast-validation-result" class="advisor-tool-result muted">Not run in this browser session.</div>
+            </div>
+            <div class="advisor-tool-card">
+              <div>
+                <strong>ESS strategy comparison</strong>
+                <p>Compare read-only alternatives against the frozen live plan. It never changes dispatch.</p>
+              </div>
+              <button id="advisor-ess-strategies" type="button" class="btn-secondary">Compare strategies</button>
+              <div id="advisor-ess-strategies-result" class="advisor-tool-result muted">Not run in this browser session.</div>
+            </div>
+          </section>
+          <div id="advisor-report" class="advisor-report">
+            <span class="muted">No review yet — run the daily review or ask a question.</span>
+          </div>
+        </div>
+      </section>
+
+      <section id="tab-config" class="tab-panel">
+        <div id="config"></div>
+      </section>
+
+      <section id="tab-logs" class="tab-panel">
+        <div class="card logs-card">
+          <div class="logs-card-head">
+            <h3 style="margin:2px 0 10px">Logs</h3>
+            <input id="logs-search" type="search" class="logs-search" placeholder="Filter…"
+                   autocomplete="off" spellcheck="false" aria-label="Filter log lines" />
+          </div>
+          <p class="cfg-note">Live tail of this service's own log output (capped buffer, most
+            recent lines). Streams while this tab is open. Filter is case-insensitive and
+            matches update live as new lines arrive.</p>
+          <div id="logs-output" class="logs-output"><span class="muted">waiting for logs…</span></div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="foot">
+      <span id="meta" class="muted"></span>
+      <button id="replan" class="btn" data-replan title="Re-run the optimizer now on current data">Replan</button>
+      <button id="restart" class="btn" data-restart title="Request a supervised service restart">Restart</button>
+      <button id="override" class="btn btn-toggle" data-ai-override title="Disable AI ESS control until toggled off">Override</button>
+      <button id="grid-assist" class="btn btn-toggle" data-grid-assist title="Force retain/grid assist until toggled off">Grid assist</button>
+    </footer>
+  </div>
+
+  <section id="vehicle-view" class="app-view vehicle-view" aria-label="Vehicle">
+    <main id="tab-vehicle">
         <div class="card">
           <div class="vehicle-card-head">
             <h3 style="margin:2px 0 10px">Vehicle</h3>
@@ -154,7 +225,12 @@
           <div class="ev-controls">
             <button id="ev-start" type="button" class="btn" data-ev-charge="start">Start charge</button>
             <button id="ev-stop" type="button" class="btn" data-ev-charge="stop">Stop charge</button>
+            <button id="vehicle-grid-assist" type="button" class="btn btn-toggle" data-grid-assist
+                    title="Allow an immediate grid-backed Start request">Grid assist</button>
           </div>
+          <p class="cfg-note">Manual Start requires Grid assist. Smart and protected solar charging start automatically when eligible.</p>
+          <div id="ev-charge-status" class="ev-charge-status muted" role="status" aria-live="polite">Waiting for charger status…</div>
+          <div id="ev-charge-observed" class="ev-charge-observed muted">Live charger power unavailable.</div>
           <!-- <p class="cfg-note"><strong>Start charge</strong> plus <strong>Grid assist</strong>
             authorizes an immediate grid-backed charge. A smart block or protected solar surplus
             can charge independently. <strong>Stop charge</strong> always stops the car and
@@ -213,58 +289,8 @@
             live streaming signals. Its unrounded all-in estimate limits normal requests to
             preserve a €0.25 margin below the monthly credit.</p> -->
         </div>
-      </section>
-
-      <section id="tab-advisor" class="tab-panel">
-        <div class="card advisor">
-          <p class="cfg-note">A read-only AI review of optimizer behaviour. Daily review uses the
-            current plan and performance; open questions can retrieve bounded history, logs,
-            runtime state, and approved code excerpts. It never changes config or control.</p>
-          <div class="advisor-controls">
-            <button id="advisor-clear" class="btn-secondary btn-danger">Clear chat</button>
-            <button id="advisor-review" class="btn-secondary">Run daily review</button>
-            <form id="advisor-ask" class="advisor-ask">
-              <input id="advisor-q" type="text" autocomplete="off"
-                     aria-label="Ask the AI Advisor a question"
-                     placeholder="Ask a question, e.g. Why did we sell at 15:00 yesterday?"/>
-              <button id="advisor-submit" type="submit" class="btn-secondary">Ask</button>
-              <span id="advisor-submit-status" class="sr-only" role="status" aria-live="polite"></span>
-            </form>
-          </div>
-          <div id="advisor-meta" class="advisor-meta muted"></div>
-          <div id="advisor-report" class="advisor-report">
-            <span class="muted">No review yet — run the daily review or ask a question.</span>
-          </div>
-        </div>
-      </section>
-
-      <section id="tab-config" class="tab-panel">
-        <div id="config"></div>
-      </section>
-
-      <section id="tab-logs" class="tab-panel">
-        <div class="card logs-card">
-          <div class="logs-card-head">
-            <h3 style="margin:2px 0 10px">Logs</h3>
-            <input id="logs-search" type="search" class="logs-search" placeholder="Filter…"
-                   autocomplete="off" spellcheck="false" aria-label="Filter log lines" />
-          </div>
-          <p class="cfg-note">Live tail of this service's own log output (capped buffer, most
-            recent lines). Streams while this tab is open. Filter is case-insensitive and
-            matches update live as new lines arrive.</p>
-          <div id="logs-output" class="logs-output"><span class="muted">waiting for logs…</span></div>
-        </div>
-      </section>
     </main>
-
-    <footer class="foot">
-      <span id="meta" class="muted"></span>
-      <button id="replan" class="btn" data-replan title="Re-run the optimizer now on current data">Replan</button>
-      <button id="restart" class="btn" data-restart title="Request a supervised service restart">Restart</button>
-      <button id="override" class="btn btn-toggle" data-ai-override title="Disable AI ESS control until toggled off">Override</button>
-      <button id="grid-assist" class="btn btn-toggle" data-grid-assist title="Force retain/grid assist until toggled off">Grid assist</button>
-    </footer>
-  </div>
+  </section>
 
   <section id="battery-view" class="app-view battery-view" aria-label="Battery rack metrics">
     <div class="card battery-frame-card">
@@ -317,10 +343,10 @@
         <button type="button" data-mobile-app-view="battery">Battery</button>
         <button type="button" id="hvac-mobile-link" data-mobile-app-view="hvac" hidden>HVAC</button>
         <button type="button" data-mobile-app-view="live">Victron</button>
+        <button type="button" data-mobile-app-view="vehicle">Vehicle</button>
       </div>
       <div class="mobile-menu-group" aria-label="Dashboard tabs">
         <button type="button" data-mobile-tab="victron">Victron Schedule</button>
-        <button type="button" data-mobile-tab="vehicle">Vehicle</button>
         <button type="button" data-mobile-tab="config">Configuration</button>
         <button type="button" data-mobile-tab="logs">Logs</button>
         <button id="mobile-replan" type="button" data-replan>Replan</button>

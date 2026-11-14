@@ -161,12 +161,53 @@ def get_victron_solar_forecast():
 
     if data:
         try:
+            # VRM can briefly return a structurally valid but empty forecast
+            # while its daily stats are being refreshed. Accepting that
+            # response would overwrite a healthy snapshot with zero PV and
+            # zero load, causing a large artificial optimizer replan. Keep
+            # the last validated snapshot until a non-empty response arrives.
+            def _reading(series, index=0):
+                try:
+                    return float(series[index][1])
+                except (TypeError, ValueError, IndexError, KeyError):
+                    return 0.0
+
+            today_forecast_wh = _reading(data.get('solar_yield_forecast'))
+            tomorrow_forecast_wh = _reading(data.get('solar_yield_forecast'), 1)
+            consumption_forecast_wh = _reading(data.get('vrm_consumption_fc'))
+            previous_today = str(STATE.get('pv_projected_today_date') or '')[:10]
+            def _state_positive(key):
+                try:
+                    return float(STATE.get(key) or 0.0) > 0.0
+                except (TypeError, ValueError):
+                    return False
+
+            previous_has_forecast = (
+                previous_today == now_tz.date().isoformat()
+                and (
+                    _state_positive('pv_projected_remaining')
+                    or _state_positive('pv_projected_tomorrow')
+                    or _state_positive('consumption_total_projected')
+                )
+            )
+            if (
+                previous_has_forecast
+                and today_forecast_wh <= 0.0
+                and tomorrow_forecast_wh <= 0.0
+                and consumption_forecast_wh <= 0.0
+            ):
+                logging.warning(
+                    "VRM returned an empty daily forecast; retaining the last validated snapshot."
+                )
+                STATE.set('pv_forecast_update_status', 'empty_response_retained')
+                return None
+
             # VRM solar forecast data
             solar_generation_kwh = actual_solar_generation(now=now_tz)
             solar_production = solar_generation_kwh * 1000
             # Clamp remaining to >= 0: once actual production exceeds the day's
             # forecast, "remaining" would otherwise go negative (meaningless).
-            solar_production_left = max(0.0, round(float(data['solar_yield_forecast'][0][1]), 2) - solar_production)
+            solar_production_left = max(0.0, round(today_forecast_wh, 2) - solar_production)
             solar_forecast_kwh = round(solar_production_left + solar_production, 2)
 
             logging.debug(
@@ -176,12 +217,13 @@ def get_victron_solar_forecast():
             STATE.set('pv_projected_remaining', solar_production_left)
             STATE.set('pv_projected_today_date', now_tz.date().isoformat())
             STATE.set('pv_forecast_updated_at', now_tz.isoformat())
+            STATE.set('pv_forecast_update_status', 'validated')
 
             # Tomorrow's forecast daily solar total (Wh) for day-2 planning. The
             # 2-day window returns index [1] for tomorrow; guarded so a missing
             # second day never affects today's values.
             try:
-                pv_tomorrow_wh = round(float(data['solar_yield_forecast'][1][1]), 2)
+                pv_tomorrow_wh = round(tomorrow_forecast_wh, 2)
                 STATE.set('pv_projected_tomorrow', pv_tomorrow_wh)
                 STATE.set(
                     'pv_projected_tomorrow_date',

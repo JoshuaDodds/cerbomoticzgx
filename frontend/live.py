@@ -29,6 +29,24 @@ EV_IDLE_POWER_W = 100.0
 # never extrapolate through a dashboard/MQTT outage. The next authoritative VRM
 # sample re-anchors any small integration drift.
 HOUSE_ENERGY_MAX_GAP_SECONDS = 120.0
+VICTRON_SCHEDULE_FIELDS = {
+    "day": "Day",
+    "start": "Start",
+    "duration": "Duration",
+    "soc": "Soc",
+}
+VICTRON_SCHEDULE_DAY_LABELS = {
+    0: "Sunday",
+    1: "Monday",
+    2: "Tuesday",
+    3: "Wednesday",
+    4: "Thursday",
+    5: "Friday",
+    6: "Saturday",
+    7: "Every day",
+    8: "Weekdays",
+    9: "Weekends",
+}
 
 
 def mqtt_client_id() -> str:
@@ -98,9 +116,11 @@ class MqttLive:
         self._house_last_tick_mono = None
         self._house_load_total_received_day = None
         self._house_ev_total_received_day = None
+        self._portal_id = None
+        self._client = None
 
     def _build_topics(self, sid):
-        return {
+        topics = {
             "soc": f"N/{sid}/battery/277/Soc",
             "price": "Tibber/home/price_info/now/total",
             "grid_w": f"N/{sid}/vebus/276/Ac/ActiveIn/P",
@@ -152,16 +172,16 @@ class MqttLive:
             # EV charging power (Watts) — the main service reads it from Domoticz
             # and publishes it here. Absent => the EV node stays hidden.
             "ev_w": "Tesla/vehicle0/charging_watts",   # local evcharger meter: fast + accurate (was the laggy domoticz-derived ev_power, which flapped)
-            # EV charger lifetime forward energy (kWh) + present session time (s),
-            # from the Victron evcharger service (instance 42; matches lib/constants.py).
-            "ev_energy_kwh": f"N/{sid}/evcharger/42/Ac/Energy/Forward",
-            "ev_charge_time": f"N/{sid}/evcharger/42/ChargingTime",
+            # ABB meter lifetime forward energy (kWh) remains the historical
+            # source; session time is a live EVCS reading (instance 40).
+            "ev_energy_kwh": f"N/{sid}/acload/42/Ac/Energy/Forward",
+            "ev_charge_time": f"N/{sid}/evcharger/40/ChargingTime",
             # ABB meter phase currents. The power-flow EV card intentionally sums
             # these three physical measurements to match the Tesla total-current
             # convention; it must not multiply the car's retained ChargeAmps value.
-            "ev_l1_a": f"N/{sid}/evcharger/42/Ac/L1/Current",
-            "ev_l2_a": f"N/{sid}/evcharger/42/Ac/L2/Current",
-            "ev_l3_a": f"N/{sid}/evcharger/42/Ac/L3/Current",
+            "ev_l1_a": f"N/{sid}/acload/42/Ac/L1/Current",
+            "ev_l2_a": f"N/{sid}/acload/42/Ac/L2/Current",
+            "ev_l3_a": f"N/{sid}/acload/42/Ac/L3/Current",
             # Tesla vehicle status (published by tesla_api / ev_charge_controller as
             # {"value": ...}). Read-only in the UI — no Fleet API cost. Absent topics
             # simply leave the field None and the Vehicle tab hides that row.
@@ -185,6 +205,9 @@ class MqttLive:
             "feed_in_state": "Cerbomoticzgx/GlobalState/feed_in_limit_state",
             "ai_ess_override_enabled": "Cerbomoticzgx/system/ai_ess_override_enabled",
             "grid_charging_enabled": "Cerbomoticzgx/system/grid_charging_enabled",
+            "ev_charge_requested": "Cerbomoticzgx/GlobalState/ev_charge_requested",
+            "ev_charge_requested_at": "Cerbomoticzgx/GlobalState/ev_charge_requested_at",
+            "ev_charge_decision": "Cerbomoticzgx/GlobalState/ev_charge_decision",
             "day_import_kwh": "Tibber/home/energy/day/imported",
             "day_import_cost": "Tibber/home/energy/day/cost",
             "day_export_kwh": "Tibber/home/energy/day/exported",
@@ -208,6 +231,17 @@ class MqttLive:
             "price_tom_high": "Tibber/home/price_info/tomorrow/highest/0/cost",
             "price_tom_high_at": "Tibber/home/price_info/tomorrow/highest/0/hour",
         }
+        # The Victron Schedule tab must mirror the settings service, not the
+        # optimizer's last intended plan. N/... values are emitted whenever any
+        # writer (GUI, Node-RED, another service, or this optimizer) changes a slot.
+        for index in range(5):
+            prefix = (
+                f"N/{sid}/settings/0/Settings/CGwacs/BatteryLife/"
+                f"Schedule/Charge/{index}/"
+            )
+            for field, mqtt_name in VICTRON_SCHEDULE_FIELDS.items():
+                topics[f"victron_schedule_{index}_{field}"] = prefix + mqtt_name
+        return topics
 
     def start(self):
         if self._started or mqtt is None:
@@ -220,6 +254,7 @@ class MqttLive:
         if not host or not sid:
             return
 
+        self._portal_id = sid
         topics = self._build_topics(sid)
         self._key_by_topic = {t: k for k, t in topics.items()}
 
@@ -239,6 +274,9 @@ class MqttLive:
         self._connected = True
         for topic in self._key_by_topic:
             client.subscribe(topic)
+        # Settings may not be retained on newer Venus/FlashMQ versions. Explicit
+        # reads hydrate all five slots immediately after every reconnect.
+        self.request_victron_schedule_refresh()
 
     def _on_disconnect(self, _c, _u, _rc):
         self._connected = False
@@ -326,6 +364,8 @@ class MqttLive:
             if key in energy_keys:
                 self._integrate_house_energy_locked(monotonic_now)
             self._values[key] = value
+            if key.startswith("victron_schedule_"):
+                self._values["victron_schedule_updated_at"] = now.isoformat()
             if key == "load_actual_today_wh":
                 self._house_load_total_received_day = day
                 self._anchor_house_energy_locked(day)
@@ -354,6 +394,76 @@ class MqttLive:
         except Exception:
             pass
         return False
+
+    def request_victron_schedule_refresh(self) -> bool:
+        """Request the current value of every Victron scheduled-charge setting.
+
+        Victron's MQTT read contract uses the corresponding ``R/`` topic and an
+        empty payload. Exact-path reads avoid the much heavier full-system
+        keepalive republish while still working when settings are not retained.
+        """
+        client = self._client
+        sid = self._portal_id
+        if client is None or not sid or not self._connected:
+            return False
+        try:
+            for index in range(5):
+                prefix = (
+                    f"R/{sid}/settings/0/Settings/CGwacs/BatteryLife/"
+                    f"Schedule/Charge/{index}/"
+                )
+                for mqtt_name in VICTRON_SCHEDULE_FIELDS.values():
+                    client.publish(prefix + mqtt_name, payload="")
+            return True
+        except Exception:
+            return False
+
+    def _victron_schedule_snapshot(self, vals: dict) -> dict:
+        available = any(
+            key.startswith("victron_schedule_") and key != "victron_schedule_updated_at"
+            for key in vals
+        )
+        if not available:
+            return {"available": False, "updated_at": None, "slots": []}
+
+        def integer(key):
+            number = self._number(vals.get(key))
+            return int(number) if number is not None else None
+
+        slots = []
+        for index in range(5):
+            prefix = f"victron_schedule_{index}_"
+            day = integer(prefix + "day")
+            start = integer(prefix + "start")
+            duration = integer(prefix + "duration")
+            target_soc = integer(prefix + "soc")
+            enabled = None if day is None else day >= 0
+            complete = day is not None and (
+                not enabled
+                or all(value is not None for value in (start, duration, target_soc))
+            )
+            start_text = None
+            if start is not None and start >= 0:
+                seconds = start % 86400
+                start_text = f"{seconds // 3600:02d}:{(seconds % 3600) // 60:02d}"
+            slots.append({
+                "index": index,
+                "day": day,
+                "day_label": VICTRON_SCHEDULE_DAY_LABELS.get(
+                    day, f"Day {day}" if day is not None else None
+                ),
+                "start_seconds": start,
+                "start": start_text,
+                "duration": duration,
+                "target_soc": target_soc,
+                "enabled": enabled,
+                "complete": complete,
+            })
+        return {
+            "available": True,
+            "updated_at": vals.get("victron_schedule_updated_at"),
+            "slots": slots,
+        }
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -454,6 +564,28 @@ class MqttLive:
         out["feed_in_state"] = vals.get("feed_in_state")
         out["ai_ess_override_enabled"] = vals.get("ai_ess_override_enabled")
         out["grid_charging_enabled"] = vals.get("grid_charging_enabled")
+        out["ev_charge_requested"] = vals.get("ev_charge_requested")
+        requested_at = _num("ev_charge_requested_at")
+        out["ev_charge_requested_at"] = requested_at
+        out["ev_charge_request_age_s"] = (
+            max(0.0, time.time() - requested_at)
+            if requested_at is not None and requested_at > 0 else None
+        )
+        decision = vals.get("ev_charge_decision")
+        out["ev_charge_decision"] = None
+        if isinstance(decision, str):
+            code, separator, timestamp = decision.partition("|")
+            try:
+                updated_at = float(timestamp) if separator else None
+            except ValueError:
+                updated_at = None
+            if code and updated_at is not None:
+                out["ev_charge_decision"] = {
+                    "code": code,
+                    "intent": code != "idle",
+                    "updated_at": updated_at,
+                    "age_s": max(0.0, time.time() - updated_at),
+                }
         out["day_import_kwh"] = _num("day_import_kwh")
         out["day_import_cost"] = _num("day_import_cost")
         out["day_export_kwh"] = _num("day_export_kwh")
@@ -491,6 +623,7 @@ class MqttLive:
         out["price_today_high_at"] = vals.get("price_today_high_at")
         out["price_tom_low_at"] = vals.get("price_tom_low_at")
         out["price_tom_high_at"] = vals.get("price_tom_high_at")
+        out["victron_schedule"] = self._victron_schedule_snapshot(vals)
         return out
 
 

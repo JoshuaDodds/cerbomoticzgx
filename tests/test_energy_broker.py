@@ -1,4 +1,5 @@
 from pathlib import Path
+from datetime import datetime, timedelta
 import sys
 import json
 import types
@@ -53,6 +54,30 @@ class DummyState:
 
     def has(self, key):
         return key in self._values
+
+
+def test_transiently_empty_forecast_is_rejected_before_replan(monkeypatch):
+    from datetime import datetime
+
+    now = datetime.now().astimezone()
+    state = DummyState({
+        "pv_projected_remaining": 0,
+        "pv_projected_tomorrow": 0,
+        "consumption_total_projected": 0,
+        "pv_projected_today_date": "0",
+        "pv_forecast_updated_at": 0,
+    })
+    monkeypatch.setattr(energy_broker, "STATE", state)
+
+    assert energy_broker._forecast_inputs_transiently_empty(now=now) is True
+
+    state._values.update({
+        "pv_projected_today_date": now.date().isoformat(),
+        "pv_forecast_updated_at": now.timestamp(),
+    })
+    # Zero load plus zero PV is still an unusable partial snapshot, even when
+    # stale metadata happens to retain today's date.
+    assert energy_broker._forecast_inputs_transiently_empty(now=now) is True
 
 
 def test_hourly_load_profile_normalised(monkeypatch):
@@ -526,6 +551,41 @@ def test_pv_nowcast_fades_with_horizon_and_leaves_tomorrow(monkeypatch):
     assert adjusted[tomorrow_slot["start"]] == base[tomorrow_slot["start"]]
 
 
+def test_pv_nowcast_single_live_uplift_is_limited_to_the_next_hour(monkeypatch):
+    """One fresh high sample must not rewrite several hours of export revenue."""
+    from datetime import datetime, timedelta, timezone
+
+    start = datetime(2026, 6, 29, 16, 0, tzinfo=timezone.utc)
+    # The first row mirrors the retained prior slot in a live optimiser plan.
+    # It must not receive a new nowcast adjustment after it has ended.
+    slots = ([{"start": start - timedelta(minutes=15)}]
+             + [{"start": start + timedelta(minutes=15 * i)} for i in range(20)]
+             + [{"start": start + timedelta(days=1)}])
+    base = {slot["start"]: 0.2 for slot in slots}
+    weather_context = {
+        "available": True,
+        "slots": {
+            slot["start"].isoformat(): {"gti_forecast_wm2": 560.0}
+            for slot in slots
+        },
+        "summary": {},
+    }
+    monkeypatch.setattr(
+        energy_broker,
+        "_pv_nowcast_anchor_kwh",
+        lambda slot_h, now=None: {"slot_kwh": 1.5, "source": "live_recent", "drop_ratio": 1.0},
+    )
+
+    adjusted = energy_broker._apply_pv_nowcast(
+        base, slots, weather_context, 0.25, now=start)
+
+    # The first hour contains the current plus three following 15-minute slots.
+    assert adjusted[slots[0]["start"]] == base[slots[0]["start"]]
+    assert all(adjusted[slot["start"]] > base[slot["start"]] for slot in slots[1:5])
+    assert all(adjusted[slot["start"]] == base[slot["start"]] for slot in slots[5:])
+    assert weather_context["summary"]["pv_nowcast_slots"] == 4
+
+
 def test_pv_nowcast_dropoff_reduces_uplift_confidence(monkeypatch):
     from datetime import datetime, timedelta, timezone
 
@@ -594,6 +654,275 @@ def test_pv_nowcast_does_not_lower_on_missing_gti(monkeypatch):
     assert adjusted[far] == base[far]
 
 
+def test_pv_nowcast_single_midday_zero_stays_pending_and_recovers(monkeypatch):
+    """One daytime zero must not erase several hours of otherwise credible PV."""
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc)
+    state = DummyState({
+        "pv_power": 0.0,
+        "pv_power_updated_at": now.timestamp(),
+    })
+    monkeypatch.setattr(energy_broker, "STATE", state)
+    monkeypatch.setattr(energy_broker, "_PV_NOWCAST_DROP_CANDIDATE", None)
+    monkeypatch.setattr(
+        energy_broker,
+        "_latest_settled_pv_slot_kwh",
+        lambda slot_h, now=None: 0.8,
+    )
+
+    pending = energy_broker._pv_nowcast_anchor_kwh(0.25, now=now)
+
+    assert pending["source"] == "live_drop_pending"
+    assert pending["drop_state"] == "pending"
+    assert pending["drop_confirmed"] is False
+    assert pending["slot_kwh"] == 0.8
+
+    slots = [{"start": now + timedelta(minutes=15 * i)} for i in range(4)]
+    # The retained last-settled anchor is 0.8 kWh. A pending live drop must not
+    # silently raise this lower baseline toward it either; it is a true no-op.
+    base = {slot["start"]: 0.5 for slot in slots}
+    context = {
+        "available": True,
+        "slots": {
+            slot["start"].isoformat(): {"gti_forecast_wm2": 500.0}
+            for slot in slots
+        },
+        "summary": {},
+    }
+    adjusted = energy_broker._apply_pv_nowcast(base, slots, context, 0.25, now=now)
+    assert adjusted == base
+    assert context["summary"]["pv_nowcast_decision"] == "pending_drop_baseline_preserved"
+    assert context["summary"]["pv_forecast_stage"] == "post_nowcast"
+
+    # A healthy new live observation clears the candidate instead of carrying a
+    # stale zero into a later optimizer cycle.
+    recovered_at = now + timedelta(seconds=60)
+    state.set("pv_power", 3200.0)
+    state.set("pv_power_updated_at", recovered_at.timestamp())
+    recovered = energy_broker._pv_nowcast_anchor_kwh(0.25, now=recovered_at)
+    assert recovered["drop_state"] == "recovered"
+    assert recovered["source"] == "live_recent"
+
+
+def test_pv_nowcast_requires_two_daytime_drop_observations_before_lowering(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    first_seen = datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc)
+    state = DummyState({
+        "pv_power": 0.0,
+        "pv_power_updated_at": first_seen.timestamp(),
+    })
+    monkeypatch.setattr(energy_broker, "STATE", state)
+    monkeypatch.setattr(energy_broker, "_PV_NOWCAST_DROP_CANDIDATE", None)
+    monkeypatch.setattr(
+        energy_broker,
+        "_latest_settled_pv_slot_kwh",
+        lambda slot_h, now=None: 0.8,
+    )
+
+    assert energy_broker._pv_nowcast_anchor_kwh(0.25, now=first_seen)["drop_state"] == "pending"
+
+    confirmed_at = first_seen + timedelta(seconds=60)
+    state.set("pv_power_updated_at", confirmed_at.timestamp())
+    confirmed = energy_broker._pv_nowcast_anchor_kwh(0.25, now=confirmed_at)
+
+    assert confirmed["source"] == "live_drop_confirmed"
+    assert confirmed["drop_state"] == "confirmed"
+    assert confirmed["drop_confirmed"] is True
+    assert confirmed["drop_samples"] == 2
+    assert confirmed["downward_weight_cap"] < 1.0
+
+    slots = [{"start": confirmed_at + timedelta(minutes=15 * i)} for i in range(4)]
+    base = {slot["start"]: 0.8 for slot in slots}
+    context = {
+        "available": True,
+        "slots": {
+            slot["start"].isoformat(): {"gti_forecast_wm2": 500.0}
+            for slot in slots
+        },
+        "summary": {},
+    }
+    adjusted = energy_broker._apply_pv_nowcast(
+        base, slots, context, 0.25, now=confirmed_at)
+
+    # A sustained outage can reduce the forecast, but a single low observation
+    # must never turn a 0.8 kWh slot into an immediate zero forecast.
+    assert 0.4 < adjusted[slots[0]["start"]] < base[slots[0]["start"]]
+    assert context["summary"]["pv_nowcast_drop_state"] == "confirmed"
+
+
+def test_pv_nowcast_expired_pending_drop_cannot_be_confirmed_by_later_measurement(monkeypatch):
+    """Repeated reads of one MQTT sample must not keep a pending drop alive."""
+    from datetime import datetime, timedelta, timezone
+
+    first_seen = datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc)
+    state = DummyState({
+        "pv_power": 0.0,
+        "pv_power_updated_at": first_seen.timestamp(),
+    })
+    monkeypatch.setattr(energy_broker, "STATE", state)
+    monkeypatch.setattr(energy_broker, "_PV_NOWCAST_DROP_CANDIDATE", None)
+    monkeypatch.setattr(
+        energy_broker,
+        "_latest_settled_pv_slot_kwh",
+        lambda slot_h, now=None: 0.8,
+    )
+
+    assert energy_broker._pv_nowcast_anchor_kwh(0.25, now=first_seen)["drop_state"] == "pending"
+
+    # Multiple optimizer reads of the exact same fresh topic update must not
+    # create samples or renew the candidate's evidence lifetime.
+    for seconds in (30, 90):
+        duplicate = energy_broker._pv_nowcast_anchor_kwh(
+            0.25, now=first_seen + timedelta(seconds=seconds))
+        assert duplicate["drop_state"] == "pending"
+        assert duplicate["drop_samples"] == 1
+
+    # A separate low observation after the evidence expiry must start a *new*
+    # pending candidate, not confirm the old one just because it is the second
+    # low value the process has seen.
+    later = first_seen + timedelta(
+        seconds=energy_broker._PV_NOWCAST_DROP_CANDIDATE_MAX_AGE_SECONDS + 60
+    )
+    state.set("pv_power_updated_at", later.timestamp())
+    restarted = energy_broker._pv_nowcast_anchor_kwh(0.25, now=later)
+
+    assert restarted["drop_state"] == "pending"
+    assert restarted["drop_samples"] == 1
+    assert restarted["drop_observed_at"] == later.timestamp()
+
+
+def test_pv_nowcast_can_reuse_one_anchor_for_parallel_forecasts(monkeypatch):
+    """Baseline and weather-shadow forecasts must see the same live evidence."""
+    from datetime import datetime, timedelta, timezone
+
+    start = datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc)
+    slots = [{"start": start + timedelta(minutes=15 * i)} for i in range(4)]
+    anchor = {
+        "slot_kwh": 0.2,
+        "source": "live_drop_confirmed",
+        "drop_ratio": 0.25,
+        "drop_state": "confirmed",
+        "drop_confirmed": True,
+        "drop_evidence": "two_distinct_live_drop_samples",
+        "drop_samples": 2,
+        "downward_weight_cap": 0.45,
+    }
+    monkeypatch.setattr(
+        energy_broker,
+        "_pv_nowcast_anchor_kwh",
+        lambda *args, **kwargs: pytest.fail("must use the supplied shared anchor"),
+    )
+    baseline = {slot["start"]: 0.8 for slot in slots}
+    shadow = {slot["start"]: 0.6 for slot in slots}
+    context = {
+        "slots": {
+            slot["start"].isoformat(): {"gti_forecast_wm2": 500.0}
+            for slot in slots
+        },
+        "summary": {},
+    }
+    shadow_context = {
+        "slots": {
+            slot["start"].isoformat(): {"gti_forecast_wm2": 500.0}
+            for slot in slots
+        },
+        "summary": {},
+    }
+
+    adjusted_baseline = energy_broker._apply_pv_nowcast(
+        baseline, slots, context, 0.25, now=start, anchor=anchor)
+    adjusted_shadow = energy_broker._apply_pv_nowcast(
+        shadow, slots, shadow_context, 0.25, now=start, anchor=anchor)
+
+    assert adjusted_baseline[slots[0]["start"]] < baseline[slots[0]["start"]]
+    assert adjusted_shadow[slots[0]["start"]] < shadow[slots[0]["start"]]
+    assert context["summary"]["pv_nowcast_drop_state"] == "confirmed"
+    assert shadow_context["summary"]["pv_nowcast_pipeline_version"] == (
+        energy_broker._PV_NOWCAST_PIPELINE_VERSION)
+
+
+def test_matched_pv_nowcast_records_fair_final_baseline_and_weather_shadow(monkeypatch):
+    """Weather validation gets two equally-nowcasted PV variants, not mixed stages."""
+    from datetime import datetime, timedelta, timezone
+
+    start = datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc)
+    slots = [{"start": start + timedelta(minutes=15 * i)} for i in range(4)]
+    baseline = {slot["start"]: 0.8 for slot in slots}
+    shadow = {slot["start"]: 0.4 for slot in slots}
+    anchor = {
+        "slot_kwh": 0.2,
+        "source": "live_drop_confirmed",
+        "drop_ratio": 0.25,
+        "drop_state": "confirmed",
+        "drop_confirmed": True,
+        "drop_evidence": "two_distinct_live_drop_samples",
+        "drop_samples": 2,
+        "downward_weight_cap": 0.45,
+    }
+    anchor_call = MagicMock(return_value=anchor)
+    monkeypatch.setattr(energy_broker, "_pv_nowcast_anchor_kwh", anchor_call)
+    context = {
+        "available": True,
+        "pv_shadow_forecast": shadow,
+        "summary": {"pv_apply": False},
+        "slots": {
+            slot["start"].isoformat(): {
+                "gti_forecast_wm2": 500.0,
+                "baseline_pv_kwh": 0.8,
+                "weather_pv_shadow_kwh": 0.4,
+            }
+            for slot in slots
+        },
+    }
+
+    selected = energy_broker._apply_matched_pv_nowcast(
+        baseline, slots, context, 0.25, now=start)
+
+    anchor_call.assert_called_once_with(0.25, now=start)
+    first = slots[0]["start"].isoformat()
+    row = context["slots"][first]
+    assert selected[slots[0]["start"]] == pytest.approx(
+        context["final_baseline_pv_forecast"][slots[0]["start"]])
+    assert row["final_baseline_pv_forecast_kwh"] < 0.8
+    assert row["final_weather_pv_shadow_kwh"] < 0.4
+    assert row["final_baseline_pv_forecast_kwh"] != row["final_weather_pv_shadow_kwh"]
+    assert context["summary"]["pv_nowcast_selected_branch"] == "baseline"
+    assert context["summary"]["pv_forecast_stage"] == "post_nowcast"
+    assert context["summary"]["pv_nowcast_pipeline_version"] == (
+        energy_broker._PV_NOWCAST_PIPELINE_VERSION)
+
+
+def test_matched_pv_nowcast_selects_weather_branch_only_when_apply_is_enabled(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    start = datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc)
+    slots = [{"start": start + timedelta(minutes=15 * i)} for i in range(2)]
+    baseline = {slot["start"]: 0.8 for slot in slots}
+    shadow = {slot["start"]: 0.4 for slot in slots}
+    monkeypatch.setattr(
+        energy_broker,
+        "_pv_nowcast_anchor_kwh",
+        lambda *args, **kwargs: None,
+    )
+    context = {
+        "available": True,
+        "pv_shadow_forecast": shadow,
+        "summary": {"pv_apply": True},
+        "slots": {slot["start"].isoformat(): {} for slot in slots},
+    }
+
+    selected = energy_broker._apply_matched_pv_nowcast(
+        baseline, slots, context, 0.25, now=start)
+
+    assert selected == shadow
+    assert context["summary"]["pv_nowcast_selected_branch"] == "weather_shadow"
+    row = context["slots"][slots[0]["start"].isoformat()]
+    assert row["final_baseline_pv_forecast_kwh"] == 0.8
+    assert row["final_weather_pv_shadow_kwh"] == 0.4
+
+
 def test_pv_nowcast_accepts_fresh_zero_watts_as_sunset_evidence(monkeypatch):
     from datetime import datetime, timezone
 
@@ -604,8 +933,10 @@ def test_pv_nowcast_accepts_fresh_zero_watts_as_sunset_evidence(monkeypatch):
         DummyState({
             "pv_power": 0.0,
             "pv_power_updated_at": now.timestamp(),
+            "sun_set": "20:45",
         }),
     )
+    monkeypatch.setattr(energy_broker, "_PV_NOWCAST_DROP_CANDIDATE", None)
     monkeypatch.setattr(
         energy_broker,
         "_latest_settled_pv_slot_kwh",
@@ -614,9 +945,11 @@ def test_pv_nowcast_accepts_fresh_zero_watts_as_sunset_evidence(monkeypatch):
 
     anchor = energy_broker._pv_nowcast_anchor_kwh(0.25, now=now)
 
-    assert anchor["source"] == "live_drop"
+    assert anchor["source"] == "live_drop_sunset"
     assert anchor["slot_kwh"] == 0.0
     assert anchor["drop_ratio"] == 0.0
+    assert anchor["drop_confirmed"] is True
+    assert anchor["downward_weight_cap"] == 1.0
 
 
 def test_confirmed_zero_pv_strongly_lowers_stale_sunset_forecast(monkeypatch):
@@ -648,6 +981,61 @@ def test_confirmed_zero_pv_strongly_lowers_stale_sunset_forecast(monkeypatch):
 
     assert adjusted[slots[0]["start"]] <= 0.1
     assert adjusted[slots[-1]["start"]] < base[slots[-1]["start"]]
+
+
+def test_cycle_history_persists_pv_nowcast_confidence_audit(monkeypatch, tmp_path):
+    """The cause of a PV correction must remain inspectable after the live plan rolls on."""
+    monkeypatch.setattr(
+        energy_broker,
+        "retrieve_setting",
+        lambda name: str(tmp_path) if name == "HISTORY_DIR" else None,
+    )
+    monkeypatch.setattr(energy_broker, "STATE", DummyState({}))
+    result = {
+        "schedule": [],
+        "control_action": "IDLE",
+        "mode": "hold",
+        "reason_code": "TEST",
+        "weather_context": {
+            "summary": {
+                "pv_nowcast_applied": False,
+                "pv_nowcast_source": "live_drop_pending",
+                "pv_nowcast_decision": "pending_drop_baseline_preserved",
+                "pv_nowcast_anchor_kwh": 0.8,
+                "pv_nowcast_live_slot_kwh": 0.0,
+                "pv_nowcast_recent_slot_kwh": 0.8,
+                "pv_nowcast_drop_ratio": 0.0,
+                "pv_nowcast_drop_state": "pending",
+                "pv_nowcast_drop_confirmed": False,
+                "pv_nowcast_drop_evidence": "single_live_drop_sample",
+                "pv_nowcast_drop_samples": 1,
+                "pv_nowcast_downward_weight_cap": 0.0,
+                "pv_nowcast_delta_kwh": 0.0,
+                "pv_forecast_stage": "post_nowcast",
+                "pv_nowcast_pipeline_version": "pv-nowcast-confidence-v3",
+            },
+        },
+    }
+
+    energy_broker._append_history(
+        result,
+        batt_soc=50,
+        applied_setpoint=0,
+        today_actuals={},
+        realized_power={},
+    )
+
+    path = next(tmp_path.glob("ess-*.ndjson"))
+    record = json.loads(path.read_text().splitlines()[-1])
+    assert record["pv_nowcast_source"] == "live_drop_pending"
+    assert record["pv_nowcast_decision"] == "pending_drop_baseline_preserved"
+    assert record["pv_nowcast_drop_state"] == "pending"
+    assert record["pv_nowcast_drop_confirmed"] is False
+    assert record["pv_nowcast_drop_evidence"] == "single_live_drop_sample"
+    assert record["pv_nowcast_drop_samples"] == 1
+    assert record["pv_nowcast_downward_weight_cap"] == 0.0
+    assert record["pv_forecast_stage"] == "post_nowcast"
+    assert record["pv_nowcast_pipeline_version"] == "pv-nowcast-confidence-v3"
 
 
 def test_pv_intraday_correction_scales_up_on_outperformance(monkeypatch):
@@ -800,6 +1188,9 @@ def test_publish_plan_json_serializes_weather_datetime_maps(monkeypatch, tmp_pat
         "ESS_MIN_SELL_PRICE": "0.18",
         "ESS_BATTERY_CYCLE_COST": "0.03",
         "ESS_ARBITRAGE_MARGIN": "0.03",
+        # Deliberately not the 20.0 fallback, so the assertion below proves the
+        # published reserve is read from configuration rather than defaulted.
+        "MIN_SOC_RESERVE_WINTER": "40",
     }
     monkeypatch.setattr(
         energy_broker,
@@ -832,6 +1223,8 @@ def test_publish_plan_json_serializes_weather_datetime_maps(monkeypatch, tmp_pat
             "load": 0.3,
             "reason": "test",
             "reason_code": "TEST",
+            "strategy": "protected_hybrid",
+            "protected_soc": 55.0,
         }],
         "victron_slots": [],
         "slot_duration_h": 0.25,
@@ -872,6 +1265,13 @@ def test_publish_plan_json_serializes_weather_datetime_maps(monkeypatch, tmp_pat
             "reason_code": "DAILY_SETTLEMENT_PROTECTED",
             "today_sacrifice_eur": 10.0,
             "future_gain_eur": 3.0,
+        },
+        "strategy": "protected_hybrid",
+        "adaptive_policy": {
+            "enabled": True,
+            "selected": "protected_hybrid",
+            "reason_code": "CONSERVATIVE_POLICY_PREFERRED",
+            "trade_hurdle_eur": 1.5,
         },
         "optimizer_mode": "winter",
         "winter_policy": {
@@ -916,8 +1316,36 @@ def test_publish_plan_json_serializes_weather_datetime_maps(monkeypatch, tmp_pat
         "battery_cycle_cost": 0.03,
         "arbitrage_margin": 0.03,
     }
+    strategy_config = payload["strategy_candidate_config"]
+    assert strategy_config["battery_capacity_kwh"] == 42.0
+    assert strategy_config["cycle_cost_eur_per_dc_kwh"] == 0.03
+    assert strategy_config["arbitrage_margin_eur_per_dc_kwh"] == 0.03
+    # The replay lattice tracks stored DC energy, whereas the live terminal
+    # price values usable AC output. The exported snapshot must preserve that
+    # conversion so a counterfactual cannot overvalue retained energy.
+    assert strategy_config["discharge_efficiency"] == 0.96
+    assert strategy_config["terminal_value_eur_per_dc_kwh"] == pytest.approx(
+        0.142 * 0.96
+    )
+    # A winter policy floor is the appropriate household-protection input; the
+    # EV's MINIMUM_ESS_SOC is intentionally not reused for this purpose.
+    assert strategy_config["protected_soc_percent"] == 46.0
+    assert payload["strategy_shadow"]["mode"] == "read_only_offline_replay"
+    assert payload["strategy_shadow"]["protected_soc_source"] == "winter_policy"
+    # Deliberately a sibling of strategy_candidate_config, which the evaluator
+    # validates against a closed field list: a key added inside it would make
+    # every plan this build publishes unreadable. The evaluator's approximate
+    # Winter-Mode row is silently dropped if this key is renamed or removed, so
+    # assert it here rather than relying on hand-written plans in the CLI tests.
+    assert payload["winter_reserve_soc_percent"] == 40.0
     assert payload["planning_policy"]["selected"] == "today_first"
     assert payload["planning_policy"]["reason_code"] == "DAILY_SETTLEMENT_PROTECTED"
+    assert payload["active_strategy"] == "protected_hybrid"
+    assert payload["adaptive_policy"]["selected"] == "protected_hybrid"
+    assert payload["schedule"][0]["strategy"] == "protected_hybrid"
+    assert payload["schedule"][0]["protected_soc"] == 55.0
+    assert payload["controller_authority"] == "optimizer"
+    assert payload["control_suppressed"] is False
     assert payload["optimizer_mode"] == "winter"
     assert payload["winter_policy"] == {
         "mode": "winter",
@@ -1058,13 +1486,23 @@ def test_settlement_writes_predicted_vs_actual(monkeypatch, tmp_path):
 
     from datetime import datetime, timezone, timedelta
     res = {"control_action": "SELL", "slot_duration_h": 0.25,
-           "schedule": [{"grid_energy": -2.0, "price": 0.30, "sell": 0.30}]}
+           "schedule": [{
+               "grid_energy": -2.0, "price": 0.30, "sell": 0.30,
+               "reason": "Selling stored energy at €0.300/kWh — the highest price in the horizon",
+               "reason_code": "PRICE_PEAK",
+           }]}
 
     t1 = datetime(2026, 7, 10, 10, 0, tzinfo=timezone.utc)
     t2 = t1 + timedelta(minutes=15)   # next slot -> the prior slot settles
     res["schedule"][0].update({"time": t1, "pv": 0.7, "load": 0.8})
     res["weather_context"] = {
-        "summary": {"hvac_apply": False, "pv_apply": False},
+        "summary": {
+            "hvac_apply": False,
+            "pv_apply": False,
+            "pv_forecast_stage": "post_nowcast",
+            "pv_nowcast_pipeline_version": "pv-nowcast-confidence-v3",
+            "pv_nowcast_selected_branch": "baseline",
+        },
         "slots": {
             t1.isoformat(): {
                 "baseline_load_kwh": 0.6,
@@ -1073,6 +1511,8 @@ def test_settlement_writes_predicted_vs_actual(monkeypatch, tmp_path):
                 "baseline_pv_kwh": 0.9,
                 "weather_pv_shadow_kwh": 0.75,
                 "final_pv_forecast_kwh": 0.7,
+                "final_baseline_pv_forecast_kwh": 0.7,
+                "final_weather_pv_shadow_kwh": 0.72,
             },
         },
     }
@@ -1098,6 +1538,10 @@ def test_settlement_writes_predicted_vs_actual(monkeypatch, tmp_path):
     assert len(settlements) == 1
     s = settlements[0]
     assert s["predicted_control_action"] == "SELL"
+    assert s["predicted_reason"] == (
+        "Selling stored energy at €0.300/kWh — the highest price in the horizon"
+    )
+    assert s["predicted_reason_code"] == "PRICE_PEAK"
     assert s["actual_control_action"] == "SELL"
     assert not s["incomplete"]
     assert abs(s["actual_export_kwh"] - 2.0) < 1e-6
@@ -1112,6 +1556,11 @@ def test_settlement_writes_predicted_vs_actual(monkeypatch, tmp_path):
     assert s["baseline_pv_forecast_kwh"] == 0.9
     assert s["weather_pv_shadow_kwh"] == 0.75
     assert s["final_pv_forecast_kwh"] == 0.7
+    assert s["final_baseline_pv_forecast_kwh"] == 0.7
+    assert s["final_weather_pv_shadow_kwh"] == 0.72
+    assert s["pv_forecast_stage"] == "post_nowcast"
+    assert s["pv_nowcast_pipeline_version"] == "pv-nowcast-confidence-v3"
+    assert s["pv_nowcast_selected_branch"] == "baseline"
     assert s["weather_hvac_apply"] is False
     assert s["weather_pv_apply"] is False
 
@@ -1246,6 +1695,124 @@ def test_realized_action_from_live_flow():
     assert energy_broker._realized_action(None, None) == "IDLE"
 
 
+def test_realized_action_requires_soc_movement_for_settled_buy_or_sell():
+    """Power direction alone must not relabel a reserve-floor load interval."""
+    # The inverter can show charge-direction power while the battery is pinned
+    # at 0% (or while a transition is settling). That is still RETAIN until the
+    # endpoint SoC proves that energy entered the battery.
+    assert energy_broker._realized_action(
+        1900, 625, soc_start=0.0, soc_end=0.0
+    ) == "RETAIN"
+    assert energy_broker._realized_action(
+        1900, 625, soc_start=0.0, soc_end=0.6
+    ) == "BUY"
+    # Likewise, exporting while the battery SoC is unchanged is not confirmed
+    # battery SELL (it may be PV-only export or meter-direction noise).
+    assert energy_broker._realized_action(
+        -4000, -1500, soc_start=6.0, soc_end=6.0
+    ) == "IDLE"
+    assert energy_broker._realized_action(
+        -4000, -1500, soc_start=6.0, soc_end=5.0
+    ) == "SELL"
+
+
+def test_settlement_does_not_call_grid_load_retain_a_buy_at_soc_floor(
+    monkeypatch, tmp_path
+):
+    """The persisted timeline uses SoC endpoints when classifying a slot."""
+    from datetime import datetime, timedelta, timezone
+
+    monkeypatch.setattr(
+        energy_broker,
+        "retrieve_setting",
+        lambda name: str(tmp_path) if name == "HISTORY_DIR" else None,
+    )
+    monkeypatch.setattr(
+        energy_broker, "STATE", DummyState({"c1_daily_yield": 0.0, "c2_daily_yield": 0.0})
+    )
+    monkeypatch.setattr(energy_broker, "_LAST_SLOT_PATH", str(tmp_path / "last_slot.json"))
+    import lib.ess_cost_basis as _cb
+    monkeypatch.setattr(_cb, "_path", lambda: str(tmp_path / "cost_basis.json"))
+
+    result = {
+        "control_action": "RETAIN",
+        "slot_duration_h": 0.25,
+        "schedule": [{"grid_energy": 0.3, "price": 0.30, "sell": 0.30}],
+    }
+    start = datetime(2026, 8, 15, 6, 45, tzinfo=timezone.utc)
+    energy_broker._settle_prior_slot(
+        result,
+        batt_soc=0.0,
+        today_actuals={"imp_kwh": 0.0, "imp_cost": 0.0, "exp_kwh": 0.0, "exp_rev": 0.0},
+        now=start,
+    )
+    energy_broker._settle_prior_slot(
+        result,
+        batt_soc=0.0,
+        today_actuals={"imp_kwh": 0.3, "imp_cost": 0.09, "exp_kwh": 0.0, "exp_rev": 0.0},
+        now=start + timedelta(minutes=15),
+        realized_power={"grid_w": 1900, "batt_w": 625},
+    )
+
+    records = [
+        json.loads(line)
+        for path in tmp_path.glob("ess-*.ndjson")
+        for line in path.read_text().splitlines()
+        if line.strip()
+    ]
+    settlement = next(row for row in records if row.get("kind") == "settlement")
+    assert settlement["predicted_control_action"] == "RETAIN"
+    assert settlement["actual_control_action"] == "RETAIN"
+
+
+def test_settlement_keeps_retain_instruction_when_floor_soc_ticks_up(
+    monkeypatch, tmp_path
+):
+    """A reserve-floor SoC tick is physical evidence, not an optimizer BUY."""
+    from datetime import datetime, timedelta, timezone
+
+    monkeypatch.setattr(
+        energy_broker,
+        "retrieve_setting",
+        lambda name: str(tmp_path) if name == "HISTORY_DIR" else None,
+    )
+    monkeypatch.setattr(
+        energy_broker, "STATE", DummyState({"c1_daily_yield": 0.0, "c2_daily_yield": 0.0})
+    )
+    monkeypatch.setattr(energy_broker, "_LAST_SLOT_PATH", str(tmp_path / "last_slot.json"))
+    import lib.ess_cost_basis as _cb
+    monkeypatch.setattr(_cb, "_path", lambda: str(tmp_path / "cost_basis.json"))
+
+    result = {
+        "control_action": "RETAIN",
+        "slot_duration_h": 0.25,
+        "schedule": [{"grid_energy": 0.3, "price": 0.30, "sell": 0.30}],
+    }
+    start = datetime(2026, 8, 16, 5, 45, tzinfo=timezone.utc)
+    energy_broker._settle_prior_slot(
+        result,
+        batt_soc=0.0,
+        today_actuals={"imp_kwh": 0.0, "imp_cost": 0.0, "exp_kwh": 0.0, "exp_rev": 0.0},
+        now=start,
+    )
+    energy_broker._settle_prior_slot(
+        result,
+        batt_soc=0.3,
+        today_actuals={"imp_kwh": 0.448, "imp_cost": 0.14, "exp_kwh": 0.0, "exp_rev": 0.0},
+        now=start + timedelta(minutes=15),
+        realized_power={"grid_w": 1809, "batt_w": 655},
+    )
+
+    settlement = next(
+        json.loads(line)
+        for path in tmp_path.glob("ess-*.ndjson")
+        for line in path.read_text().splitlines()
+        if json.loads(line).get("kind") == "settlement"
+    )
+    assert settlement["actual_control_action"] == "RETAIN"
+    assert settlement["observed_power_action"] == "BUY"
+
+
 def test_is_truthy_parses_false_string():
     # Regression: bool("False") is True, which made HOME_CONNECT_APPLIANCE_SCHEDULING
     # (and similar flags) ignore a "False" setting.
@@ -1290,19 +1857,190 @@ def test_grid_assist_stands_down_during_ai_buy_slot(monkeypatch):
     assert len(applied) == 1                    # retain setpoint applied outside a BUY
 
 
-def test_ai_ess_override_stands_optimizer_down(monkeypatch):
-    monkeypatch.setattr(energy_broker, "retrieve_setting",
-                        lambda name: "1" if name == "AI_POWERED_ESS_ALGORITHM" else None)
-    monkeypatch.setattr(energy_broker, "STATE", DummyState({"ai_ess_override_enabled": "True", "batt_soc": 57}))
-    prices = MagicMock(return_value=[{"start": "2026-06-29T09:00:00+02:00", "total": 0.2}])
-    monkeypatch.setattr(energy_broker, "get_all_price_points", prices)
-    optimizer = MagicMock()
+def _stub_observational_optimizer_run(monkeypatch, state_values):
+    """Prepare a complete optimizer pass while exposing every control write."""
+    from datetime import datetime, timedelta, timezone
+    import lib.weather as weather
+
+    start = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    prices = [
+        {"start": (start + timedelta(minutes=15 * i)).isoformat(), "total": 0.20}
+        for i in range(2)
+    ]
+    monkeypatch.setattr(
+        energy_broker, "retrieve_setting",
+        lambda name: "1" if name == "AI_POWERED_ESS_ALGORITHM" else None,
+    )
+    defaults = {
+        "batt_soc": 57,
+        "ac_in_power": 500,
+        "pv_power": 0,
+        "ac_out_power": 500,
+        "batt_power": 0,
+    }
+    defaults.update(state_values)
+    monkeypatch.setattr(energy_broker, "STATE", DummyState(defaults))
+    monkeypatch.setattr(energy_broker, "get_all_price_points", lambda: prices)
+    monkeypatch.setattr(
+        energy_broker, "_build_pv_forecast_by_slot",
+        lambda slots, slot_h: {slot["start"]: 0.0 for slot in slots},
+    )
+    monkeypatch.setattr(
+        energy_broker, "_build_load_forecast_by_slot",
+        lambda slots, slot_h: {slot["start"]: 0.2 for slot in slots},
+    )
+    monkeypatch.setattr(
+        weather, "weather_context_for_slots",
+        lambda *args, **kwargs: {"available": False, "summary": {}, "slots": {}},
+    )
+    monkeypatch.setattr(energy_broker, "_apply_pv_nowcast", lambda pv, *args: pv)
+    monkeypatch.setattr(
+        energy_broker, "_apply_appliance_reservations_to_forecast",
+        lambda load, **kwargs: (load, {"enabled": False}),
+    )
+    monkeypatch.setattr(
+        energy_broker, "_apply_ev_smart_charge_to_forecast",
+        lambda load, *args, **kwargs: (load, {"plan": {}}),
+    )
+    optimizer = MagicMock(return_value={
+        "schedule": [{
+            "time": prices[0]["start"], "action": "hold",
+            "control_action": "RETAIN", "soc_start": 57.0, "soc_end": 57.0,
+            "grid_energy": 0.2, "price": 0.20, "sell": 0.20,
+            "load": 0.2, "pv": 0.0,
+        }],
+        "victron_slots": [{"start": start, "duration": 900, "target_soc": 80}],
+        "slot_duration_h": 0.25, "setpoint": 0.0,
+        "control_action": "RETAIN", "grid_assist": True, "mode": "hold",
+        "current_price": 0.20, "limit_feed_in": False,
+    })
     monkeypatch.setattr(energy_broker, "optimize_schedule", optimizer)
+    controls = {
+        "setpoint": MagicMock(),
+        "feed": MagicMock(),
+        "minimum": MagicMock(),
+        "clear": MagicMock(),
+        "publish": MagicMock(),
+    }
+    monkeypatch.setattr(energy_broker, "ac_power_setpoint", controls["setpoint"])
+    monkeypatch.setattr(energy_broker, "limit_grid_feed_in", controls["feed"])
+    monkeypatch.setattr(energy_broker, "set_minimum_ess_soc", controls["minimum"])
+    monkeypatch.setattr(energy_broker, "clear_victron_schedules", controls["clear"])
+    monkeypatch.setattr(energy_broker, "publish_message", controls["publish"])
+    monkeypatch.setattr(energy_broker, "get_today_energy_actuals", lambda: {})
+    history = MagicMock()
+    settlement = MagicMock()
+    plans = []
+    monkeypatch.setattr(energy_broker, "_append_history", history)
+    monkeypatch.setattr(energy_broker, "_settle_prior_slot", settlement)
+    monkeypatch.setattr(
+        energy_broker, "_publish_plan_json",
+        lambda result, **kwargs: plans.append(result.copy()),
+    )
+    return optimizer, controls, history, settlement, plans
 
-    energy_broker.run_ai_optimizer()
 
-    prices.assert_not_called()
-    optimizer.assert_not_called()
+def test_ai_ess_override_observes_and_settles_without_control_writes(monkeypatch):
+    optimizer, controls, history, settlement, plans = _stub_observational_optimizer_run(
+        monkeypatch, {"ai_ess_override_enabled": "True"}
+    )
+
+    assert energy_broker.run_ai_optimizer() is True
+
+    optimizer.assert_called_once()
+    history.assert_called_once()
+    settlement.assert_called_once()
+    assert plans[0]["controller_authority"] == "manual_override"
+    assert plans[0]["reason_code"] == "MANUAL_OVERRIDE_OBSERVATION"
+    for control in controls.values():
+        control.assert_not_called()
+
+
+def test_grid_offline_allows_emergency_reserve_discharge_without_control_writes(monkeypatch):
+    optimizer, controls, history, settlement, plans = _stub_observational_optimizer_run(
+        monkeypatch,
+        {"ac_in_connected": 0, "batt_soc": 35, "batt_power": -1200,
+         "ac_in_power": 0, "ac_out_power": 1200},
+    )
+
+    assert energy_broker.run_ai_optimizer() is True
+
+    optimizer.assert_called_once()
+    history.assert_called_once()
+    settlement.assert_called_once()
+    assert plans[0]["controller_authority"] == "grid_offline"
+    assert plans[0]["control_action"] == "IDLE"
+    assert plans[0]["reason_code"] == "GRID_OFFLINE_PASS_THROUGH"
+    assert plans[0]["victron_slots"] == []
+    assert all(
+        row["control_action"] == "IDLE"
+        and row["grid_energy"] == 0.0
+        and row["protected_soc"] == 0.0
+        for row in plans[0]["schedule"]
+    )
+    for control in controls.values():
+        control.assert_not_called()
+
+
+def test_grid_connection_state_requires_explicit_offline_value(monkeypatch):
+    monkeypatch.setattr(energy_broker, "STATE", DummyState({}))
+    assert energy_broker._grid_connection_state() is None
+    monkeypatch.setattr(energy_broker, "STATE", DummyState({"ac_in_connected": "0"}))
+    assert energy_broker._grid_connection_state() is False
+    monkeypatch.setattr(energy_broker, "STATE", DummyState({"ac_in_connected": "1"}))
+    assert energy_broker._grid_connection_state() is True
+
+
+def test_grid_offline_trajectory_can_use_winter_emergency_reserve(monkeypatch):
+    monkeypatch.setattr(
+        energy_broker,
+        "retrieve_setting",
+        lambda name: {
+            "BATTERY_CAPACITY_KWH": "10",
+            "AC_DC_CHARGE_EFFICIENCY": "1",
+            "AC_DC_DISCHARGE_EFFICIENCY": "1",
+        }.get(name),
+    )
+    start = datetime.now().astimezone()
+    result = energy_broker._grid_offline_pass_through({
+        "schedule": [
+            {"time": start, "load": 2.0, "pv": 0.0},
+            {"time": start + timedelta(minutes=15), "load": 2.0, "pv": 0.0},
+        ],
+        "victron_slots": [{"start": start, "duration": 900, "target_soc": 40}],
+        "winter_policy": {"protected_soc_percent": 40.0},
+    }, 40.0)
+
+    assert result["victron_slots"] == []
+    assert [row["soc_end"] for row in result["schedule"]] == [20.0, 0.0]
+    assert all(row["control_action"] == "IDLE" for row in result["schedule"])
+    assert result["winter_policy"]["protected_soc_percent"] == 0.0
+    assert result["winter_policy"]["grid_connected_backup_reserve_percent"] == 40.0
+
+
+def test_grid_offline_blocks_event_driven_and_legacy_control_paths(monkeypatch):
+    state = DummyState({
+        "ac_in_connected": 0,
+        "ai_grid_assist": "on",
+        "batt_soc": 80,
+    })
+    monkeypatch.setattr(energy_broker, "STATE", state)
+    setpoint = MagicMock()
+    schedule_clear = MagicMock()
+    publish = MagicMock()
+    monkeypatch.setattr(energy_broker, "ac_power_setpoint", setpoint)
+    monkeypatch.setattr(energy_broker, "clear_victron_schedules", schedule_clear)
+    monkeypatch.setattr(energy_broker, "publish_message", publish)
+
+    energy_broker.manage_grid_usage_based_on_current_price(price=0.10, power=2000)
+    energy_broker.manage_sale_of_stored_energy_to_the_grid()
+    energy_broker.set_charging_schedule(slots=[{"start": datetime.now().astimezone()}])
+    energy_broker._apply_grid_assist_setpoint(2000)
+
+    assert state.get("ai_grid_assist") == "off"
+    setpoint.assert_not_called()
+    schedule_clear.assert_not_called()
+    publish.assert_not_called()
 
 
 def test_run_ai_optimizer_skips_when_optimizer_lock_is_held(monkeypatch, caplog):

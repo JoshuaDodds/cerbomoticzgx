@@ -67,6 +67,7 @@ const fmtPower = (w) => {
 let lastPlan = null;
 let lastLive = null;
 let lastEvSmartCharge = null;
+let evChargeRequest = null;
 let expandedHours = new Set();   // hour keys the user has expanded (survive refreshes)
 let lastHoursGen = null;          // generated_at of the last tree we built
 let lastCurrentHourKey = null;
@@ -135,6 +136,7 @@ function activateTab(tabName) {
   if (tab) tab.classList.add("active");
   panel.classList.add("active");
   syncMobileNavState();
+  if (tabName === "victron") requestVictronScheduleRefresh();
   if (tabName === "logs") connectLogsStream(); else disconnectLogsStream();
 }
 
@@ -145,7 +147,7 @@ document.querySelectorAll(".tab").forEach((t) => {
 let firstRender = true;
 
 // ---- Top-level app views ----
-const APP_VIEWS = ["overview", "ess", "battery", "hvac", "live"];
+const APP_VIEWS = ["overview", "ess", "battery", "hvac", "live", "vehicle"];
 function defaultAppViewName() {
   return "overview";
 }
@@ -185,6 +187,8 @@ window.addEventListener("scroll", keepMobileLiveViewPinned, { passive: true });
 function appRouteFromHash() {
   const raw = (window.location.hash || "").replace(/^#/, "");
   const [viewName, tabName] = raw.split("/", 2);
+  // Existing Vehicle bookmarks used the old ESS tab route.
+  if (viewName === "ess" && tabName === "vehicle") return { view: "vehicle", tab: null };
   const view = APP_VIEWS.includes(viewName) ? viewName : defaultAppViewName();
   const tab = view === "ess" && tabName && document.getElementById("tab-" + tabName)
     ? tabName
@@ -194,6 +198,9 @@ function appRouteFromHash() {
 
 function applyAppRouteFromHash() {
   const route = appRouteFromHash();
+  if (route.view === "vehicle" && window.location.hash === "#ess/vehicle") {
+    history.replaceState(null, "", "#vehicle");
+  }
   setAppView(route.view);
   if (route.tab) activateTab(route.tab);
 }
@@ -202,7 +209,7 @@ function navigatePowerFlowTarget(target) {
   const destinations = {
     battery: { hash: "#battery", view: "battery" },
     victron: { hash: "#live", view: "live" },
-    vehicle: { hash: "#ess/vehicle", view: "ess", tab: "vehicle" },
+    vehicle: { hash: "#vehicle", view: "vehicle" },
   };
   const destination = destinations[target];
   if (!destination) return false;
@@ -743,6 +750,13 @@ function renderDaySummary(plan) {
 function planStrategySummary(plan) {
   const now = new Date();
   const winterPolicy = plan.optimizer_mode === "winter" ? (plan.winter_policy || {}) : null;
+  const adaptivePolicy = plan.optimizer_mode !== "winter" ? (plan.adaptive_policy || null) : null;
+  if (plan.control_suppressed && plan.controller_authority === "grid_offline") {
+    return "Grid outage: optimizer control is suspended. Victron may use the full emergency reserve to support the house while forecasting and settlement continue.";
+  }
+  if (plan.control_suppressed && plan.controller_authority === "manual_override") {
+    return "Manual Override: optimizer control is suspended; live measurements, settlement and the observational plan continue updating.";
+  }
   const configuredSlotHours = Number(plan.slot_duration_h);
   const slotHours = Number.isFinite(configuredSlotHours) && configuredSlotHours > 0
     ? configuredSlotHours : 0.25;
@@ -799,11 +813,11 @@ function planStrategySummary(plan) {
       : null;
     const objective = selected === "exceptional_arbitrage"
       ? "An exceptional spread cleared every loss and safety hurdle; only energy above the protected household requirement may be sold."
-      : "The plan buys only the forecast household requirement at low prices and avoids routine battery export.";
+      : "The plan buys at selected low prices when useful, uses stored energy when it saves money, and avoids routine battery export.";
     const detail = [
       Number.isFinite(target) ? `charge toward ${Math.round(target)}%` : null,
-      Number.isFinite(requiredKwh) ? `${requiredKwh.toFixed(1)} kWh forecast house energy protected` : null,
-      Number.isFinite(protectedSoc) ? `protected floor ${Math.round(protectedSoc)}%` : null,
+      Number.isFinite(requiredKwh) ? `${requiredKwh.toFixed(1)} kWh forecast house demand` : null,
+      Number.isFinite(protectedSoc) ? `outage reserve ${Math.round(protectedSoc)}%` : null,
     ].filter(Boolean).join(" · ");
     const warning = winterPolicy.warning ? ` Warning: ${winterPolicy.warning}` : "";
     return `Winter Mode: ${parts.join(", then ")}. ${objective}${detail ? ` ${detail}.` : ""}${warning}`;
@@ -813,7 +827,15 @@ function planStrategySummary(plan) {
   if (buys.length && sells.length) strategy = "Buy low, then sell at the stronger price peaks";
   else if (buys.length) strategy = "Buy low to cover the planned energy requirement";
   else if (sells.length) strategy = "Sell stored energy only at the strongest remaining prices";
-  return `From now until midnight: ${parts.join(", then ")}. ${strategy} to minimise cost and maximise the day's net result.`;
+  const adaptiveNames = {
+    market_arbitrage: "Trading",
+    pv_first_self_sufficiency: "PV-first self-sufficiency",
+    protected_hybrid: "protected hybrid",
+    green_conservation: "Green conservation",
+  };
+  const adaptiveName = adaptivePolicy && adaptiveNames[adaptivePolicy.selected];
+  const prefix = adaptiveName ? `Adaptive Summer selected ${adaptiveName}. ` : "";
+  return `${prefix}From now until midnight: ${parts.join(", then ")}. ${strategy} to minimise cost and maximise the day's net result.`;
 }
 
 // ---- Render: hours tree ----
@@ -1264,6 +1286,8 @@ function makeConfigValueEditable(valueControl, label, activate) {
   });
 }
 
+const openAdvancedConfigGroups = new Set();
+
 function renderConfig(cfg) {
   const box = $("#config");
   box.innerHTML = "";
@@ -1272,7 +1296,7 @@ function renderConfig(cfg) {
   cfg.groups.forEach((g) => {
     const grp = el("div", "card cfg-group");
     grp.appendChild(el("h3", null, g.group));
-    g.settings.forEach((s) => {
+    const appendSetting = (container, s) => {
       const item = el("div", "cfg-item");
       const val = s.effective_label || (s.value === "" ? "—" : s.value);
       const description = s.editor_help || s.desc || "";
@@ -1296,8 +1320,21 @@ function renderConfig(cfg) {
       }
       const valueControl = item.querySelector(".v");
       makeConfigValueEditable(valueControl, s.label, () => startEdit(item, s));
-      grp.appendChild(item);
-    });
+      container.appendChild(item);
+    };
+    g.settings.filter((s) => !s.advanced).forEach((s) => appendSetting(grp, s));
+    const advanced = g.settings.filter((s) => s.advanced);
+    if (advanced.length) {
+      const disclosure = el("details", "cfg-advanced");
+      disclosure.open = openAdvancedConfigGroups.has(g.group);
+      disclosure.addEventListener("toggle", () => {
+        if (disclosure.open) openAdvancedConfigGroups.add(g.group);
+        else openAdvancedConfigGroups.delete(g.group);
+      });
+      disclosure.appendChild(el("summary", null, `Advanced settings (${advanced.length})`));
+      advanced.forEach((s) => appendSetting(disclosure, s));
+      grp.appendChild(disclosure);
+    }
     box.appendChild(grp);
   });
 }
@@ -1308,16 +1345,29 @@ function fmtDur(sec) {
   const h = Math.floor(sec / 3600), m = Math.round((sec % 3600) / 60);
   return (h ? h + "h " : "") + m + "m";
 }
-function renderVictron(plan) {
+function renderVictron(plan, live = lastLive) {
   const box = $("#victron-schedules");
   if (!box) return;
-  if (!plan || !plan.available) { box.innerHTML = "<span class='muted'>no plan yet…</span>"; return; }
-  const slots = plan.victron_slots || [];
+  const actual = live && live.victron_schedule;
+  const hasActual = !!(actual && actual.available);
+  if (!hasActual && (!plan || !plan.available)) {
+    box.innerHTML = "<span class='muted'>waiting for CerboGX schedule state…</span>";
+    return;
+  }
+  const slots = hasActual ? (actual.slots || []) : (plan.victron_slots || []);
   let html = "";
   for (let i = 0; i < 5; i++) {
     const s = slots[i];
     let right;
-    if (s) {
+    if (hasActual && s && s.enabled === false) {
+      right = `<span class="muted">Disabled</span>`;
+    } else if (hasActual && s && !s.complete) {
+      right = `<span class="muted">Reading current settings…</span>`;
+    } else if (hasActual && s) {
+      const day = _esc(s.day_label || "Scheduled");
+      const time = _esc(s.start || "--:--");
+      right = `<span class="vic-on">${day} ${time} <span class="muted">(${fmtDur(s.duration)})</span> &nbsp;→ ${Number(s.target_soc).toFixed(0)}%</span>`;
+    } else if (s) {
       let day = "";
       try { day = new Date(s.start).toLocaleDateString([], { weekday: "long" }); } catch (_) {}
       const time = (s.start || "").slice(11, 16);
@@ -1328,6 +1378,18 @@ function renderVictron(plan) {
     html += `<div class="vic-row"><span class="vic-name">Schedule ${i + 1}</span>${right}<span class="vic-chev">›</span></div>`;
   }
   box.innerHTML = html;
+}
+
+let _victronScheduleRequestAt = 0;
+async function requestVictronScheduleRefresh() {
+  // Route/hash setup can activate the same tab twice in quick succession.
+  // Coalesce that harmless duplication while still refreshing on every real visit.
+  const now = Date.now();
+  if (now - _victronScheduleRequestAt < 1000) return;
+  _victronScheduleRequestAt = now;
+  try {
+    await fetch("/api/victron/request-schedule", { method: "POST" });
+  } catch (_) { /* the cached/plan fallback remains visible while offline */ }
 }
 
 function renderMeta(plan) {
@@ -1389,7 +1451,7 @@ async function refreshPlan() {
       lastHoursGen = lastPlan.generated_at;
     }
     safeRenderChart();
-    renderVictron(lastPlan);
+    renderVictron(lastPlan, lastLive);
     renderMeta(lastPlan);
   } catch (e) {
     noteServerFailure();
@@ -1439,6 +1501,7 @@ function renderVehicle() {
     : `${telemetryWarning}<span class="muted">waiting for vehicle status…</span>`;
   const title = document.querySelector("#tab-vehicle h3");
   if (title && has(L.veh_name)) title.textContent = L.veh_name;
+  renderEvChargeControl();
 }
 
 function evSmartView(data) {
@@ -1791,6 +1854,7 @@ function applyLive(data) {
   updateControlButtons();
   safeRenderPowerFlow();
   renderVehicle();
+  renderVictron(lastPlan, lastLive);
   if (lastPlan) renderMeta(lastPlan);
 }
 
@@ -1927,7 +1991,7 @@ async function clearImportSchedule() {
     if (!response.ok || !body.ok) throw new Error(body.error || "clear failed");
     if (lastPlan) {
       lastPlan = { ...lastPlan, victron_slots: [] };
-      renderVictron(lastPlan);
+      renderVictron(lastPlan, lastLive);
     }
     btn.textContent = "Cleared";
     setTimeout(() => { btn.textContent = label; }, 1200);
@@ -2451,6 +2515,213 @@ function runAdvisor(question, callbacks) {
 }
 const _advReview = $("#advisor-review");
 if (_advReview) _advReview.addEventListener("click", () => runAdvisor(null));
+
+function advisorToolEur(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? `${number >= 0 ? "+" : "−"}€${Math.abs(number).toFixed(2)}` : "—";
+}
+
+function renderForecastValidationTool(report) {
+  const load = report && report.load ? report.load : {};
+  const current = load.baseline && load.baseline.mae_kwh;
+  const trial = load.shadow && load.shadow.mae_kwh;
+  const recommendation = (report && report.overall && report.overall.recommendation) || "KEEP_APPLY_OFF";
+  const decision = recommendation === "KEEP_APPLY_OFF"
+    ? "Keep forecast adjustments OFF" : recommendation;
+  const reasons = (load.gate && Array.isArray(load.gate.reasons)) ? load.gate.reasons : [];
+  return `<div class="advisor-tool-summary"><strong>${_esc(decision)}</strong>
+    <span>Current forecast error ${_esc(current == null ? "—" : `${Number(current).toFixed(4)} kWh/slot`)}</span>
+    <span>Weather/HVAC trial error ${_esc(trial == null ? "—" : `${Number(trial).toFixed(4)} kWh/slot`)}</span>
+    ${reasons.length ? `<ul>${reasons.map((reason) => `<li>${_esc(reason)}</li>`).join("")}</ul>` : ""}
+  </div>`;
+}
+
+function advisorCandidateLabel(candidateId) {
+  return ({
+    market_arbitrage: "Market arbitrage",
+    pv_first_self_sufficiency: "PV-first self-sufficiency",
+    protected_hybrid: "Protected hybrid",
+    green_conservation: "Green conservation",
+    winter_self_sufficiency: "Winter-style (approx.)",
+  })[candidateId] || candidateId;
+}
+
+function advisorOptimizerModeLabel(mode) {
+  const m = String(mode || "").trim().toLowerCase();
+  if (m === "winter") return "Winter mode";
+  if (m === "summer") return "Summer mode";
+  return null;
+}
+
+// One line per row, in the vocabulary the rest of the dashboard already uses
+// (BUY/SELL/RETAIN/IDLE are the literal control_action values shown elsewhere;
+// "reserve"/"grid charging"/"export" match the .env and Settings wording) —
+// not the €-denominated column headers, which describe outcome, not policy.
+const ADVISOR_STRATEGY_LEGEND = {
+  live_plan: "The AI optimizer actually controlling the battery right now — chooses BUY / SELL / RETAIN / IDLE each cycle from live prices and forecasts.",
+  market_arbitrage: "No protected reserve — BUYs and SELLs freely down to the minimum SoC reserve, whichever the price favors.",
+  protected_hybrid: "BUYs only enough to hold a protected reserve, then SELLs freely from whatever is stored above it.",
+  pv_first_self_sufficiency: "Never BUYs or SELLs — solar and the protected reserve cover household load alone.",
+  winter_self_sufficiency: "BUYs up to the reserve to cover household load, like Winter Mode's routine policy, but never SELLs.",
+};
+
+// Every row below is a whole calendar day: the already-settled part of today
+// plus that policy's planned remainder. The report supplies the live plan's own
+// figure on exactly that basis, so this must NOT fall back to the day-summary
+// tile — that number is built with different per-slot rules and mixing the two
+// is what made the alternatives look far better than they are.
+function advisorStrategyCells(today) {
+  if (!today) return null;
+  // Spell out the floor the carried figure is measured above: rows holding a
+  // higher reserve are not carrying less by choice, and side by side that reads
+  // as a handicap unless the basis is visible in the cell itself.
+  const floor = today.floor_soc_percent == null
+    ? "" : ` above ${Number(today.floor_soc_percent).toFixed(0)}%`;
+  const carried = today.carried_energy_kwh == null
+    ? "—"
+    : `${Number(today.carried_energy_kwh).toFixed(1)} kWh${floor} (${advisorToolEur(today.carried_energy_value_eur)})`;
+  const closing = today.closing_soc_percent == null
+    ? "—"
+    : `${Number(today.closing_soc_percent).toFixed(0)}%`;
+  return [
+    advisorToolEur(today.whole_day_cash_net_eur),
+    advisorToolEur(today.whole_day_economic_net_eur),
+    `${Number(today.full_equivalent_cycles || 0).toFixed(2)}`,
+    closing,
+    carried,
+  ];
+}
+
+// data-label mirrors each column heading so the narrow-viewport stacked layout
+// can label every value without a second markup path.
+// MUST stay a hard-coded literal: these are interpolated into a quoted
+// data-label attribute, and _esc() escapes & < > but NOT quotes. Sourcing this
+// from report data would turn it into an attribute-breakout injection point.
+const ADVISOR_STRATEGY_COLUMNS = [
+  "Grid result", "After wear", "Cycles", "SoC at midnight", "Carried to tomorrow",
+];
+
+function advisorStrategyRow(label, today, opts) {
+  const active = !!(opts && opts.active);
+  const cls = active ? ' class="is-active"' : "";
+  const name = `${_esc(label)}${active ? ' <span class="advisor-strategy-flag">active</span>' : ""}`;
+  const cells = advisorStrategyCells(today);
+  if (!cells) {
+    const why = (opts && opts.note) || "no result for today";
+    return `<tr${cls}><th scope="row">${name}</th><td colspan="5" data-label="Result">${_esc(why)}</td></tr>`;
+  }
+  const tds = cells.map((cell, i) =>
+    `<td data-label="${_esc(ADVISOR_STRATEGY_COLUMNS[i] || "")}">${_esc(cell)}</td>`).join("");
+  return `<tr${cls}><th scope="row">${name}</th>${tds}</tr>`;
+}
+
+function renderEssStrategyTool(report) {
+  const plan = lastPlan || {};
+  const current = plan.current || {};
+  const liveAction = current.control_action || current.action || "—";
+  const liveReason = current.reason_code || "";
+  const baseline = (report && report.plan_baseline) || {};
+  const settled = report && report.settled_today;
+  const candidates = Object.entries((report && report.candidates) || {});
+  const modeLabel = advisorOptimizerModeLabel(report && report.optimizer_mode);
+  const liveLabel = "Live plan" + (modeLabel ? ` (${modeLabel})` : "");
+  const liveRow = advisorStrategyRow(liveLabel, baseline.available ? baseline.today : null, {
+    active: true,
+    note: `not comparable — ${baseline.unavailable_reason
+      || "the published plan is missing per-slot grid flows"}`,
+  });
+  const rows = candidates.map(([candidateId, candidate]) => advisorStrategyRow(
+    advisorCandidateLabel(candidateId),
+    (candidate && candidate.feasible) ? candidate.today : null,
+    { note: `unavailable — ${(candidate && candidate.rejection_reason) || "unknown reason"}` },
+  )).join("");
+  const settledNote = settled
+    ? `Already settled today, identical in every row: ${_esc(advisorToolEur(settled.cash_net_eur))}.`
+    : "This plan carries no settled totals for today, so the rows below cover only the planned remainder of today.";
+  // Rows in the same top-to-bottom order as the table, so the legend reads as
+  // a caption for it rather than a second, separately-ordered list.
+  const legendRows = [["live_plan", liveLabel]]
+    .concat(candidates.map(([candidateId]) => [candidateId, advisorCandidateLabel(candidateId)]))
+    .map(([id, label]) => (ADVISOR_STRATEGY_LEGEND[id]
+      ? `<div><dt>${_esc(label)}</dt><dd>${_esc(ADVISOR_STRATEGY_LEGEND[id])}</dd></div>`
+      : "")).join("");
+  return `<div class="advisor-tool-summary">
+    <div class="advisor-live-plan"><strong>CURRENT LIVE PLAN</strong>
+      <span>AI Optimizer — ${_esc(liveAction)}${liveReason ? ` · ${_esc(liveReason)}` : ""}.</span>
+      <small>This is the plan currently used for forecast and dispatch. None of the alternatives below is active.</small>
+    </div>
+    <p class="muted">Whole day, midnight to midnight — the same basis as the Today tile. ${settledNote} Alternatives still plan over the full known horizon; only their result is limited to today.</p>
+    <div class="advisor-table-wrap"><table class="advisor-strategy-table">
+      <thead><tr>
+        <th scope="col">Strategy</th>
+        ${ADVISOR_STRATEGY_COLUMNS.map((c) => `<th scope="col">${_esc(c)}</th>`).join("")}
+      </tr></thead>
+      <tbody>${liveRow}${rows || '<tr><td colspan="6">No candidate data was returned.</td></tr>'}</tbody>
+    </table></div>
+    <p class="muted">Grid result = export reward − import cost. After battery wear subtracts estimated battery cycle cost. Carried energy is what a policy leaves above its own floor at midnight — a today-only total credits selling it without debiting the emptier battery handed to tomorrow.</p>
+    <p class="advisor-strategy-legend-heading">What drives each strategy:</p>
+    <dl class="advisor-strategy-legend">${legendRows}</dl>
+    ${advisorWinterCaveats(report && report.winter_candidate)}
+  </div>`;
+}
+
+// The winter row is a stand-in built from this evaluator's constraint model, not
+// the winter engine. Never render the figure without the caveats beside it.
+function advisorWinterCaveats(winter) {
+  if (!winter) return "";
+  const items = (winter.caveats || []).map((c) => `<li>${_esc(c)}</li>`).join("");
+  const raised = winter.reserve_was_raised
+    ? ` (raised from the requested ${_esc(Number(winter.requested_reserve_soc_percent || 0).toFixed(0))}% to the configured minimum)`
+    : "";
+  return `<details class="advisor-strategy-note">
+    <summary>Winter-style row is an approximation held above a ${_esc(Number(winter.reserve_soc_percent || 0).toFixed(0))}% reserve — how it differs</summary>
+    <p>It is not <code>${_esc(winter.engine_module || "the winter engine")}</code>. That engine is selected once at startup by <code>WINTER_MODE</code> and is not what this row simulates${raised}. It differs in that it:</p>
+    <ul>${items}</ul>
+  </details>`;
+}
+
+async function runAdvisorTool(tool, button, result) {
+  if (!button || button.disabled) return;
+  const label = button.textContent;
+  button.disabled = true;
+  button.textContent = "Running…";
+  if (result) result.innerHTML = '<span class="muted">Reading the saved plan and history…</span>';
+  try {
+    const response = await fetch(`/api/advisor/tools/${tool}`, { method: "POST" });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || !payload.ok) throw new Error(payload.error || "tool failed");
+    if (result) {
+      result.innerHTML = tool === "forecast-validation"
+        ? renderForecastValidationTool(payload.report)
+        : renderEssStrategyTool(payload.report);
+      // Widen this card only once a comparison table actually exists, so the
+      // two-up tool grid is left alone until there is something to widen for.
+      const card = result.closest(".advisor-tool-card");
+      if (card) card.classList.toggle("is-wide", !!result.querySelector(".advisor-strategy-table"));
+    }
+  } catch (error) {
+    if (result) {
+      result.innerHTML = `<span class="banner">${_esc(error.message || "Could not run the read-only report.")}</span>`;
+      // Release the widened row: an error banner must not keep the card
+      // stretched across a layout sized for a table that is no longer there.
+      const card = result.closest(".advisor-tool-card");
+      if (card) card.classList.remove("is-wide");
+    }
+  } finally {
+    button.disabled = false;
+    button.textContent = label;
+  }
+}
+
+const _advForecastValidation = $("#advisor-forecast-validation");
+if (_advForecastValidation) _advForecastValidation.addEventListener("click", () => {
+  runAdvisorTool("forecast-validation", _advForecastValidation, $("#advisor-forecast-validation-result"));
+});
+const _advEssStrategies = $("#advisor-ess-strategies");
+if (_advEssStrategies) _advEssStrategies.addEventListener("click", () => {
+  runAdvisorTool("ess-strategies", _advEssStrategies, $("#advisor-ess-strategies-result"));
+});
+
 async function clearAdvisorChat() {
   if (_advisorBusy) return;
   const confirmed = await advisorConfirm({
@@ -2686,21 +2957,183 @@ async function refreshWeather() {
   } catch (e) { /* leave the placeholder */ }
 }
 
-// EV manual Start/Stop: Start plus Grid assist is the explicit immediate grid-charge override.
-// Schedule and protected-PV authority remain independent; Stop is always imperative.
-document.querySelectorAll("[data-ev-charge]").forEach((btn) => {
-  btn.addEventListener("click", async () => {
-    const enabled = btn.getAttribute("data-ev-charge") === "start";
-    btn.disabled = true;
-    try {
-      await fetch("/api/control/ev-charge", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ enabled }),
-      });
-    } catch (e) { /* ignore; controller acts on its next tick */ }
-    setTimeout(() => { btn.disabled = false; }, 1500);
+// This endpoint accepts an intent; physical charging is confirmed separately by
+// live charger telemetry. Keep the opposite action available after acceptance so
+// Stop can still interrupt a pending Start.
+const EV_CHARGE_DECISION_TEXT = {
+  telemetry: "Waiting for vehicle telemetry before sending a Start command.",
+  away: "Vehicle is away; Start will wait until it is home.",
+  home_unknown: "Vehicle location is unknown; waiting for fresh vehicle telemetry.",
+  unplugged: "Vehicle is unplugged; Start will wait for a cable.",
+  plug_unknown: "Plug state is unknown; waiting for fresh vehicle telemetry.",
+  supercharging: "Vehicle is supercharging elsewhere; home charge is unavailable.",
+  at_limit: "Vehicle is already at its charge limit.",
+  charging: "Vehicle is drawing charge power.",
+  starting_grid: "Grid assist authorizes Start; waiting for the vehicle command and charger delivery.",
+  grid_invalid_target: "Grid assist is on, but the configured EV charge current is zero; no Start command can be sent.",
+  grid_command_rejected: "Grid assist is on, but the vehicle rejected the current request; the controller will retry.",
+  grid_command_cooldown: "Grid assist is on; waiting for the command cooldown before retrying the vehicle.",
+  grid_confirmation_pending: "Grid assist is on; waiting for vehicle telemetry to confirm the current request.",
+  grid_confirmed_waiting_for_delivery: "Grid assist is on; current is confirmed, but the charger has not delivered power yet.",
+  grid_delivery_limited: "Grid assist is on; local delivery is limited by Maxem or site capacity.",
+  starting_scheduled: "A smart block or protected PV surplus authorizes charging; waiting for charger delivery.",
+  waiting_authorization: "Start is pending: Grid assist is off, no active smart charge block applies, and protected PV surplus is unavailable. Enable Grid assist for an immediate grid-backed charge.",
+};
+const EV_CHARGE_FEEDBACK_MS = 60000;
+const EV_CHARGE_PENDING_MAX_AGE_S = 15 * 60;
+function renderEvChargeControl() {
+  const status = document.getElementById("ev-charge-status");
+  const observed = document.getElementById("ev-charge-observed");
+  if (!status || !observed) return;
+  const L = lastLive || {};
+  const evWatts = L.ev_w == null ? NaN : Number(L.ev_w);
+  if (!L.connected || !Number.isFinite(evWatts)) {
+    observed.textContent = "Live charger power unavailable.";
+  } else {
+    observed.textContent = evWatts > 100
+      ? `Charger drawing ${fmtPower(evWatts)} now.`
+      : "Charger currently idle (100 W or less).";
+  }
+
+  if (evChargeRequest && evChargeRequest.finishedAt
+      && Date.now() - evChargeRequest.finishedAt >= EV_CHARGE_FEEDBACK_MS) {
+    evChargeRequest = null;
+  }
+  const request = evChargeRequest;
+  const decision = L.ev_charge_decision && typeof L.ev_charge_decision === "object"
+    ? L.ev_charge_decision : null;
+  const decisionText = decision && EV_CHARGE_DECISION_TEXT[decision.code];
+  const decisionAge = decision && Number(decision.age_s);
+  const decisionFresh = decision && Number.isFinite(decisionAge) && decisionAge <= 180;
+  const requestAge = L.ev_charge_request_age_s == null
+    ? NaN : Number(L.ev_charge_request_age_s);
+  const requestTime = L.ev_charge_requested_at == null
+    ? NaN : Number(L.ev_charge_requested_at);
+  const manualIntent = truthy(L.ev_charge_requested);
+  const pendingCurrent = manualIntent && truthy(L.grid_charging_enabled)
+    && Number.isFinite(requestTime) && requestTime > 0
+    && Number.isFinite(requestAge) && requestAge <= EV_CHARGE_PENDING_MAX_AGE_S;
+  const chargingCurrent = manualIntent && Number.isFinite(evWatts) && evWatts > 100;
+  const validDecision = decisionFresh && decisionText && decision.intent === true
+    && Number(decision.updated_at) + 0.01 >= requestTime
+    && (decision.code === "charging" ? chargingCurrent : pendingCurrent);
+  status.className = "ev-charge-status";
+  let statusText;
+  if (!request) {
+    if (validDecision) {
+      if (decision.code !== "charging") status.classList.add("pending");
+      statusText = decisionText;
+    } else if (pendingCurrent) {
+      status.classList.add("muted");
+      statusText = "Manual Start is active; waiting for a current controller decision.";
+    } else if (manualIntent && truthy(L.grid_charging_enabled)) {
+      status.classList.add("muted");
+      statusText = "Manual grid charging is enabled. Stop or disable Grid assist to end it.";
+    } else {
+      status.classList.add("muted");
+      statusText = "No manual charge request pending.";
+    }
+  } else if (request.phase === "sending") {
+    status.classList.add("pending");
+    statusText = `Sending ${request.action} request to the dashboard service…`;
+  } else if (request.phase === "accepted") {
+    status.classList.add("pending");
+    if (request.action === "start") {
+      const freshDecision = validDecision
+        && Number(decision.updated_at) > request.decisionAt;
+      statusText = freshDecision
+        ? `Start request accepted. ${decisionText}`
+        : L.grid_charging_enabled == null
+          ? "Start request accepted. Waiting for the controller to report its charge decision."
+          : truthy(L.grid_charging_enabled)
+          ? "Start request accepted. Grid assist is on; waiting for the controller and charger."
+          : "Start was accepted while Grid assist was on, but Grid assist is now off. Stop clears the pending manual request.";
+    } else {
+      statusText = "Stop request accepted. Waiting for the controller and charger to stop.";
+    }
+  } else {
+    status.classList.add("error");
+    statusText = request.message;
+  }
+  if (status.textContent !== statusText) status.textContent = statusText;
+
+  document.querySelectorAll("[data-ev-charge]").forEach((btn) => {
+    const action = btn.getAttribute("data-ev-charge");
+    const sending = request && request.phase === "sending";
+    const cooling = request && request.phase === "accepted"
+      && request.action === action && Date.now() < request.retryAt;
+    btn.disabled = !!(sending || cooling);
+    btn.classList.toggle("is-pending", !!(sending || cooling));
+    btn.textContent = sending && request.action === action ? "Sending…"
+      : cooling ? `${action === "start" ? "Start" : "Stop"} requested`
+      : action === "start" ? "Start charge" : "Stop charge";
   });
+}
+
+async function requestEvCharge(action) {
+  if (action !== "start" && action !== "stop") return;
+  if (evChargeRequest && (evChargeRequest.phase === "sending"
+      || (evChargeRequest.phase === "accepted" && evChargeRequest.action === action
+        && Date.now() < evChargeRequest.retryAt))) return;
+  const previousDecision = lastLive && lastLive.ev_charge_decision;
+  const request = {
+    action, phase: "sending", retryAt: 0, message: "",
+    decisionAt: previousDecision ? Number(previousDecision.updated_at) || 0 : 0,
+  };
+  evChargeRequest = request;
+  renderEvChargeControl();
+  const abort = typeof AbortController === "function" ? new AbortController() : null;
+  let timeoutId;
+  try {
+    const timeout = new Promise((_, reject) => {
+      timeoutId = setTimeout(() => {
+        if (abort) abort.abort();
+        reject(new Error("request timed out; its outcome is unknown"));
+      }, 10000);
+    });
+    const { response, result } = await Promise.race([fetch("/api/control/ev-charge", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: action === "start" }),
+      ...(abort ? { signal: abort.signal } : {}),
+    }).then(async (response) => ({
+      response, result: await response.json().catch(() => ({})),
+    })), timeout]);
+    if (action === "start" && response.status === 409
+        && result.code === "grid_assist_required") {
+      request.phase = "blocked";
+      request.message = `Start blocked: ${result.error} No charge request was queued.`;
+      renderEvChargeControl();
+      return;
+    }
+    if (!response.ok || !result.ok || result.enabled !== (action === "start")) {
+      throw new Error(result.error || "The service did not accept the request.");
+    }
+    request.phase = "accepted";
+    request.retryAt = Date.now() + 30000;
+    renderEvChargeControl();
+    setTimeout(() => {
+      if (evChargeRequest === request) renderEvChargeControl();
+    }, 30000);
+  } catch (error) {
+    request.phase = "failed";
+    const detail = error && error.name === "AbortError"
+      ? "request timed out; its outcome is unknown" : ((error && error.message) || "network error");
+    request.message = `${action === "start" ? "Start" : "Stop"} request failed: ${detail}. No change was confirmed.`;
+    renderEvChargeControl();
+  } finally {
+    clearTimeout(timeoutId);
+    if (request.phase !== "sending") {
+      request.finishedAt = Date.now();
+      setTimeout(() => {
+        if (evChargeRequest === request) renderEvChargeControl();
+      }, EV_CHARGE_FEEDBACK_MS);
+    }
+  }
+}
+
+document.querySelectorAll("[data-ev-charge]").forEach((btn) => {
+  btn.addEventListener("click", () => requestEvCharge(btn.getAttribute("data-ev-charge")));
 });
 
 // Manual "Refresh data" (Vehicle tab): one-shot flag that wakes the car on the controller's

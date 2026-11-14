@@ -41,6 +41,7 @@ SMOKE_SCRIPT = ROOT / "tests" / "js" / "cold_load_smoke.js"
 POWERFLOW_ROUTING_SCRIPT = ROOT / "tests" / "js" / "app_powerflow_routing.js"
 TIMELINE_EV_HISTORY_SCRIPT = ROOT / "tests" / "js" / "timeline_ev_history.js"
 POWERFLOW_HOUSE_LOAD_SCRIPT = ROOT / "tests" / "js" / "powerflow_house_load.js"
+EV_CHARGE_CONTROLS_SCRIPT = ROOT / "tests" / "js" / "ev_charge_controls.js"
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
@@ -71,6 +72,21 @@ def test_powerflow_navigation_events_reach_the_app_router():
     assert result.returncode == 0, (
         "Power Flow emitted a navigation event that the application shell did not "
         "route correctly.\n\n"
+        f"stdout:\n{result.stdout}\n\nstderr:\n{result.stderr}"
+    )
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_ev_charge_controls_show_feedback_and_prevent_duplicate_requests():
+    result = subprocess.run(
+        ["node", str(EV_CHARGE_CONTROLS_SCRIPT)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        cwd=str(ROOT),
+    )
+    assert result.returncode == 0, (
+        "EV charge control feedback regression:\n\n"
         f"stdout:\n{result.stdout}\n\nstderr:\n{result.stderr}"
     )
 

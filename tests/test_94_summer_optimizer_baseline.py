@@ -74,9 +74,11 @@ def test_completed_summer_optimizer_golden_arbitrage_plan():
     )
 
     assert _signature(result) == [
-        (0, "BUY", 20.0, 42.5625, 10.0, "PRECHARGE_FOR_PEAK"),
-        (1, "BUY", 42.5625, 65.125, 10.0, "PRECHARGE_FOR_PEAK"),
-        (2, "BUY", 65.125, 80.0, 6.7632, "PRECHARGE_FOR_PEAK"),
+        # The falling tariff at 01:00 is a separate Victron target stage, so
+        # the 01:00 energy is not pulled into the dearer 00:00 slot.
+        (0, "BUY", 20.0, 40.0, 8.9211, "PRECHARGE_FOR_PEAK"),
+        (1, "BUY", 40.0, 62.5625, 10.0, "PRECHARGE_FOR_PEAK"),
+        (2, "BUY", 62.5625, 80.0, 7.8421, "PRECHARGE_FOR_PEAK"),
         (3, "SELL", 80.0, 55.0, -9.0, "PRICE_HIGH"),
         (4, "SELL", 55.0, 30.0, -9.0, "PRICE_PEAK"),
         (5, "SELL", 30.0, 5.0, -9.0, "PRICE_PEAK"),
@@ -84,7 +86,9 @@ def test_completed_summer_optimizer_golden_arbitrage_plan():
         (7, "RETAIN", 5.0, 5.0, 0.5, "RESERVE_POLICY"),
     ]
     assert result["victron_slots"] == [
-        {"start": BASE_TIME, "duration": 10800, "target_soc": 80}
+        {"start": BASE_TIME, "duration": 3600, "target_soc": 40},
+        {"start": BASE_TIME + timedelta(hours=1),
+         "duration": 7200, "target_soc": 80},
     ]
 
 

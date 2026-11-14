@@ -16,24 +16,25 @@ assert.strictEqual(document.body.dataset.appView, "live");
 assert.strictEqual(window.location.hash, "#live");
 
 navigate("vehicle");
-assert.strictEqual(document.body.dataset.appView, "ess");
-assert.strictEqual(window.location.hash, "#ess/vehicle");
+assert.strictEqual(document.body.dataset.appView, "vehicle");
+assert.strictEqual(window.location.hash, "#vehicle");
 assert.strictEqual(
-  document.querySelector("#tab-vehicle").classList.contains("active"),
+  document.querySelector("#vehicle-view").classList.contains("active"),
   true,
 );
 
 const callsBeforeUnknown = window.history.calls.length;
 navigate("not-allow-listed");
 assert.strictEqual(window.history.calls.length, callsBeforeUnknown);
-assert.strictEqual(document.body.dataset.appView, "ess");
-assert.strictEqual(window.location.hash, "#ess/vehicle");
+assert.strictEqual(document.body.dataset.appView, "vehicle");
+assert.strictEqual(window.location.hash, "#vehicle");
 
 window.location.hash = "#ess/vehicle";
 window.dispatchEvent({ type: "popstate" });
-assert.strictEqual(document.body.dataset.appView, "ess");
+assert.strictEqual(document.body.dataset.appView, "vehicle");
+assert.strictEqual(window.location.hash, "#vehicle");
 assert.strictEqual(
-  document.querySelector("#tab-vehicle").classList.contains("active"),
+  document.querySelector("#vehicle-view").classList.contains("active"),
   true,
 );
 

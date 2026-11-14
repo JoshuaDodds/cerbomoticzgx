@@ -12,18 +12,34 @@ CONFIG_SCHEMA = [
         "settings": [
             {"key": "AI_POWERED_ESS_ALGORITHM", "label": "AI optimizer enabled", "type": "bool",
              "desc": "Master switch for the AI-powered ESS optimizer."},
-            {"key": "WINTER_MODE", "label": "Winter Mode", "type": "bool",
-             "desc": "Use the restart-isolated winter optimizer and winter SoC reserve. Off keeps the summer optimizer and summer reserve."},
+            {"key": "WINTER_MODE", "label": "Green / Winter mode", "type": "bool",
+             "desc": "On: Green planning with the winter reserve and cheap-price replenishment. Off: Summer Trading with the summer reserve. Switching mode requires a service restart."},
             {"key": "APPLIANCE_OPTIMIZATION_ENABLED", "label": "Appliance optimized scheduling", "type": "bool",
              "desc": "Defer supported appliances to lower-cost times in either Summer or Winter Mode when Home Connect scheduling is enabled. Dishwasher preferred-program enforcement remains active whenever Home Connect scheduling is enabled. Requires a restart."},
+            {"key": "ESS_ADAPTIVE_POLICY_ENABLED", "label": "Compare Summer strategies", "type": "bool",
+             "desc": "Compare Trading with PV-first and Green conservation in Summer Mode. Green can buy cheap household energy without routine battery export. The selected strategy replans every cycle. Defaults off for attended validation."},
+            {"key": "ESS_ADAPTIVE_TRADE_MIN_BENEFIT_EUR", "label": "Minimum Trading advantage (€)", "type": "float",
+             "desc": "Minimum forecast benefit Trading must add above the best conservative Summer plan, before the configured fraction of learned forecast risk is added."},
+            {"key": "ESS_ADAPTIVE_FORECAST_RISK_MAX_EUR", "label": "Forecast-risk cap (€)", "type": "float",
+             "desc": "Maximum historical forecast error considered before the risk factor is applied; old pipeline errors cannot disable Trading indefinitely."},
+            {"key": "ESS_ADAPTIVE_FORECAST_RISK_FACTOR", "label": "Coverage / forecast risk factor", "type": "float",
+             "desc": "Fractional allowance applied to protected household energy and capped historical forecast risk (0.20 = 20%)."},
+            {"key": "ESS_ADAPTIVE_UNKNOWN_HORIZON_HOURS", "label": "Unknown-horizon coverage (h)", "type": "float",
+             "desc": "Hours of bounded trailing household load protected or credited beyond the final published price slot. Used by all Summer candidates; hybrid also enforces it as a reserve."},
+            {"key": "ESS_ADAPTIVE_POLICY_MIN_DWELL_MIN", "label": "Strategy minimum dwell (min)", "type": "int",
+             "desc": "Minimum time to keep an adaptive Summer strategy unless another candidate clears the configured switch margin."},
+            {"key": "ESS_ADAPTIVE_POLICY_SWITCH_MARGIN_EUR", "label": "Strategy switch margin (€)", "type": "float",
+             "desc": "Extra forecast value a different Summer strategy must show during the dwell period before switching."},
+            {"key": "ESS_ADAPTIVE_FULL_EVALUATION_INTERVAL_MIN", "label": "Full strategy comparison interval (min)", "type": "int",
+             "desc": "Re-score all three Summer strategies this often. The selected strategy still replans every cycle; materially changed prices, load/PV, SoC, EV blocks, or an extended horizon force an immediate full comparison."},
             {"key": "OPTIMIZER_SLOT_MINUTES", "label": "Planning resolution (min)", "type": "int",
              "desc": "Sub-divides hourly prices into slots of this size; 15 matches quarter-hourly prices."},
             {"key": "OPTIMIZER_SOC_STEP_PCT", "label": "SoC step (%)", "type": "float",
              "desc": "DP discretization step. Smaller = finer control, more compute."},
             {"key": "ESS_TERMINAL_VALUE_FACTOR", "label": "Terminal value factor", "type": "float",
-             "desc": "Value of end-of-horizon stored energy on multi-day horizons as a multiple of mean buy price. Same-day-only horizons ignore it so late Tibber prices do not cause evening over-retain."},
+             "desc": "Scales the bounded value of household energy carried beyond any truncated price horizon; the credit is capped by configured continuation demand."},
             {"key": "ESS_EXPECTED_PEAK_PRICE", "label": "Expected peak price (€/kWh)", "type": "float",
-             "desc": "Holds charge for the typical evening/morning peak even before tomorrow's prices publish; 0 disables."},
+             "desc": "Optional floor for the bounded continuation value before tomorrow's prices publish; 0 disables only this explicit floor, while the visible p75 model remains active."},
             {"key": "ESS_MIN_SELL_PRICE", "label": "Min sell price floor (€/kWh)", "type": "float",
              "desc": "Battery is never actively exported below this price (PV surplus still exports freely)."},
             {"key": "ESS_BATTERY_CYCLE_COST", "label": "Battery cycle cost (€/kWh)", "type": "float",
@@ -62,9 +78,9 @@ CONFIG_SCHEMA = [
             {"key": "ESS_EXPORT_AC_SETPOINT", "label": "Max export setpoint (W)", "type": "float",
              "desc": "Negative AC power setpoint commanded for a forced SELL (e.g. -13000)."},
             {"key": "MIN_SOC_RESERVE_WINTER", "label": "Winter SoC reserve (%)", "type": "float",
-             "desc": "Logical planning floor used when Winter Mode is on; it does not command Victron Recharge."},
+             "desc": "Outage reserve for Green/Winter planning and the offline Summer Green candidate. It does not command Victron Recharge."},
             {"key": "MIN_SOC_RESERVE_SUMMER", "label": "Summer SoC reserve (%)", "type": "float",
-             "desc": "Logical planning floor used when Winter Mode is off; it does not change Victron's hard minimum."},
+             "desc": "Logical floor for live Summer Trading and its current conservative alternatives. It does not change Victron's hard minimum."},
         ],
     },
     {
@@ -74,9 +90,9 @@ CONFIG_SCHEMA = [
              "options": ["QUARTER_HOURLY", "HOURLY"],
              "desc": "QUARTER_HOURLY (15-min, how Tibber bills) or HOURLY."},
             {"key": "ESS_EXPORT_PRICE_FACTOR", "label": "Export price factor", "type": "float",
-             "desc": "sell price = buy × factor − fee."},
+             "desc": "Multiplier in sell = buy × factor − fee. 1.0 assumes exports remain inside the 2026 annual saldering allowance; the optimizer does not track that allowance."},
             {"key": "ESS_EXPORT_FEE", "label": "Export fee (€/kWh)", "type": "float",
-             "desc": "Per-kWh fee subtracted from the export price."},
+             "desc": "Per-kWh export fee (2026 Tibber NL default €0.0248). Reconfigure for net overproduction or post-2026 tariffs."},
             {"key": "DAILY_HOME_ENERGY_CONSUMPTION", "label": "Daily consumption (kWh)", "type": "float",
              "desc": "Fallback daily load when the VRM consumption forecast is unavailable."},
             {"key": "ESS_PV_SHAPE_DAYS", "label": "PV shape window (days)", "type": "int",
@@ -239,6 +255,13 @@ _NUMERIC_BOUNDS = {
     "ESS_MODEL_CHARGE_RATE": (0, 1),
     "ESS_SELL_MIN_DWELL_MIN": (0, 240),
     "ESS_SELL_HYSTERESIS_EUR": (0, 1),
+    "ESS_ADAPTIVE_TRADE_MIN_BENEFIT_EUR": (0, 50),
+    "ESS_ADAPTIVE_FORECAST_RISK_MAX_EUR": (0, 50),
+    "ESS_ADAPTIVE_FORECAST_RISK_FACTOR": (0, 1),
+    "ESS_ADAPTIVE_UNKNOWN_HORIZON_HOURS": (0, 24),
+    "ESS_ADAPTIVE_POLICY_MIN_DWELL_MIN": (0, 1440),
+    "ESS_ADAPTIVE_POLICY_SWITCH_MARGIN_EUR": (0, 10),
+    "ESS_ADAPTIVE_FULL_EVALUATION_INTERVAL_MIN": (0, 1440),
     "BATTERY_CAPACITY_KWH": (1, 200),
     "AC_DC_CHARGE_EFFICIENCY": (0.1, 1),
     "AC_DC_DISCHARGE_EFFICIENCY": (0.1, 1),
@@ -300,3 +323,21 @@ for _group in CONFIG_SCHEMA:
     for _setting in _group["settings"]:
         if _setting.get("type") in ("int", "float"):
             _setting["min"], _setting["max"] = _NUMERIC_BOUNDS[_setting["key"]]
+
+# Presentation only: all settings stay in the API, edit allow-list, and Advisor.
+# Keep physical and tariff facts visible; put optimizer internals behind disclosure.
+_ESS_VISIBLE_KEYS = {
+    "AI_POWERED_ESS_ALGORITHM", "WINTER_MODE",
+    "APPLIANCE_OPTIMIZATION_ENABLED", "ESS_ADAPTIVE_POLICY_ENABLED",
+    "ESS_ADAPTIVE_TRADE_MIN_BENEFIT_EUR", "ESS_MIN_SELL_PRICE",
+    "BATTERY_CAPACITY_KWH", "VICTRON_HARDWARE_MIN_SOC",
+    "MIN_SOC_RESERVE_WINTER", "MIN_SOC_RESERVE_SUMMER",
+    "ESS_MAX_GRID_CHARGE_SOC", "ESS_MAX_CHARGE_KW",
+    "ESS_MAX_DISCHARGE_KW", "ESS_MAX_GRID_IMPORT_KW",
+    "ESS_MAX_GRID_EXPORT_KW", "TIBBER_PRICE_RESOLUTION",
+    "ESS_EXPORT_PRICE_FACTOR", "ESS_EXPORT_FEE",
+}
+for _group in CONFIG_SCHEMA[:3]:
+    for _setting in _group["settings"]:
+        if _setting["key"] not in _ESS_VISIBLE_KEYS:
+            _setting["advanced"] = True

@@ -117,6 +117,30 @@ def _hvac_control_command(unit_key, command, value):
     return module.get_control_service().command(unit_key, command, value)
 
 
+def _run_forecast_validation():
+    """Build the same read-only forecast evidence report as the CLI command."""
+    from lib.forecast_validation import (
+        ValidationCriteria,
+        analyze_records,
+        load_history_records,
+    )
+
+    history_dir = str(data._env().get("HISTORY_DIR") or "data/history")
+    return analyze_records(
+        load_history_records(history_dir),
+        criteria=ValidationCriteria(),
+    )
+
+
+def _run_ess_strategy_evaluation():
+    """Build the CLI's read-only counterfactual report from the frozen plan."""
+    from scripts.evaluate_ess_strategies import _parser, build_report
+
+    # The parser supplies the deliberately fixed runtime-plan default.  No live
+    # broker, settings, MQTT, Victron, or controller state is consulted here.
+    return build_report(_parser().parse_args([]))
+
+
 @app.route("/api/hvac")
 def api_hvac():
     """Return cached ONECTA state only; rendering the page never calls Daikin."""
@@ -490,6 +514,14 @@ def api_victron_clear_schedule():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.route("/api/victron/request-schedule", methods=["POST"])
+def api_victron_request_schedule():
+    """Ask Venus MQTT for the authoritative values of all five charge slots."""
+    if live.request_victron_schedule_refresh():
+        return jsonify({"ok": True})
+    return jsonify({"ok": False, "error": "Victron MQTT is not connected"}), 503
+
+
 @app.route("/api/restart", methods=["POST"])
 def api_restart():
     """Request the existing supervised restart path via MQTT.
@@ -530,16 +562,31 @@ def api_control_grid_assist():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+class EvChargePreconditionError(ValueError):
+    """A manual EV Start lacks its required authorization."""
+
+
 def _set_ev_charge_requested(enabled: bool):
     """Manual EV Start/Stop. Sets the DEDICATED ev_charge_requested intent flag the EV controller
-    reads. Immediate grid-backed Start requires grid-assist too; schedule and protected-PV
-    authority remain independent. Stop is latched through bounded wake escalation, suppresses
+    reads. Reject Start before writing intent unless Grid assist is enabled; smart and protected-PV
+    charging do not need manual Start. Stop is latched through bounded wake escalation, suppresses
     the current smart block, and uses local-meter verification even if pushed fields are stale.
     Publishing the retained control topic keeps persistent intent in sync and survives a restart
     via the state restore."""
     from lib.global_state import GlobalStateClient
     state = GlobalStateClient()
+    if enabled and not _boolish(state.get("grid_charging_enabled"), False):
+        raise EvChargePreconditionError(
+            "Enable Grid assist before using manual Start. Smart and protected "
+            "solar charging start automatically when eligible."
+        )
+    if enabled:
+        # Write the age before the intent so the controller cannot see an
+        # undated newly accepted Start during a concurrent tick.
+        state.set("ev_charge_requested_at", time.time())
     state.set("ev_charge_requested", bool(enabled))
+    if not enabled:
+        state.set("ev_charge_requested_at", 0)
     # Stop is an imperative safety action, not merely the false state of a persistent
     # start-intent latch. Preserve a latched request even when intent was already false (for
     # example, a Tesla onboard schedule started the car); the controller clears it only after
@@ -557,6 +604,12 @@ def api_control_ev_charge():
     try:
         _set_ev_charge_requested(enabled)
         return jsonify({"ok": True, "enabled": enabled})
+    except EvChargePreconditionError as e:
+        logging.info("Manual EV charge START rejected: %s", e)
+        return jsonify({
+            "ok": False, "enabled": False,
+            "code": "grid_assist_required", "error": str(e),
+        }), 409
     except Exception as e:
         logging.warning("EV charge request failed: %s", e)
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -624,6 +677,23 @@ def api_advisor_latest():
     """Return the persisted advisor chat session, if one exists."""
     from frontend import advisor
     return jsonify(advisor.latest_report())
+
+
+@app.route("/api/advisor/tools/<tool>", methods=["POST"])
+def api_advisor_tool(tool):
+    """Run one explicit, read-only local evidence tool for the Advisor tab."""
+    runners = {
+        "forecast-validation": _run_forecast_validation,
+        "ess-strategies": _run_ess_strategy_evaluation,
+    }
+    runner = runners.get(tool)
+    if runner is None:
+        return jsonify({"ok": False, "error": "unknown advisor tool"}), 404
+    try:
+        return jsonify({"ok": True, "report": runner()})
+    except Exception as e:
+        logging.warning("Advisor read-only tool %s failed: %s", tool, e)
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/api/advisor/clear", methods=["POST"])

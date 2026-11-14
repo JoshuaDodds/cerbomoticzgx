@@ -106,12 +106,6 @@
   }
 
   const MOBILE_MAX = 600;   // container width (px) below which the 2-column layout kicks in
-  // Firefox's SVG implementation paints the actual glyph box higher above its
-  // baseline than Chromium/WebKit for the system UI font.  The desktop cards use
-  // closely packed, baseline-positioned text, so reserve a little more header
-  // space there only.  Keep the established Chrome/Safari coordinates untouched.
-  const IS_FIREFOX = typeof navigator !== "undefined" && /firefox/i.test(navigator.userAgent || "");
-
   function layout(W, H, hasEV, hasGas) {
     return W < MOBILE_MAX ? layoutMobile(W, H, hasEV, hasGas) : layoutDesktop(W, H, hasEV, hasGas);
   }
@@ -120,11 +114,11 @@
   function layoutDesktop(W, H, hasEV, hasGas) {
     const xL = 0.145 * W, xC = 0.485 * W, xR = 0.825 * W;
     const wSide = 0.235 * W, wCtr = 0.30 * W;
-    // Firefox needs slightly taller SVG cards to preserve the same readable
-    // detail-row rhythm as Chromium/WebKit.  There is vertical room in the
-    // existing desktop topology, so grow the card rather than compressing text.
+    // Desktop cards carry several live detail rows. Keep the roomier geometry
+    // in every desktop browser rather than relying on a browser-specific SVG
+    // text quirk; mobile uses its own compact, content-budgeted layout below.
     const yT = 0.25 * H, yB = 0.72 * H;
-    const rowH = (IS_FIREFOX ? 0.45 : 0.36) * H;
+    const rowH = 0.45 * H;
     const N = {
       grid:  { x: xL, y: yT, w: wSide, h: rowH },
       inv:   { x: xC, y: yT, w: wCtr,  h: rowH },
@@ -359,9 +353,9 @@
     const r = N[key]; if (!r) return "";
     const F = boxFonts(r, mobile ? 0.8 : 1), x0 = r.x - r.w / 2, y0 = r.y - r.h / 2;
     const pad = clamp(r.w * (mobile ? 0.05 : 0.06), mobile ? 5 : 8, mobile ? 12 : 20), L = x0 + pad, R = x0 + r.w - pad;
-    // See IS_FIREFOX above.  These offsets intentionally affect only the
-    // desktop SVG text bands, not the separately content-budgeted mobile cards.
-    const firefoxDesktop = !mobile && IS_FIREFOX;
+    // The desktop diagram uses the roomier card geometry above. Mobile cards
+    // are separately content-budgeted and deliberately retain their positions.
+    const desktopDetailLayout = !mobile;
     let s = `<rect id="pf-card-${key}" x="${f(x0)}" y="${f(y0)}" width="${f(r.w)}" height="${f(r.h)}" rx="14" fill="var(--panel-2)" stroke="var(--line)" stroke-width="2.5"/>`;
     s += `<g id="pf-icon-${key}" transform="translate(${f(x0 + pad + 9)},${f(y0 + pad + 9)}) scale(${F.iscale.toFixed(2)})" color="var(--muted)">${ICON[key]}</g>`;
     s += txt(null, x0 + pad + 22, y0 + pad + F.title + 1, { size: F.title, fill: "var(--muted)" }, NODE_LABEL[key]);
@@ -370,12 +364,12 @@
     // Mobile cards are rendered by buildCardMobile() and remain unchanged.
     const desktopPhaseStep = r.h * 0.062;
     if (key === "grid") {
-      const heroY = y0 + r.h * (firefoxDesktop ? 0.37 : 0.31);
-      const dividerY = y0 + r.h * (firefoxDesktop ? 0.43 : 0.37);
+      const heroY = y0 + r.h * (desktopDetailLayout ? 0.37 : 0.31);
+      const dividerY = y0 + r.h * (desktopDetailLayout ? 0.43 : 0.37);
       s += txt("pf-grid-big", L, heroY, { size: F.big, weight: 700 }, "—");
       s += `<line x1="${f(L)}" y1="${f(dividerY)}" x2="${f(R)}" y2="${f(dividerY)}" stroke="var(--line)"/>`;
       [["Import today", "pf-grid-import"], ["Export today", "pf-grid-export"]].forEach(([lab, id], i) => {
-        const y = y0 + r.h * (firefoxDesktop ? 0.51 : 0.47) + i * desktopPhaseStep;
+        const y = y0 + r.h * (desktopDetailLayout ? 0.51 : 0.47) + i * desktopPhaseStep;
         s += txt(null, L, y, { size: F.row * 0.88, fill: "var(--muted)" }, lab);
         s += txt(id, R, y, { size: F.row * 0.88, anchor: "end" }, "—");
       });
@@ -388,13 +382,13 @@
         size: F.row * 0.78, fill: "var(--muted)",
       }, "");
     } else if (key === "house") {
-      s += txt("pf-house-big", L, y0 + r.h * (firefoxDesktop ? 0.40 : 0.34), { size: F.big, weight: 700 }, "—");
-      s += txt("pf-house-today", L, y0 + r.h * (firefoxDesktop ? 0.55 : 0.47), {
+      s += txt("pf-house-big", L, y0 + r.h * (desktopDetailLayout ? 0.40 : 0.34), { size: F.big, weight: 700 }, "—");
+      s += txt("pf-house-today", L, y0 + r.h * (desktopDetailLayout ? 0.55 : 0.47), {
         size: F.big * 0.50, weight: 700,
       }, "—");
-      s += `<line x1="${f(L)}" y1="${f(y0 + r.h * (firefoxDesktop ? 0.61 : 0.53))}" x2="${f(R)}" y2="${f(y0 + r.h * (firefoxDesktop ? 0.61 : 0.53))}" stroke="var(--line)"/>`;
+      s += `<line x1="${f(L)}" y1="${f(y0 + r.h * (desktopDetailLayout ? 0.61 : 0.53))}" x2="${f(R)}" y2="${f(y0 + r.h * (desktopDetailLayout ? 0.61 : 0.53))}" stroke="var(--line)"/>`;
       ["L1", "L2", "L3"].forEach((lab, i) => {
-        const y = y0 + r.h * (firefoxDesktop ? 0.70 : 0.66) + i * desktopPhaseStep;
+        const y = y0 + r.h * (desktopDetailLayout ? 0.70 : 0.66) + i * desktopPhaseStep;
         s += txt(null, L, y, { size: F.row, fill: "var(--muted)" }, lab);
         s += txt(`pf-house-l${i + 1}`, R, y, { size: F.row, anchor: "end" }, "—");
       });
@@ -411,9 +405,9 @@
       s += txt(`pf-batt-temp`, R, y0 + pad + F.title + 1, { size: F.row, fill: "var(--muted)", anchor: "end" }, "");
       // Hero: SoC% (reduced) with the live charge/discharge power tight underneath —
       // the two headline metrics — then the state word.
-      s += txt(`pf-batt-big`, L, y0 + r.h * (firefoxDesktop ? 0.37 : 0.33), { size: F.big * 0.82, weight: 700 }, "—");
-      s += txt(`pf-batt-power`, L, y0 + r.h * (firefoxDesktop ? 0.50 : 0.46), { size: F.big * 0.44, weight: 700, fill: "var(--text)" }, "");
-      s += txt(`pf-batt-state`, L, y0 + r.h * (firefoxDesktop ? 0.605 : 0.565), { size: F.row, fill: "var(--muted)" }, "");
+      s += txt(`pf-batt-big`, L, y0 + r.h * (desktopDetailLayout ? 0.37 : 0.33), { size: F.big * 0.82, weight: 700 }, "—");
+      s += txt(`pf-batt-power`, L, y0 + r.h * (desktopDetailLayout ? 0.50 : 0.46), { size: F.big * 0.44, weight: 700, fill: "var(--text)" }, "");
+      s += txt(`pf-batt-state`, L, y0 + r.h * (desktopDetailLayout ? 0.605 : 0.565), { size: F.row, fill: "var(--muted)" }, "");
       // BMS detail rows (label left / value right); min/max cell temps sit top-right.
       [["Voltage", "pf-batt-volt"], ["Current", "pf-batt-curr"], ["Min / Max (V)", "pf-batt-cells"],
        ["Capacity", "pf-batt-cap"], ["Modules Online", "pf-batt-mods"]].forEach(([lab, id], i) => {
@@ -424,17 +418,17 @@
     } else if (key === "inv") {
       s += txt(`pf-inv-big`, L, bigY + 4, { size: F.state, weight: 700 }, "—");
     } else if (key === "ev") {
-      s += txt(`pf-ev-big`, L, y0 + r.h * (firefoxDesktop ? 0.36 : 0.26), { size: F.big, weight: 700 }, "—");
-      s += txt(`pf-ev-energy`, L, y0 + r.h * (firefoxDesktop ? 0.48 : 0.40), { size: F.row, fill: "var(--muted)" }, "");
-      s += txt(null, L, y0 + r.h * (firefoxDesktop ? 0.57 : 0.49), {
+      s += txt(`pf-ev-big`, L, y0 + r.h * (desktopDetailLayout ? 0.36 : 0.26), { size: F.big, weight: 700 }, "—");
+      s += txt(`pf-ev-energy`, L, y0 + r.h * (desktopDetailLayout ? 0.48 : 0.40), { size: F.row, fill: "var(--muted)" }, "");
+      s += txt(null, L, y0 + r.h * (desktopDetailLayout ? 0.57 : 0.49), {
         size: F.row, fill: "var(--muted)",
       }, "Today");
-      s += txt("pf-ev-today", R, y0 + r.h * (firefoxDesktop ? 0.57 : 0.49), {
+      s += txt("pf-ev-today", R, y0 + r.h * (desktopDetailLayout ? 0.57 : 0.49), {
         size: F.row, anchor: "end",
       }, "—");
       // Tesla detail: SoC / charge limit / measured amps / ETA-to-limit (label left, value right).
       [["SoC", "pf-ev-soc"], ["Limit", "pf-ev-limit"], ["Amps", "pf-ev-amps"], ["ETA", "pf-ev-eta"]].forEach(([lab, id], i) => {
-        const y = y0 + r.h * (firefoxDesktop ? 0.66 : 0.60) + i * (r.h * 0.095);
+        const y = y0 + r.h * (desktopDetailLayout ? 0.66 : 0.60) + i * (r.h * 0.095);
         s += txt(null, L, y, { size: F.row, fill: "var(--muted)" }, lab);
         s += txt(id, R, y, { size: F.row, anchor: "end" }, "—");
       });

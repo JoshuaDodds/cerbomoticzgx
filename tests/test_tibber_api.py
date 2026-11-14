@@ -234,3 +234,47 @@ def test_after_publish_today_only_result_logs_truthful_warning(monkeypatch, tmp_
     assert calls == ["QUARTER_HOURLY", "HOURLY"]
     assert result == today_only
     assert "next-day quarter-hourly prices still unavailable" in caplog.text
+
+
+def test_tibber_backoff_compatibility_converts_exception_list_and_adds_timeout(
+    monkeypatch, tmp_path
+):
+    module, _cache_path = _load_tibber_api(monkeypatch, tmp_path)
+    calls = []
+
+    class WrappedBackoff:
+        def on_exception(self, wait_gen, exception, *args, **kwargs):
+            calls.append((wait_gen, exception, args, kwargs))
+            return "decorator"
+
+    adapter = module._TibberBackoffCompatibility(WrappedBackoff())
+    wait_gen = object()
+
+    result = adapter.on_exception(wait_gen, [ValueError], max_tries=3)
+
+    assert result == "decorator"
+    assert calls[0][0] is wait_gen
+    assert calls[0][1] == (ValueError, TimeoutError)
+    assert calls[0][3]["max_tries"] == 3
+
+
+def test_live_measurements_uses_persistent_reconnects(monkeypatch, tmp_path):
+    module, _cache_path = _load_tibber_api(monkeypatch, tmp_path)
+    calls = []
+
+    class FakeHome:
+        def event(self, _name):
+            return lambda callback: callback
+
+        def start_live_feed(self, **kwargs):
+            calls.append(kwargs)
+
+    monkeypatch.setattr(
+        module, "_install_tibber_backoff_compatibility", lambda _home: True
+    )
+
+    module.live_measurements(FakeHome())
+
+    assert len(calls) == 1
+    assert calls[0]["retries"] is None
+    assert calls[0]["retry_interval"] == 10

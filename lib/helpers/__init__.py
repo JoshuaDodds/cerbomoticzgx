@@ -204,7 +204,7 @@ def current_min_soc_reserve() -> float:
             return default
 
     if WINTER_MODE:
-        return _f('MIN_SOC_RESERVE_WINTER', 20.0)
+        return _f('MIN_SOC_RESERVE_WINTER', 40.0)
     return _f('MIN_SOC_RESERVE_SUMMER', 5.0)
 
 def get_seasonally_adjusted_max_charge_slots(batt_soc: float, pv_production_remaining: float = 0.0) -> int:

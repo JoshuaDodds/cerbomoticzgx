@@ -40,6 +40,65 @@ def _snapshot_with(values):
     return m.snapshot()
 
 
+def test_dashboard_keeps_abb_energy_and_phase_current_with_evcs_session_time():
+    topics = MqttLive()._build_topics("portal-123")
+    assert topics["ev_energy_kwh"] == "N/portal-123/acload/42/Ac/Energy/Forward"
+    assert topics["ev_charge_time"] == "N/portal-123/evcharger/40/ChargingTime"
+    for phase in (1, 2, 3):
+        assert topics[f"ev_l{phase}_a"] == (
+            f"N/portal-123/acload/42/Ac/L{phase}/Current"
+        )
+    assert topics["ev_charge_decision"] == (
+        "Cerbomoticzgx/GlobalState/ev_charge_decision"
+    )
+    assert topics["ev_charge_requested"] == (
+        "Cerbomoticzgx/GlobalState/ev_charge_requested"
+    )
+    assert topics["ev_charge_requested_at"] == (
+        "Cerbomoticzgx/GlobalState/ev_charge_requested_at"
+    )
+
+
+def test_snapshot_exposes_manual_ev_start_decision():
+    decision = {
+        "intent": True,
+        "code": "waiting_authorization",
+        "updated_at": 123.0,
+    }
+    parsed = _snapshot_with({"ev_charge_decision": "waiting_authorization|123.0"})[
+        "ev_charge_decision"]
+    assert parsed.pop("age_s") >= 0
+    assert parsed == decision
+    assert _snapshot_with({"ev_charge_decision": None})[
+        "ev_charge_decision"] is None
+
+    live_client = MqttLive()
+    topic = "Cerbomoticzgx/GlobalState/ev_charge_decision"
+    live_client._key_by_topic[topic] = "ev_charge_decision"
+    message = type("Message", (), {
+        "topic": topic,
+        "payload": b'{"value": "waiting_authorization|123.0"}',
+    })()
+    live_client._on_message(None, None, message)
+    parsed = live_client.snapshot()["ev_charge_decision"]
+    assert parsed.pop("age_s") >= 0
+    assert parsed == decision
+
+
+def test_snapshot_exposes_original_manual_request_age():
+    requested_at = time.time() - 20
+    snapshot = _snapshot_with({
+        "ev_charge_requested": "True",
+        "ev_charge_requested_at": str(requested_at),
+    })
+    assert snapshot["ev_charge_requested"] == "True"
+    assert snapshot["ev_charge_requested_at"] == pytest.approx(requested_at)
+    assert snapshot["ev_charge_request_age_s"] == pytest.approx(20, abs=2)
+
+    snapshot = _snapshot_with({"ev_charge_requested": "False"})
+    assert snapshot["ev_charge_request_age_s"] is None
+
+
 def test_snapshot_exposes_v2_fields_when_present():
     snap = _snapshot_with({
         "grid_l1": -2056, "grid_l2": -714, "grid_l3": -1445,
@@ -88,6 +147,95 @@ def test_snapshot_bad_values_become_none_not_exceptions():
     snap = _snapshot_with({"batt_current": "n/a", "system_state": None})
     assert snap["batt_current"] is None
     assert snap["system_state"] is None
+
+
+def test_victron_schedule_topics_are_subscribed_as_authoritative_settings():
+    topics = MqttLive()._build_topics("portal-123")
+
+    for index in range(5):
+        prefix = (
+            "N/portal-123/settings/0/Settings/CGwacs/BatteryLife/"
+            f"Schedule/Charge/{index}/"
+        )
+        assert topics[f"victron_schedule_{index}_day"] == prefix + "Day"
+        assert topics[f"victron_schedule_{index}_start"] == prefix + "Start"
+        assert topics[f"victron_schedule_{index}_duration"] == prefix + "Duration"
+        assert topics[f"victron_schedule_{index}_soc"] == prefix + "Soc"
+
+
+def test_snapshot_exposes_actual_victron_schedule_including_recurring_days():
+    snap = _snapshot_with({
+        "victron_schedule_0_day": "1",
+        "victron_schedule_0_start": "23400",
+        "victron_schedule_0_duration": "5400",
+        "victron_schedule_0_soc": "80",
+        "victron_schedule_1_day": "7",
+        "victron_schedule_1_start": "3600",
+        "victron_schedule_1_duration": "1800",
+        "victron_schedule_1_soc": "65",
+        "victron_schedule_2_day": "-1",
+    })
+
+    schedule = snap["victron_schedule"]
+    assert schedule["available"] is True
+    assert schedule["slots"][0] == {
+        "index": 0,
+        "day": 1,
+        "day_label": "Monday",
+        "start_seconds": 23400,
+        "start": "06:30",
+        "duration": 5400,
+        "target_soc": 80,
+        "enabled": True,
+        "complete": True,
+    }
+    assert schedule["slots"][1]["day_label"] == "Every day"
+    assert schedule["slots"][2]["enabled"] is False
+    assert schedule["slots"][2]["complete"] is True
+
+
+def test_snapshot_marks_partially_received_victron_schedule_as_incomplete():
+    snap = _snapshot_with({"victron_schedule_0_day": 2})
+
+    schedule = snap["victron_schedule"]
+    assert schedule["available"] is True
+    assert schedule["slots"][0]["enabled"] is True
+    assert schedule["slots"][0]["complete"] is False
+
+
+def test_snapshot_has_no_authoritative_schedule_before_mqtt_values_arrive():
+    assert _snapshot_with({})["victron_schedule"] == {
+        "available": False,
+        "updated_at": None,
+        "slots": [],
+    }
+
+
+def test_schedule_refresh_reads_each_setting_from_victron():
+    class FakeClient:
+        def __init__(self):
+            self.calls = []
+
+        def publish(self, topic, payload="", **_kwargs):
+            self.calls.append((topic, payload))
+
+    tracker = MqttLive()
+    tracker._client = FakeClient()
+    tracker._portal_id = "portal-123"
+    tracker._connected = True
+
+    assert tracker.request_victron_schedule_refresh() is True
+    assert len(tracker._client.calls) == 20
+    assert tracker._client.calls[0] == (
+        "R/portal-123/settings/0/Settings/CGwacs/BatteryLife/"
+        "Schedule/Charge/0/Day",
+        "",
+    )
+    assert tracker._client.calls[-1] == (
+        "R/portal-123/settings/0/Settings/CGwacs/BatteryLife/"
+        "Schedule/Charge/4/Soc",
+        "",
+    )
 
 
 def test_local_ev_meter_overrides_stale_charging_status_at_idle_power():
